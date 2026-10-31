@@ -10,6 +10,7 @@ import { fixedKubectl, kubectl, POD_FABRIC_CLI, readPod, verifyKubeconfig, type 
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
   socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "../seat-drain/run.js";
 import { natsLinkAllowListConfig } from "../mesh/bridge-nats-config.js";
+import { redactNatsError } from "../mesh/state-backend-nats.js";
 import { applyPlan, planPublish, planRestore, readLinkConfig, rollbackAuthority, withConfigLock, type LinkConfigFile, type ReadOptions, type RollbackAuthority,
   type SeatEntry, type WriterPlan } from "./allow-writer.js";
 import { awaitRoutable, LINK_UNIT, natsRecords, otherRoutesBack, reloadLink, routeTable, type LinkDeps } from "./link.js";
@@ -91,9 +92,15 @@ const object = (value: unknown): value is Record<string, unknown> => typeof valu
 const keys = (value: Record<string, unknown>): string => Object.keys(value).sort().join(",");
 const receipt = (request: SeamRequest, result: "pass" | "refused", observed: Record<string, unknown>): string =>
   JSON.stringify({ schema: "d3-seam-receipt-v1", run: request.run, phase: request.phase, owner: OWNER, result, observed });
+const errorDetails = (error: unknown): { errorClass: string; errorMessage: string } => {
+  const safe = redactNatsError(error);
+  return { errorClass: safe.name.slice(0, 500), errorMessage: safe.message.slice(0, 500) };
+};
 const evidence = (context: Context, name: string, value: Record<string, unknown>): string =>
   writeOnce(context.runDir, `fabric-v2-bridge-${context.request.phase}-${name}.json`, Buffer.from(`${JSON.stringify({
-    ...value, owner: OWNER, run: context.request.run, phase: context.request.phase, sessionId: context.request.sessionId,
+    ...value, ...(name === "outcome" && value.result !== "pass" ? {
+      errorClass: value.errorClass ?? null, errorMessage: value.errorMessage ?? null } : {}),
+    owner: OWNER, run: context.request.run, phase: context.request.phase, sessionId: context.request.sessionId,
     requestSha256: context.requestSha256, elapsedMs: Math.round(context.now() - context.started) }, null, 1)}\n`));
 const clock = (context: Context, budgetMs = Number.POSITIVE_INFINITY) => ({
   now: context.now, sleep: context.sleep, deadline: Math.min(context.deadline, context.now() + budgetMs) });
@@ -166,11 +173,33 @@ export interface PodIdentity {
  * still running. Read-only throughout.
  */
 const podIdentity = async (context: Context, access: KubeAccess, pin: { name: string; uid: string },
-  seal?: { leafId: string; journalBytes: number }) => {
-  const before = await readPod(access, pin.name, podReadBudget(context, 30_000));
+  seal?: { leafId: string; journalBytes: number }, measured = { observations: 0, waitedMs: 0 }) => {
+  measured.observations += 1;
+  let before = await readPod(access, pin.name, podReadBudget(context, 30_000));
   if (before && before.uid !== pin.uid) throw new SeamGap("pod-uid-mismatch");
   if (before && before.nodeName !== targetNode(context)) throw new SeamGap("pod-node-mismatch");
+  if (context.now() >= context.deadline) throw new SeamGap("phase-deadline");
   const cli = context.deps.podCli !== undefined ? context.deps.podCli : POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null;
+  // Only the pinned Pod's not-yet-running container is polled; no unavailable or failed identity is retried.
+  if (cli && before && !before.piRunning && before.piTerminated === null) {
+    const wait = clock(context, 180_000);
+    const started = wait.now();
+    try {
+      while (before && !before.piRunning && before.piTerminated === null && wait.now() < wait.deadline) {
+        await wait.sleep(Math.min(1_000, wait.deadline - wait.now()));
+        const remaining = wait.deadline - wait.now();
+        // kubectl floors timeouts at 1 s. A late wake or exhausted wait must not start another API read.
+        if (remaining < 1_000) break;
+        measured.observations += 1;
+        before = await readPod(access, pin.name, podReadBudget(context, Math.min(30_000, remaining)));
+        if (before && before.uid !== pin.uid) throw new SeamGap("pod-uid-mismatch");
+        if (before && before.nodeName !== targetNode(context)) throw new SeamGap("pod-node-mismatch");
+        if (context.now() >= context.deadline) throw new SeamGap("phase-deadline");
+      }
+    } finally {
+      measured.waitedMs += Math.round(wait.now() - started);
+    }
+  }
   let reason: string | null = null;
   let identity: PodIdentity | null = null;
   let journal: JournalRead | null = null;
@@ -209,11 +238,12 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
       }
     }
   }
-  const after = before ? await readPod(access, pin.name, podReadBudget(context, 30_000)) : undefined;
-  if (context.now() >= context.deadline) throw new SeamGap("phase-deadline");
+  const after = before && !reason ? await readPod(access, pin.name, podReadBudget(context, 30_000)) : undefined;
+  if (!reason && context.now() >= context.deadline) throw new SeamGap("phase-deadline");
   if (!reason && (!after || after.uid !== pin.uid)) reason = "pod-uid-changed";
   if (!reason && !after!.piRunning) reason = "pod-not-running";
-  return { before: before ?? null, after: after ?? null, identity, journal, journalError, reason, line, execCode, cli };
+  return { before: before ?? null, after: after ?? null, identity, journal, journalError, reason, line, execCode, cli,
+    observations: measured.observations, waitedMs: measured.waitedMs };
 };
 
 interface JournalRead {
@@ -328,87 +358,103 @@ const resume = async (context: Context): Promise<number> => {
   const intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-resume-intent-v1", pod: pin, finalSeal: inputs.finalSeal,
     measured: { kubectl: access.kubectl, server: access.server, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() },
     residuals: RESIDUALS });
-  let read = await podIdentity(context, access, pin, seal);
-  let observations = 1;
-  // Only the one state that Pi's startup append ends is re-observed: the exact sealed bytes, nothing after them.
-  const awaitingAppend = (): boolean => {
+  const measured = { finalSeal: seal, observations: 0, waitedMs: 0 };
+  let outcome: Record<string, unknown> = { measured };
+  let failed = false;
+  let output = "";
+  try {
+    let read = await podIdentity(context, access, pin, seal, measured);
+    // Only the one state that Pi's startup append ends is re-observed: the exact sealed bytes, nothing after them.
+    const awaitingAppend = (): boolean => {
+      const rendered = sessionArg(read.before);
+      const journal = read.journal;
+      return !seal.sealHasThinkingEntry && read.reason === null && rendered !== null &&
+        read.identity !== null && read.identity.sessionFile === rendered && journal !== null &&
+        read.identity.leafId === journal.leafId && journal.leafId === seal.leafId &&
+        journal.journalBytes === seal.journalBytes && journal.journalSha256 === seal.journalSha256 &&
+        journal.sealedSha256 === seal.journalSha256 && journal.sealOnBranch && !journal.truncated &&
+        journal.suffixBytes === 0 && journal.suffixBase64 === "" && journal.appendedSinceSeal?.length === 0;
+    };
+    const wait = clock(context, APPEND_WAIT_MS);
+    while (awaitingAppend() && wait.now() < wait.deadline) {
+      await wait.sleep(Math.min(APPEND_POLL_MS, wait.deadline - wait.now()));
+      // Do not let another full identity read consume the phase's last budget and bypass the missing-append outcome.
+      // A late wake also stops polling; the last coherent observation still gets its normal checks below.
+      if (wait.deadline - wait.now() <= APPEND_READ_MS) break;
+      read = await podIdentity(context, access, pin, seal, measured);
+    }
     const rendered = sessionArg(read.before);
     const journal = read.journal;
-    return !seal.sealHasThinkingEntry && read.reason === null && rendered !== null &&
-      read.identity !== null && read.identity.sessionFile === rendered && journal !== null &&
-      read.identity.leafId === journal.leafId && journal.leafId === seal.leafId &&
-      journal.journalBytes === seal.journalBytes && journal.journalSha256 === seal.journalSha256 &&
-      journal.sealedSha256 === seal.journalSha256 && journal.sealOnBranch && !journal.truncated &&
-      journal.suffixBytes === 0 && journal.suffixBase64 === "" && journal.appendedSinceSeal?.length === 0;
-  };
-  const wait = clock(context, APPEND_WAIT_MS);
-  while (awaitingAppend() && wait.now() < wait.deadline) {
-    await wait.sleep(Math.min(APPEND_POLL_MS, wait.deadline - wait.now()));
-    // Do not let another full identity read consume the phase's last budget and bypass the missing-append outcome.
-    // A late wake also stops polling; the last coherent observation still gets its normal checks below.
-    if (wait.deadline - wait.now() <= APPEND_READ_MS) break;
-    read = await podIdentity(context, access, pin, seal);
-    observations += 1;
-  }
-  const rendered = sessionArg(read.before);
-  const journal = read.journal;
-  const gap = (code: string): never => {
-    evidence(context, "outcome", { schema: "fabric-v2-bridge-resume-outcome-v1", result: "unknown", gap: code, intentSha256,
-      measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal, finalSeal: seal,
-        observations },
-      asserted: { identity: read.identity, podLine: read.line } });
-    throw new SeamGap(code);
-  };
-  // The in-image reader found the resumed file's branch broken (a cycle or a missing parent). The sealed branch was
-  // whole when A sealed it, so an appended entry broke it: one reusing an id (Pi's index lets a later id win) or one
-  // that does not chain. Never a resume.
-  if (read.journalError === "JOURNAL_BRANCH_BROKEN") gap("resume-tail-id-reused");
-  let reason = read.reason;
-  let appended: AppendedEntry[] = [];
-  if (!reason && journal) {
-    // The journal itself must still begin with exactly the sealed bytes, and grew by at most 64 KiB: no receipt otherwise.
-    if (journal.sealedSha256 !== seal.journalSha256) gap("journal-prefix-mismatch");
-    if (journal.suffixBytes > SUFFIX_MAX || journal.suffixBase64 === null) gap("journal-suffix-too-large");
-    // The sealed leaf must be the current leaf or an ancestor: otherwise the branch diverged after the seal.
-    if (!journal.sealOnBranch) gap("branch-diverged");
-    // The seam's own measure of the suffix: its bytes are the size the CLI reports, and its entries ARE the appended
-    // branch entries, in order, the first one's parent the sealed leaf (so the CLI's branch read is checked here).
-    const suffix = Buffer.from(journal.suffixBase64!, "base64");
-    if (suffix.length !== journal.suffixBytes || journal.journalBytes !== seal.journalBytes + suffix.length ||
-      (suffix.length === 0 && journal.journalSha256 !== seal.journalSha256)) gap("journal-suffix-inconsistent");
-    try {
-      appended = suffix.toString("utf8").split("\n").filter(line => line.trim()).map(line => entryFacts(line)!)
-        .filter((entry): entry is AppendedEntry => entry !== null);
-    } catch { gap("journal-suffix-invalid"); }
-    // Every appended entry is NEW: not an id of the sealed journal (read from the host's own sealed copy, never the
-    // Pod's report) and not repeated in the tail. A reused id can re-point a sealed entry under Pi's later-id-wins index.
-    if (appended.length > 0) {
-      const sealedIds = sealedEntryIds(context, seal);
-      const tail = new Set<string>();
-      for (const entry of appended) {
-        if (sealedIds.has(entry.id) || tail.has(entry.id)) gap("resume-tail-id-reused");
-        tail.add(entry.id);
+    const gap = (code: string): never => {
+      outcome = { result: "unknown", gap: code,
+        measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal, ...measured },
+        asserted: { identity: read.identity, podLine: read.line } };
+      throw new SeamGap(code);
+    };
+    // The in-image reader found the resumed file's branch broken (a cycle or a missing parent). The sealed branch was
+    // whole when A sealed it, so an appended entry broke it: one reusing an id (Pi's index lets a later id win) or one
+    // that does not chain. Never a resume.
+    if (read.journalError === "JOURNAL_BRANCH_BROKEN") gap("resume-tail-id-reused");
+    let reason = read.reason;
+    let appended: AppendedEntry[] = [];
+    if (!reason && journal) {
+      // The journal itself must still begin with exactly the sealed bytes, and grew by at most 64 KiB: no receipt otherwise.
+      if (journal.sealedSha256 !== seal.journalSha256) gap("journal-prefix-mismatch");
+      if (journal.suffixBytes > SUFFIX_MAX || journal.suffixBase64 === null) gap("journal-suffix-too-large");
+      // The sealed leaf must be the current leaf or an ancestor: otherwise the branch diverged after the seal.
+      if (!journal.sealOnBranch) gap("branch-diverged");
+      // The seam's own measure of the suffix: its bytes are the size the CLI reports, and its entries ARE the appended
+      // branch entries, in order, the first one's parent the sealed leaf (so the CLI's branch read is checked here).
+      const suffix = Buffer.from(journal.suffixBase64!, "base64");
+      if (suffix.length !== journal.suffixBytes || journal.journalBytes !== seal.journalBytes + suffix.length ||
+        (suffix.length === 0 && journal.journalSha256 !== seal.journalSha256)) gap("journal-suffix-inconsistent");
+      try {
+        appended = suffix.toString("utf8").split("\n").filter(line => line.trim()).map(line => entryFacts(line)!)
+          .filter((entry): entry is AppendedEntry => entry !== null);
+      } catch { gap("journal-suffix-invalid"); }
+      // Every appended entry is NEW: not an id of the sealed journal (read from the host's own sealed copy, never the
+      // Pod's report) and not repeated in the tail. A reused id can re-point a sealed entry under Pi's later-id-wins index.
+      if (appended.length > 0) {
+        const sealedIds = sealedEntryIds(context, seal);
+        const tail = new Set<string>();
+        for (const entry of appended) {
+          if (sealedIds.has(entry.id) || tail.has(entry.id)) gap("resume-tail-id-reused");
+          tail.add(entry.id);
+        }
       }
+      // With new ids, a chain from the sealed leaf through the tail in order has no cycle and ends at the reported leaf.
+      const chained = appended.every((entry, index) => entry.parentId === (index === 0 ? seal.leafId : appended[index - 1]!.id));
+      if (journal.truncated || !chained || !sameEntries(appended, journal.appendedSinceSeal ?? []) ||
+        journal.leafId !== (appended.at(-1)?.id ?? seal.leafId)) gap("journal-suffix-not-the-branch");
     }
-    // With new ids, a chain from the sealed leaf through the tail in order has no cycle and ends at the reported leaf.
-    const chained = appended.every((entry, index) => entry.parentId === (index === 0 ? seal.leafId : appended[index - 1]!.id));
-    if (journal.truncated || !chained || !sameEntries(appended, journal.appendedSinceSeal ?? []) ||
-      journal.leafId !== (appended.at(-1)?.id ?? seal.leafId)) gap("journal-suffix-not-the-branch");
+    if (!reason && !rendered) reason = "pod-session-arg-unknown";
+    if (!reason && read.identity!.sessionFile !== rendered) reason = "journal-mismatch";
+    // Rule T-FIX3: the TRUE current leaf, read from the session file; the Main's own leaf must agree with it.
+    if (!reason && read.identity!.leafId !== journal!.leafId) reason = "leaf-memory-file-mismatch";
+    // Only a coherent identity and unchanged journal can mean the startup append is still missing. Do not mask a
+    // readable Main's session/leaf mismatch with this GAP, even when its journal is a byte-identical sealed copy.
+    if (!reason && !seal.sealHasThinkingEntry && appended.length === 0) gap("resume-thinking-append-missing");
+    const observed = { sessionId, journal: read.identity?.sessionFile ?? "", leafId: journal?.leafId ?? "", podUid: pin.uid,
+      appendedSinceSeal: appended, journalSha256: journal?.journalSha256 ?? "", suffixBase64: journal?.suffixBase64 ?? "" };
+    const passed = reason === null;
+    outcome = { result: passed ? "pass" : "refused", reason,
+      observed, measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal,
+        ...measured }, asserted: { identity: read.identity, podLine: read.line } };
+    output = receipt(context.request, passed ? "pass" : "refused", observed);
+  } catch (error) {
+    failed = true;
+    outcome = { ...outcome, ...(outcome.result === "unknown" ? {} : {
+      result: "refused", reason: error instanceof SeamGap ? error.code : "seam-internal" }), ...errorDetails(error) };
+    throw error;
+  } finally {
+    try {
+      evidence(context, "outcome", { schema: "fabric-v2-bridge-resume-outcome-v1", ...outcome, intentSha256 });
+    } catch (error) {
+      // Preserve the original operation's GAP if its outcome cannot be persisted either.
+      if (!failed) throw error;
+    }
   }
-  if (!reason && !rendered) reason = "pod-session-arg-unknown";
-  if (!reason && read.identity!.sessionFile !== rendered) reason = "journal-mismatch";
-  // Rule T-FIX3: the TRUE current leaf, read from the session file; the Main's own leaf must agree with it.
-  if (!reason && read.identity!.leafId !== journal!.leafId) reason = "leaf-memory-file-mismatch";
-  // Only a coherent identity and unchanged journal can mean the startup append is still missing. Do not mask a
-  // readable Main's session/leaf mismatch with this GAP, even when its journal is a byte-identical sealed copy.
-  if (!reason && !seal.sealHasThinkingEntry && appended.length === 0) gap("resume-thinking-append-missing");
-  const observed = { sessionId, journal: read.identity?.sessionFile ?? "", leafId: journal?.leafId ?? "", podUid: pin.uid,
-    appendedSinceSeal: appended, journalSha256: journal?.journalSha256 ?? "", suffixBase64: journal?.suffixBase64 ?? "" };
-  const passed = reason === null;
-  evidence(context, "outcome", { schema: "fabric-v2-bridge-resume-outcome-v1", result: passed ? "pass" : "refused", reason, intentSha256,
-    observed, measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal,
-      finalSeal: seal, observations }, asserted: { identity: read.identity, podLine: read.line } });
-  context.io.stdout(receipt(context.request, passed ? "pass" : "refused", observed));
+  context.io.stdout(output);
   return 0;
 };
 
@@ -445,15 +491,26 @@ type Gate = Record<string, unknown> | null;
  * The route, judged through the link's REAL identity gate plus the records it rests on: the gate resolves the seat on
  * `side` as `live` (an id with a second record, live or not, is ambiguous there and refuses); the hub's record is the
  * expected kind (native, or this link's mirror) and live; the NATS records for the id are exactly ONE, on
- * `natsMachine`, live; and both carry `incarnation`.
+ * `natsMachine`, live; and both carry `incarnation`. Only a separately proved legacy v1 writer may use the FILE
+ * exception: the link's gate and native FILE record must agree on any incarnation they expose, or both omit it.
  */
 const routeHolds = (gate: Gate, receiptValue: Record<string, unknown>, want: { side: "file" | "nats"; fileRemoteHost: string | null;
-  natsMachine: string; incarnation: string }): boolean => {
+  natsMachine: string; incarnation: string | null; legacySessionId?: string }): boolean => {
   const file = object(receiptValue.file) ? receiptValue.file : undefined;
+  if (gate === null || gate.status !== "live" || gate.side !== want.side ||
+    (want.side !== "file" && gate.machine !== want.natsMachine) ||
+    file === undefined || (file.remoteHost ?? null) !== want.fileRemoteHost || file.live !== true) return false;
+  if (want.legacySessionId !== undefined) {
+    if (want.side !== "file" || receiptValue.side !== "file" || want.fileRemoteHost !== null ||
+      gate.key !== `session:${want.legacySessionId}` || gate.id !== `session:${want.legacySessionId}`) return false;
+    return want.incarnation === null
+      ? file.ownerIncarnation == null && gate.ownerIncarnation == null
+      : (file.ownerIncarnation == null || file.ownerIncarnation === want.incarnation) &&
+        (gate.ownerIncarnation == null || gate.ownerIncarnation === want.incarnation) &&
+        (file.ownerIncarnation === want.incarnation || gate.ownerIncarnation === want.incarnation);
+  }
   const nats = object(receiptValue.nats) && Array.isArray(receiptValue.nats.records) ? (receiptValue.nats.records as unknown[]).filter(object) : [];
-  return gate !== null && gate.status === "live" && gate.side === want.side &&
-    (want.side === "file" || gate.machine === want.natsMachine) &&
-    file !== undefined && (file.remoteHost ?? null) === want.fileRemoteHost && file.live === true && file.ownerIncarnation === want.incarnation &&
+  return want.incarnation !== null && file.ownerIncarnation === want.incarnation &&
     nats.length === 1 && nats[0]!.machine === want.natsMachine && nats[0]!.live === true && nats[0]!.ownerIncarnation === want.incarnation;
 };
 
@@ -487,54 +544,79 @@ const publish = async (context: Context): Promise<number> => {
   const measuredPod = { kubectl: access.kubectl, server: access.server, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() };
   let plan: WriterPlan | null = null;
   let post: LinkConfigFile | null = null;
-  let intentSha256: string;
-  if (reason) {
-    intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine, plan: null,
-      rollback: null, unit: context.pins.linkUnit, routesBefore, measured: measuredPod, residuals: RESIDUALS });
-  } else {
-    // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
-    const locked = await withConfigLock(context.pins.linkConfig, () => {
-      const current = readLinkConfig(context.pins.linkConfig, readOptions(context));
-      const planned = planPublish(current, pins, { sessionId, machine });
-      // Durable BEFORE the write: the exact change, and the rollback authority (null when nothing is written).
-      const sha = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine,
-        plan: planEvidence(planned), rollback: authorityEvidence(rollbackAuthority(planned)), unit: context.pins.linkUnit, routesBefore,
-        measured: measuredPod, residuals: RESIDUALS });
-      return { planned, sha, after: applyPlan(planned) };
-    }, lockOptions(context));
-    plan = locked.planned;
-    intentSha256 = locked.sha;
-    post = locked.after;
+  let intentSha256: string | null = null;
+  let outcome: Record<string, unknown> = { written: false, measured: { before: read.before, after: read.after,
+    observations: read.observations, waitedMs: read.waitedMs }, asserted: { identity: read.identity, podLine: read.line } };
+  let failed = false;
+  let output = "";
+  try {
+    if (reason) {
+      intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine, plan: null,
+        rollback: null, unit: context.pins.linkUnit, routesBefore, measured: measuredPod, residuals: RESIDUALS });
+    } else {
+      // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
+      const locked = await withConfigLock(context.pins.linkConfig, () => {
+        const current = readLinkConfig(context.pins.linkConfig, readOptions(context));
+        const planned = planPublish(current, pins, { sessionId, machine });
+        // Durable BEFORE the write: keep its sha even if applyPlan throws before the callback returns.
+        intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine,
+          plan: planEvidence(planned), rollback: authorityEvidence(rollbackAuthority(planned)), unit: context.pins.linkUnit, routesBefore,
+          measured: measuredPod, residuals: RESIDUALS });
+        outcome.written = planned.change === "none" ? false : null;
+        const after = applyPlan(planned);
+        outcome.written = planned.change !== "none";
+        return { planned, after };
+      }, lockOptions(context));
+      plan = locked.planned;
+      post = locked.after;
+    }
+    const written = plan !== null && plan.change !== "none";
+    let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
+    let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
+    let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
+    // Everything after the write reads the config ON DISK now (re-read and re-validated by applyPlan).
+    if (!reason && written) {
+      reload = await reloadLink(post!.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000));
+      if (!reload.statusOk) reason = "link-not-reloaded";
+    }
+    if (!reason) {
+      const incarnation = read.identity!.ownerIncarnation!;
+      routed = await awaitRoutable(post!.config, sessionId, context.deps, clock(context, PUBLISH_SEAT_ROUTE_WAIT_MS), (gate, value) =>
+        routeHolds(gate, value, { side: "nats", fileRemoteHost: post!.config.link, natsMachine: machine, incarnation }));
+      if (!routed.ok) reason = routed.gate !== null && routed.gate.status !== "live" ? "seat-route-refused-by-gate" : "seat-not-routable";
+    }
+    if (written) {
+      // Every other route the link carried live before the restart must be live again, whatever this seat's result.
+      others = await otherRoutesBack(post!.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, OTHER_ROUTES_WAIT_MS));
+      if (!reason && others.down.length > 0) reason = "other-routes-down";
+    }
+    // A known precheck refusal needs no final read, especially after the startup wait used the phase's last time.
+    const final = read.reason === null && context.deadline - context.now() >= 1_000
+      ? await readPod(access, pin.name, podReadBudget(context, 30_000)) : undefined;
+    if (!reason && (!final || final.uid !== pin.uid || !final.piRunning)) reason = "pod-uid-changed";
+    const route = `v2@${pin.uid}:${(post?.sha256 ?? first.sha256).slice(0, 12)}`;
+    const observed = { sessionId, incarnation: pin.uid, route };
+    const passed = reason === null;
+    outcome = { result: passed ? "pass" : "refused", reason,
+      observed, written, measured: { before: read.before, after: read.after, final: final ?? null, configSha256: post?.sha256 ?? null, reload,
+        otherRoutes: others, gate: routed?.gate ?? null, receipt: routed?.receipt ?? null,
+        observations: read.observations, waitedMs: read.waitedMs }, asserted: { identity: read.identity, podLine: read.line } };
+    output = receipt(context.request, passed ? "pass" : "refused", observed);
+  } catch (error) {
+    failed = true;
+    outcome = { ...outcome, result: "refused", reason: error instanceof SeamGap ? error.code : "seam-internal", ...errorDetails(error) };
+    throw error;
+  } finally {
+    if (intentSha256 !== null) {
+      try {
+        evidence(context, "outcome", { schema: "fabric-v2-bridge-publish-outcome-v1", ...outcome, intentSha256 });
+      } catch (error) {
+        // Preserve the original operation's GAP if its outcome cannot be persisted either.
+        if (!failed) throw error;
+      }
+    }
   }
-  const written = plan !== null && plan.change !== "none";
-  let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
-  let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
-  let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
-  // Everything after the write reads the config ON DISK now (re-read and re-validated by applyPlan).
-  if (!reason && written) {
-    reload = await reloadLink(post!.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000));
-    if (!reload.statusOk) reason = "link-not-reloaded";
-  }
-  if (!reason) {
-    const incarnation = read.identity!.ownerIncarnation!;
-    routed = await awaitRoutable(post!.config, sessionId, context.deps, clock(context, PUBLISH_SEAT_ROUTE_WAIT_MS), (gate, value) =>
-      routeHolds(gate, value, { side: "nats", fileRemoteHost: post!.config.link, natsMachine: machine, incarnation }));
-    if (!routed.ok) reason = routed.gate !== null && routed.gate.status !== "live" ? "seat-route-refused-by-gate" : "seat-not-routable";
-  }
-  if (written) {
-    // Every other route the link carried live before the restart must be live again, whatever this seat's result.
-    others = await otherRoutesBack(post!.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, OTHER_ROUTES_WAIT_MS));
-    if (!reason && others.down.length > 0) reason = "other-routes-down";
-  }
-  const final = await readPod(access, pin.name, Math.min(30_000, Math.max(1_000, context.deadline - context.now())));
-  if (!reason && (!final || final.uid !== pin.uid || !final.piRunning)) reason = "pod-uid-changed";
-  const route = `v2@${pin.uid}:${(post?.sha256 ?? first.sha256).slice(0, 12)}`;
-  const observed = { sessionId, incarnation: pin.uid, route };
-  const passed = reason === null;
-  evidence(context, "outcome", { schema: "fabric-v2-bridge-publish-outcome-v1", result: passed ? "pass" : "refused", reason, intentSha256,
-    observed, written, measured: { before: read.before, after: read.after, final: final ?? null, configSha256: post?.sha256 ?? null, reload,
-      otherRoutes: others, gate: routed?.gate ?? null, receipt: routed?.receipt ?? null }, asserted: { identity: read.identity, podLine: read.line } });
-  context.io.stdout(receipt(context.request, passed ? "pass" : "refused", observed));
+  context.io.stdout(output);
   return 0;
 };
 
@@ -650,10 +732,21 @@ const restoreRoute = async (context: Context): Promise<number> => {
     const local = await localIdentity(context, meshRoot);
     const start = procStartTime(writer.pid as number, context.deps.procRoot) ?? null;
     const v1 = "reply" in local ? local.reply : undefined;
+    // b7221c04's status predates `session`. Absence is legacy; a present malformed value is never legacy.
+    const legacy = v1 !== undefined && !Object.hasOwn(v1, "session");
+    const v1Session = v1 && object(v1.session) ? v1.session : null;
+    const reportedIncarnation = v1Session?.ownerIncarnation;
+    let incarnation = typeof reportedIncarnation === "string" && reportedIncarnation ? reportedIncarnation : null;
+    let incarnationSource = legacy ? "unavailable-v1-b7221c04" : "main-drain-session";
     if (!reason && !v1) reason = "v1-unreachable";
-    if (!reason && (v1!.pid !== writer.pid || start === null || local.owner?.processStartedAt !== start)) reason = "v1-writer-mismatch";
-    if (!reason && v1!.session.file !== writer.sessionFile) reason = "v1-session-file-mismatch";
-    if (!reason && !v1!.session.ownerIncarnation) reason = "v1-incarnation-unknown";
+    if (!reason && (v1!.pid !== writer.pid || v1!.rootId !== `session:${sessionId}` || start === null ||
+      local.owner?.pid !== writer.pid || local.owner?.rootId !== `session:${sessionId}` ||
+      local.owner?.processStartedAt !== start)) reason = "v1-writer-mismatch";
+    // Legacy has no server-reported session file: the verified live owner's record must name A's recovered file.
+    if (!reason && legacy && local.owner?.sessionFile !== writer.sessionFile) reason = "v1-session-file-mismatch";
+    if (!reason && !legacy && v1Session === null) reason = "v1-session-unreadable";
+    if (!reason && !legacy && v1Session!.file !== writer.sessionFile) reason = "v1-session-file-mismatch";
+    if (!reason && !legacy && incarnation === null) reason = "v1-incarnation-unknown";
     let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
     let v2Live: Array<Record<string, unknown>> = [];
     // Whether the seat is on the post-state's allow.file (its v1 entry, put back or never moved).
@@ -663,11 +756,20 @@ const restoreRoute = async (context: Context): Promise<number> => {
       !entries.some(entry => entry.side === "nats" && (entry.id === `session:${sessionId}` ||
         (entry.kind === "actor" && entry.rootId === `session:${sessionId}`)));
     if (!reason) {
-      const incarnation = v1!.session.ownerIncarnation!;
       routed = await awaitRoutable(post.config, sessionId, context.deps, clock(context, RESTORE_SEAT_ROUTE_WAIT_MS), (gate, value) => {
-        // Listed on allow.file: the gate must resolve it live, and the link mirror v1 into NATS under its own machine.
-        if (listed) return routeHolds(gate, value, { side: "file", fileRemoteHost: null, natsMachine: post.config.nats.machine, incarnation });
         const file = object(value.file) ? value.file : undefined;
+        if (legacy) {
+          // No activationId guess: use the link's FILE incarnation when available, otherwise record its absence.
+          const fileIncarnation = file?.ownerIncarnation;
+          const gateIncarnation = gate?.ownerIncarnation;
+          incarnation = typeof fileIncarnation === "string" && fileIncarnation ? fileIncarnation
+            : typeof gateIncarnation === "string" && gateIncarnation ? gateIncarnation : null;
+          incarnationSource = incarnation === null ? "unavailable-v1-b7221c04" : "link-file-route";
+          return routeHolds(gate, value, { side: "file", fileRemoteHost: null, natsMachine: post.config.nats.machine,
+            incarnation, legacySessionId: sessionId });
+        }
+        // Current protocol: preserve the Main's session file/incarnation proof and the link's NATS mirror check.
+        if (listed) return routeHolds(gate, value, { side: "file", fileRemoteHost: null, natsMachine: post.config.nats.machine, incarnation });
         return file !== undefined && (file.remoteHost ?? null) === null && file.live === true && file.ownerIncarnation === incarnation;
       });
       if (!routed.ok) reason = "v1-not-routable";
@@ -685,12 +787,13 @@ const restoreRoute = async (context: Context): Promise<number> => {
     const passed = reason === null;
     outcome = { result: passed ? "pass" : "refused", ...(reason === null ? {} : { reason }),
       observed, written: plan.change !== "none", measured: { configSha256: post.sha256, reload, otherRoutes: others,
-        gate: routed?.gate ?? null, receipt: routed?.receipt ?? null, v2Live, writerStart: start, owner: local.owner }, asserted: { v1: v1 ? { pid: v1.pid, rootId: v1.rootId, session: v1.session } : null,
+        gate: routed?.gate ?? null, receipt: routed?.receipt ?? null, v2Live, writerStart: start, owner: local.owner,
+        incarnation, incarnationSource }, asserted: { v1: v1 ? { pid: v1.pid, rootId: v1.rootId, session: v1Session } : null,
         error: "error" in local ? local.error : null } };
     output = receipt(context.request, passed ? "pass" : "refused", observed);
   } catch (error) {
     failed = true;
-    outcome = { ...outcome, result: "refused", reason: error instanceof SeamGap ? error.code : "seam-internal" };
+    outcome = { ...outcome, result: "refused", reason: error instanceof SeamGap ? error.code : "seam-internal", ...errorDetails(error) };
     throw error;
   } finally {
     if (intentSha256 !== null) {

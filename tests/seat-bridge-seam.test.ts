@@ -1,18 +1,24 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
+import net from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { procStartTime } from "../src/main-drain/binding.js";
+import * as mainBinding from "../src/main-drain/binding.js";
+import * as mainClient from "../src/main-drain/client.js";
+import type { MainDrainReply } from "../src/main-drain/protocol.js";
 import { readBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { journalBranch } from "../src/seat-drain/journal-branch.js";
 import * as kube from "../src/seat-drain/kube.js";
 import { SeamGap } from "../src/seat-drain/run.js";
+import * as runBoundary from "../src/seat-drain/run.js";
+import { redactNatsError } from "../src/mesh/state-backend-nats.js";
 import { main, type BridgeDeps } from "../src/seat-bridge/seam.js";
 import { createSeat, SID, type Seat } from "./seat-drain-fixture.js";
 
-// The D3 bridge seam (principal-seat move), synthetic only: a fake kubectl (no cluster), a fake systemctl, fake link
-// readers, a synthetic org (principal "Delta", seat = the fixture's session) and a synthetic nats-link config.
+// The D3 bridge seam (principal-seat move): synthetic kubectl/systemctl/link fixtures plus the explicitly labeled
+// real-a19 captured-byte replay below. Neither fixture accesses a live cluster, broker or principal filesystem.
 const linux = process.platform === "linux" && typeof process.getuid === "function";
 const sha = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
 const seats: Seat[] = [];
@@ -225,7 +231,8 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     } });
     expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
     const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
-    expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing", elapsedMs,
+    expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing",
+      errorClass: "SeamGap", errorMessage: "resume-thinking-append-missing", elapsedMs,
       measured: { observations, finalSeal: { sealHasThinkingEntry: false }, journal: { appendedSinceSeal: [], suffixBytes: 0 } } });
     expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(observations);
     expect(t).toBe(elapsedMs);
@@ -253,6 +260,189 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect((await run(w, "resume", resumeInputs, { sleep: async () => { throw new Error("unexpected append wait"); } })).receipt)
       .toMatchObject({ result: "pass" });
     expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ elapsedMs: 0, measured: { observations: 1 } });
+  });
+
+  // A19 (B08 attempt 19): A called resume while the pinned Pod's pi was still waiting, one second before startup.
+  it("resume startup regression: a19 sealed-with-thinking Pod starts after three polls and executes identity once", async () => {
+    const w = await world({ sealed: SEALED });
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: null });
+    let t = 0;
+    let polls = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      t += ms;
+      if (++polls === 3) setKube(w, RAW, { line: identityLine(w) });
+    });
+    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep });
+    const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
+    // Keep the actual a19 receipt, stderr and outcome in the RED assertion, not just a mock-call failure.
+    expect(result, JSON.stringify({ stdout: result.stdout, stderr: result.stderr, outcome }, null, 2))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "pass", observed: { leafId: "e2", appendedSinceSeal: [] } } });
+    expect(sleep).toHaveBeenCalledTimes(3);
+    expect(t).toBeGreaterThan(0);
+    expect(t).toBeLessThanOrEqual(180_000);
+    expect(outcome).toMatchObject({ result: "pass", elapsedMs: t, measured: {
+      observations: 4, waitedMs: t, finalSeal: { sealHasThinkingEntry: true } } });
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+  });
+
+  it.each([840_000, 5_000])("resume startup regression: neverstarts respects the 180 s startup and %i ms phase caps", async phaseCap => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: null });
+    let t = 0;
+    const reads: Array<{ at: number; budget: number }> = [];
+    const actualRead = kube.readPod;
+    vi.spyOn(kube, "readPod").mockImplementation(async (access, name, budget) => {
+      reads.push({ at: t, budget });
+      return actualRead(access, name, budget);
+    });
+    const sleep = vi.fn(async (ms: number) => { t += phaseCap === 840_000 ? 30_000 : ms; });
+    const result = await run(w, "resume", resumeInputs, { deadlineMs: phaseCap, now: () => t, sleep });
+    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(t).toBeGreaterThan(0);
+    expect(t).toBeLessThanOrEqual(Math.min(180_000, phaseCap));
+    if (phaseCap === 840_000) expect(t).toBe(180_000);
+    expect(sleep).toHaveBeenCalled();
+    expect(reads.every(read => read.at < phaseCap && read.budget >= 1_000 && read.budget <= Math.min(30_000, phaseCap - read.at)))
+      .toBe(true);
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-not-running",
+      elapsedMs: t, measured: { observations: expect.any(Number), waitedMs: t } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json").measured.observations).toBeGreaterThan(1);
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+  });
+
+  it.each([0, 23])("resume startup regression: already terminated with exit %i refuses without sleeping or exec", async terminated => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated });
+    const sleep = vi.fn(async () => { throw new Error("terminated pi must not be polled"); });
+    expect(await run(w, "resume", resumeInputs, { sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-not-running",
+      elapsedMs: 0, measured: { observations: 1, waitedMs: 0 } });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+  });
+
+  it("resume startup regression: already running preserves one observation and zero startup wait", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) });
+    const sleep = vi.fn(async () => { throw new Error("already running pi must not wait"); });
+    expect(await run(w, "resume", resumeInputs, { sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "pass" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "pass", elapsedMs: 0,
+      measured: { observations: 1, waitedMs: 0 } });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+  });
+
+  it.each([
+    { fault: "uid", gap: "pod-uid-mismatch" },
+    { fault: "node", gap: "pod-node-mismatch" },
+  ])("resume startup regression: $fault replacement while waiting is a GAP with an outcome, never exec", async ({ fault, gap }) => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: null });
+    let t = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      t += ms;
+      if (fault === "uid") setKube(w, { ...RAW, uid: "00000000-0000-4000-8000-0000000000ff" }, { line: identityLine(w) }, { running: false });
+      else setKube(w, RAW, { line: identityLine(w) }, { running: false, nodeName: "replacement-node" });
+    });
+    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep }))
+      .toMatchObject({ code: 2, stdout: "", stderr: `GAP: ${gap} [owner: fabric-v2]\n` });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: gap,
+      elapsedMs: t, intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+  });
+
+  it("resume startup regression: termination during waiting stops after that observation", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: null });
+    let t = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      t += ms;
+      setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: 0 });
+    });
+    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-not-running",
+      elapsedMs: t, measured: { observations: 2, waitedMs: t } });
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+  });
+
+  it.each([false, true])("resume startup regression: unreadable Pod duringWait=%s is not blindly retried", async duringWait => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: null });
+    const makeUnreadable = () => {
+      const file = path.join(w.kube, "kube-state.json");
+      const state = JSON.parse(fs.readFileSync(file, "utf8"));
+      state.pod = null;
+      fs.writeFileSync(file, JSON.stringify(state));
+    };
+    if (!duringWait) makeUnreadable();
+    let t = 0;
+    const sleep = vi.fn(async (ms: number) => { t += ms; makeUnreadable(); });
+    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-unreadable",
+      elapsedMs: t, measured: { observations: duringWait ? 2 : 1, waitedMs: t } });
+    expect(sleep).toHaveBeenCalledTimes(duringWait ? 1 : 0);
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+  });
+
+  it("resume startup regression: unreadable identity after startup is refused without another wait or exec", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: "not json", code: 1 }, { running: false, terminated: null });
+    let t = 0;
+    const sleep = vi.fn(async (ms: number) => { t += ms; setKube(w, RAW, { line: "not json", code: 1 }); });
+    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-identity-unreadable",
+      elapsedMs: t, measured: { observations: 2, waitedMs: t } });
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+  });
+
+  it("resume startup regression: a slow read consumes only the short original phase budget and retains its GAP outcome", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: null });
+    const phaseCap = 3_500;
+    let t = 0;
+    const budgets: number[] = [];
+    const actualRead = kube.readPod;
+    vi.spyOn(kube, "readPod").mockImplementation(async (access, name, budget) => {
+      expect(t).toBeLessThan(phaseCap);
+      budgets.push(budget);
+      const value = await actualRead(access, name, budget);
+      t += budget;
+      return value;
+    });
+    const sleep = vi.fn(async (ms: number) => { t += ms; });
+    expect(await run(w, "resume", resumeInputs, { deadlineMs: phaseCap, now: () => t, sleep }))
+      .toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
+    expect(budgets).toEqual([phaseCap]);
+    expect(t).toBe(phaseCap);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "phase-deadline",
+      elapsedMs: phaseCap, intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
+  });
+
+  it("resume startup regression: a generic sleep throw after INTENT attempts one refused outcome and keeps exit 2 seam-internal", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: false, terminated: null });
+    const error = new Error("synthetic pi startup timer failure");
+    const onError = vi.fn();
+    const open = vi.spyOn(fs, "openSync");
+    const outcomeFile = path.join(w.seat.runDir, "fabric-v2-bridge-resume-outcome.json");
+    expect(await run(w, "resume", resumeInputs, { sleep: async () => { throw error; }, onError }))
+      .toMatchObject({ code: 2, stdout: "", stderr: "GAP: seam-internal [owner: fabric-v2]\n" });
+    expect(onError).toHaveBeenCalledWith(error);
+    expect(open.mock.calls.filter(([file, flags]) => file === outcomeFile && typeof flags === "number" && (flags & fs.constants.O_EXCL) !== 0))
+      .toHaveLength(1);
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "seam-internal",
+      errorClass: "Error", errorMessage: error.message,
+      intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
   });
 
   // F1: a readable but mismatched identity is a refusal, not a candidate for the missing-append wait. The Main's
@@ -365,7 +555,9 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
       expect(budgets).toEqual([30_000, 30_000, 120_000, 20_000]);
       expect(t).toBe(phaseCap);
-      expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-outcome.json"))).toBe(false);
+      expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "phase-deadline",
+        errorClass: "SeamGap", errorMessage: "phase-deadline", elapsedMs: phaseCap,
+        intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
     } else {
       expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
       expect(budgets).toEqual([30_000, 30_000, 120_000, 30_000, 30_000, 30_000, 120_000, 30_000]);
@@ -409,7 +601,9 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(t).toBe(840_000);
     expect(budgets).toEqual([30_000, 30_000, 30_000]);
     expect(w.calls()).toHaveLength(5);
-    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-outcome.json"))).toBe(false);
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "phase-deadline",
+      errorClass: "SeamGap", errorMessage: "phase-deadline", elapsedMs: 840_000,
+      intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
   });
 
   /** A thinking_level_change line as Pi writes it (5 keys). */
@@ -431,7 +625,8 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       appendedSinceSeal: [{ id: "b1", parentId: "e2" }] });
     setKube(off, RAW, { line: identityLine(off) });
     expect(await run(off, "resume", resumeInputs)).toMatchObject(reused);
-    expect(evidenceOf(off, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown", gap: "resume-tail-id-reused" });
+    expect(evidenceOf(off, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown", gap: "resume-tail-id-reused",
+      errorClass: "SeamGap", errorMessage: "resume-tail-id-reused" });
     // An on-branch sealed id: a cycle under later-id-wins. The real reader refuses the branch, and the CLI says so.
     const tail = thinkingLine("e1", "e2");
     const cycle = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + tail });
@@ -697,6 +892,86 @@ const routable = (incarnation = INCARNATION, machine = MACHINE) => ({ ok: true, 
 const gateLive = (side: "file" | "nats", machine?: string) => ({ side, key: `session:${SID}`, kind: "root", status: "live", id: `session:${SID}`,
   ...(machine ? { machine } : {}) });
 
+describe.skipIf(!linux)("the shared Pod identity startup wait before publish effects", () => {
+  it("resume startup regression: publish waits for its pinned managed Pod, then checks identity once before writing", async () => {
+    const w = await world();
+    const before = fs.readFileSync(w.config);
+    setKube(w, MANAGED, { line: identityLine(w) }, { running: false, terminated: null });
+    w.receipt = routable();
+    w.gate = gateLive("nats", MACHINE);
+    let t = 0;
+    let polls = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      expect(fs.readFileSync(w.config)).toEqual(before);
+      expect(fs.existsSync(w.marker)).toBe(false);
+      t += ms;
+      if (++polls === 2) setKube(w, MANAGED, { line: identityLine(w) });
+    });
+    expect(await run(w, "publish", { owner }, { now: () => t, sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "pass" } });
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(t).toBeGreaterThan(0);
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "pass", written: true, elapsedMs: t,
+      measured: { observations: 3, waitedMs: t } });
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(fs.readFileSync(w.config)).not.toEqual(before);
+    expect(fs.readFileSync(w.marker, "utf8")).toBe("--user restart smarty-nats-link.service\n");
+  });
+
+  it("resume startup regression: publish neverstarts refuses normally within 180 s without writing or restarting", async () => {
+    const w = await world();
+    const before = fs.readFileSync(w.config);
+    setKube(w, MANAGED, { line: identityLine(w) }, { running: false, terminated: null });
+    let t = 0;
+    const sleep = vi.fn(async () => { t += 30_000; });
+    expect(await run(w, "publish", { owner }, { now: () => t, sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(t).toBe(180_000);
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "refused", reason: "pod-not-running",
+      written: false, elapsedMs: t, measured: { waitedMs: t } });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json").measured.observations).toBeGreaterThan(1);
+    expect(sleep).toHaveBeenCalled();
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    expect(fs.existsSync(w.marker)).toBe(false);
+  });
+
+  it("resume startup regression: publish startup time counts against the later route wait's original phase deadline", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) }, { running: false, terminated: null });
+    let t = 0;
+    let startupMs = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      t += ms;
+      if (startupMs === 0) { startupMs = t; setKube(w, MANAGED, { line: identityLine(w) }); }
+    });
+    expect(await run(w, "publish", { owner }, { deadlineMs: 5_000, now: () => t, sleep }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(startupMs).toBeGreaterThan(0);
+    expect(t).toBe(5_000);
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "refused", reason: "seat-not-routable",
+      written: true, elapsedMs: 5_000, measured: { observations: 2, waitedMs: startupMs } });
+  });
+
+  it("resume startup regression: a publish reload timer throw after INTENT attempts one outcome and keeps its GAP", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    w.holderStuck = true;
+    const error = new Error("synthetic publish reload timer failure");
+    const onError = vi.fn();
+    const open = vi.spyOn(fs, "openSync");
+    const outcomeFile = path.join(w.seat.runDir, "fabric-v2-bridge-publish-outcome.json");
+    expect(await run(w, "publish", { owner }, { sleep: async () => { throw error; }, onError }))
+      .toMatchObject({ code: 2, stdout: "", stderr: "GAP: seam-internal [owner: fabric-v2]\n" });
+    expect(onError).toHaveBeenCalledWith(error);
+    expect(open.mock.calls.filter(([file, flags]) => file === outcomeFile && typeof flags === "number" && (flags & fs.constants.O_EXCL) !== 0))
+      .toHaveLength(1);
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "refused", reason: "seam-internal", written: true,
+      errorClass: "Error", errorMessage: error.message,
+      intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-publish-intent.json"))) });
+  });
+});
+
 describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link restart, and the read-backs", () => {
   it("passes when the real seat route becomes live at +659 s, before its 780 s cap", async () => {
     const w = await world();
@@ -946,6 +1221,349 @@ describe.skipIf(!linux)("the REAL bridge bundle: built as scripts/build.mjs buil
   }, 60_000);
 });
 
+interface A19CapturedFile { path: string; sha256: string; bytes: number; mode: string; uid: number; base64: string }
+const a19Asset = () => JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "seat-bridge-a19-replay.json"), "utf8")) as {
+  schema: string; provenance: { inputSHA: string; liveCaptureSHA: string; legacyV1Commit: string }; files: Record<string, A19CapturedFile>;
+  request: { base64: string; sha256: string; exactMatch: boolean; journalRequestSha256: string[] };
+  liveCapture: { bundle: A19CapturedFile; mainDrainStatusReply: A19CapturedFile; natsLinkStatus: A19CapturedFile;
+    processSubstitution: { field: string; captured: number; reboundTo: number; explanation: string } };
+};
+const a19Decode = (entry: A19CapturedFile): Buffer => {
+  const bytes = Buffer.from(entry.base64, "base64");
+  expect(sha(bytes)).toBe(entry.sha256);
+  expect(bytes.length).toBe(entry.bytes);
+  return bytes;
+};
+
+// Check the ACTUAL client acceptance boundary, not merely what a direct mock can return. This socket and all
+// captured filesystem replicas stay under createSeat's test-owned temporary root. Peer liveness is modeled below.
+const a19WireReply = async (base: string, sessionId: string, wire: unknown, verifyRefusal?: string) => {
+  const directory = path.join(base, "wire");
+  fs.mkdirSync(directory, { mode: 0o700 });
+  const socket = path.join(directory, "status.sock");
+  const server = net.createServer(client => { client.once("data", () => client.end(`${JSON.stringify(wire)}\n`)); });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
+  try {
+    return { reply: await mainClient.callMainDrain(socket, sessionId, "status", null, 2_000,
+      verifyRefusal ? async () => verifyRefusal : undefined) };
+  } catch (error) { return { error }; }
+  finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+};
+
+interface A19Scenario { shape: string; reason: string | null; clientError?: string; capture?: "raw" | "pid-rebound"; fault?: string }
+const a19Cases: A19Scenario[] = [
+  { shape: "captured legacy raw reply keeps its distinct PID and refuses writer mismatch", reason: "v1-writer-mismatch", capture: "raw" },
+  { shape: "captured legacy PID-only substitution (explicit process substitution, no incarnation)", reason: null, capture: "pid-rebound" },
+  ...[
+    { fault: "reply root", reason: "v1-unreachable" },
+    { fault: "owner pid", reason: "v1-writer-mismatch" },
+    { fault: "owner root", reason: "v1-writer-mismatch" },
+    { fault: "owner start time", reason: "v1-writer-mismatch" },
+    { fault: "owner session file", reason: "v1-session-file-mismatch" },
+    { fault: "wrong gate identity", reason: "v1-not-routable" },
+    { fault: "gate not live", reason: "v1-not-routable" },
+    { fault: "cross-side gate", reason: "v1-not-routable" },
+    { fault: "cross-side receipt", reason: "v1-not-routable" },
+    { fault: "file not live", reason: "v1-not-routable" },
+    { fault: "file remote host", reason: "v1-not-routable" },
+    { fault: "link incarnation mismatch", reason: "v1-not-routable" },
+  ].map(value => ({ ...value, shape: `legacy captured ${value.fault}; PID-substituted`, capture: "pid-rebound" as const })),
+  { shape: "legacy captured link incarnation match; PID-substituted", reason: null, capture: "pid-rebound", fault: "link incarnation match" },
+  { shape: "legitimate matching v1 status", reason: null },
+  { shape: "missing session", reason: null },
+  { shape: "null session", reason: "v1-session-unreadable" },
+  { shape: "numeric session", reason: "v1-session-unreadable" },
+  { shape: "array session", reason: "v1-session-unreadable" },
+  { shape: "missing file", reason: "v1-session-file-mismatch" },
+  { shape: "null file", reason: "v1-session-file-mismatch" },
+  { shape: "missing incarnation", reason: "v1-incarnation-unknown" },
+  { shape: "null incarnation", reason: "v1-incarnation-unknown" },
+  { shape: "numeric incarnation", reason: "v1-incarnation-unknown" },
+  { shape: "object incarnation", reason: "v1-incarnation-unknown" },
+  { shape: "wrong root", reason: "v1-unreachable" },
+  { shape: "string pid", reason: "v1-writer-mismatch" },
+  { shape: "error reply", reason: "v1-unreachable", clientError: "MAIN_DRAIN_REFUSED_MAIN_DRAIN_BUSY" },
+  { shape: "null reply", reason: "v1-unreachable", clientError: "MAIN_DRAIN_REPLY_INVALID" },
+  { shape: "missing native", reason: "v1-unreachable", clientError: "MAIN_DRAIN_REPLY_MISMATCH" },
+  { shape: "invalid probes", reason: "v1-unreachable", clientError: "MAIN_DRAIN_REPLY_MISMATCH" },
+  // A literal null local owner cannot arise from varying reply fields while retaining the captured owner bytes.
+  // Its real verifier returns this refusal instead; do not bypass it and claim an impossible successful call.
+  { shape: "owner unavailable at peer verification", reason: "v1-unreachable", clientError: "MAIN_DRAIN_OWNER_UNREADABLE" },
+  { shape: "null route receipt", reason: "v1-not-routable" },
+  { shape: "malformed route records", reason: "v1-not-routable" },
+  { shape: "missing live gate", reason: "v1-not-routable" },
+] as const;
+
+// Recorded catch: a19 b3 refused a no-publish restore with seam-internal. A later actual pinned-v1 status
+// capture lacks session entirely. Its unchanged PID MUST refuse against the older writer packet. The regression
+// explicitly substitutes ONLY that volatile PID; it is not the unchanged historical reply. Gate/receipt are modeled.
+describe.skipIf(!linux)("bridge real-a19 replay", () => {
+  it.each(a19Cases)("real-a19 replay: $shape through the actual restore main", async scenario => {
+    const asset = a19Asset();
+    expect(asset.schema).toBe("seat-bridge-a19-replay-v1");
+    expect(asset.provenance.inputSHA).toBe("76a40da18543ae2a30058094e0c690c8b9ecf40cb6ddd2d72720436818e65951");
+    expect(asset.provenance.liveCaptureSHA).toBe("0e8af23ea620ec6297d7bf048493bba14a53f19b9e8dc488027ea0b2cf2ecd2f");
+    expect(asset.provenance.legacyV1Commit).toBe("b7221c04ab7d40027af10b548d8cc2cb07e25480");
+    const liveBundle = JSON.parse(a19Decode(asset.liveCapture.bundle).toString("utf8"));
+    expect(asset.liveCapture.bundle.sha256).toBe(asset.provenance.liveCaptureSHA);
+    const capturedStatusBytes = a19Decode(asset.liveCapture.mainDrainStatusReply);
+    const capturedLinkBytes = a19Decode(asset.liveCapture.natsLinkStatus);
+    expect(capturedStatusBytes.toString("utf8")).toBe(liveBundle.mainDrainStatusReply);
+    expect(capturedLinkBytes.toString("utf8")).toBe(liveBundle.natsLinkStatus.stdout);
+    const capturedStatus = JSON.parse(capturedStatusBytes.toString("utf8"));
+    const capturedLinkStatus = JSON.parse(capturedLinkBytes.toString("utf8"));
+    expect(capturedStatus).not.toHaveProperty("session");
+    // Decode and hash EVERY retained original file; the old refusal is evidence, not an expected replay result.
+    const bytes = Object.fromEntries(Object.entries(asset.files).map(([name, file]) => [name, a19Decode(file)]));
+    const capturedRun = JSON.parse(bytes["seat-run.json"]!.toString("utf8"));
+    const capturedInputs = JSON.parse(bytes["seat-inputs.json"]!.toString("utf8"));
+    const oldIntent = JSON.parse(bytes["fabric-v2-bridge-rc-restore-route-intent.json"]!.toString("utf8"));
+    const oldOutcome = JSON.parse(bytes["fabric-v2-bridge-rc-restore-route-outcome.json"]!.toString("utf8"));
+    const capturedConfig = JSON.parse(bytes["link-config d3.json"]!.toString("utf8"));
+    const ownerName = Object.keys(bytes).find(name => name.startsWith("mesh owner "))!;
+    const capturedOwner = JSON.parse(bytes[ownerName]!.toString("utf8"));
+    const relaunch = JSON.parse(bytes["receipts/rc-relaunch.json"]!.toString("utf8"));
+    const stdin = Buffer.from(asset.request.base64, "base64");
+    const req = JSON.parse(stdin.toString("utf8"));
+    expect(sha(stdin)).toBe(asset.request.sha256);
+    expect(asset.request).toMatchObject({ exactMatch: true, journalRequestSha256: [sha(stdin)] });
+    expect(oldIntent.requestSha256).toBe(sha(stdin));
+    expect(oldOutcome).toMatchObject({ result: "refused", reason: "seam-internal", written: false,
+      intentSha256: sha(bytes["fabric-v2-bridge-rc-restore-route-intent.json"]!) });
+    expect(req.runSha256).toBe(sha(bytes["seat-run.json"]!));
+    expect(capturedInputs).toMatchObject({ run: req.run, runSha256: req.runSha256 });
+    expect(req.inputs.writer).toEqual(relaunch.observed);
+    expect(capturedOwner).toMatchObject({ pid: req.inputs.writer.pid, sessionFile: req.inputs.writer.sessionFile,
+      sessionId: req.sessionId, rootId: `session:${req.sessionId}` });
+    expect(capturedConfig.allow.nats).toEqual([]);
+    expect(oldIntent.plan).toMatchObject({ change: "none", beforeHadNats: true, beforeSha256: sha(bytes["link-config d3.json"]!) });
+
+    const seat = await createSeat({ start: false });
+    seats.push(seat);
+    const config = path.join(seat.base, "captured-link", "d3.json");
+    fs.mkdirSync(path.dirname(config), { mode: 0o700 });
+    fs.writeFileSync(config, bytes["link-config d3.json"]!, { mode: 0o600 });
+    const localOwner = structuredClone(capturedOwner);
+    if (scenario.fault === "owner pid") localOwner.pid += 1;
+    if (scenario.fault === "owner root") localOwner.rootId = "session:wrong-owner";
+    if (scenario.fault === "owner start time") localOwner.processStartedAt += "0";
+    if (scenario.fault === "owner session file") localOwner.sessionFile += ".wrong";
+    fs.writeFileSync(path.join(seat.meshRoot, "main-followups", `${req.sessionId}.owner.json`),
+      scenario.fault?.startsWith("owner ") ? JSON.stringify(localOwner) : bytes[ownerName]!, { mode: 0o600 });
+    const lockFd = seat.lockFd(); // Real held flock and real main() proveSeatLock/verifyRunDir, not a fabricated fd.
+    // Control journal/source header/Fabric config were not captured. Supply ONLY their sealed metadata/resolution
+    // boundary, derived from the original byte-verified pair; preserve all captured fields, including home and UID.
+    vi.spyOn(runBoundary, "readSealedRun").mockImplementation((runDir, request, _uid, seamName) => {
+      expect(runDir).toBe(seat.runDir);
+      expect(request).toMatchObject(req);
+      expect(seamName).toBe("bridge");
+      return { runBytes: bytes["seat-run.json"]!, run: capturedRun, inputs: capturedInputs,
+        inputsSha256: sha(bytes["seat-inputs.json"]!), seat: capturedInputs.seat, journal: capturedRun.source.journal };
+    });
+    const resolveMesh = vi.spyOn(runBoundary, "resolveSeatMeshRoot").mockImplementation((journal, sessionId) => {
+      expect(journal).toBe(capturedRun.source.journal);
+      expect(sessionId).toBe(req.sessionId);
+      return seat.meshRoot;
+    });
+    const realpath = fs.realpathSync;
+    vi.spyOn(fs, "realpathSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      // Preserve config bytes and logical paths. Never resolve a captured path against the principal's live FS.
+      if (file === capturedConfig.file.mesh) return seat.meshRoot;
+      if (file === capturedConfig.stateDir) return capturedConfig.stateDir;
+      return realpath(file, options as never);
+    }) as typeof fs.realpathSync);
+    const startTime = mainBinding.procStartTime;
+    vi.spyOn(mainBinding, "procStartTime").mockImplementation((pid, procRoot) =>
+      pid === capturedOwner.pid ? capturedOwner.processStartedAt : startTime(pid, procRoot));
+    // Generate the FULL current v1 wire shape from the real controller, then relocate only its live identity.
+    // Incarnation and leaf were not captured: this modeled live reply is NOT evidence of the historical response.
+    seat.native.state.sessionFile = req.inputs.writer.sessionFile;
+    const statusReply = await seat.control.handle("status", null, { pid: process.pid, uid: process.getuid!() }, process.getuid!());
+    expect(typeof statusReply).toBe("object");
+    const reply: MainDrainReply = { ...(statusReply as MainDrainReply), rootId: capturedOwner.rootId,
+      sessionId: req.sessionId, meshRoot: capturedConfig.file.mesh, pid: capturedOwner.pid,
+      session: { file: capturedOwner.sessionFile, leafId: null, ownerIncarnation: V1_INCARNATION } };
+    expect(reply).toMatchObject({ v: 1, ok: true, op: "status", error: null });
+    let wire: any = scenario.capture ? structuredClone(capturedStatus) : structuredClone(reply);
+    if (scenario.capture) {
+      expect(capturedStatus.pid).not.toBe(req.inputs.writer.pid);
+      expect(asset.liveCapture.processSubstitution).toMatchObject({ field: "pid", captured: capturedStatus.pid, reboundTo: req.inputs.writer.pid });
+      if (scenario.capture === "pid-rebound") wire.pid = req.inputs.writer.pid;
+      const { pid: _wirePid, ...preserved } = wire;
+      const { pid: _capturedPid, ...original } = capturedStatus;
+      expect(preserved).toEqual(original); // All fields other than the explicitly substituted PID remain captured.
+    }
+    if (scenario.shape === "missing session") delete wire.session;
+    if (scenario.shape === "null session") wire.session = null;
+    if (scenario.shape === "numeric session") wire.session = 7;
+    if (scenario.shape === "array session") wire.session = [];
+    if (scenario.shape === "missing file") delete wire.session.file;
+    if (scenario.shape === "null file") wire.session.file = null;
+    if (scenario.shape === "missing incarnation") delete wire.session.ownerIncarnation;
+    if (scenario.shape === "null incarnation") wire.session.ownerIncarnation = null;
+    if (scenario.shape === "numeric incarnation") wire.session.ownerIncarnation = 7;
+    if (scenario.shape === "object incarnation") wire.session.ownerIncarnation = {};
+    if (scenario.shape === "wrong root" || scenario.fault === "reply root") wire.rootId = "session:wrong";
+    if (scenario.shape === "string pid") wire.pid = String(capturedOwner.pid);
+    if (scenario.shape === "error reply") { wire.ok = false; wire.error = "MAIN_DRAIN_BUSY"; }
+    if (scenario.shape === "null reply") wire = null;
+    if (scenario.shape === "missing native") delete wire.native;
+    if (scenario.shape === "invalid probes") wire.probes = {};
+    // Read the real client result before mocking that environmental call for main(). Missing/null/malformed
+    // session and incarnation are genuinely CLIENT-ACCEPTED JSON, unlike a null or error reply.
+    const received = await a19WireReply(seat.base, req.sessionId, wire,
+      scenario.shape === "owner unavailable at peer verification" ? "MAIN_DRAIN_OWNER_UNREADABLE" : undefined);
+    if (scenario.clientError) expect(received.error).toMatchObject({ code: scenario.clientError });
+    else expect(received.reply).toEqual(wire);
+    vi.spyOn(mainClient, "mainDrainSocket").mockImplementation((meshRoot, sessionId) => {
+      expect(meshRoot).toBe(seat.meshRoot);
+      expect(sessionId).toBe(req.sessionId);
+      return path.join(seat.base, "unavailable-live-main-drain.sock");
+    });
+    const status = vi.spyOn(mainClient, "callMainDrain").mockImplementation(async (_socket, sessionId, op) => {
+      expect(sessionId).toBe(req.sessionId);
+      expect(op).toBe("status");
+      if ("error" in received) throw received.error;
+      return structuredClone(received.reply!);
+    });
+    const roots = vi.fn(async () => { throw new Error("no live NATS root read is permitted in this no-publish replay"); });
+    const legacy = scenario.capture !== undefined || scenario.shape === "missing session";
+    // The old owner activationId is NOT an ownerIncarnation. Neither captured v1 nor link status exposes one.
+    const liveRoute: Record<string, any> = { ok: true, verdict: "routable", side: "file", file: { remoteHost: null, live: true,
+      ...(legacy ? {} : { ownerIncarnation: V1_INCARNATION }) },
+      nats: { read: true, records: [{ machine: capturedConfig.nats.machine, live: true,
+        ...(legacy ? {} : { ownerIncarnation: V1_INCARNATION }) }] } };
+    const liveGate: Record<string, unknown> = { side: "file", key: capturedOwner.rootId,
+      kind: "root", status: "live", id: capturedOwner.rootId, principal: capturedConfig.allow.file[0].principal };
+    if (scenario.fault === "wrong gate identity") { liveGate.id = "session:wrong-gate"; liveGate.key = liveGate.id; }
+    if (scenario.fault === "gate not live") liveGate.status = "not-live";
+    if (scenario.fault === "cross-side gate") liveGate.side = "nats";
+    if (scenario.fault === "cross-side receipt") liveRoute.side = "nats";
+    if (scenario.fault === "file not live") liveRoute.file.live = false;
+    if (scenario.fault === "file remote host") liveRoute.file.remoteHost = "synthetic-remote";
+    if (scenario.fault?.startsWith("link incarnation")) {
+      liveGate.ownerIncarnation = V1_INCARNATION;
+      liveRoute.file.ownerIncarnation = scenario.fault === "link incarnation match" ? V1_INCARNATION : INCARNATION;
+      liveRoute.nats.records[0].ownerIncarnation = liveRoute.file.ownerIncarnation;
+    }
+    let t = 0;
+    const deps: BridgeDeps = { seatPins: () => readBridgeNatsSeatPins({ productOwner: { name: capturedConfig.allow.file[0].principal },
+      principals: [{ name: capturedConfig.allow.file[0].principal, orgInstance: { fabricSession: req.sessionId,
+        herdrAgent: capturedRun.instance, herdrWorkspaceLabel: capturedConfig.allow.file[0].principal } }] }),
+      now: () => t, sleep: async ms => { t += ms; }, deadlineMs: 2_000, roots,
+      status: async () => legacy ? structuredClone(capturedLinkStatus) : ({ ok: true, problems: [], allow: { file: Object.entries(oldIntent.routesBefore)
+        .filter(([, route]) => (route as { side: string }).side === "file").map(([identity, route]) => ({ identity, live: (route as { live: boolean }).live })), nats: [] } }),
+      dryRun: async () => ({ rows: scenario.shape === "missing live gate" ? [] : [structuredClone(liveGate)] }),
+      receipt: async () => scenario.shape === "null route receipt" ? null as never : scenario.shape === "malformed route records"
+        ? { ...liveRoute, nats: { read: true, records: {} } } : structuredClone(liveRoute),
+      onError: vi.fn(),
+    };
+    // Test-only exact-HEAD baseline; the artifact rebases static imports only. Normal CI always uses current main.
+    const replayMain: typeof main = process.env.D3_REPLAY_BASE
+      ? (await import(/* @vite-ignore */ process.env.D3_REPLAY_BASE)).main : main;
+    let stdout = ""; let stderr = "";
+    const code = await replayMain(["--run-dir", seat.runDir, "--phase", req.phase], {
+      stdin: () => stdin, stdout: value => { stdout += value; }, stderr: value => { stderr += value; },
+      env: { D3_SEAT_LOCK_FD: String(lockFd) },
+    }, { linkConfig: config, linkUnit: oldIntent.unit }, deps);
+    // onError exposes any REAL throw's class/message/stack to the assertion, without inventing malformed inputs.
+    const errors = (deps.onError as ReturnType<typeof vi.fn>).mock.calls.map(([error]) => {
+      const safe = redactNatsError(error);
+      return { errorClass: safe.name, errorMessage: safe.message, stack: safe.stack };
+    });
+    expect({ code, stderr, errors }, JSON.stringify({ code, stderr, errors })).toEqual({ code: 0, stderr: "", errors: [] });
+    const intent = JSON.parse(fs.readFileSync(path.join(seat.runDir, "fabric-v2-bridge-rc-restore-route-intent.json"), "utf8"));
+    const outcome = JSON.parse(fs.readFileSync(path.join(seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"), "utf8"));
+    expect(JSON.parse(stdout), JSON.stringify(outcome)).toMatchObject({ result: scenario.reason === null ? "pass" : "refused",
+      phase: req.phase, run: req.run,
+      observed: { sessionId: req.sessionId, route: `v1@${capturedOwner.pid}:${capturedOwner.processStartedAt}` } });
+    const { file: _originalPath, ...oldPlan } = oldIntent.plan;
+    expect(intent.plan).toEqual({ ...oldPlan, file: config });
+    expect(intent).toMatchObject({ requestSha256: sha(stdin), writer: req.inputs.writer, routesBefore: oldIntent.routesBefore });
+    expect(outcome).toMatchObject({ result: scenario.reason === null ? "pass" : "refused", written: false,
+      measured: { owner: localOwner } });
+    if (scenario.reason === null && legacy) {
+      const linkIncarnation = scenario.fault === "link incarnation match";
+      expect(outcome).toMatchObject({ measured: { incarnation: linkIncarnation ? V1_INCARNATION : null,
+        incarnationSource: linkIncarnation ? "link-file-route" : "unavailable-v1-b7221c04" },
+        asserted: { v1: { pid: wire.pid, rootId: wire.rootId } } });
+      expect(outcome.measured.incarnation).not.toBe(capturedOwner.activationId);
+      expect(outcome.measured.gate).toMatchObject({ side: "file", status: "live", id: capturedOwner.rootId });
+      expect(outcome.measured.receipt.file).toMatchObject({ remoteHost: null, live: true });
+      if (linkIncarnation) expect(outcome.measured.receipt.file.ownerIncarnation).toBe(outcome.measured.gate.ownerIncarnation);
+      else expect(outcome.measured.receipt.file).not.toHaveProperty("ownerIncarnation");
+    } else if (scenario.reason === null) expect(outcome).toMatchObject({ asserted: { v1: { pid: reply.pid, rootId: reply.rootId, session: reply.session } } });
+    else expect(outcome).toMatchObject({ reason: scenario.reason });
+    // Exact-base replay predates diagnostics. Current-source non-pass outcomes must always state null/null
+    // when no exception escaped, including client refusals normalized by localIdentity.
+    if (scenario.reason !== null && !process.env.D3_REPLAY_BASE) expect(outcome).toMatchObject({ errorClass: null, errorMessage: null });
+    expect(fs.readFileSync(config)).toEqual(bytes["link-config d3.json"]);
+    expect(resolveMesh).toHaveBeenCalledTimes(1);
+    expect(status).toHaveBeenCalledTimes(1);
+    expect(roots).not.toHaveBeenCalled();
+  });
+});
+
+// Data-safety/failure-path coverage: outcomes must be useful without retaining exception stacks or credentials.
+describe.skipIf(!linux)("bridge nonpass diagnostics", () => {
+  const phases = ["resume", "publish", "rc-restore-route"] as const;
+  const scenario = async (phase: typeof phases[number]) => {
+    const w = await world({ allow: { file: [leadEntry, seatFileEntry], nats: [] } });
+    if (phase === "resume") setKube(w, RAW, { line: identityLine(w) }, { running: false });
+    if (phase === "publish") setKube(w, MANAGED, { line: identityLine(w) });
+    if (phase === "rc-restore-route") w.seat.native.state.sessionFile = "/synthetic/v1/session.jsonl";
+    const inputs = phase === "resume" ? resumeInputs(w) : phase === "publish" ? { owner } : writerInputs(w);
+    return { w, inputs };
+  };
+  it.each(phases)("nonpass diagnostics: %s normal refusal has explicit null/null fields", async phase => {
+    const { w, inputs } = await scenario(phase);
+    const result = await run(w, phase, inputs, { deadlineMs: 2_000 });
+    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    const outcome = evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`);
+    const reason = phase === "resume" ? "pod-not-running" : phase === "publish" ? "seat-not-routable" : "v1-not-routable";
+    expect(outcome).toMatchObject({ result: "refused", reason, errorClass: null, errorMessage: null });
+    expect(outcome).not.toHaveProperty("gap");
+    expect(Object.hasOwn(outcome, "errorClass") && Object.hasOwn(outcome, "errorMessage")).toBe(true);
+  });
+  it.each(phases.flatMap(phase => ["error", "string", "object"].map(kind => ({ phase, kind }))))(
+    "nonpass diagnostics: $phase sanitizes a thrown $kind and retains exactly one intent-linked outcome", async ({ phase, kind }) => {
+      const { w, inputs } = await scenario(phase);
+      const sensitive = "password=b4-password Bearer b4-bearer https://b4-user:b4-url-password@example.invalid/path?token=b4-query ";
+      const typed = new TypeError(`${sensitive}${"m".repeat(700)} token=b4-tail`);
+      typed.name = `TypeError secret=b4-class ${"n".repeat(600)}`;
+      typed.stack = "B4_STACK_MUST_NOT_LEAK";
+      Object.assign(typed, { rawpayload: "B4_RAW_PAYLOAD_MUST_NOT_LEAK" });
+      const error: unknown = kind === "error" ? typed : kind === "string" ? `${sensitive}${"s".repeat(700)}`
+        : { code: "B4_DIAGNOSTIC", rawpayload: "B4_RAW_PAYLOAD_MUST_NOT_LEAK", password: "b4-password", Bearer: "b4-bearer" };
+      const safe = redactNatsError(error);
+      const onError = vi.fn();
+      const outcomeFile = path.join(w.seat.runDir, `fabric-v2-bridge-${phase}-outcome.json`);
+      const originalOpen = fs.openSync;
+      const attempts: number[] = [];
+      vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: number | string, mode?: fs.Mode) => {
+        if (file === outcomeFile && typeof flags === "number" && (flags & fs.constants.O_EXCL) !== 0) attempts.push(flags);
+        return originalOpen(file, flags, mode);
+      }) as typeof fs.openSync);
+      const result = await run(w, phase, inputs, { deadlineMs: 5_000, sleep: async () => { throw error; }, onError });
+      expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: seam-internal [owner: fabric-v2]\n" });
+      expect(onError).toHaveBeenCalledExactlyOnceWith(error);
+      expect(attempts).toHaveLength(1);
+      const outcome = evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`);
+      expect(outcome).toMatchObject({ result: "refused", reason: "seam-internal", errorClass: safe.name.slice(0, 500),
+        errorMessage: safe.message.slice(0, 500),
+        intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, `fabric-v2-bridge-${phase}-intent.json`))) });
+      expect(outcome.errorClass.length).toBeLessThanOrEqual(500);
+      expect(outcome.errorMessage.length).toBeLessThanOrEqual(500);
+      if (kind === "error" || kind === "string") expect(outcome.errorMessage).toHaveLength(500);
+      if (kind === "error") expect(outcome.errorClass).toHaveLength(500);
+      const serialized = JSON.stringify(outcome);
+      for (const secret of ["b4-password", "b4-bearer", "b4-url-password", "b4-query", "b4-class", "b4-tail",
+        "B4_STACK_MUST_NOT_LEAK", "B4_RAW_PAYLOAD_MUST_NOT_LEAK"]) expect(serialized).not.toContain(secret);
+      expect(outcome).not.toHaveProperty("stack");
+      expect(outcome).not.toHaveProperty("rawpayload");
+    });
+});
+
 const writerInputs = (w: World, extra: Record<string, unknown> = {}) => ({ recoveryRun: "c".repeat(32), parentRun: w.seat.run,
   parentRunSha256: w.seat.runSha256, writer: { sessionId: SID, pid: process.pid, sessionFile: "/synthetic/v1/session.jsonl", singleWriter: true, ...extra } });
 
@@ -1047,7 +1665,7 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     expect(fs.readFileSync(w.marker, "utf8").trim().split("\n")).toHaveLength(2);
     expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"))).toBe(true);
     expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused",
-      reason: "nats-presence-unreadable", written: true });
+      reason: "nats-presence-unreadable", written: true, errorClass: "SeamGap", errorMessage: "nats-presence-unreadable" });
   });
 
   it("restore regression: applyPlan GAP after locked intent still records an outcome", async () => {
@@ -1071,7 +1689,8 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     expect(fs.existsSync(w.marker)).toBe(false);
     expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"))).toBe(true);
     expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused",
-      reason: "link-config-unreadable", written: false, intentSha256: sha(fs.readFileSync(intentFile)) });
+      reason: "link-config-unreadable", written: false, errorClass: "SeamGap", errorMessage: "link-config-unreadable",
+      intentSha256: sha(fs.readFileSync(intentFile)) });
   });
 
   it("restore regression: a non-SeamGap after intent retains seam-internal and records an outcome", async () => {
@@ -1087,7 +1706,8 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     expect(fs.existsSync(w.marker)).toBe(false);
     expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"))).toBe(true);
     expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused",
-      reason: "seam-internal", written: false });
+      reason: "seam-internal", written: false, errorClass: "Error", errorMessage: error.message,
+      intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-intent.json"))) });
   });
 
   // Regression: restoring the route needs only the source header, even for a Paul-sized Pi session.

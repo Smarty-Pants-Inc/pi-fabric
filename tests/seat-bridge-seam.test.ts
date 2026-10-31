@@ -7,6 +7,7 @@ import { procStartTime } from "../src/main-drain/binding.js";
 import { readBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { journalBranch } from "../src/seat-drain/journal-branch.js";
 import * as kube from "../src/seat-drain/kube.js";
+import { SeamGap } from "../src/seat-drain/run.js";
 import { main, type BridgeDeps } from "../src/seat-bridge/seam.js";
 import { createSeat, SID, type Seat } from "./seat-drain-fixture.js";
 
@@ -967,6 +968,127 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     w.roots = [{ id: `session:${SID}`, machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }];
     return w;
   };
+
+  /** Failed init leaves the raw Pod's pi waiting: resume refuses before publish ever runs. */
+  const failedInit = async () => {
+    const w = await world({ allow: { file: [leadEntry, seatFileEntry], nats: [] } });
+    const before = fs.readFileSync(w.config);
+    setKube(w, RAW, { line: "", code: 1 }, { running: false });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-not-running" });
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-publish-intent.json"))).toBe(false);
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-publish-outcome.json"))).toBe(false);
+    expect(JSON.parse(before.toString("utf8")).allow).toEqual({ file: [leadEntry, seatFileEntry], nats: [] });
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    // A relaunches v1 on its RECOVERED journal, not the original sealed source; it still owns the same mesh.
+    const recovered = path.join(w.seat.base, "org-recovery", "c".repeat(32), "pi", "sessions", `${SID}.jsonl`);
+    const source = JSON.parse(fs.readFileSync(path.join(w.seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
+    fs.mkdirSync(path.dirname(recovered), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(source, recovered);
+    expect(recovered).not.toBe(source);
+    w.seat.native.state.sessionFile = recovered;
+    w.gate = gateLive("file");
+    w.receipt = { ok: true, verdict: "routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
+      nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }] } };
+    return { w, before, inputs: writer(w, { sessionFile: recovered }) };
+  };
+
+  it("restore regression: failed raw init then no-publish restore passes without reading roots", async () => {
+    const { w, before, inputs } = await failedInit();
+    const roots = vi.fn(async () => { throw new Error("synthetic roots unavailable"); });
+    const result = await run(w, "rc-restore-route", inputs, { roots });
+    expect.soft(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "pass", observed: {
+      sessionId: SID, route: `v1@${process.pid}:${procStartTime(process.pid)}` } } });
+    const intent = evidenceOf(w, "fabric-v2-bridge-rc-restore-route-intent.json");
+    expect(intent.plan).toMatchObject({ change: "none", beforeHadNats: true });
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    expect(fs.existsSync(w.marker)).toBe(false);
+    expect.soft(roots).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"))).toBe(true);
+    const outcome = evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json");
+    expect(outcome).toMatchObject({ result: "pass", written: false, asserted: { v1: { session: { file: inputs.writer.sessionFile } } },
+      measured: { gate: { side: "file", status: "live" }, receipt: { verdict: "routable", side: "file" } } });
+    expect(outcome).not.toHaveProperty("reason");
+  });
+
+  it.each([
+    { fault: "writer pid", reason: "v1-writer-mismatch" },
+    { fault: "missing writer", reason: "v1-unreachable" },
+    { fault: "session file", reason: "v1-session-file-mismatch" },
+    { fault: "identity gate", reason: "v1-not-routable" },
+    { fault: "route incarnation", reason: "v1-not-routable" },
+  ])("restore regression: no-publish restore still refuses a bad $fault", async ({ fault, reason }) => {
+    const { w, before, inputs } = await failedInit();
+    if (fault === "writer pid") inputs.writer.pid += 100_000;
+    if (fault === "missing writer") await w.seat.server.close();
+    if (fault === "session file") w.seat.native.state.sessionFile = "/synthetic/wrong-session.jsonl";
+    if (fault === "identity gate") w.gate = { ...gateLive("file"), status: "BRIDGE_NATS_AMBIGUOUS" };
+    if (fault === "route incarnation") w.receipt = { ...w.receipt,
+      nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: INCARNATION }] } };
+    const roots = vi.fn(async () => []);
+    expect(await run(w, "rc-restore-route", inputs, { roots, deadlineMs: 2_000 }))
+      .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused", reason, written: false });
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    expect(fs.existsSync(w.marker)).toBe(false);
+    expect(roots).not.toHaveBeenCalled();
+  });
+
+  it("restore regression: published restore retains the roots GAP and records its refusal outcome", async () => {
+    const w = await published();
+    const original = evidenceOf(w, "fabric-v2-bridge-publish-intent.json").plan.beforeBytes as string;
+    const roots = vi.fn(async () => { throw new Error("synthetic roots unavailable"); });
+    expect(await run(w, "rc-restore-route", writer(w), { roots })).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: nats-presence-unreadable [owner: fabric-v2]\n" });
+    expect(roots).toHaveBeenCalledTimes(1);
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-intent.json").plan.change).toBe("revert");
+    expect(fs.readFileSync(w.config, "utf8")).toBe(original);
+    expect(fs.readFileSync(w.marker, "utf8").trim().split("\n")).toHaveLength(2);
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"))).toBe(true);
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused",
+      reason: "nats-presence-unreadable", written: true });
+  });
+
+  it("restore regression: applyPlan GAP after locked intent still records an outcome", async () => {
+    const { w, before, inputs } = await failedInit();
+    const intentFile = path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-intent.json");
+    const readFile = fs.readFileSync;
+    let injected = 0;
+    // applyPlan re-reads the specific config through a numeric fd, AFTER intent but before the lock callback returns.
+    const read = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (typeof file === "number" && fs.existsSync(intentFile) && fs.readlinkSync(`/proc/self/fd/${file}`) === w.config) {
+        injected += 1;
+        if (injected === 1) throw new SeamGap("link-config-unreadable");
+      }
+      return readFile(file, options as never);
+    }) as typeof fs.readFileSync);
+    const result = await run(w, "rc-restore-route", inputs).finally(() => read.mockRestore());
+    expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: link-config-unreadable [owner: fabric-v2]\n" });
+    expect(injected).toBe(1);
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-intent.json").plan.change).toBe("none");
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    expect(fs.existsSync(w.marker)).toBe(false);
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"))).toBe(true);
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused",
+      reason: "link-config-unreadable", written: false, intentSha256: sha(fs.readFileSync(intentFile)) });
+  });
+
+  it("restore regression: a non-SeamGap after intent retains seam-internal and records an outcome", async () => {
+    const { w, before, inputs } = await failedInit();
+    w.gate = null;
+    const error = new Error("synthetic route timer failure");
+    const onError = vi.fn();
+    expect(await run(w, "rc-restore-route", inputs, { sleep: async () => { throw error; }, onError }))
+      .toMatchObject({ code: 2, stdout: "", stderr: "GAP: seam-internal [owner: fabric-v2]\n" });
+    expect(onError).toHaveBeenCalledWith(error);
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-intent.json").plan.change).toBe("none");
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    expect(fs.existsSync(w.marker)).toBe(false);
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-rc-restore-route-outcome.json"))).toBe(true);
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused",
+      reason: "seam-internal", written: false });
+  });
 
   // Regression: restoring the route needs only the source header, even for a Paul-sized Pi session.
   it.each([157_000_000, 314_000_000])("restores the route with a sparse %i-byte source journal", async bytes => {

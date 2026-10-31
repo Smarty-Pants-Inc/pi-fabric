@@ -614,64 +614,95 @@ const restoreRoute = async (context: Context): Promise<number> => {
   planRestore(first, pins, sessionId, authority);
   const routesBefore = await routeTable(first.config, context.deps);
   if (!routesBefore) throw new SeamGap("link-status-unreadable");
-  // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
-  const locked = await withConfigLock(context.pins.linkConfig, () => {
-    const current = readLinkConfig(context.pins.linkConfig, readOptions(context));
-    const planned = planRestore(current, pins, sessionId, authority);
-    const sha = evidence(context, "intent", { schema: "fabric-v2-bridge-rc-restore-route-intent-v1", writer, machine,
-      plan: planEvidence(planned), unit: context.pins.linkUnit, routesBefore,
-      measured: { meshRoot, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() }, residuals: RESIDUALS });
-    return { planned, sha, after: applyPlan(planned) };
-  }, lockOptions(context));
-  const { planned: plan, sha: intentSha256, after: post } = locked;
-  let reason: string | null = null;
-  let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
-  let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
-  if (plan.change !== "none") {
-    // The v2 seat's old mirror row on the hub is the one expected leftover once its entry is gone.
-    const leftover = `mirror not on allow.nats: session:${sessionId}`;
-    reload = await reloadLink(post.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000),
-      problem => problem === leftover);
-    if (!reload.statusOk) reason = "link-not-reloaded";
-    others = await otherRoutesBack(post.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, OTHER_ROUTES_WAIT_MS));
-    if (!reason && others.down.length > 0) reason = "other-routes-down";
+  let intentSha256: string | null = null;
+  let outcome: Record<string, unknown> = {};
+  let failed = false;
+  let output = "";
+  try {
+    // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
+    const locked = await withConfigLock(context.pins.linkConfig, () => {
+      const current = readLinkConfig(context.pins.linkConfig, readOptions(context));
+      const planned = planRestore(current, pins, sessionId, authority);
+      // Keep the durable intent even if applyPlan throws before the lock callback returns.
+      intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-rc-restore-route-intent-v1", writer, machine,
+        plan: planEvidence(planned), unit: context.pins.linkUnit, routesBefore,
+        measured: { meshRoot, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() }, residuals: RESIDUALS });
+      // A failed write/read-back may already have swapped the bytes; do not claim it left them unchanged.
+      outcome.written = planned.change === "none" ? false : null;
+      const after = applyPlan(planned);
+      outcome.written = planned.change !== "none";
+      return { planned, after };
+    }, lockOptions(context));
+    const { planned: plan, after: post } = locked;
+    let reason: string | null = null;
+    let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
+    let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
+    if (plan.change !== "none") {
+      // The v2 seat's old mirror row on the hub is the one expected leftover once its entry is gone.
+      const leftover = `mirror not on allow.nats: session:${sessionId}`;
+      reload = await reloadLink(post.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000),
+        problem => problem === leftover);
+      if (!reload.statusOk) reason = "link-not-reloaded";
+      others = await otherRoutesBack(post.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, OTHER_ROUTES_WAIT_MS));
+      if (!reason && others.down.length > 0) reason = "other-routes-down";
+    }
+    // v1: the relaunched writer is this session's live inbox owner (pid + start time), with the session file A named.
+    const local = await localIdentity(context, meshRoot);
+    const start = procStartTime(writer.pid as number, context.deps.procRoot) ?? null;
+    const v1 = "reply" in local ? local.reply : undefined;
+    if (!reason && !v1) reason = "v1-unreachable";
+    if (!reason && (v1!.pid !== writer.pid || start === null || local.owner?.processStartedAt !== start)) reason = "v1-writer-mismatch";
+    if (!reason && v1!.session.file !== writer.sessionFile) reason = "v1-session-file-mismatch";
+    if (!reason && !v1!.session.ownerIncarnation) reason = "v1-incarnation-unknown";
+    let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
+    let v2Live: Array<Record<string, unknown>> = [];
+    // Whether the seat is on the post-state's allow.file (its v1 entry, put back or never moved).
+    const entries = natsLinkAllowListConfig(post.config).entries;
+    const listed = entries.some(entry => entry.side === "file" && entry.kind === "root" && entry.id === `session:${sessionId}`);
+    const noPublishNoop = authority === null && plan.change === "none" && listed &&
+      !entries.some(entry => entry.side === "nats" && (entry.id === `session:${sessionId}` ||
+        (entry.kind === "actor" && entry.rootId === `session:${sessionId}`)));
+    if (!reason) {
+      const incarnation = v1!.session.ownerIncarnation!;
+      routed = await awaitRoutable(post.config, sessionId, context.deps, clock(context, RESTORE_SEAT_ROUTE_WAIT_MS), (gate, value) => {
+        // Listed on allow.file: the gate must resolve it live, and the link mirror v1 into NATS under its own machine.
+        if (listed) return routeHolds(gate, value, { side: "file", fileRemoteHost: null, natsMachine: post.config.nats.machine, incarnation });
+        const file = object(value.file) ? value.file : undefined;
+        return file !== undefined && (file.remoteHost ?? null) === null && file.live === true && file.ownerIncarnation === incarnation;
+      });
+      if (!routed.ok) reason = "v1-not-routable";
+      // A no-publish FILE no-op still proves v1 above, but has no v2 publication to audit here.
+      if (!noPublishNoop) {
+        // No v2 left: no live NATS presence for the session on any machine but the link's own (its mirror of v1).
+        const records = await natsRecords(post.config, context.deps);
+        v2Live = records.filter(record => record.id === `session:${sessionId}` && record.live && record.machine !== post.config.nats.machine)
+          .map(record => ({ machine: record.machine, ownerIncarnation: record.ownerIncarnation }));
+        if (!reason && v2Live.length > 0) reason = "v2-presence-live";
+      }
+    }
+    const route = `v1@${writer.pid as number}:${start ?? "unknown"}`;
+    const observed = { sessionId, route };
+    const passed = reason === null;
+    outcome = { result: passed ? "pass" : "refused", ...(reason === null ? {} : { reason }),
+      observed, written: plan.change !== "none", measured: { configSha256: post.sha256, reload, otherRoutes: others,
+        gate: routed?.gate ?? null, receipt: routed?.receipt ?? null, v2Live, writerStart: start, owner: local.owner }, asserted: { v1: v1 ? { pid: v1.pid, rootId: v1.rootId, session: v1.session } : null,
+        error: "error" in local ? local.error : null } };
+    output = receipt(context.request, passed ? "pass" : "refused", observed);
+  } catch (error) {
+    failed = true;
+    outcome = { ...outcome, result: "refused", reason: error instanceof SeamGap ? error.code : "seam-internal" };
+    throw error;
+  } finally {
+    if (intentSha256 !== null) {
+      try {
+        evidence(context, "outcome", { schema: "fabric-v2-bridge-rc-restore-route-outcome-v1", ...outcome, intentSha256 });
+      } catch (error) {
+        // Preserve the original operation's GAP if its outcome cannot be persisted either.
+        if (!failed) throw error;
+      }
+    }
   }
-  // v1: the relaunched writer is this session's live inbox owner (pid + start time), with the session file A named.
-  const local = await localIdentity(context, meshRoot);
-  const start = procStartTime(writer.pid as number, context.deps.procRoot) ?? null;
-  const v1 = "reply" in local ? local.reply : undefined;
-  if (!reason && !v1) reason = "v1-unreachable";
-  if (!reason && (v1!.pid !== writer.pid || start === null || local.owner?.processStartedAt !== start)) reason = "v1-writer-mismatch";
-  if (!reason && v1!.session.file !== writer.sessionFile) reason = "v1-session-file-mismatch";
-  if (!reason && !v1!.session.ownerIncarnation) reason = "v1-incarnation-unknown";
-  let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
-  let v2Live: Array<Record<string, unknown>> = [];
-  // Whether the seat is on the post-state's allow.file (its v1 entry, put back or never moved).
-  const listed = natsLinkAllowListConfig(post.config).entries.some(entry => entry.side === "file" && entry.kind === "root" &&
-    entry.id === `session:${sessionId}`);
-  if (!reason) {
-    const incarnation = v1!.session.ownerIncarnation!;
-    routed = await awaitRoutable(post.config, sessionId, context.deps, clock(context, RESTORE_SEAT_ROUTE_WAIT_MS), (gate, value) => {
-      // Listed on allow.file: the gate must resolve it live, and the link mirror v1 into NATS under its own machine.
-      if (listed) return routeHolds(gate, value, { side: "file", fileRemoteHost: null, natsMachine: post.config.nats.machine, incarnation });
-      const file = object(value.file) ? value.file : undefined;
-      return file !== undefined && (file.remoteHost ?? null) === null && file.live === true && file.ownerIncarnation === incarnation;
-    });
-    if (!routed.ok) reason = "v1-not-routable";
-    // No v2 left: no live NATS presence for the session on any machine but the link's own (its mirror of v1).
-    const records = await natsRecords(post.config, context.deps);
-    v2Live = records.filter(record => record.id === `session:${sessionId}` && record.live && record.machine !== post.config.nats.machine)
-      .map(record => ({ machine: record.machine, ownerIncarnation: record.ownerIncarnation }));
-    if (!reason && v2Live.length > 0) reason = "v2-presence-live";
-  }
-  const route = `v1@${writer.pid as number}:${start ?? "unknown"}`;
-  const observed = { sessionId, route };
-  const passed = reason === null;
-  evidence(context, "outcome", { schema: "fabric-v2-bridge-rc-restore-route-outcome-v1", result: passed ? "pass" : "refused", reason,
-    intentSha256, observed, written: plan.change !== "none", measured: { configSha256: post.sha256, reload, otherRoutes: others,
-      gate: routed?.gate ?? null, receipt: routed?.receipt ?? null, v2Live, writerStart: start, owner: local.owner }, asserted: { v1: v1 ? { pid: v1.pid, rootId: v1.rootId, session: v1.session } : null,
-      error: "error" in local ? local.error : null } });
-  context.io.stdout(receipt(context.request, passed ? "pass" : "refused", observed));
+  context.io.stdout(output);
   return 0;
 };
 

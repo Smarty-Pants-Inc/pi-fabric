@@ -10,11 +10,12 @@ import * as mainClient from "../src/main-drain/client.js";
 import type { MainDrainReply } from "../src/main-drain/protocol.js";
 import { readBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { journalBranch } from "../src/seat-drain/journal-branch.js";
-import * as kube from "../src/seat-drain/kube.js";
+import * as kube from "../src/seat-bridge/kube.js";
 import { SeamGap } from "../src/seat-drain/run.js";
 import * as runBoundary from "../src/seat-drain/run.js";
 import { redactNatsError } from "../src/mesh/state-backend-nats.js";
 import { main, type BridgeDeps } from "../src/seat-bridge/seam.js";
+import { podJournalArgv, podOwnerArgv } from "../src/seat-bridge/pod-journal.js";
 import { createSeat, SID, type Seat } from "./seat-drain-fixture.js";
 
 // The D3 bridge seam (principal-seat move): synthetic kubectl/systemctl/link fixtures plus the explicitly labeled
@@ -94,7 +95,7 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   const journalFile = path.join(seat.base, "pod-journal.jsonl");
   fs.writeFileSync(journalFile, options.podJournal ?? sealed);
   const kubectl = path.join(kube, "kubectl");
-  fs.copyFileSync(path.join("tests", "fixtures", "fake-kubectl.py"), kubectl);
+  fs.copyFileSync(path.join("tests", "seat-bridge-kubectl.py"), kubectl);
   fs.chmodSync(kubectl, 0o700);
   // The synthetic link config: hub file mesh = the seat's mesh, the seat's own Path B machine listed. Its seat pins are
   // the synthetic org.json beside it (the pins the in-process runs inject), never a host's real org.json.
@@ -148,21 +149,25 @@ const resealRun = (w: World, mutate: (run: Record<string, unknown>) => void): vo
   (w.seat as { runSha256: string }).runSha256 = runSha256;
 };
 
-const setKube = (w: World, pod: { name: string; uid: string }, identity: { line: string; code?: number; changeUid?: string },
+const setKube = (w: World, pod: { name: string; uid: string }, identity: { line: string; code?: number; changeUid?: string; restart?: Record<string, unknown> },
   podExtra: Record<string, unknown> = {}) => {
+  const ownerLine = JSON.stringify({ rootId: `session:${SID}`, ownerHostId: `session:${SID}`, ownerIdentityId: `session:${SID}`,
+    ownerIncarnation: INCARNATION, machine: "sp-org-d3synth", pid: 7, processStartedAt: "123", projectionKey: "sp-org-d3synth.p.synthetic", projectionRevision: 1 });
   fs.writeFileSync(path.join(w.kube, "kube-state.json"), JSON.stringify({ server: SERVER, caB64: CA.toString("base64"), cliPresent: true,
+    image0112: true, journalFile: w.journalFile, readOverride: identity.line !== "READ_REAL_JOURNAL",
+    ownerLine: identity.line === "READ_REAL_JOURNAL" ? ownerLine : identity.line,
     pod: { name: pod.name, uid: pod.uid, meshRoot: "/var/lib/fabric/mesh", running: true, terminated: null, args: ["--session", POD_JOURNAL],
       natsMachine: "sp-org-d3synth", ...podExtra },
     exec: { line: "" }, identity }));
 };
 
-/** The in-Pod CLI's `--identity` line, with the journal read by the REAL reader over the synthetic Pod journal. */
-const identityLine = (w: World, options: { leafId?: string; sessionFile?: string; ownerIncarnation?: string; journal?: unknown } = {}) => {
-  const journal = options.journal ?? journalBranch(w.journalFile, "e2", Buffer.byteLength(w.sealed));
-  const leaf = options.leafId ?? (journal as { leafId: string }).leafId;
-  return JSON.stringify({ format: 1, sessionId: SID, ptraceScope: "1", op: "identity", identity: { rootId: `session:${SID}`, pid: 7,
-    meshRoot: "/var/lib/fabric/mesh", sessionFile: options.sessionFile ?? POD_JOURNAL, leafId: leaf,
-    ownerIncarnation: options.ownerIncarnation ?? INCARNATION }, journal });
+/** Default runs the exact Python reader over the fixture's real file. Overrides exercise malformed byte reports. */
+const identityLine = (w: World, options: { journal?: unknown } = {}) => {
+  if (Object.keys(options).length === 0) return "READ_REAL_JOURNAL";
+  const journal = (options.journal ?? journalBranch(w.journalFile, "e2", Buffer.byteLength(w.sealed))) as Record<string, any>;
+  if (journal.error) return JSON.stringify({ error: "journal-suffix-invalid" });
+  return JSON.stringify({ size: journal.journalBytes, sha256: journal.journalSha256, prefixSha256: journal.sealedSha256,
+    suffixBase64: journal.suffixBase64, mtimeNs: "123" });
 };
 
 const request = (seat: Seat, phase: string, inputs: Record<string, unknown>) => JSON.stringify({ schema: "d3-seam-request-v1", run: seat.run,
@@ -174,7 +179,7 @@ const run = async (w: World, phase: string, given: Record<string, unknown> | ((w
   let stdout = ""; let stderr = "";
   let t = 0;
   const deps: BridgeDeps = {
-    kubectl: path.join(w.kube, "kubectl"), podCli: "/opt/pi-fabric/dist/cli/index.js", systemctl: path.join(w.seat.base, "systemctl"),
+    kubectl: path.join(w.kube, "kubectl"), systemctl: path.join(w.seat.base, "systemctl"),
     seatPins: () => pins, now: () => t, sleep: async ms => { t += ms; },
     holder: () => ({ pid: !w.holderStuck && fs.existsSync(w.marker) ? 101 + fs.readFileSync(w.marker, "utf8").split("\n").length : 100,
       startTime: "1", purpose: "start" }),
@@ -182,7 +187,8 @@ const run = async (w: World, phase: string, given: Record<string, unknown> | ((w
       return structuredClone(w.statusAfter && fs.existsSync(w.marker) ? w.statusAfter : w.status); },
     receipt: async config => { w.seenConfigs.push({ allow: structuredClone(config.allow) }); return structuredClone(w.receipt); },
     dryRun: async config => { w.seenConfigs.push({ allow: structuredClone(config.allow) }); return { rows: w.gate ? [structuredClone(w.gate)] : [] }; },
-    roots: async () => structuredClone(w.roots) as never,
+    roots: async () => structuredClone(phase === "publish" && w.roots.length === 0 ? [{ id: `session:${SID}`, machine: "sp-org-d3synth",
+      ownerHostId: `session:${SID}`, ownerIdentityId: `session:${SID}`, ownerIncarnation: INCARNATION, live: true }] : w.roots) as never,
     onError: error => { if (!(error instanceof Error && error.name === "SeamGap")) throw error; },
     ...extra,
   };
@@ -204,9 +210,60 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(result).toMatchObject({ code: 0, stderr: "" });
     expect(result.receipt).toEqual({ schema: "d3-seam-receipt-v1", run: w.seat.run, phase: "resume", owner: "fabric-v2", result: "pass",
       observed: { sessionId: SID, journal: POD_JOURNAL, leafId: "e2", podUid: RAW.uid, appendedSinceSeal: [], journalSha256: sha(SEALED), suffixBase64: "" } });
-    const exec = w.calls().find(call => call.argv.includes("--identity"))!;
-    expect(exec.argv.slice(exec.argv.indexOf("--"))).toEqual(["--", "/opt/pi-fabric/dist/cli/index.js", "session", "drain", SID, "--mesh",
-      "/var/lib/fabric/mesh", "--identity", "--since", "e2", "--sealed-bytes", String(Buffer.byteLength(SEALED))]);
+    const exec = w.calls().find(call => call.argv.includes("/usr/bin/python3"))!;
+    expect(exec.argv.slice(exec.argv.indexOf("--"))).toEqual(["--", ...podJournalArgv(POD_JOURNAL, Buffer.byteLength(SEALED))]);
+  });
+
+  it.each([false, true])("b5 image CLI regression a19/a20: startup waiting=%s passes with seven byte-derived fields, no session CLI", async waiting => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { running: !waiting });
+    let t = 0;
+    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep: async ms => {
+      t += ms; setKube(w, RAW, { line: identityLine(w) });
+    } });
+    const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
+    expect(result, JSON.stringify(outcome)).toMatchObject({ code: 0, stderr: "", receipt: { result: "pass" } });
+    expect(Object.keys(result.receipt!.observed).sort()).toEqual([
+      "sessionId", "journal", "leafId", "podUid", "appendedSinceSeal", "journalSha256", "suffixBase64"].sort());
+    expect(w.calls().some(call => call.argv.includes("session"))).toBe(false);
+    expect(outcome).toMatchObject({ measured: { before: { piRestartCount: 0, piStartedAt: "2026-10-31T00:00:00Z",
+      piContainerId: "containerd://synthetic-pi", pvcWriters: ["pi"] }, after: { piRestartCount: 0 } } });
+  });
+
+  it.each([
+    { restartCount: 1 }, { startedAt: "2026-10-31T00:01:00Z" }, { containerID: "containerd://replacement" },
+  ])("b5: Pod restart during journal read %j refuses and records its outcome", async restart => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w), restart });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 0, receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ reason: "pod-restarted-during-read",
+      errorClass: null, errorMessage: null });
+  });
+
+  it("b5: the saved a19 args shape has BOTH --session-dir and --session; only the explicit file is read", async () => {
+    const w = await world();
+    const journal = "/var/lib/smarty/state/pi/sessions/synthetic/known.jsonl";
+    setKube(w, RAW, { line: identityLine(w) }, { args: ["--mode", "rpc", "--model", "synthetic/model", "--thinking", "xhigh",
+      "--session-dir", "/var/lib/smarty/state/pi/sessions", "--session", journal] });
+    const result = await run(w, "resume", resumeInputs);
+    expect(result.receipt).toMatchObject({ result: "pass", observed: { journal } });
+    const exec = w.calls().find(call => call.argv.includes("/usr/bin/python3"))!;
+    expect(exec.argv.at(-2)).toBe(journal);
+  });
+
+  it.each(["extraContainers", "initContainers", "ephemeralContainers"])("b5: another writable PVC container in %s refuses before exec", async field => {
+    const w = await world();
+    const writer = { name: "other", restartPolicy: "Always", volumeMounts: [{ name: "state", mountPath: "/var/lib/fabric" }] };
+    setKube(w, RAW, { line: identityLine(w) }, { [field]: [writer] });
+    expect((await run(w, "resume", resumeInputs)).receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json").reason).toBe("pod-pvc-writers-unproved");
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
+  });
+
+  it("b5: RESUME does not require meshRoot, owner incarnation or a Main-drain PID", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) }, { meshRoot: "" });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 0, receipt: { result: "pass" } });
   });
 
   it("reports exactly the one thinking_level_change Pi appends on resume, its bytes and the true leaf", async () => {
@@ -234,7 +291,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing",
       errorClass: "SeamGap", errorMessage: "resume-thinking-append-missing", elapsedMs,
       measured: { observations, finalSeal: { sealHasThinkingEntry: false }, journal: { appendedSinceSeal: [], suffixBytes: 0 } } });
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(observations);
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(observations);
     expect(t).toBe(elapsedMs);
     expect(t).toBeLessThan(phaseCap);
   });
@@ -282,7 +339,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(t).toBeLessThanOrEqual(180_000);
     expect(outcome).toMatchObject({ result: "pass", elapsedMs: t, measured: {
       observations: 4, waitedMs: t, finalSeal: { sealHasThinkingEntry: true } } });
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(1);
   });
 
   it.each([840_000, 5_000])("resume startup regression: neverstarts respects the 180 s startup and %i ms phase caps", async phaseCap => {
@@ -331,7 +388,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "pass", elapsedMs: 0,
       measured: { observations: 1, waitedMs: 0 } });
     expect(sleep).not.toHaveBeenCalled();
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(1);
   });
 
   it.each([
@@ -397,10 +454,10 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     const sleep = vi.fn(async (ms: number) => { t += ms; setKube(w, RAW, { line: "not json", code: 1 }); });
     expect(await run(w, "resume", resumeInputs, { now: () => t, sleep }))
       .toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
-    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-identity-unreadable",
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-journal-unreadable",
       elapsedMs: t, measured: { observations: 2, waitedMs: t } });
     expect(sleep).toHaveBeenCalledTimes(1);
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(1);
   });
 
   it("resume startup regression: a slow read consumes only the short original phase budget and retains its GAP outcome", async () => {
@@ -445,64 +502,40 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
   });
 
-  // F1: a readable but mismatched identity is a refusal, not a candidate for the missing-append wait. The Main's
-  // reported file is a real, byte-identical copy here: content equality cannot substitute for rendered --session.
-  it.each([
-    { name: "missing rendered --session", args: [], sessionFile: POD_JOURNAL, leafId: "e2", reason: "pod-session-arg-unknown" },
-    { name: "changed rendered --session", args: ["--session", "/var/lib/fabric/sessions/changed.jsonl"],
-      sessionFile: POD_JOURNAL, leafId: "e2", reason: "journal-mismatch" },
-    { name: "Main on another byte-identical file", args: ["--session", POD_JOURNAL],
-      sessionFile: "/var/lib/fabric/sessions/other.jsonl", leafId: "e2", reason: "journal-mismatch" },
-    { name: "Main memory leaf differs from its file", args: ["--session", POD_JOURNAL],
-      sessionFile: POD_JOURNAL, leafId: "e1", reason: "leaf-memory-file-mismatch" },
-  ])("F1: $name refuses immediately with a no-thinking seal", async ({ args, sessionFile, leafId, reason }) => {
+  // b5 deliberately has no Main-drain memory identity: A pins this path and re-derives the bytes.
+  it.each([{ args: [] }, { args: ["--session", "relative.jsonl"] }, { args: ["--session"] },
+    { args: ["--session", POD_JOURNAL, "--session", POD_JOURNAL] },
+    { args: ["--session-dir", "/var/lib/smarty/state/pi/sessions"] }])(
+    "b5: invalid rendered session args $args refuse without reading", async ({ args }) => {
     const w = await world({ sealed: SEALED_BARE });
-    const mainFile = path.join(w.seat.base, "main-journal-copy.jsonl");
-    fs.copyFileSync(w.journalFile, mainFile);
-    const journal = journalBranch(mainFile, "e2", Buffer.byteLength(SEALED_BARE));
-    expect(journal).toMatchObject({ journalSha256: sha(SEALED_BARE), journalBytes: Buffer.byteLength(SEALED_BARE),
-      leafId: "e2", appendedSinceSeal: [], suffixBytes: 0 });
-    setKube(w, RAW, { line: identityLine(w, { sessionFile, leafId, journal }) }, { args });
-    let t = 0;
-    const sleep = vi.fn(async (ms: number) => { t += ms; throw new Error("F1: unexpected append wait for mismatched identity"); });
-    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep });
-    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
-    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason, elapsedMs: 0,
-      measured: { observations: 1 } });
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    setKube(w, RAW, { line: identityLine(w) }, { args });
+    const sleep = vi.fn(async () => { throw new Error("invalid path must not wait"); });
+    expect(await run(w, "resume", resumeInputs, { sleep })).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ reason: "pod-session-arg-unknown" });
+    expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
     expect(sleep).not.toHaveBeenCalled();
-    expect(t).toBe(0);
   });
 
-  it.each([
-    { name: "Main file changes", sessionFile: "/var/lib/fabric/sessions/other.jsonl", leafId: "e2", reason: "journal-mismatch" },
-    { name: "Main memory leaf changes", sessionFile: POD_JOURNAL, leafId: "e1", reason: "leaf-memory-file-mismatch" },
-  ])("F1: $name after a coherent observation stops polling at the next observation", async ({ sessionFile, leafId, reason }) => {
+  it("b5: rendered session path changing during an append observation stops polling", async () => {
     const w = await world({ sealed: SEALED_BARE });
     setKube(w, RAW, { line: identityLine(w) });
-    let t = 0;
-    const sleep = vi.fn(async (ms: number) => {
-      t += ms;
-      if (t !== 2_000) throw new Error("F1: unexpected second wait after identity mismatch");
-      // The journal stays byte-for-byte sealed; only the live Main's identity changes on the next read.
-      setKube(w, RAW, { line: identityLine(w, { sessionFile, leafId }) });
+    const actualRead = kube.readPod;
+    let reads = 0;
+    vi.spyOn(kube, "readPod").mockImplementation(async (...args) => {
+      const pod = await actualRead(...args);
+      if (++reads === 4 && pod) pod.piArgs = ["--session", "/changed.jsonl"];
+      return pod;
     });
-    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep });
-    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
-    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason, elapsedMs: 2_000,
-      measured: { observations: 2, journal: { journalSha256: sha(SEALED_BARE), journalBytes: Buffer.byteLength(SEALED_BARE),
-        leafId: "e2", appendedSinceSeal: [], suffixBytes: 0 } } });
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(2);
-    expect(sleep).toHaveBeenCalledTimes(1);
-    expect(sleep).toHaveBeenCalledWith(2_000);
-    expect(t).toBe(2_000);
+    let t = 0;
+    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep: async ms => { t += ms; } }))
+      .toMatchObject({ code: 0, receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ reason: "pod-spec-changed", elapsedMs: 2_000 });
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(2);
   });
 
   it.each([
     { field: "journalBytes", value: Buffer.byteLength(SEALED_BARE) + 1, gap: "journal-suffix-inconsistent" },
     { field: "journalSha256", value: sha("not the sealed journal"), gap: "journal-suffix-inconsistent" },
-    { field: "leafId", value: "e1", gap: "journal-suffix-not-the-branch" },
-    { field: "truncated", value: true, gap: "journal-suffix-not-the-branch" },
     { field: "suffixBase64", value: "Cg==", gap: "journal-suffix-inconsistent" },
   ])("F1: an unchanged-journal claim with incoherent $field is an immediate GAP", async ({ field, value, gap }) => {
     const w = await world({ sealed: SEALED_BARE });
@@ -514,7 +547,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       stderr: `GAP: ${gap} [owner: fabric-v2]\n` });
     expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown", gap, elapsedMs: 0,
       measured: { observations: 1 } });
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(1);
     expect(sleep).not.toHaveBeenCalled();
     expect(t).toBe(0);
   });
@@ -529,7 +562,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     } });
     expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
     expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused",
-      reason: "pod-identity-unreadable", elapsedMs: 2_000, measured: { observations: 2 } });
+      reason: "pod-journal-unreadable", elapsedMs: 2_000, measured: { observations: 2 } });
   });
 
   it.each([200_000, 600_000])("slow per-read calls preserve the %i ms cap and distinguish initial identity from missing append", async phaseCap => {
@@ -550,22 +583,16 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       return value;
     });
     const result = await run(w, "resume", resumeInputs, { deadlineMs: phaseCap, now: () => t, sleep: async ms => { t += ms; } });
-    if (phaseCap === 200_000) {
-      // No coherent initial identity was established: this is not a missing-append diagnosis.
-      expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
-      expect(budgets).toEqual([30_000, 30_000, 120_000, 20_000]);
-      expect(t).toBe(phaseCap);
-      expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "phase-deadline",
-        errorClass: "SeamGap", errorMessage: "phase-deadline", elapsedMs: phaseCap,
-        intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
-    } else {
-      expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
-      expect(budgets).toEqual([30_000, 30_000, 120_000, 30_000, 30_000, 30_000, 120_000, 30_000]);
-      expect(t).toBe(424_000);
-      expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown",
-        gap: "resume-thinking-append-missing", elapsedMs: 424_000, measured: { observations: 2 } });
-      expect(t).toBeLessThan(phaseCap);
-    }
+    // No CLI executable probe: a complete fixed-script read costs 180 s rather than b4's 210 s.
+    const observations = phaseCap === 200_000 ? 1 : 3;
+    // The final short poll wake is counted even when there is no full-read budget left.
+    const elapsed = observations * (180_000 + 2_000);
+    expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
+    expect(budgets).toEqual(Array.from({ length: observations }, () => [30_000, 120_000, 30_000]).flat());
+    expect(t).toBe(elapsed);
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown",
+      gap: "resume-thinking-append-missing", elapsedMs: elapsed, measured: { observations } });
+    expect(t).toBeLessThan(phaseCap);
   });
 
   it("keeps Pi's missing-append wait at 600 s under the default 840 s phase ceiling", async () => {
@@ -600,7 +627,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
     expect(t).toBe(840_000);
     expect(budgets).toEqual([30_000, 30_000, 30_000]);
-    expect(w.calls()).toHaveLength(5);
+    expect(w.calls()).toHaveLength(4);
     expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "phase-deadline",
       errorClass: "SeamGap", errorMessage: "phase-deadline", elapsedMs: 840_000,
       intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))) });
@@ -632,7 +659,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     const cycle = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + tail });
     expect(() => journalBranch(cycle.journalFile, "e2", Buffer.byteLength(SEALED_BARE)))
       .toThrow(expect.objectContaining({ code: "JOURNAL_BRANCH_BROKEN" }));
-    setKube(cycle, RAW, { line: identityLine(cycle, { leafId: "e1", journal: { error: "JOURNAL_BRANCH_BROKEN" } }), code: 1 });
+    setKube(cycle, RAW, { line: identityLine(cycle) });
     expect(await run(cycle, "resume", resumeInputs)).toMatchObject(reused);
     // The same tail with a reader that hides the cycle: the seam's own check (the HOST's sealed ids) refuses it.
     const hidden = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + tail });
@@ -685,22 +712,24 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(await run(big, "resume", resumeInputs)).toMatchObject({ code: 2, stdout: "", stderr: "GAP: journal-suffix-too-large [owner: fabric-v2]\n" });
   });
 
-  it("a CLI whose appended list does not match the suffix bytes is UNKNOWN (the seam checks the branch itself)", async () => {
+  it("does not accept CLI-style appended/leaf assertions in the closed byte-report schema", async () => {
     const w = await world({ podJournal: SEALED + THINKING });
-    const honest = journalBranch(w.journalFile, "e2", Buffer.byteLength(SEALED));
-    setKube(w, RAW, { line: identityLine(w, { journal: { ...honest, appendedSinceSeal: [] } }) });
-    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 2, stderr: "GAP: journal-suffix-not-the-branch [owner: fabric-v2]\n" });
+    const report = JSON.parse(identityLine(w, { journal: journalBranch(w.journalFile, "e2", Buffer.byteLength(SEALED)) }));
+    setKube(w, RAW, { line: JSON.stringify({ ...report, appendedSinceSeal: [], leafId: "e2" }) });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 0, receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json").reason).toBe("pod-journal-unreadable");
   });
 
-  it("refuses (truthfully) a Main on another session file, or whose leaf differs from its file's", async () => {
+  it("reports the rendered path and byte-derived leaf, without pretending to verify Main-drain memory", async () => {
     const file = await world();
-    setKube(file, RAW, { line: identityLine(file, { sessionFile: "/var/lib/fabric/sessions/other.jsonl" }) });
-    expect((await run(file, "resume", resumeInputs)).receipt).toMatchObject({ result: "refused" });
-    expect(evidenceOf(file, "fabric-v2-bridge-resume-outcome.json").reason).toBe("journal-mismatch");
-    const leaf = await world();
-    setKube(leaf, RAW, { line: identityLine(leaf, { leafId: "e1" }) });
-    expect((await run(leaf, "resume", resumeInputs)).receipt).toMatchObject({ result: "refused" });
-    expect(evidenceOf(leaf, "fabric-v2-bridge-resume-outcome.json").reason).toBe("leaf-memory-file-mismatch");
+    const rendered = "/var/lib/fabric/sessions/other-rendered.jsonl";
+    setKube(file, RAW, { line: identityLine(file) }, { args: ["--session", rendered] });
+    expect((await run(file, "resume", resumeInputs)).receipt).toMatchObject({ result: "pass", observed: { journal: rendered, leafId: "e2" } });
+    const exec = file.calls().find(call => call.argv.includes("/usr/bin/python3"))!;
+    expect(exec.argv.at(-2)).toBe(rendered);
+    const leaf = await world({ podJournal: SEALED + THINKING });
+    setKube(leaf, RAW, { line: identityLine(leaf) });
+    expect((await run(leaf, "resume", resumeInputs)).receipt).toMatchObject({ result: "pass", observed: { leafId: "e3" } });
   });
 
   it("checks A's final seal from RUN itself: a request seal that differs, or an unjournaled seal file, is UNKNOWN", async () => {
@@ -893,7 +922,7 @@ const gateLive = (side: "file" | "nats", machine?: string) => ({ side, key: `ses
   ...(machine ? { machine } : {}) });
 
 describe.skipIf(!linux)("the shared Pod identity startup wait before publish effects", () => {
-  it("resume startup regression: publish waits for its pinned managed Pod, then checks identity once before writing", async () => {
+  it("resume startup regression: publish waits for its pinned managed Pod and rechecks local process identity against live presence", async () => {
     const w = await world();
     const before = fs.readFileSync(w.config);
     setKube(w, MANAGED, { line: identityLine(w) }, { running: false, terminated: null });
@@ -913,7 +942,7 @@ describe.skipIf(!linux)("the shared Pod identity startup wait before publish eff
     expect(t).toBeGreaterThan(0);
     expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "pass", written: true, elapsedMs: t,
       measured: { observations: 3, waitedMs: t } });
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(2);
     expect(fs.readFileSync(w.config)).not.toEqual(before);
     expect(fs.readFileSync(w.marker, "utf8")).toBe("--user restart smarty-nats-link.service\n");
   });
@@ -973,6 +1002,36 @@ describe.skipIf(!linux)("the shared Pod identity startup wait before publish eff
 });
 
 describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link restart, and the read-backs", () => {
+  it.each(["missing", "no incarnation", "different incarnation", "stale", "other machine", "other owner"])(
+    "b5: presence %s refuses; no unapproved no-incarnation fallback", async fault => {
+      const w = await world();
+      setKube(w, MANAGED, { line: identityLine(w) });
+      w.gate = gateLive("nats", MACHINE); w.receipt = routable();
+      const record = { id: `session:${SID}`, machine: MACHINE, ownerHostId: `session:${SID}`, ownerIdentityId: `session:${SID}`,
+        ownerIncarnation: INCARNATION, live: true };
+      if (fault === "no incarnation") record.ownerIncarnation = "";
+      if (fault === "different incarnation") record.ownerIncarnation = V1_INCARNATION;
+      if (fault === "stale") record.live = false;
+      if (fault === "other machine") record.machine = "sandbox1";
+      if (fault === "other owner") record.ownerHostId = "other-host";
+      expect(await run(w, "publish", { owner }, { deadlineMs: 5_000, roots: async () => fault === "missing" ? [] : [record] as never }))
+        .toMatchObject({ code: 0, receipt: { result: "refused" } });
+      expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ reason: "seat-not-routable", errorClass: null,
+        errorMessage: null, measured: { incarnationSource: "pod-local-nats-projection-and-nats-presence" } });
+    });
+
+  it("b5: live presence incarnation matches this Pod's locally process-bound projection", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    w.gate = gateLive("nats", MACHINE); w.receipt = routable();
+    expect(await run(w, "publish", { owner })).toMatchObject({ code: 0, receipt: { result: "pass" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ measured: {
+      incarnationSource: "pod-local-nats-projection-and-nats-presence", presence: [{ ownerIncarnation: INCARNATION, live: true }] },
+      asserted: { identity: { ownerIncarnation: INCARNATION, pid: 7, processStartedAt: "123" } } });
+    const exec = w.calls().find(call => call.argv.includes("/usr/bin/python3"))!;
+    expect(exec.argv.slice(exec.argv.indexOf("--"))).toEqual(["--", ...podOwnerArgv("/var/lib/fabric/mesh", SID)]);
+  });
+
   it("passes when the real seat route becomes live at +659 s, before its 780 s cap", async () => {
     const w = await world();
     setKube(w, MANAGED, { line: identityLine(w) });
@@ -1055,6 +1114,34 @@ describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link
     const intent = evidenceOf(w, "fabric-v2-bridge-publish-intent.json");
     expect(intent.plan).toMatchObject({ change: "move", fileEntry: { index: 1, entry: seatFileEntry } });
     expect(intent.rollback).toMatchObject({ beforeSha256: sha(Buffer.from(intent.plan.beforeBytes)), afterSha256: sha(fs.readFileSync(w.config)) });
+  });
+
+  it("b5: piRunning before Fabric activation waits for presence, then reads the new local process-bound projection", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: JSON.stringify({ error: "pod-owner-unreadable" }), code: 1 });
+    w.receipt = routable();
+    w.gate = gateLive("nats", MACHINE);
+    const result = await run(w, "publish", { owner }, { roots: async () => {
+      setKube(w, MANAGED, { line: identityLine(w) });
+      return [{ id: `session:${SID}`, machine: MACHINE, ownerHostId: `session:${SID}`,
+        ownerIdentityId: `session:${SID}`, ownerIncarnation: INCARNATION, live: true }] as never;
+    } });
+    expect(result.receipt).toMatchObject({ result: "pass" });
+    expect(w.calls().filter(call => call.argv.includes("/usr/bin/python3"))).toHaveLength(2);
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({
+      measured: { incarnationSource: "pod-local-nats-projection-and-nats-presence" }, asserted: { identity: { ownerIncarnation: INCARNATION } } });
+  });
+
+  it("b5: a thrown initial publish Pod read still records one intent-linked refusal outcome", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    const before = fs.readFileSync(w.config);
+    vi.spyOn(kube, "readPod").mockRejectedValue(new SeamGap("pod-read-failed"));
+    expect(await run(w, "publish", { owner })).toMatchObject({ code: 2, stdout: "", stderr: "GAP: pod-read-failed [owner: fabric-v2]\n" });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "refused", reason: "pod-read-failed",
+      written: false, errorClass: "SeamGap", errorMessage: "pod-read-failed",
+      intentSha256: sha(fs.readFileSync(path.join(w.seat.runDir, "fabric-v2-bridge-publish-intent.json"))) });
+    expect(fs.readFileSync(w.config)).toEqual(before);
   });
 
   it("#1609 review P1-4: a route the link's REAL identity gate refuses (an ambiguous id) is refused, never passed", async () => {
@@ -1592,7 +1679,8 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     const w = await world({ allow: { file: [leadEntry, seatFileEntry], nats: [] } });
     const before = fs.readFileSync(w.config);
     setKube(w, RAW, { line: "", code: 1 }, { running: false });
-    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    // Dedicated startup tests cover 180 s; this restore regression needs only a bounded failed-start refusal.
+    expect(await run(w, "resume", resumeInputs, { deadlineMs: 5_000 })).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
     expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason: "pod-not-running" });
     expect(w.calls().some(call => call.argv.includes("exec"))).toBe(false);
     expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-publish-intent.json"))).toBe(false);

@@ -165,14 +165,14 @@ export const otherRoutesBack = async (config: NatsLinkConfig, before: Record<str
  */
 export const awaitRoutable = async (config: NatsLinkConfig, sessionId: string, deps: LinkDeps,
   clock: { now: () => number; sleep: (ms: number) => Promise<void>; deadline: number },
-  accept: (gate: Record<string, unknown> | null, receipt: Record<string, unknown>) => boolean) => {
+  accept: (gate: Record<string, unknown> | null, receipt: Record<string, unknown>) => boolean | Promise<boolean>) => {
   let last: Record<string, unknown> | null = null;
   let gate: Record<string, unknown> | null = null;
   for (;;) {
     gate = await gateRow(config, sessionId, deps);
     try { last = await (deps.receipt ?? ((c, s) => sessionReceipt(c, s, { nats: true })))(config, sessionId); }
     catch (error) { last = { ok: false, problems: [error instanceof Error ? error.message.slice(0, 300) : "receipt failed"] }; }
-    if (last && accept(gate, last)) return { ok: true, gate, receipt: last };
+    if (last && await accept(gate, last)) return { ok: true, gate, receipt: last };
     if (clock.now() >= clock.deadline) return { ok: false, gate, receipt: last };
     await clock.sleep(1_000);
   }

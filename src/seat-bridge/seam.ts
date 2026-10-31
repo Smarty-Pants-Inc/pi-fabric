@@ -6,7 +6,8 @@ import { loadBridgeNatsSeatPins, type BridgeNatsSeatPins } from "../mesh/bridge-
 import { procStartTime } from "../main-drain/binding.js";
 import { callMainDrain, mainDrainSocket } from "../main-drain/client.js";
 import { ENTRY_ID, entryFacts, journalBranch, JournalBranchError, SUFFIX_MAX, type AppendedEntry } from "../seat-drain/journal-branch.js";
-import { fixedKubectl, kubectl, POD_FABRIC_CLI, readPod, verifyKubeconfig, type KubeAccess, type PodView } from "../seat-drain/kube.js";
+import { fixedKubectl, kubectl, readPod, verifyKubeconfig, type KubeAccess, type PodView } from "./kube.js";
+import { podJournalArgv, podOwnerArgv } from "./pod-journal.js";
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
   socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "../seat-drain/run.js";
 import { natsLinkAllowListConfig } from "../mesh/bridge-nats-config.js";
@@ -21,14 +22,13 @@ import { awaitRoutable, LINK_UNIT, natsRecords, otherRoutesBack, reloadLink, rou
  * lock in D3_SEAT_LOCK_FD (the same three-step proof), ONE receipt on stdout with exit 0 and empty stderr. A lock or
  * binding failure prints no receipt and exits 2 with one `GAP: <code> [owner: fabric-v2]` line (UNKNOWN).
  *
- * - resume: read-only. The raw Pod (API: UID pin, sealed target node, its rendered `--session`) and, through
- *   `kubectl exec` of the in-image CLI's server-verified `--identity` read, the resumed Main's session file and
- *   current leaf. Pass only when all equal what A pinned.
- * - publish: the A' link allow-list entry for this seat (the pinned config writer, allow-writer.ts), a restart of the
- *   pinned link unit, then read-backs: the link reloaded with no problem; every other route it carried is live again;
- *   the seat's NATS presence on its own Path B machine and the hub mirror, live, with the SAME owner incarnation the
- *   managed Pod's Main reports from inside that Pod (whose UID the API reads before and after). That chain is why
- *   `incarnation` may be reported as the managed Pod UID: a Main's presence incarnation is a per-process random id.
+ * - resume: read-only. Pin the raw Pod's UID/node and rendered `--session`; exec the image's Python with a fixed
+ *   stdlib script to read exact journal bytes/hash/stat. Derive the last-entry leaf and suffix facts here. A independently
+ *   re-derives these from its sealed copy plus the bounded suffix. No 0.112.0 `session drain` CLI exists.
+ * - publish: change this seat's A' allow-list entry, restart the pinned link, then re-check every other live route.
+ *   Require live NATS presence on the seat machine and its hub mirror with the SAME incarnation as the Pod's local
+ *   NATS projection, whose mainProcess PID/start time and comm=pi are checked inside the pinned pi container.
+ *   Pod UID/node and container restartCount/startedAt/containerID stay unchanged across reads; no incarnation fallback.
  * - rc-restore-route: the reverse write (exactly what publish recorded), the restart and the route re-check, no live
  *   v2 presence for the seat, and the relaunched v1 writer is the live owner of the session.
  *
@@ -51,7 +51,8 @@ const MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 export const RESIDUALS = [
   "A6 (A's seat contract): a same-UID writer could alter this seam, its interpreter or the link config between check and use",
   "the link restart briefly interrupts every route the link carries; the seam re-checks each one afterwards",
-  "incarnation == pod UID is a proof chain (API pod UID -> exec in that Pod -> server-verified Main -> presence incarnation)",
+  "resume proves rendered journal bytes, not the Main's in-memory leaf; A independently re-derives the seven resume fields",
+  "publish incarnation == pod UID is a proof chain (API pod/container -> exec -> local projection + live pi PID/start -> NATS incarnation)",
 ];
 
 export interface BridgeIo {
@@ -73,8 +74,9 @@ export interface BridgeDeps extends LinkDeps {
   python?: string;
   procRoot?: string;
   uid?: number;
-  /** Tests only: the kubectl client and the in-image CLI path (null: unconfirmed). */
+  /** Tests only: the kubectl client. The in-Pod Python argv is fixed. */
   kubectl?: string;
+  /** Legacy test-injection API retained for callers; never used to select or execute a Pod CLI. */
   podCli?: string | null;
   /** Tests only: the org.json seat pins (production: the link config's own orgJson, as `nats-link start`). */
   seatPins?: () => BridgeNatsSeatPins;
@@ -164,24 +166,28 @@ const targetNode = (context: Context): string => {
 };
 
 export interface PodIdentity {
-  rootId: string; pid: number; meshRoot: string; sessionFile: string | null; leafId: string | null; ownerIncarnation: string | null;
+  rootId: string; pid: number; ownerHostId: string; ownerIdentityId: string; ownerIncarnation: string;
+  machine: string; processStartedAt: string; projectionKey: string; projectionRevision: number;
 }
 
+const samePi = (before: PodView, after: PodView): boolean => before.piRestartCount !== null && before.piStartedAt !== null &&
+  before.piContainerId !== null && after.piRestartCount === before.piRestartCount && after.piStartedAt === before.piStartedAt &&
+  after.piContainerId === before.piContainerId;
+const onlyPiWrites = (pod: PodView): boolean => pod.pvcWriters.length === 1 && pod.pvcWriters[0] === "pi";
+
 /**
- * The pinned Pod (API: UID, the sealed target node, pi running), then the in-image CLI's `--identity` read inside it
- * (the CLI verifies its server against the session's owner record and SO_PEERCRED), then the Pod again: same UID,
- * still running. Read-only throughout.
+ * Pin the Pod and its running container, read with fixed Python argv, then re-check the same container.
+ * Resume reads only journal bytes; publish reads the image's own local NATS projection + live /proc identity.
  */
 const podIdentity = async (context: Context, access: KubeAccess, pin: { name: string; uid: string },
-  seal?: { leafId: string; journalBytes: number }, measured = { observations: 0, waitedMs: 0 }) => {
+  seal?: { leafId: string; journalBytes: number; journalSha256: string }, measured = { observations: 0, waitedMs: 0 }) => {
   measured.observations += 1;
   let before = await readPod(access, pin.name, podReadBudget(context, 30_000));
   if (before && before.uid !== pin.uid) throw new SeamGap("pod-uid-mismatch");
   if (before && before.nodeName !== targetNode(context)) throw new SeamGap("pod-node-mismatch");
   if (context.now() >= context.deadline) throw new SeamGap("phase-deadline");
-  const cli = context.deps.podCli !== undefined ? context.deps.podCli : POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null;
-  // Only the pinned Pod's not-yet-running container is polled; no unavailable or failed identity is retried.
-  if (cli && before && !before.piRunning && before.piTerminated === null) {
+  // Only the pinned Pod's not-yet-running container is polled; no unavailable or failed read is retried.
+  if (before && !before.piRunning && before.piTerminated === null) {
     const wait = clock(context, 180_000);
     const started = wait.now();
     try {
@@ -205,74 +211,81 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
   let journal: JournalRead | null = null;
   let line: string | null = null;
   let execCode: number | null = null;
-  /** The CLI's own refusal of the session file's branch (it found a cycle or a missing parent), when it says so. */
   let journalError: string | null = null;
+  const rendered = sessionArg(before ?? null);
   if (!before) reason = "pod-unreadable";
-  else if (!cli) reason = "pod-cli-unconfirmed";
   else if (!before.piRunning) reason = "pod-not-running";
-  else if (!before.meshRoot) reason = "pod-mesh-root-unknown";
-  else if ((await kubectl(access, ["-n", access.namespace, "exec", pin.name, "-c", "pi", "--", "test", "-x", cli],
-    podReadBudget(context, 30_000))).code !== 0) reason = "pod-cli-missing";
+  else if (!samePi(before, before)) reason = "pod-container-identity-unknown";
+  else if (!onlyPiWrites(before)) reason = "pod-pvc-writers-unproved";
+  else if (seal && (!rendered || !path.isAbsolute(rendered))) reason = "pod-session-arg-unknown";
+  else if (!seal && !before.meshRoot) reason = "pod-mesh-root-unknown";
   else {
-    const result = await kubectl(access, ["-n", access.namespace, "exec", pin.name, "-c", "pi", "--", cli, "session", "drain",
-      context.request.sessionId, "--mesh", before.meshRoot, "--identity",
-      ...(seal ? ["--since", seal.leafId, "--sealed-bytes", String(seal.journalBytes)] : [])], podReadBudget(context, 120_000));
+    const argv = seal ? podJournalArgv(rendered!, seal.journalBytes) : podOwnerArgv(before.meshRoot!, context.request.sessionId);
+    const result = await kubectl(access, ["-n", access.namespace, "exec", pin.name, "-c", "pi", "--", ...argv],
+      podReadBudget(context, 120_000));
     execCode = result.code;
-    line = (result.stdout.trim().split("\n").at(-1) ?? "").slice(0, 1024 * 1024);
-    let parsed: Record<string, unknown> | undefined;
-    try { parsed = JSON.parse(line) as Record<string, unknown>; } catch { parsed = undefined; }
-    const value = parsed && object(parsed.identity) ? parsed.identity : undefined;
-    if (parsed && parsed.format === 1 && parsed.op === "identity" && parsed.sessionId === context.request.sessionId && object(parsed.journal) &&
-      typeof parsed.journal.error === "string" && /^[A-Z_]{1,64}$/.test(parsed.journal.error)) journalError = parsed.journal.error;
-    if (result.code !== 0 || !parsed || parsed.format !== 1 || parsed.op !== "identity" || parsed.sessionId !== context.request.sessionId || !value ||
-      value.rootId !== `session:${context.request.sessionId}` || !Number.isSafeInteger(value.pid) || typeof value.meshRoot !== "string") {
-      reason = "pod-identity-unreadable";
+    line = result.stdout.trim();
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { parsed = undefined; }
+    if (object(parsed) && typeof parsed.error === "string") journalError = parsed.error;
+    if (seal) {
+      journal = result.code === 0 ? journalRead(parsed, seal) : null;
+      if (!journal) reason = "pod-journal-unreadable";
     } else {
-      const text = (key: string): string | null => typeof value[key] === "string" && (value[key] as string).length > 0 &&
-        (value[key] as string).length <= 4096 ? value[key] as string : null;
-      identity = { rootId: value.rootId as string, pid: value.pid as number, meshRoot: value.meshRoot as string,
-        sessionFile: text("sessionFile"), leafId: text("leafId"), ownerIncarnation: text("ownerIncarnation") };
-      if (seal) {
-        journal = journalRead(parsed!.journal);
-        if (!journal) reason = "pod-journal-unreadable";
-      }
+      if (result.code !== 0 || !object(parsed) || parsed.rootId !== `session:${context.request.sessionId}` ||
+        !Number.isSafeInteger(parsed.pid) || (parsed.pid as number) < 1 ||
+        parsed.ownerIdentityId !== parsed.rootId || typeof parsed.ownerHostId !== "string" || !parsed.ownerHostId ||
+        typeof parsed.ownerIncarnation !== "string" || !parsed.ownerIncarnation || parsed.ownerIncarnation.length > 128 ||
+        typeof parsed.machine !== "string" || typeof parsed.processStartedAt !== "string" || !/^[1-9][0-9]*$/.test(parsed.processStartedAt) ||
+        typeof parsed.projectionKey !== "string" || !Number.isSafeInteger(parsed.projectionRevision) || (parsed.projectionRevision as number) < 1) {
+        reason = "pod-identity-unreadable";
+      } else identity = parsed as unknown as PodIdentity;
     }
   }
-  const after = before && !reason ? await readPod(access, pin.name, podReadBudget(context, 30_000)) : undefined;
+  const after = before?.piRunning && execCode !== null ? await readPod(access, pin.name, podReadBudget(context, 30_000)) : undefined;
   if (!reason && context.now() >= context.deadline) throw new SeamGap("phase-deadline");
-  if (!reason && (!after || after.uid !== pin.uid)) reason = "pod-uid-changed";
-  if (!reason && !after!.piRunning) reason = "pod-not-running";
-  return { before: before ?? null, after: after ?? null, identity, journal, journalError, reason, line, execCode, cli,
+  if (before?.piRunning && execCode !== null) {
+    if (!after || after.uid !== pin.uid) reason = "pod-uid-changed";
+    else if (after.nodeName !== targetNode(context)) reason = "pod-node-mismatch";
+    else if (!after.piRunning) reason = "pod-not-running";
+    else if (!samePi(before, after)) reason = "pod-restarted-during-read";
+    else if (!onlyPiWrites(after) || sessionArg(after) !== rendered || after.meshRoot !== before.meshRoot ||
+      after.natsMachine !== before.natsMachine) reason = "pod-spec-changed";
+  }
+  return { before: before ?? null, after: after ?? null, identity, journal, journalError, reason, line, execCode,
     observations: measured.observations, waitedMs: measured.waitedMs };
 };
 
 interface JournalRead {
   leafId: string; entries: number; sealOnBranch: boolean; truncated: boolean;
   appendedSinceSeal: AppendedEntry[] | null;
-  journalSha256: string; journalBytes: number; sealedSha256: string | null; suffixBytes: number; suffixBase64: string | null;
+  journalSha256: string; journalBytes: number; sealedSha256: string | null; suffixBytes: number; suffixBase64: string | null; mtimeNs: string;
 }
 
-/** The in-Pod CLI's journal read, shape-checked (closed keys per appended entry). */
-const journalRead = (value: unknown): JournalRead | null => {
-  if (!object(value) || typeof value.leafId !== "string" || !ENTRY_ID.test(value.leafId) || !Number.isSafeInteger(value.entries) ||
-    typeof value.sealOnBranch !== "boolean" || typeof value.truncated !== "boolean" ||
-    typeof value.journalSha256 !== "string" || !HEX64.test(value.journalSha256) || !Number.isSafeInteger(value.journalBytes) ||
-    !(value.sealedSha256 === null || (typeof value.sealedSha256 === "string" && HEX64.test(value.sealedSha256))) ||
-    !Number.isSafeInteger(value.suffixBytes) || (value.suffixBytes as number) < 0 ||
-    !(value.suffixBase64 === null || (typeof value.suffixBase64 === "string" && value.suffixBase64.length <= 4 * Math.ceil(SUFFIX_MAX / 3) &&
-      /^[A-Za-z0-9+/]*={0,2}$/.test(value.suffixBase64)))) return null;
-  const appended = value.appendedSinceSeal;
-  if (value.sealOnBranch ? !Array.isArray(appended) : appended !== null) return null;
-  const entries = (appended ?? []) as unknown[];
-  if (!entries.every(entry => object(entry) && keys(entry) === "id,parentId,thinkingLevel,type" && typeof entry.id === "string" &&
-    ENTRY_ID.test(entry.id) && (entry.parentId === null || (typeof entry.parentId === "string" && ENTRY_ID.test(entry.parentId))) &&
-    typeof entry.type === "string" && entry.type.length <= 64 && (entry.thinkingLevel === null ||
-      (entry.type === "thinking_level_change" && typeof entry.thinkingLevel === "string" && entry.thinkingLevel.length <= 64)))) return null;
-  return { leafId: value.leafId, entries: value.entries as number, sealOnBranch: value.sealOnBranch, truncated: value.truncated,
-    appendedSinceSeal: appended === null ? null : (entries as AppendedEntry[])
-      .map(entry => ({ id: entry.id, parentId: entry.parentId, type: entry.type, thinkingLevel: entry.thinkingLevel })),
-    journalSha256: value.journalSha256, journalBytes: value.journalBytes as number, sealedSha256: value.sealedSha256 as string | null,
-    suffixBytes: value.suffixBytes as number, suffixBase64: value.suffixBase64 as string | null };
+/** Only bytes/stat facts come from Python. Pi's last-entry leaf and suffix facts are derived here, never asserted by a CLI. */
+const journalRead = (value: unknown, seal: { leafId: string; journalBytes: number; journalSha256: string }): JournalRead | null => {
+  if (!object(value) || keys(value) !== "mtimeNs,prefixSha256,sha256,size,suffixBase64" ||
+    !Number.isSafeInteger(value.size) || (value.size as number) < seal.journalBytes ||
+    typeof value.sha256 !== "string" || !HEX64.test(value.sha256) ||
+    typeof value.prefixSha256 !== "string" || !HEX64.test(value.prefixSha256) ||
+    typeof value.mtimeNs !== "string" || !/^[0-9]+$/.test(value.mtimeNs) ||
+    typeof value.suffixBase64 !== "string" || value.suffixBase64.length > 4 * Math.ceil(SUFFIX_MAX / 3)) return null;
+  if (value.prefixSha256 !== seal.journalSha256) throw new SeamGap("journal-prefix-mismatch");
+  const suffix = Buffer.from(value.suffixBase64, "base64");
+  if (suffix.toString("base64") !== value.suffixBase64 || suffix.length > SUFFIX_MAX ||
+    !Buffer.from(suffix.toString("utf8"), "utf8").equals(suffix)) return null;
+  let entries: AppendedEntry[];
+  try {
+    entries = suffix.toString("utf8").split("\n").filter(line => line.trim()).map(line => {
+      const fact = entryFacts(line);
+      if (!fact) throw new Error("session header in suffix");
+      return fact;
+    });
+  } catch { throw new SeamGap("journal-suffix-invalid"); }
+  const chained = entries.every((entry, index) => entry.parentId === (index === 0 ? seal.leafId : entries[index - 1]!.id));
+  return { leafId: entries.at(-1)?.id ?? seal.leafId, entries: entries.length, sealOnBranch: chained, truncated: false,
+    appendedSinceSeal: entries, journalSha256: value.sha256, journalBytes: value.size as number, sealedSha256: value.prefixSha256,
+    suffixBytes: suffix.length, suffixBase64: value.suffixBase64, mtimeNs: value.mtimeNs };
 };
 
 /** A's final seal (A at 7d2e09af+, rule T-FIX3): exactly these seven keys. */
@@ -318,8 +331,8 @@ const finalSealOf = (context: Context, requested: unknown):
  */
 const APPEND_WAIT_MS = 600_000;
 const APPEND_POLL_MS = 2_000;
-// podIdentity's two API reads, executable check and identity exec; leave time to record the last coherent read.
-const APPEND_READ_MS = 30_000 + 30_000 + 120_000 + 30_000;
+// Keep b4's conservative full-read allowance: two API reads, fixed exec, and 30 s to record the coherent outcome.
+const APPEND_READ_MS = 30_000 + 120_000 + 30_000 + 30_000;
 
 /**
  * Every entry id of the sealed journal, from the seat host's own sealed copy (the seal's `journal`). Its bytes must be
@@ -342,7 +355,8 @@ const sealedEntryIds = (context: Context, seal: { journalSha256: string; journal
 const sessionArg = (pod: PodView | null): string | null => {
   const args = pod?.piArgs;
   const index = args ? args.indexOf("--session") : -1;
-  return args && index >= 0 && typeof args[index + 1] === "string" ? args[index + 1]! : null;
+  return args && args.filter(arg => arg === "--session").length === 1 && index >= 0 &&
+    typeof args[index + 1] === "string" ? args[index + 1]! : null;
 };
 
 // ---------------------------------------------------------------- resume
@@ -369,8 +383,7 @@ const resume = async (context: Context): Promise<number> => {
       const rendered = sessionArg(read.before);
       const journal = read.journal;
       return !seal.sealHasThinkingEntry && read.reason === null && rendered !== null &&
-        read.identity !== null && read.identity.sessionFile === rendered && journal !== null &&
-        read.identity.leafId === journal.leafId && journal.leafId === seal.leafId &&
+        journal !== null && journal.leafId === seal.leafId &&
         journal.journalBytes === seal.journalBytes && journal.journalSha256 === seal.journalSha256 &&
         journal.sealedSha256 === seal.journalSha256 && journal.sealOnBranch && !journal.truncated &&
         journal.suffixBytes === 0 && journal.suffixBase64 === "" && journal.appendedSinceSeal?.length === 0;
@@ -391,10 +404,10 @@ const resume = async (context: Context): Promise<number> => {
         asserted: { identity: read.identity, podLine: read.line } };
       throw new SeamGap(code);
     };
-    // The in-image reader found the resumed file's branch broken (a cycle or a missing parent). The sealed branch was
-    // whole when A sealed it, so an appended entry broke it: one reusing an id (Pi's index lets a later id win) or one
-    // that does not chain. Never a resume.
-    if (read.journalError === "JOURNAL_BRANCH_BROKEN") gap("resume-tail-id-reused");
+    // Fixed reader failures with a precise byte-level cause remain UNKNOWN, never a pass.
+    if (read.journalError && ["journal-suffix-too-large", "journal-prefix-mismatch", "journal-changed-during-read"].includes(read.journalError)) {
+      gap(read.journalError);
+    }
     let reason = read.reason;
     let appended: AppendedEntry[] = [];
     if (!reason && journal) {
@@ -404,7 +417,7 @@ const resume = async (context: Context): Promise<number> => {
       // The sealed leaf must be the current leaf or an ancestor: otherwise the branch diverged after the seal.
       if (!journal.sealOnBranch) gap("branch-diverged");
       // The seam's own measure of the suffix: its bytes are the size the CLI reports, and its entries ARE the appended
-      // branch entries, in order, the first one's parent the sealed leaf (so the CLI's branch read is checked here).
+      // branch entries, in order, the first one's parent the sealed leaf.
       const suffix = Buffer.from(journal.suffixBase64!, "base64");
       if (suffix.length !== journal.suffixBytes || journal.journalBytes !== seal.journalBytes + suffix.length ||
         (suffix.length === 0 && journal.journalSha256 !== seal.journalSha256)) gap("journal-suffix-inconsistent");
@@ -428,13 +441,12 @@ const resume = async (context: Context): Promise<number> => {
         journal.leafId !== (appended.at(-1)?.id ?? seal.leafId)) gap("journal-suffix-not-the-branch");
     }
     if (!reason && !rendered) reason = "pod-session-arg-unknown";
-    if (!reason && read.identity!.sessionFile !== rendered) reason = "journal-mismatch";
-    // Rule T-FIX3: the TRUE current leaf, read from the session file; the Main's own leaf must agree with it.
-    if (!reason && read.identity!.leafId !== journal!.leafId) reason = "leaf-memory-file-mismatch";
+    // 0.112.0 exposes no Main-drain identity. The rendered path and exact bytes are A's resume contract;
+    // A independently re-derives hash, leaf, appended entries and the thinking-entry rule from its sealed copy.
     // Only a coherent identity and unchanged journal can mean the startup append is still missing. Do not mask a
     // readable Main's session/leaf mismatch with this GAP, even when its journal is a byte-identical sealed copy.
     if (!reason && !seal.sealHasThinkingEntry && appended.length === 0) gap("resume-thinking-append-missing");
-    const observed = { sessionId, journal: read.identity?.sessionFile ?? "", leafId: journal?.leafId ?? "", podUid: pin.uid,
+    const observed = { sessionId, journal: rendered ?? "", leafId: journal?.leafId ?? "", podUid: pin.uid,
       appendedSinceSeal: appended, journalSha256: journal?.journalSha256 ?? "", suffixBase64: journal?.suffixBase64 ?? "" };
     const passed = reason === null;
     outcome = { result: passed ? "pass" : "refused", reason,
@@ -536,20 +548,25 @@ const publish = async (context: Context): Promise<number> => {
   planPublish(first, pins, { sessionId, machine });
   const routesBefore = await routeTable(first.config, context.deps);
   if (!routesBefore) throw new SeamGap("link-status-unreadable");
-  // The managed Pod and its Main, read-only, BEFORE any write: the incarnation and the Pod's own NATS machine.
-  const read = await podIdentity(context, access, pin);
-  let reason = read.reason;
-  if (!reason && !read.identity!.ownerIncarnation) reason = "pod-incarnation-unknown";
-  if (!reason && read.before?.natsMachine !== machine) reason = read.before?.natsMachine ? "pod-nats-machine-mismatch" : "pod-nats-machine-unknown";
   const measuredPod = { kubectl: access.kubectl, server: access.server, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() };
   let plan: WriterPlan | null = null;
   let post: LinkConfigFile | null = null;
   let intentSha256: string | null = null;
-  let outcome: Record<string, unknown> = { written: false, measured: { before: read.before, after: read.after,
-    observations: read.observations, waitedMs: read.waitedMs }, asserted: { identity: read.identity, podLine: read.line } };
+  let outcome: Record<string, unknown> = { written: false };
   let failed = false;
   let output = "";
   try {
+    // The managed Pod, read-only BEFORE any write; also look for its own NATS projection.
+    const read = await podIdentity(context, access, pin);
+    let reason = read.reason;
+    // piRunning precedes Fabric activation. The existing route wait waits for publication and re-reads the local copy.
+    if (reason === "pod-identity-unreadable" && read.execCode === 1 && read.journalError === "pod-owner-unreadable") reason = null;
+    if (!reason && (read.before?.natsMachine !== machine || (read.identity !== null && read.identity.machine !== machine))) {
+      reason = read.before?.natsMachine ? "pod-nats-machine-mismatch" : "pod-nats-machine-unknown";
+    }
+    let liveRead = read;
+    outcome = { written: false, measured: { before: read.before, after: read.after,
+      observations: read.observations, waitedMs: read.waitedMs }, asserted: { identity: read.identity, podLine: read.line } };
     if (reason) {
       intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine, plan: null,
         rollback: null, unit: context.pins.linkUnit, routesBefore, measured: measuredPod, residuals: RESIDUALS });
@@ -574,15 +591,27 @@ const publish = async (context: Context): Promise<number> => {
     let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
     let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
     let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
+    let presence: Awaited<ReturnType<typeof natsRecords>> = [];
+    const incarnationSource = "pod-local-nats-projection-and-nats-presence";
     // Everything after the write reads the config ON DISK now (re-read and re-validated by applyPlan).
     if (!reason && written) {
       reload = await reloadLink(post!.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000));
       if (!reload.statusOk) reason = "link-not-reloaded";
     }
     if (!reason) {
-      const incarnation = read.identity!.ownerIncarnation!;
-      routed = await awaitRoutable(post!.config, sessionId, context.deps, clock(context, PUBLISH_SEAT_ROUTE_WAIT_MS), (gate, value) =>
-        routeHolds(gate, value, { side: "nats", fileRemoteHost: post!.config.link, natsMachine: machine, incarnation }));
+      routed = await awaitRoutable(post!.config, sessionId, context.deps, clock(context, PUBLISH_SEAT_ROUTE_WAIT_MS), async (gate, value) => {
+        presence = (await natsRecords(post!.config, context.deps)).filter(record => record.id === `session:${sessionId}`);
+        const record = presence.length === 1 ? presence[0] : undefined;
+        if (!record || record.machine !== machine || record.live !== true || !record.ownerIncarnation ||
+          !routeHolds(gate, value, { side: "nats", fileRemoteHost: post!.config.link, natsMachine: machine,
+            incarnation: record.ownerIncarnation })) return false;
+        if (context.deadline - context.now() < 1_000) return false;
+        liveRead = await podIdentity(context, access, pin);
+        if (liveRead.reason !== null || !liveRead.identity) return false;
+        if (!samePi(read.before!, liveRead.before!)) throw new SeamGap("pod-restarted-during-publish");
+        return liveRead.identity.machine === machine && record.ownerIncarnation === liveRead.identity.ownerIncarnation &&
+          record.ownerHostId === liveRead.identity.ownerHostId && record.ownerIdentityId === liveRead.identity.ownerIdentityId;
+      });
       if (!routed.ok) reason = routed.gate !== null && routed.gate.status !== "live" ? "seat-route-refused-by-gate" : "seat-not-routable";
     }
     if (written) {
@@ -591,20 +620,30 @@ const publish = async (context: Context): Promise<number> => {
       if (!reason && others.down.length > 0) reason = "other-routes-down";
     }
     // A known precheck refusal needs no final read, especially after the startup wait used the phase's last time.
-    const final = read.reason === null && context.deadline - context.now() >= 1_000
+    const final = reason === null && context.deadline - context.now() >= 1_000
       ? await readPod(access, pin.name, podReadBudget(context, 30_000)) : undefined;
     if (!reason && (!final || final.uid !== pin.uid || !final.piRunning)) reason = "pod-uid-changed";
+    if (!reason && (final!.nodeName !== targetNode(context) || !samePi(read.before!, final!) || !onlyPiWrites(final!))) {
+      reason = "pod-restarted-during-publish";
+    }
     const route = `v2@${pin.uid}:${(post?.sha256 ?? first.sha256).slice(0, 12)}`;
     const observed = { sessionId, incarnation: pin.uid, route };
     const passed = reason === null;
     outcome = { result: passed ? "pass" : "refused", reason,
       observed, written, measured: { before: read.before, after: read.after, final: final ?? null, configSha256: post?.sha256 ?? null, reload,
-        otherRoutes: others, gate: routed?.gate ?? null, receipt: routed?.receipt ?? null,
-        observations: read.observations, waitedMs: read.waitedMs }, asserted: { identity: read.identity, podLine: read.line } };
+        otherRoutes: others, gate: routed?.gate ?? null, receipt: routed?.receipt ?? null, presence, incarnationSource,
+        observations: read.observations, waitedMs: read.waitedMs, ownerReadBefore: liveRead.before, ownerReadAfter: liveRead.after },
+      asserted: { identity: liveRead.identity, podLine: liveRead.line } };
     output = receipt(context.request, passed ? "pass" : "refused", observed);
   } catch (error) {
     failed = true;
     outcome = { ...outcome, result: "refused", reason: error instanceof SeamGap ? error.code : "seam-internal", ...errorDetails(error) };
+    if (intentSha256 === null) {
+      // A failed Pod/startup read made no config change but still gets an intent/outcome pair.
+      // An existing intent is never replaced (a repeated phase remains refused).
+      try { intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine,
+        plan: null, rollback: null, unit: context.pins.linkUnit, routesBefore, measured: measuredPod, residuals: RESIDUALS }); } catch { /* keep original GAP */ }
+    }
     throw error;
   } finally {
     if (intentSha256 !== null) {

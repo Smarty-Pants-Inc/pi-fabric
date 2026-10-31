@@ -1,9 +1,32 @@
 import path from "node:path";
-import { kubectl, type KubeAccess, type PodView as DrainPodView } from "../seat-drain/kube.js";
+import { spawn } from "node:child_process";
+import { type KubeAccess, type PodView as DrainPodView } from "../seat-drain/kube.js";
 
 // Bridge-only view: leave the separately pinned DRAIN's module and exported API unchanged.
-export { fixedKubectl, kubectl, verifyKubeconfig } from "../seat-drain/kube.js";
+export { fixedKubectl, verifyKubeconfig } from "../seat-drain/kube.js";
 export type { KubeAccess } from "../seat-drain/kube.js";
+
+// Same fixed argv, environment, timeout and stdout bound as DRAIN, but keep stderr for bridge evidence.
+// DRAIN is a separately pinned RAW; do not change its transport or API as part of this fix.
+const MAX_OUTPUT = 4 * 1024 * 1024;
+export const kubectl = (access: KubeAccess, args: readonly string[], timeoutMs: number):
+  Promise<{ code: number | null; stdout: string; stderr: string }> => new Promise(resolve => {
+    const child = spawn(access.kubectl, ["--kubeconfig", access.kubeconfig, "--context", access.context, ...args], {
+      stdio: ["ignore", "pipe", "pipe"], timeout: Math.max(1_000, Math.floor(timeoutMs)),
+      env: { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C", LC_ALL: "C", HOME: access.home, KUBECONFIG: access.kubeconfig },
+    });
+    let out = Buffer.alloc(0); let err = Buffer.alloc(0);
+    child.stdout!.on("data", (chunk: Buffer) => {
+      if (out.length < MAX_OUTPUT) out = Buffer.concat([out, chunk.subarray(0, MAX_OUTPUT - out.length)]);
+    });
+    child.stderr!.on("data", (chunk: Buffer) => {
+      if (err.length < MAX_OUTPUT) err = Buffer.concat([err, chunk.subarray(0, MAX_OUTPUT - err.length)]);
+    });
+    let spawnError = "";
+    child.on("error", error => { spawnError = error.message; });
+    child.on("close", code => resolve({ code, stdout: out.toString("utf8"), stderr: err.toString("utf8") || spawnError }));
+  });
+
 export interface PodView extends DrainPodView {
   piRestartCount: number | null;
   piStartedAt: string | null;

@@ -48,6 +48,7 @@ elif rest[0] == "-n" and rest[2] == "exec" and rest[7:9] == ["test", "-x"]:
     sys.exit(0 if state.get("cliPresent", True) else 1)
 elif rest[0] == "-n" and rest[2] == "exec" and rest[7:10] == ["/usr/bin/python3", "-I", "-c"]:
     identity = state["identity"]
+    sys.stderr.write(identity.get("stderr", ""))
     if "exact resume exec argv" in rest[10] and state.get("journalFile") and not state.get("readOverride"):
         # Execute the EXACT production script, substituting only the fixture's mounted path.
         result = subprocess.run(rest[7:11] + [state["journalFile"], rest[12]], capture_output=True, text=True)

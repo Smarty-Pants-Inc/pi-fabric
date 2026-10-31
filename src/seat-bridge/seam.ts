@@ -85,9 +85,11 @@ export interface BridgeDeps extends LinkDeps {
   /** Tests only: the real-broker test's link state directory, counted as durable (allow-writer ReadOptions). */
   durableStateDir?: string;
 }
+interface ExecObservation { execCode: number | null; execStdout: string; execStderr: string }
 interface Context {
   runDir: string; request: SeamRequest; sealed: SealedRun; lockFd: number; uid: number; io: BridgeIo; deps: BridgeDeps; pins: BridgePins;
   now: () => number; sleep: (ms: number) => Promise<void>; deadline: number; started: number; requestSha256: string;
+  execs: ExecObservation[];
 }
 
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -98,10 +100,30 @@ const errorDetails = (error: unknown): { errorClass: string; errorMessage: strin
   const safe = redactNatsError(error);
   return { errorClass: safe.name.slice(0, 500), errorMessage: safe.message.slice(0, 500) };
 };
+// Redact BEFORE truncating: a credentials block or quoted token can extend beyond the 500-character window.
+const execText = (text: string): string => errorDetails(new Error(text)).errorMessage.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "?");
+const execStdout = (text: string): string => {
+  const first = text.split(/\r?\n/, 1)[0] ?? "";
+  try {
+    const parsed: unknown = JSON.parse(first);
+    // Decode the JSON error before redaction (its embedded quotes may be JSON-escaped).
+    if (object(parsed) && typeof parsed.error === "string") return execText(JSON.stringify({ error: execText(parsed.error) }));
+  } catch { /* non-JSON transport output: retain the sanitized first line */ }
+  return execText(first);
+};
+const execEvidence = (context: Context, value: Record<string, unknown>): Record<string, unknown> => {
+  const last = context.execs.at(-1);
+  if (!last) return {};
+  const failed = context.execs.findLast(read => read.execCode !== 0);
+  return { measured: { ...(object(value.measured) ? value.measured : {}), ...last, execs: context.execs },
+    ...(failed ? { errorClass: "KubectlExecError", errorMessage: JSON.stringify({ execCode: failed.execCode,
+      stdout: failed.execStdout, stderr: failed.execStderr }) } : {}) };
+};
 const evidence = (context: Context, name: string, value: Record<string, unknown>): string =>
   writeOnce(context.runDir, `fabric-v2-bridge-${context.request.phase}-${name}.json`, Buffer.from(`${JSON.stringify({
     ...value, ...(name === "outcome" && value.result !== "pass" ? {
       errorClass: value.errorClass ?? null, errorMessage: value.errorMessage ?? null } : {}),
+    ...(name === "outcome" ? execEvidence(context, value) : {}),
     owner: OWNER, run: context.request.run, phase: context.request.phase, sessionId: context.request.sessionId,
     requestSha256: context.requestSha256, elapsedMs: Math.round(context.now() - context.started) }, null, 1)}\n`));
 const clock = (context: Context, budgetMs = Number.POSITIVE_INFINITY) => ({
@@ -131,7 +153,7 @@ export const main = async (argv: string[], io: BridgeIo, pins: BridgePins | unde
     verifyRunDir(runDir, uid);
     const sealed = readSealedRun(runDir, request, uid, "bridge");
     const lockFd = proveSeatLock(runDir, io.env.D3_SEAT_LOCK_FD, uid, deps.python);
-    const context: Context = { runDir, request, sealed, lockFd, uid, io, deps, pins, now, sleep, deadline, started, requestSha256: sha256(stdin) };
+    const context: Context = { runDir, request, sealed, lockFd, uid, io, deps, pins, now, sleep, deadline, started, requestSha256: sha256(stdin), execs: [] };
     if (phase === "resume") return await resume(context);
     if (phase === "publish") return await publish(context);
     return await restoreRoute(context);
@@ -224,9 +246,13 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
     const result = await kubectl(access, ["-n", access.namespace, "exec", pin.name, "-c", "pi", "--", ...argv],
       podReadBudget(context, 120_000));
     execCode = result.code;
-    line = result.stdout.trim();
+    // Record immediately: parsing, the after-read API call or a later route wait may throw.
+    context.execs.push({ execCode, execStdout: execStdout(result.stdout),
+      execStderr: execText(result.stderr) });
+    const rawLine = result.stdout.trim();
+    line = execCode === 0 ? rawLine : execStdout(rawLine);
     let parsed: unknown;
-    try { parsed = JSON.parse(line); } catch { parsed = undefined; }
+    try { parsed = JSON.parse(rawLine); } catch { parsed = undefined; }
     if (object(parsed) && typeof parsed.error === "string") journalError = parsed.error;
     if (seal) {
       journal = result.code === 0 ? journalRead(parsed, seal) : null;

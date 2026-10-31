@@ -149,7 +149,7 @@ const resealRun = (w: World, mutate: (run: Record<string, unknown>) => void): vo
   (w.seat as { runSha256: string }).runSha256 = runSha256;
 };
 
-const setKube = (w: World, pod: { name: string; uid: string }, identity: { line: string; code?: number; changeUid?: string; restart?: Record<string, unknown> },
+const setKube = (w: World, pod: { name: string; uid: string }, identity: { line: string; code?: number; stderr?: string; changeUid?: string; restart?: Record<string, unknown> },
   podExtra: Record<string, unknown> = {}) => {
   const ownerLine = JSON.stringify({ rootId: `session:${SID}`, ownerHostId: `session:${SID}`, ownerIdentityId: `session:${SID}`,
     ownerIncarnation: INCARNATION, machine: "sp-org-d3synth", pid: 7, processStartedAt: "123", projectionKey: "sp-org-d3synth.p.synthetic", projectionRevision: 1 });
@@ -203,6 +203,22 @@ const resumeInputs = (w: World) => ({ pod: RAW, finalSeal: finalSealFor(w.seat, 
 const evidenceOf = (w: World, name: string) => JSON.parse(fs.readFileSync(path.join(w.seat.runDir, name), "utf8"));
 
 describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in the raw Pod", () => {
+  it("b6 a20 failed-exec replay: empty stdout + Forbidden stderr records the actual cause", async () => {
+    // a20's byte shape is not the bug: the same exact reader succeeds with size == sealed.
+    const padding = 76414 - Buffer.byteLength(SEALED);
+    const sealed = SEALED.replace('"cwd":"/synthetic"', `"cwd":"/synthetic","padding":"${"x".repeat(padding - 13)}"`);
+    expect(Buffer.byteLength(sealed)).toBe(76414);
+    const w = await world({ sealed });
+    const forbidden = 'error: unable to upgrade connection: pods "principal-d3synth-owner" is forbidden: User "system:serviceaccount:d3-rehearsal:d3r-executor" cannot create resource "pods/exec" in API group "" in the namespace "d3-rehearsal"';
+    setKube(w, RAW, { line: "", code: 1, stderr: forbidden });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
+    expect(outcome).toMatchObject({ reason: "pod-journal-unreadable", errorClass: "KubectlExecError",
+      measured: { execCode: 1, execStdout: "", execStderr: forbidden, journal: null } });
+    expect(JSON.parse(outcome.errorMessage)).toEqual({ execCode: 1, stdout: "", stderr: forbidden });
+    expect(outcome.asserted.podLine).toBe("");
+  });
+
   it("passes with no append: the true leaf, the file's sha256, an empty suffix, [] appended", async () => {
     const w = await world();
     setKube(w, RAW, { line: identityLine(w) });
@@ -920,6 +936,78 @@ const routable = (incarnation = INCARNATION, machine = MACHINE) => ({ ok: true, 
   file: { remoteHost: "v2", live: true, ownerIncarnation: incarnation }, nats: { read: true, records: [{ machine, live: true, ownerIncarnation: incarnation }] } });
 const gateLive = (side: "file" | "nats", machine?: string) => ({ side, key: `session:${SID}`, kind: "root", status: "live", id: `session:${SID}`,
   ...(machine ? { machine } : {}) });
+
+describe.skipIf(!linux)("b6 bridge exec diagnostics (a20): never discard a failed exec", () => {
+  it.each(["resume", "publish"])("%s preserves JSON errors or non-JSON first lines and both sanitized streams", async phase => {
+    for (const json of [true, false]) {
+      const w = await world();
+      const cause = 'transport denied token="never-log-this"';
+      const line = json ? JSON.stringify({ error: cause }) : `${cause}\nnot the first line`;
+      const stderr = 'Forbidden Authorization: Bearer never-log-this\nhttps://u:never-log-this@cluster.test/?token=never-log-this';
+      setKube(w, phase === "resume" ? RAW : MANAGED, { line, code: 1, stderr });
+      const before = fs.readFileSync(w.config);
+      expect(await run(w, phase, phase === "resume" ? resumeInputs : { owner })).toMatchObject({ code: 0, receipt: { result: "refused" } });
+      const outcome = evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`);
+      expect(outcome.errorClass).toBe("KubectlExecError");
+      expect(outcome.measured).toMatchObject({ execCode: 1, execStderr: expect.stringContaining("Forbidden") });
+      expect(outcome.measured.execStdout).toContain("transport denied");
+      expect(outcome.measured.execStdout).not.toContain("not the first line");
+      expect(JSON.parse(outcome.errorMessage)).toEqual({ execCode: 1, stdout: outcome.measured.execStdout, stderr: outcome.measured.execStderr });
+      expect(JSON.stringify(outcome)).not.toContain("never-log-this");
+      expect(fs.readFileSync(w.config)).toEqual(before);
+      expect(fs.existsSync(w.marker)).toBe(false);
+    }
+  });
+
+  it.each(["resume", "publish"])("%s redacts before the 500-character bound, including a credential crossing it", async phase => {
+    const w = await world();
+    const text = 'prefix password="' + "secret-value".repeat(100) + '" ' + "x".repeat(1000);
+    setKube(w, phase === "resume" ? RAW : MANAGED, { line: text, code: 1, stderr: text });
+    await run(w, phase, phase === "resume" ? resumeInputs : { owner });
+    const outcome = evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`);
+    expect(outcome.measured.execStdout).toHaveLength(500);
+    expect(outcome.measured.execStderr).toHaveLength(500);
+    expect(outcome.measured.execStdout).toContain('password=***');
+    expect(JSON.stringify(outcome)).not.toContain("secret-value");
+  });
+
+  it("retains the initial publish exec failure even when a later owner read succeeds", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: JSON.stringify({ error: "pod-owner-unreadable" }), code: 1, stderr: "startup projection not yet present" });
+    w.receipt = routable(); w.gate = gateLive("nats", MACHINE);
+    const result = await run(w, "publish", { owner }, { roots: async () => {
+      setKube(w, MANAGED, { line: identityLine(w) });
+      return [{ id: `session:${SID}`, machine: MACHINE, ownerHostId: `session:${SID}`, ownerIdentityId: `session:${SID}`,
+        ownerIncarnation: INCARNATION, live: true }] as never;
+    } });
+    expect(result.receipt.result).toBe("pass");
+    const outcome = evidenceOf(w, "fabric-v2-bridge-publish-outcome.json");
+    expect(outcome.measured.execs).toHaveLength(2);
+    expect(outcome.measured.execs[0]).toMatchObject({ execCode: 1, execStderr: "startup projection not yet present" });
+    expect(outcome.measured.execs[1]).toMatchObject({ execCode: 0, execStderr: "" });
+    expect(outcome.errorClass).toBe("KubectlExecError");
+    expect(JSON.parse(outcome.errorMessage)).toMatchObject({ execCode: 1, stdout: '{"error":"pod-owner-unreadable"}' });
+  });
+
+  it.each(["resume", "publish"])("%s persists failed exec evidence when the after-read API throws", async phase => {
+    const w = await world();
+    setKube(w, phase === "resume" ? RAW : MANAGED, { line: "", code: 1, stderr: "Forbidden pods/exec" });
+    const actual = kube.readPod;
+    vi.spyOn(kube, "readPod").mockImplementationOnce(actual).mockRejectedValue(new SeamGap("after-read-failed"));
+    expect(await run(w, phase, phase === "resume" ? resumeInputs : { owner })).toMatchObject({ code: 2 });
+    expect(evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`)).toMatchObject({ reason: "after-read-failed",
+      errorClass: "KubectlExecError", measured: { execCode: 1, execStdout: "", execStderr: "Forbidden pods/exec" } });
+  });
+
+  it.each(["resume", "publish"])("%s records stderr on successful exec too, without changing the resume/publish verdict", async phase => {
+    const w = await world();
+    setKube(w, phase === "resume" ? RAW : MANAGED, { line: identityLine(w), stderr: "benign kubectl warning" });
+    w.receipt = routable(); w.gate = gateLive("nats", MACHINE);
+    expect(await run(w, phase, phase === "resume" ? resumeInputs : { owner })).toMatchObject({ code: 0, receipt: { result: "pass" } });
+    expect(evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`).measured.execs[0])
+      .toMatchObject({ execCode: 0, execStderr: "benign kubectl warning" });
+  });
+});
 
 describe.skipIf(!linux)("the shared Pod identity startup wait before publish effects", () => {
   it("resume startup regression: publish waits for its pinned managed Pod and rechecks local process identity against live presence", async () => {

@@ -4,7 +4,8 @@
 // Hosted CI logs TEST_DELETION_REPORT: per outside operand, then delegates. Children inherit NODE_OPTIONS.
 // ponytail: a JS seam, not native race protection; helpers deleting through their own syscalls are out of reach.
 import fs from "node:fs";
-import { hostedOnly } from "../scripts/hosted-only.mjs";
+import childProcess from "node:child_process";
+import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
@@ -17,7 +18,8 @@ const stateKey = Symbol.for("pi-fabric.test-deletion-guard");
 const windows = process.platform === "win32";
 
 const selfUrl = new URL(import.meta.url);
-const inheritedRoot = selfUrl.searchParams.get("root");
+const inheritedRoot = selfUrl.searchParams.get("root")
+  ?? (process.versions.bun ? process.env.TEST_DELETION_GUARD_ROOT ?? null : null);
 selfUrl.search = "";
 selfUrl.hash = "";
 const guardHref = selfUrl.href;
@@ -53,8 +55,11 @@ const isShared = (root) => {
     try { return realpath(p); } catch { return p; }
   }));
   if (shared.has(root)) return true;
-  // Fleet isolation redirects HOME/USERPROFILE into private TMPDIR before installation.
-  // Protect the native account home, not that mutable environment; unprovable means shared.
+  // Bun caches HOME in userInfo().homedir too: it is not a native-account lookup.
+  // Carry the Node parent's validated private-root decision, bound to this exact
+  // physical ceiling. Missing proof fails closed, never consult the child's HOME.
+  if (process.versions.bun) return process.env.TEST_DELETION_GUARD_PRIVATE_ROOT !== root;
+  // Fleet isolation redirects HOME/USERPROFILE; Node userInfo uses the native account.
   try {
     const home = userInfo().homedir;
     return !isAbsolute(home) || within(root, realpath(home));
@@ -123,7 +128,8 @@ function callerFrame() {
 }
 
 function install() {
-  const report = hostedOnly("outside-temp deletion reporting");
+  // Authorization is a silent predicate: installing a preload is not a skipped test.
+  const report = isHostedOnlyAllowed(process.env);
   const state = { report, root: pinRoot(), count: 0 };
 
   /** An Error to refuse with, or undefined to delegate. */
@@ -243,10 +249,55 @@ function install() {
   fs.cp = cpCallback("cp", fs.cp);
   fs.cpSync = cpSync("cpSync", fs.cpSync);
   fs.promises.cp = cpPromise("promises.cp", fs.promises.cp);
+  const childOptionsIndex = (name, args) => name === "exec" || name === "execSync"
+    ? 1 : Array.isArray(args[1]) || args[1] == null ? 2 : 1;
+  const pinnedBunEnvironment = (env, root) => {
+    let cap = root ?? sep;
+    try {
+      const requested = env.TEST_DELETION_GUARD_ROOT && realpath(env.TEST_DELETION_GUARD_ROOT);
+      if (requested && root && within(root, requested)) cap = requested;
+    } catch { /* retain the pinned ceiling */ }
+    const preload = windows ? guardPath.replaceAll("\\", "/") : guardPath;
+    const token = `--preload=${/[\s"\\]/.test(preload) ? JSON.stringify(preload) : preload}`;
+    const options = env.BUN_OPTIONS ?? "";
+    return { ...env, BUN_OPTIONS: options.split(/\s+/).includes(token) ? options : [options.trim(), token].filter(Boolean).join(" "),
+      TEST_DELETION_GUARD_ROOT: cap, TEST_DELETION_GUARD_PRIVATE_ROOT: root ? cap : "" };
+  };
+  const pinChildArgs = (name, args) => {
+    const index = childOptionsIndex(name, args), options = args[index];
+    // ponytail: executable/argv guessing cannot prove a launcher will not relay
+    // to Bun with this explicit environment. Keep the preload on intermediaries too.
+    if (options?.env) args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+    return args;
+  };
+  for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync"]) {
+    const original = childProcess[name];
+    const wrapped = function (...args) {
+      return Reflect.apply(original, this, pinChildArgs(name, args));
+    };
+    // exec/execFile's custom promisifier returns {stdout, stderr} plus .child.
+    // Preserve that native protocol AND pin its args, rather than dropping the
+    // symbol or exposing the original uninstrumented launch as a bypass.
+    const custom = Symbol.for("nodejs.util.promisify.custom");
+    if (typeof original[custom] === "function") wrapped[custom] = function (...args) {
+      return Reflect.apply(original[custom], this, pinChildArgs(name, args));
+    };
+    childProcess[name] = wrapped;
+  }
+  if (process.versions.bun) for (const name of ["spawn", "spawnSync"]) {
+    const original = Bun[name];
+    Bun[name] = function (...args) {
+      const index = Array.isArray(args[0]) ? 1 : 0, options = args[index];
+      if (options?.env) args[index] = { ...options, env: pinnedBunEnvironment(options.env, state.root) };
+      return Reflect.apply(original, this, args);
+    };
+  }
   syncBuiltinESMExports();
 
   process.once("exit", () => {
-    if (!state.count) return;
+    // A caught refusal in a Bun CLI must not add output to its stderr protocol.
+    // Hosted outside-operand reports (and their total) remain observable.
+    if (!state.count || (process.versions.bun && !state.report)) return;
     const key = state.report ? "reported" : "refused";
     try { process.stderr.write(`TEST_DELETION_REPORT_TOTAL: ${JSON.stringify({ [key]: state.count })}\n`); } catch { /* exit */ }
   });
@@ -258,6 +309,13 @@ owner[stateKey] ??= install();
 
 // Children inherit the guard and its pinned ceiling, not a wider test-mutated TMPDIR.
 {
+  const root = owner[stateKey].root;
+  const preload = windows ? guardPath.replaceAll("\\", "/") : guardPath;
+  const token = `--preload=${/[\s"\\]/.test(preload) ? JSON.stringify(preload) : preload}`;
+  const options = process.env.BUN_OPTIONS ?? "";
+  process.env.BUN_OPTIONS = options.split(/\s+/).includes(token) ? options : [options.trim(), token].filter(Boolean).join(" ");
+  process.env.TEST_DELETION_GUARD_ROOT = root ?? sep;
+  process.env.TEST_DELETION_GUARD_PRIVATE_ROOT = root ?? "";
   const existing = process.env.NODE_OPTIONS ?? "";
   if (!existing.includes(guardHref)) {
     const preload = new URL(guardHref);

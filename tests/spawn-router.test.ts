@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -732,15 +733,34 @@ describe("external spawn router behavior", () => {
       for (const key of keys.length ? keys : [name.toLowerCase()]) vi.stubEnv(key, value);
     }
     const body = `require('node:fs').writeFileSync(process.argv[1] + '.env', JSON.stringify(process.env)); process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`;
-    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
-    let routed: ReturnType<typeof routeAgentCreation>;
-    try {
-      // Inject only while the hook constructs env/spawn options; restore before
-      // asynchronous process retirement so a Linux child is retired on Linux.
-      Object.defineProperty(process, "platform", { ...descriptor, value: platform });
-      routed = routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } });
-    } finally { Object.defineProperty(process, "platform", descriptor); }
-    expect(await routed).toEqual(expect.objectContaining({ model: pick.model, thinking: pick.thinking, decisionId: expect.any(String) }));
+    // Run the real product source in an uninstrumented Node parent, as in round 3.
+    // The deletion guard deliberately pins explicit envs even on unknown relays
+    // to Bun; that test-only wrapper must not become part of the router contract.
+    // Node's native TS stripping plus this extension resolver keeps source imports
+    // real (no mock spawn, copied router logic, or built/stale product artifact).
+    const source = new URL("../src/agents/spawn-router.ts", import.meta.url).href;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import { registerHooks } from "node:module";
+      registerHooks({ resolve(specifier, context, next) {
+        try { return next(specifier, context); } catch (error) {
+          if (specifier.startsWith(".") && specifier.endsWith(".js")) return next(specifier.slice(0, -3) + ".ts", context);
+          throw error;
+        }
+      }});
+      const { routeAgentCreation } = await import(${JSON.stringify(source)});
+      for (const name of ${JSON.stringify(["SMARTY_AUTH", "GITHUB_TOKEN", "MY_TOKEN", "API_KEY", "PI_CODING_AGENT_DIR", "NODE_OPTIONS", "LD_PRELOAD", "COMSPEC", "PATHEXT"])}) process.env[name] = "must-not-reach-router";
+      const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+      let routed;
+      try {
+        Object.defineProperty(process, "platform", { ...descriptor, value: ${JSON.stringify(platform)} });
+        const pick = ${JSON.stringify(pick)};
+        routed = routeAgentCreation({ ...${JSON.stringify({ ...opts, config: { ...opts.config, command: command(dir, body) } })}, validateModel: ${opts.validateModel.toString()} });
+      } finally { Object.defineProperty(process, "platform", descriptor); }
+      console.log(JSON.stringify(await routed));
+    `], { env: { ...process.env, NODE_OPTIONS: "", LD_PRELOAD: "" }, encoding: "utf8", timeout: 15_000 });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual(expect.objectContaining({ model: pick.model, thinking: pick.thinking, decisionId: expect.any(String) }));
     const platformEnv = platform === "win32" ? {
       ...essentials, SystemRoot: systemRoot,
       PATH: `${path.win32.join(systemRoot, "System32")};${systemRoot}`,

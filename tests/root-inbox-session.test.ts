@@ -520,17 +520,11 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     let cancelQueued: (() => void) | undefined;
     const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, {
       persisted: true,
-      extensions: root => {
-        const observer = path.join(root, "cancel-inbox-followup.ts");
-        fs.writeFileSync(observer, `export default function(pi) {
-          pi.on("turn_end", () => globalThis[Symbol.for("pi-fabric.test.cancel-inbox-followup")]?.());
-        }`);
-        return [observer];
-      },
+      config: { mesh: { followUpFlushMs: 1_000 } },
     });
-    const cancelKey = Symbol.for("pi-fabric.test.cancel-inbox-followup");
-    const globals = globalThis as Record<symbol, unknown>;
-    globals[cancelKey] = () => cancelQueued?.();
+    // SDK public turn_end is emitted AFTER all extension handlers, including the lazy
+    // Main drain. An external extension's registration order is not handoff evidence.
+    const stopObserving = session.subscribe(event => { if (event.type === "turn_end") cancelQueued?.(); });
     const { MeshStore } = await import("../src/mesh/store.js");
     const mesh = new MeshStore(meshRoot, 64 * 1024, 500);
     const rootId = `session:${session.sessionManager.getSessionId()}`;
@@ -538,13 +532,27 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const cursor = () => mesh.get(key, { fresh: true })!.value as { after: number; pending?: { ids: string[] } };
     const ids = () => inboxMessages().flatMap(message => (message as { details?: { ids?: string[] } }).details?.ids ?? []);
     const held = missedWork("held before cancellation");
-    let pending = "", cancellations = 0, inferences = 0;
+    let pending = "", cancelledNonce = "", cancellations = 0, inferences = 0;
+    const calls = faux.state.callCount;
+    let setupInferences = 0;
     try {
       faux.setResponses([() => {
-        inferences++; pending = missedWork("cancel after enqueue before receipt");
+        // One explicit healthy setup tool turn creates the held carrier at turn_end.
+        // The cancellation/resume inference counts below exclude only this named setup.
+        setupInferences++; pending = missedWork("cancel after enqueue before receipt");
+        return fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" }));
+      }, async () => {
+        inferences++;
+        expect(cursor().pending?.ids).toEqual([pending]);
+        expect(ids()).toEqual([held]);
+        await new Promise(resolve => setTimeout(resolve, 1_100)); // Age the already-held carrier past this fixture's explicit 1s flush.
         cancelQueued = () => {
-          expect(session.agent.peekQueuedMessages().some(message => message.role === "custom" &&
-            (message as { details?: { ids?: string[] } }).details?.ids?.includes(pending))).toBe(true);
+          const queued = session.agent.peekQueuedMessages().find(message => message.role === "custom" &&
+            (message as { details?: { ids?: string[] } }).details?.ids?.includes(pending));
+          expect(queued).toBeDefined();
+          cancelledNonce = (queued as unknown as { details: { nonce: string } }).details.nonce;
+          expect(cancelledNonce).toEqual(expect.any(String));
+          expect(cursor().pending?.ids).toEqual([pending]);
           expect(ids()).toEqual([held]);
           cancelQueued = undefined; cancellations++;
           session.clearQueue(); session.agent.abort();
@@ -553,6 +561,8 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       }]);
       await session.prompt("enqueue then cancel");
       expect(cancellations).toBe(1);
+      expect(setupInferences).toBe(1);
+      expect(faux.state.callCount).toBe(calls + setupInferences + 1);
       expect(inferences).toBe(1);
       expect(ids()).toEqual([held]);
       expect(cursor().pending?.ids).toEqual([pending]);
@@ -563,17 +573,25 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       await session.prompt("resume without reload");
       expect(ids()).toEqual([held, pending, newer]);
       expect(new Set(ids()).size).toBe(3);
+      const resumed = inboxMessages().find(message =>
+        (message as { details?: { ids?: string[] } }).details?.ids?.includes(pending));
+      expect((resumed as unknown as { details: { nonce: string } }).details.nonce).not.toBe(cancelledNonce);
       // Both action events join the resumed inference; priority lookahead adds no extra turn.
       expect(inferences).toBe(2);
+      expect(faux.state.callCount).toBe(calls + setupInferences + 2);
       expect(cursor().pending).toBeUndefined();
       faux.setResponses([fauxAssistantMessage("no duplicate")]);
       await session.prompt("check once more");
       expect(ids()).toEqual([held, pending, newer]);
-    } finally { delete globals[cancelKey]; mesh.closeState(); }
+    } finally { stopObserving(); mesh.closeState(); }
   }, 60_000);
 
   it("does not consume unsigned split carriers, then delivers the same IDs once through the extension", async () => {
-    const { session, faux, inboxMessages, missedWork } = await start(1_000, false, { warm: false });
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, false, {
+      warm: false,
+      config: { mesh: { followUpFlushMs: 1_000 } },
+    });
+    session.setAutoRetryEnabled(false);
     const identityId = `session:${session.sessionManager.getSessionId()}`;
     const { createHash } = await import("node:crypto");
     const { MeshStore } = await import("../src/mesh/store.js");
@@ -598,9 +616,28 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(issuedIds()).toEqual([]);
     // Raw native messages are not extension-issued receipts. The real runtime must
     // inject these same IDs, even when its warm run ends unsuccessfully.
+    const calls = faux.state.callCount;
     faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
-      { ...fauxAssistantMessage("warm failed"), stopReason: "error", errorMessage: "test warm failure" }]);
+      async () => {
+        // Runtime activation's first tool boundary has issued, but not handed, the
+        // authenticated carrier. A second healthy tool turn ages that actual hold.
+        expect(issuedIds()).toEqual([]);
+        expect((mesh.get(key, { fresh: true })!.value as { pending?: { ids: string[] } }).pending?.ids).toEqual(ids);
+        await new Promise(resolve => setTimeout(resolve, 1_100));
+        return fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 2" }));
+      }, context => {
+        // Native message_end has consumed the exact signed carrier BEFORE this failed
+        // inference. Unsigned history is still present but never became an ACK.
+        expect(issuedIds()).toEqual(ids);
+        const signed = inboxMessages().at(-1) as unknown as { content: string; details: { nonce: string; ids: string[] } };
+        expect(signed.details.nonce).toEqual(expect.any(String));
+        expect(JSON.stringify(context.messages)).toContain(JSON.stringify(signed.content).slice(1, -1));
+        expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeUndefined();
+        return fauxAssistantMessage("warm failed", { stopReason: "error", errorMessage: "test warm failure" });
+      }]);
     await session.prompt("warm");
+    expect(faux.state.callCount).toBe(calls + 3); // Activation, explicit aging tool turn, then the failed inference.
+    expect(session.messages.at(-1)).toMatchObject({ stopReason: "error", errorMessage: "test warm failure" });
     expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeUndefined();
     expect(inboxMessages()).toHaveLength(3);
     expect(issuedIds()).toEqual(ids);
@@ -678,17 +715,31 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     while (!done() && Date.now() < deadline) await sleep(50);
   };
 
+  // Count the durable wake publications, not merely the eventual native messages: #18131
+  // repeatedly published its own next watch notification while Main held one valid carrier.
+  const inboxWakes = (meshRoot: string, id: string) => fs.readFileSync(path.join(meshRoot, "events.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map(line => JSON.parse(line) as { topic?: string; kind?: string; data?: { ids?: string[] } })
+    .filter(event => event.topic === "fabric.inbox.wake" && event.kind === "idle-wake" && event.data?.ids?.includes(id));
+
   it.each(["during-error", "after-error"] as const)("wakes once for mailbox work queued %s before automatic stream-error recovery (#4012)", async (timing) => {
-    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(1_000, true);
     session.setAutoRetryEnabled(false);
     const calls = faux.state.callCount;
+    let id = "";
     faux.setResponses([
       () => {
-        if (timing === "during-error") missedWork("Follow up after stream disconnect.");
+        if (timing === "during-error") id = missedWork("Follow up after stream disconnect.");
         return fauxAssistantMessage("partial answer", { stopReason: "error",
           errorMessage: "stream disconnected before completion: stream closed before response.completed" });
       },
-      fauxAssistantMessage("mailbox followUp processed"),
+      context => {
+        // The original carrier must join the retry's FIRST request, before its success
+        // can open Main's provider gate. Success followed by another inference is wrong.
+        expect(inboxMessages()).toHaveLength(1);
+        expect((inboxMessages()[0] as { details: { ids: string[] } }).details.ids).toEqual([id]);
+        expect(JSON.stringify(context.messages)).toContain("Follow up after stream disconnect.");
+        return fauxAssistantMessage("mailbox followUp processed");
+      },
     ]);
     await session.prompt("fail the stream");
     // During-error work may already have started its one event-driven followUp
@@ -698,30 +749,112 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       expect(session.isStreaming).toBe(false);
       await sleep(300); // Mail arriving before the 1s retry can satisfy the continuation.
       expect(faux.state.callCount).toBe(calls + 1);
-      missedWork("Follow up after stream disconnect.");
+      id = missedWork("Follow up after stream disconnect.");
     }
+    await until(() => inboxWakes(meshRoot, id).length > 0, 1_000);
+    await sleep(300); // Main's provider-held carrier is outside Pi's native pending queue.
+    expect(inboxWakes(meshRoot, id)).toHaveLength(1);
     await until(() => inboxMessages().length > 0 && !session.isStreaming, 2_000);
     expect(inboxMessages()).toHaveLength(1);
     expect(faux.state.callCount).toBe(calls + 2);
     expect(JSON.stringify(session.messages.at(-1))).toContain("mailbox followUp processed");
+    expect((inboxMessages()[0] as { details: { ids: string[] } }).details.ids).toEqual([id]);
     await sleep(300);
     expect(inboxMessages()).toHaveLength(1);
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(inboxWakes(meshRoot, id)).toHaveLength(1);
+  }, 60_000);
+
+  it("joins a provider-held root to the next owner prompt's first inference, without an extra wake", async () => {
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(1_000, true);
+    session.setAutoRetryEnabled(false);
+    const calls = faux.state.callCount;
+    let id = "";
+    faux.setResponses([() => {
+      id = missedWork("Held root joins the owner prompt.");
+      return fauxAssistantMessage("partial answer", { stopReason: "error", errorMessage: "stream disconnected before completion" });
+    }]);
+    await session.prompt("fail with pending work");
+    await until(() => inboxWakes(meshRoot, id).length === 1, 500);
+    expect(inboxWakes(meshRoot, id)).toHaveLength(1);
+    expect(inboxMessages()).toEqual([]); // Main custody, not a native receipt.
+    expect(session.agent.peekQueuedMessages()).toEqual([]);
+    expect(faux.state.callCount).toBe(calls + 1);
+    faux.setResponses([context => {
+      expect(inboxMessages()).toHaveLength(1);
+      expect((inboxMessages()[0] as { details: { ids: string[] } }).details.ids).toEqual([id]);
+      expect(JSON.stringify(context.messages)).toContain("Held root joins the owner prompt.");
+      return fauxAssistantMessage("owner resumed held work");
+    }]);
+    await session.prompt("resume now");
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(JSON.stringify(session.messages.at(-1))).toContain("owner resumed held work");
+    await sleep(1_100); // The superseded 1s automatic retry must not buy another inference.
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(inboxWakes(meshRoot, id)).toHaveLength(1);
+  }, 60_000);
+
+  it("does not let a joined root buy another retry after the one recovery attempt fails", async () => {
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(1_000, true);
+    session.setAutoRetryEnabled(false);
+    const calls = faux.state.callCount;
+    let id = "";
+    faux.setResponses([() => {
+      id = missedWork("Root consumed on the one failed retry.");
+      return fauxAssistantMessage("initial failure", { stopReason: "error", errorMessage: "stream disconnected before completion" });
+    }, context => {
+      expect(inboxMessages()).toHaveLength(1);
+      expect((inboxMessages()[0] as { details: { ids: string[] } }).details.ids).toEqual([id]);
+      expect(JSON.stringify(context.messages)).toContain("Root consumed on the one failed retry.");
+      return fauxAssistantMessage("failed again", { stopReason: "error", errorMessage: "retry also failed" });
+    }]);
+    await session.prompt("fail the request and its one retry");
+    await until(() => faux.state.callCount === calls + 2 && !session.isStreaming, 2_000);
+    expect(session.messages.filter(message => message.role === "assistant").at(-1))
+      .toMatchObject({ stopReason: "error", errorMessage: "retry also failed" });
+    expect(inboxMessages()).toHaveLength(1);
+    await sleep(1_300);
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(inboxWakes(meshRoot, id)).toHaveLength(1);
+    expect(session.messages.some(message => message.role === "custom" &&
+      (message as { customType?: string }).customType === "pi-fabric-provider-blocked")).toBe(true);
+  }, 60_000);
+
+  it("uses only the existing automatic recovery attempt when no root carrier is held", async () => {
+    const { session, faux, inboxMessages } = await start(1_000, true);
+    session.setAutoRetryEnabled(false);
+    const calls = faux.state.callCount;
+    faux.setResponses([
+      fauxAssistantMessage("partial answer", { stopReason: "error", errorMessage: "stream disconnected before completion" }),
+      fauxAssistantMessage("recovered without mailbox work"),
+    ]);
+    await session.prompt("fail without work");
+    await until(() => faux.state.callCount === calls + 2 && !session.isStreaming, 2_000);
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(inboxMessages()).toEqual([]);
+    expect(JSON.stringify(session.messages.at(-1))).toContain("recovered without mailbox work");
+    await sleep(300);
     expect(faux.state.callCount).toBe(calls + 2);
   }, 60_000);
 
   it("wakes an idle Main for an addressed work event with one new turn, and only once", async () => {
-    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(1_000, true);
+    const calls = faux.state.callCount;
     faux.setResponses([fauxAssistantMessage("woken"), fauxAssistantMessage("extra")]);
-    missedWork("Published from a shell while you were idle.");
+    const id = missedWork("Published from a shell while you were idle.");
     await until(() => inboxMessages().length > 0 && !session.isStreaming);
     expect(inboxMessages()).toHaveLength(1);
     expect(JSON.stringify(inboxMessages()[0])).toContain("Published from a shell while you were idle.");
     const last = session.messages.at(-1) as { role?: string; content?: unknown };
     expect(last.role).toBe("assistant");
     expect(JSON.stringify(last.content)).toContain("woken");
-    // More ticks: the batch is held, so it never comes again.
+    // More watch notifications: consumed work never comes again, but fresh idle work still woke.
     await sleep(1_000);
     expect(inboxMessages()).toHaveLength(1);
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(inboxWakes(meshRoot, id)).toHaveLength(1);
   }, 60_000);
 
   it("never wakes for a broadcast without `to`, or for a shadow copy whose steer the session holds", async () => {
@@ -787,12 +920,17 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
   // Review F3: a fresh Main that announces itself at startup and has not had a turn yet: its inbox
   // starts when it becomes available, so an event sent before the first tick still wakes it.
   it("wakes a fresh Main, with no turn yet, for an event sent before its first tick", async () => {
-    const { session, faux, inboxMessages, missedWork } = await start(1_000, true, { warm: false, wakeMs: "1500", config: { mesh: { announce: true } } });
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(1_000, true, { warm: false, wakeMs: "1500", config: { mesh: { announce: true } } });
+    const calls = faux.state.callCount;
     faux.setResponses([fauxAssistantMessage("woken fresh")]);
-    missedWork("Sent right after you started.");
+    const id = missedWork("Sent right after you started.");
     await until(() => inboxMessages().length > 0 && !session.isStreaming, 15_000);
     expect(inboxMessages()).toHaveLength(1);
     expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
+    await sleep(300);
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(inboxWakes(meshRoot, id)).toHaveLength(1);
   }, 60_000);
 
   // A passive followUp records context without inference. Its receipt prevents repeated idle

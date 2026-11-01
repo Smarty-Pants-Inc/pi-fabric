@@ -19,6 +19,13 @@ import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathB
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
 import { assertMainInboxOpen, type MainDrainAdmission } from "./main-drain/gate.js";
+import { rootInboxDrains, type RootInboxCarrier, type RootInboxCarrierOptions } from "./topology/root-inbox-shared.js";
+
+// Registration/cleanup belongs to lazy Main, not the eager metadata bridge.
+const registerRootInboxDrain = (pi: ExtensionAPI, drain: NonNullable<ReturnType<typeof rootInboxDrains.get>>): (() => void) => {
+  rootInboxDrains.set(pi, drain);
+  return () => { if (rootInboxDrains.get(pi) === drain) rootInboxDrains.delete(pi); };
+};
 
 const MAIN_AGENT_ALIAS = "main";
 // Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
@@ -346,6 +353,8 @@ const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, sourc
     deliveryId.startsWith("resident:") && source !== "actor-output");
 
 export interface HeldAgentMessage {
+  /** Transient native carrier: RootInbox, not Main's journal, owns durable custody and ACKs. */
+  rootInboxCarrier?: { message: RootInboxCarrier; options: RootInboxCarrierOptions };
   outcomeSend?: DeliverySend;
   /** Per-handoff evidence, never inferred from Main's later state at confirmation. */
   deliveryReason?: "operator-halt";
@@ -426,7 +435,8 @@ const itemBytes = (item: HeldAgentMessage): number => {
   const data = nativeItemData(item);
   // deliveryReason is fixed host-owned bookkeeping, not caller payload. Held-item
   // count quotas bound it even when a later halt adds the marker after admission.
-  return Buffer.byteLength(item.message) + (data === undefined ? 0 : Buffer.byteLength(JSON.stringify(data))) +
+  return (item.rootInboxCarrier ? Buffer.byteLength(JSON.stringify(item.rootInboxCarrier)) : Buffer.byteLength(item.message)) +
+    (data === undefined ? 0 : Buffer.byteLength(JSON.stringify(data))) +
     // The retained key and native data are separate serialized representations: charge both.
     (item.inboxKey === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.inboxKey))) +
     (item.deliveryId === undefined ? 0 : Buffer.byteLength(JSON.stringify(item.deliveryId))) +
@@ -776,7 +786,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     return this.#deliverAgent(originalTargetId, request);
   }
 
-  #deliverAgent(recipientId: string, request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
+  #deliverAgent(recipientId: string, request: FabricMainAgentDeliveryRequest,
+    rootInboxCarrier?: HeldAgentMessage["rootInboxCarrier"]): FabricAgentMessageResult {
     assertSteerPriority(request.priority, request.delivery);
     if (request.priority && request.triggerTurn === false) throw new Error("interrupt priority requires a triggering steer");
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
@@ -825,6 +836,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       cause.from.name !== derivedWake.from.name || cause.from.kind !== derivedWake.from.kind));
     const item: HeldAgentMessage = {
       id: randomUUID(),
+      ...(rootInboxCarrier ? { rootInboxCarrier } : {}),
       ...(request.outcomeSend ? { outcomeSend: request.outcomeSend } : {}),
       from: sender,
       ...(admittedCauses?.length ? { wakeCause: admittedCauses[0]!,
@@ -931,7 +943,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         triggered = canTrigger && this.#sent.includes(item);
       }
 
-    } else if (deliveryId !== undefined || this.#journal) {
+    } else if (!rootInboxCarrier && (deliveryId !== undefined || this.#journal)) {
       // A sent message may wait in Pi's volatile queue (prompt preflight, a settle): it stays in
       // the journal until the session holds it, and a restart replays it (#confirm, #replay).
       item.handed = true;
@@ -1182,7 +1194,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#nativeJournalUnknown) throw new Error("Cannot overwrite unreadable native recovery Main journal");
     // Before the journal: an item leaves the journal only once its id is recorded as consumed.
     this.#saveIndex();
-    const items = [...this.#unverified, ...this.#sent, ...this.#held];
+    // RootInbox already retains its pending range durably. Never create a second journal
+    // owner, rotation carrier or delivery acknowledgement for these native messages.
+    const items = [...this.#unverified, ...this.#sent, ...this.#held].filter(item => !item.rootInboxCarrier);
     if (!items.length) { fs.rmSync(this.#journal, { force: true }); return; }
     writeFileAtomic(this.#journal, JSON.stringify({ version: 1, items }), { durable: true });
     if (probeAdmission && hasFabricPathBProbeObserver()) recordFabricPathBProbe({ type: "main-followup-journal-commit",
@@ -1571,6 +1585,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     const sessionId = sessionManager?.getSessionId?.();
     this.#nativeSessionRef = readNativeCustody && sessionId && sessionFile
       ? { sessionId, sessionFile } : undefined;
+    this.#unsubscribe.push(registerRootInboxDrain(this.pi, {
+      send: (message, options, from) => {
+        this.#deliverAgent(this.id, { from, message: typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+          delivery: options?.deliverAs ?? "followUp",
+          ...(options?.triggerTurn === undefined ? {} : { triggerTurn: options.triggerTurn }) }, { message, options });
+      },
+      pending: () => this.#held.flatMap(item => item.rootInboxCarrier ? [item.rootInboxCarrier.message] : []),
+    }));
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
@@ -1762,7 +1784,14 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (event.reason === "manual") this.#wakeWhenIdle();
       else { this.#stopWake(); this.#stopOperation(); }
     });
+    on("before_agent_start", (event: { messageType?: string }, ctx) => {
+      this.#context = ctx;
+      // User nextTurn context is collected after these hooks. Custom starts instead
+      // flush passive context before dispatch; nextTurn belongs only to user prompts.
+      this.#joinRootInbox(event.messageType === "custom" ? "followUp" : "nextTurn");
+    });
     on("agent_start", (_event, ctx) => {
+      this.#context = ctx;
       resetPrincipalDiagnosticTurn(this.pi, ctx);
       // The HOLD-induced restart belongs to the interrupted turn, not a fresh abort budget.
       if (!this.#interruptResume) this.#interruptUsedThisTurn = false;
@@ -1774,6 +1803,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       // A run is the attempt (or its settle re-arms recovery); stop waiting for idle.
       this.#stopProviderDeadTimer();
       this.#stopProviderDeadDeadline();
+      // Legacy custom starts skip before_agent_start. agent_start is awaited before
+      // the initial steering poll, so this joins the authorized attempt, not another run.
+      this.#joinRootInbox("steer");
     });
     // The end of a run, and a finished /tree summary, are idle edges for a pending recovery step.
     on("agent_end", () => { this.#armProviderDeadTimer(); });
@@ -1857,6 +1889,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#stopWake();
     for (const off of this.#unsubscribe.splice(0)) off();
     this.#closed = true;
+    // Transient root carriers return to the existing durable RootInbox pending range.
+    // Closing/reloading must neither inject nor acknowledge them.
+    for (let index = this.#held.length - 1; index >= 0; index--) {
+      if (this.#held[index]!.rootInboxCarrier) this.#held.splice(index, 1);
+    }
     // With a journal, a reload or the next start replays them; handing them to Pi here as
     // well would deliver them twice. Without one, Pi's own queue takes them, as before.
     if (this.#journal) this.#trySave();
@@ -1930,8 +1967,27 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
+  /** Join only the FIFO prefix through the last root carrier to an already-authorized prompt. */
+  #joinRootInbox(deliverAs: "nextTurn" | "followUp" | "steer"): void {
+    const ctx = this.#context;
+    if (!ctx || this.#reloading || this.#halted || ctx.signal?.aborted || this.#runRecoverySuppressed ||
+      (this.#providerDead && this.#providerDead.phase !== "probation")) return;
+    const running = deliverAs === "steer";
+    if (running && ctx.isIdle()) return;
+    let count = this.#held.length;
+    while (count > 0 && !this.#held[count - 1]!.rootInboxCarrier) count--;
+    // A saved nextTurn/passive replay must not gain active delivery permission merely
+    // because a root carrier is behind it. User prompts can take that context normally.
+    if (deliverAs !== "nextTurn" && this.#held.slice(0, count).some(item => item.deliverAs !== undefined)) return;
+    while (count > 0) {
+      const before = this.#held.length;
+      if (!this.#handOver(count, deliverAs, running, false, running)) return;
+      count -= before - this.#held.length;
+    }
+  }
+
   /** Send the first count held items as one message; they leave the queue only once it is sent. */
-  #handOver(count: number, deliverAs: FabricMainAgentDelivery, triggerTurn: boolean, flushed: boolean): boolean {
+  #handOver(count: number, deliverAs: FabricMainAgentDelivery, triggerTurn: boolean, flushed: boolean, joiningRun = false): boolean {
     // smarty-dev#1826: an item that cannot be rendered fails every retry and, first in the queue,
     // holds every later followUp. It leaves the queue, with a report; the rest go. A failure of
     // Pi's queue itself keeps them all for the next boundary.
@@ -1949,7 +2005,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     for (let index = 0; index < Math.min(count, this.#held.length);) {
       const item = this.#held[index]!;
       try {
-        agentMessageBlock(item, delivery);
+        if (!item.rootInboxCarrier) agentMessageBlock(item, delivery);
         index++;
       } catch (error) {
         this.#consume(this.#held.splice(index, 1)[0]!);
@@ -1963,6 +2019,10 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     count = Math.min(count, this.#held.length);
     if (count <= 0) { this.#trySave(); return true; }
+    // An authenticated root carrier is indivisible: never wrap it, merge its details,
+    // or render it as an agent-message. Ordinary prefixes stop before the next carrier.
+    const carrier = this.#held.slice(0, count).findIndex(item => item.rootInboxCarrier !== undefined);
+    if (carrier >= 0) count = carrier === 0 ? 1 : carrier;
     // A turn has one sender. Keep legacy batching unchanged, and hand over only a homogeneous
     // FIFO prefix on capable hosts. Each successful prefix is journalled before the next send.
     if (this.supportsProvenance()) {
@@ -1972,13 +2032,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     const batch = this.#held.slice(0, count);
     try {
-      this.#send(batch, deliverAs, triggerTurn, flushed);
+      this.#send(batch, deliverAs, triggerTurn, flushed, false, joiningRun);
     } catch {
       return false;                                      // kept; the next boundary or release retries
     }
     this.#held.splice(0, count);
-    for (const item of batch) item.handed = true;
-    this.#sent.push(...batch);
+    for (const item of batch) if (!item.rootInboxCarrier) item.handed = true;
+    // Native message_end, not this handover, is the root carrier's sole ACK path.
+    this.#sent.push(...batch.filter(item => !item.rootInboxCarrier));
     this.#trySave();
     return true;
   }
@@ -2523,6 +2584,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     triggerTurn: boolean,
     flushed: boolean,
     peerSteer = false,
+    joiningRun = false,
   ): boolean | undefined {
     items = items.filter(item => !this.#inboxFence || this.#inboxFence.owns(item.id));
     if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
@@ -2531,7 +2593,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       throw new Error("Native recovery owns this carrier; Fabric must not send it");
     }
     const interrupt = this.#context?.isIdle() === true && items.every(item => this.#interrupts.has(item.id));
-    triggerTurn &&= (peerSteer || !this.#halted) && !this.#providerHeld() && (!this.#context?.signal?.aborted || interrupt);
+    // A starting run has already passed host recovery admission. Native steer needs
+    // triggerTurn=true to enter that run's initial poll, not to request another attempt.
+    triggerTurn &&= (peerSteer || !this.#halted) && (joiningRun || !this.#providerHeld()) && (!this.#context?.signal?.aborted || interrupt);
     // Capture the actual handoff decision before native admission, not at delayed
     // confirmation. A previously triggered handoff must not be relabelled by a later halt.
     if (this.#halted && !peerSteer) for (const item of items) item.deliveryReason = "operator-halt";
@@ -2541,7 +2605,10 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#journal && items.some(item => item.deliveryReason === "operator-halt")) this.#save();
     // Each item keeps its own delivery mark: a flushed batch goes in as a steer, but it holds followUps.
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
-    const blocks = items.map((item) => agentMessageBlock(item, delivery));
+    const triggered = !triggerTurn || deliverAs === "nextTurn" ? false : this.#context?.isIdle();
+    const carrier = items[0]!.rootInboxCarrier;
+    if (carrier && items.length !== 1) throw new Error("Root inbox carriers must be handed over individually");
+    const blocks = carrier ? [] : items.map((item) => agentMessageBlock(item, delivery));
     const itemDetails = (item: HeldAgentMessage) => {
       // Use the same native shape admission charged, including synthesized work claims.
       const data = nativeItemData(item);
@@ -2563,9 +2630,10 @@ export class MainAgentController implements FabricMainAgentTarget {
     const first = items[0]!;
     const provenance = this.#provenance(first);
     const options = { deliverAs, triggerTurn };
-    const triggered = !triggerTurn || deliverAs === "nextTurn" ? false : this.#context?.isIdle();
     this.pi.sendMessage(
-      fabricWakeMessage(this.pi, {
+      // Root carriers keep the exact stamped object (including private wake admission),
+      // nonce, content and provenance. Only transport policy changes at the boundary.
+      carrier?.message ?? fabricWakeMessage(this.pi, {
         customType: "pi-fabric-agent-message",
         content: [
           ...(flushed
@@ -2589,7 +2657,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         ? [{ cause: "unattributed" as const }]
         : item.wakeCauses ?? [item.wakeCause ?? mainWakeCause(item.from, item.source, delivery,
           item.admissionTopic, item.admissionKey ?? item.deliveryId)])),
-      provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
+      carrier ? { ...carrier.options, ...options } : provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
     );
     // A fresh delivery can win the deadline without going through #releaseQueue. It is
     // still the one retry attempt; later peer wakes must wait for its actual outcome.

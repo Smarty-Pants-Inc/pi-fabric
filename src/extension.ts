@@ -5,11 +5,10 @@ import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import {
-  rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE,
+  pendingRootInboxCarriers, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE,
   rootInboxReceiptIssuer, registerRootInboxReceipt, verifyRootInboxReceipt,
   type RootInboxBatch, type RootInboxReceiptVerifier, type RootInboxReconcileOptions,
 } from "./topology/root-inbox-shared.js";
-import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
@@ -823,6 +822,17 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // Older Pi drops ctx.signal before agent_settled and omits its outcome. Retain the
   // host signal so a cancel after turn_end still invalidates the unreceived queue.
   let rootInboxRunSignal: AbortSignal | undefined;
+  // One existing stable lazy entry: actual nonempty delivery or the first inbox-bearing context.
+  let inboxContext: typeof import("./topology/root-inbox-context.js") | undefined;
+  const inboxDeliveryCurrent = (context: ExtensionContext): (() => boolean) => {
+    const issuer = inboxIssuer, sessionId = context.sessionManager.getSessionId();
+    const owner = inboxWake.context, settling = inboxWake.settling;
+    const signal = context.signal, runSignal = rootInboxRunSignal;
+    return () => state.initialized && inboxIssuer === issuer && inboxWake.context === owner &&
+      inboxWake.armed && inboxWake.settling === settling && extensionContextLive(context) &&
+      context.sessionManager.getSessionId() === sessionId && context.signal === signal &&
+      rootInboxRunSignal === runSignal && !signal?.aborted && !runSignal?.aborted;
+  };
   // Native drafts authenticate nonce + content, not identity. Only same-manager reloads retain custody.
   const verifyIssuedInbox: RootInboxReceiptVerifier = (details, carrier, accepted) =>
     verifyRootInboxReceipt(inboxIssuer, details, carrier, accepted);
@@ -833,7 +843,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const pending = new Set(inbox.events.map(event => event.id));
     const queued = new Set<string>();
     let hiddenBySteer = false;
-    for (const message of pendingMessages ?? []) {
+    // A triggering root carrier can still belong to Main's aged followUp drain,
+    // not Pi's preview. That is live queue evidence, never a consumption receipt.
+    const heldCarriers = pendingRootInboxCarriers(pi).map(message => ({ ...message, role: "custom" }));
+    for (const message of [...(pendingMessages ?? []), ...heldCarriers]) {
       if (message.role !== "custom" || message.customType !== "pi-fabric-inbox") {
         // Pi's boundary preview selects steers instead of the followUp queue when both
         // exist. Absence from that partial snapshot is not proof of cancellation.
@@ -848,7 +861,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       else if (queued.has(id) || hiddenBySteer) inboxIssuer.queued.set(id, inboxIssuer.turn);
       else if (inboxIssuer.turn - queuedAt > 1) inboxIssuer.queued.delete(id);
     }
-    return inbox.events.filter(event => !inboxIssuer.queued.has(event.id));
+    // A cancelled/error boundary clears old leases, not live queue custody. In particular,
+    // provider backoff can still retain the original carrier in Main's held FIFO.
+    return inbox.events.filter(event => !inboxIssuer.queued.has(event.id) && !queued.has(event.id));
   };
   const consumeInjectedInbox = async (details: unknown, carrier: unknown): Promise<void> => {
     const issued = verifyIssuedInbox(details, carrier, new Set());
@@ -873,15 +888,20 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // Invalidate cancelled/unreceived leases even if the durable cursor read fails.
     if (options.commitOnly) inboxIssuer.queued.clear();
     if (!state.initialized) return;
+    const current = inboxDeliveryCurrent(context);
     const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), undefined, options).catch(() => undefined);
     reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     // Commit-only returns no deliverable events, including for an unheld pending batch.
     // Prune before returning: a cancelled native queue must not suppress the next prompt.
     const events = inboxEventsToQueue(inbox, pendingMessages);
-    if (options.commitOnly) return;
-    if (!events.length) return;
-    for (const id of deliverRootInbox(pi, events, undefined, registerIssuedInbox)) inboxIssuer.queued.set(id, inboxIssuer.turn);
+    if (options.commitOnly || !events.length || !current()) return;
+    const delivery = inboxContext ??= await import("./topology/root-inbox-context.js");
+    if (!current()) return;
+    // Queue custody can change during the load; never renew a stale pre-load lease decision.
+    for (const id of delivery.deliverRootInbox(pi, inboxEventsToQueue(inbox, pendingMessages), undefined, registerIssuedInbox)) {
+      inboxIssuer.queued.set(id, inboxIssuer.turn);
+    }
   };
   const stopInboxWake = (): void => {
     // Closes the runtime's mesh-root watch and deadline timer; session_start arms them anew.
@@ -906,8 +926,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // The host's whole settle counts, not only Fabric's handler (#111 review F4): a turn requested
     // then is deferred past every agent_settled handler, where neither the transcript nor
     // hasPendingMessages() shows it, and an earlier handler may still precede Fabric's disarm.
-    const idle = () => inboxWake.context === context && inboxWake.armed && !inboxWake.settling &&
-      context.isIdle() && !hostSettling(context) && !promptPending(context) && !context.hasPendingMessages();
+    const current = inboxDeliveryCurrent(context);
+    const idle = () => current() && !inboxWake.settling &&
+      context.isIdle() && !hostSettling(context) && !promptPending(context) && !context.hasPendingMessages() &&
+      pendingRootInboxCarriers(pi).length === 0;
     inboxWake.reading = true;
     try {
       if (!idle()) return;
@@ -915,7 +937,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        for (const id of deliverRootInbox(pi, inbox.events, undefined, registerIssuedInbox)) inboxIssuer.queued.set(id, inboxIssuer.turn);
+        const delivery = inboxContext ??= await import("./topology/root-inbox-context.js");
+        if (!idle()) return;
+        for (const id of delivery.deliverRootInbox(pi, inbox.events, undefined, registerIssuedInbox)) inboxIssuer.queued.set(id, inboxIssuer.turn);
         return undefined;
       }
       // Records: the same gate, re-checked after the read (F21).
@@ -1484,9 +1508,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   });
 
   // The root inbox context filter (smarty-dev#8962) loads at the first request whose context holds
-  // an inbox message, not at startup; without one it has nothing to cut. Once loaded it runs on
-  // every request, synchronously.
-  let inboxContext: typeof import("./topology/root-inbox-context.js") | undefined;
+  // an inbox message (or actual delivery), not at startup; without one it has nothing to cut.
+  // Once loaded it runs on every request, synchronously.
   const projectContext = async (event: ContextEvent, context: ExtensionContext): Promise<ContextEventResult | undefined> => {
     const sessionId = context.sessionManager.getSessionId();
     const pendingContinuation = state.initialized
@@ -1676,24 +1699,28 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
 
   // Work events a steer missed reach the Main with its next turn (smarty-dev#754).
   pi.on("before_agent_start", async (_event, context) => {
+    // A fresh prompt replaces the cancelled run's signal before capturing delivery ownership.
     rootInboxRunSignal = context.signal;
     inboxWake.context = context;
     inboxWake.armed = true;
     if (!state.initialized) return;
+    const current = inboxDeliveryCurrent(context);
     const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), undefined, { priority: true }).catch(() => undefined);
     await reportInboxExpiry(pi, inbox);
-    if (!inbox) return;
+    if (!inbox || !current() || !inboxEventsToQueue(inbox).length) return;
+    const delivery = inboxContext ??= await import("./topology/root-inbox-context.js");
+    if (!current()) return;
     const events = inboxEventsToQueue(inbox);
     if (!events.length) return;
     // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result. Lease
     // only actual rows, never the overflow summary, so withheld work is eligible next turn.
     if (!fabricProvenanceSupported(pi)) {
-      const message = rootInboxMessage(events);
+      const message = delivery.rootInboxMessage(events);
       registerIssuedInbox(message.details, message.content);
       for (const id of message.details.ids) inboxIssuer.queued.set(id, inboxIssuer.turn);
       return { message };
     }
-    for (const id of deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false }, registerIssuedInbox)) {
+    for (const id of delivery.deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false }, registerIssuedInbox)) {
       inboxIssuer.queued.set(id, inboxIssuer.turn);
     }
   });

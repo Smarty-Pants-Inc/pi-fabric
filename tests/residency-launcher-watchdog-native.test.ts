@@ -16,7 +16,7 @@ const until = async (condition: () => boolean, ms = 15_000) => {
   const end = Date.now() + ms;
   while (!condition()) { if (Date.now() > end) throw new Error("Compiled watchdog probe deadline"); await sleep(20); }
 };
-const fixture = (mode: "tree" | "renew" | "evidence" | "orphan-stale" | "orphan-healthy" | "orphan-owner-loss") => {
+const fixture = (mode: "tree" | "renew" | "evidence" | "orphan-stale" | "orphan-healthy" | "orphan-owner-loss", reparented = false) => {
   const orphan = mode.startsWith("orphan-");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-launcher-wedge-"));
   const owned = launchLog(root);
@@ -50,7 +50,7 @@ const dir=path.join(config.meshRoot,'host-leases');fs.mkdirSync(dir,{recursive:t
 const file=path.join(dir,createHash('sha256').update('fixture-host').digest('hex').slice(0,32)+'.json');
 const renew=()=>{const now=Date.now();fs.writeFileSync(file+'.tmp',JSON.stringify({format:1,id:'fixture-host',rootId:config.rootId,identityId:'fixture-host',updatedAt:now,expiresAt:now+1000}));fs.renameSync(file+'.tmp',file);};
 renew();let timer=setInterval(renew,20);${mode === "orphan-healthy" || mode === "orphan-owner-loss" ? "" : "setTimeout(()=>clearInterval(timer),75);"}
-${mode === "tree" ? `const intermediate=spawn(process.execPath,[${JSON.stringify(path.join(root, "intermediate.mjs"))}],{stdio:'ignore'});intermediate.unref();` : orphan ? `spawn(process.execPath,[${JSON.stringify(path.join(root, "helper.mjs"))}],{stdio:'ignore'});` : ""}
+${mode === "tree" || reparented ? `const intermediate=spawn(process.execPath,[${JSON.stringify(path.join(root, "intermediate.mjs"))}],{stdio:'ignore'});intermediate.unref();` : orphan ? `spawn(process.execPath,[${JSON.stringify(path.join(root, "helper.mjs"))}],{stdio:'ignore'});` : ""}
 ${mode === "renew" ? "process.on('SIGUSR2',()=>{renew();timer=setInterval(renew,20);});" : ""}
 process.on('SIGTERM',()=>{fs.appendFileSync(path.join(root,'terms.jsonl'),JSON.stringify({pid:process.pid})+'\\n');process.exit(0);});
 ${mode === "orphan-owner-loss" ? "process.stdin.on('end',()=>fs.writeFileSync(path.join(root,'ignored-eof.json'),JSON.stringify({pid:process.pid})));process.stdin.resume();" : ""}
@@ -107,7 +107,7 @@ setTimeout(()=>{record({event:'main-readiness-timeout'});process.exit(3);},10000
     console.error("native fixture cleanup", JSON.stringify({ mode, root,
       processes: owned.owned().map(record => ({ ...record, live: same(record) && live(record.pid) })),
     }));
-    fs.rmSync(root, { recursive: true, force: true });
+    // Retain the native session traces, including RED evidence, after owned cleanup.
   };
   return { root, launcher, lifetime, events, launches, close };
 };
@@ -185,8 +185,75 @@ describe.skipIf(process.platform !== "linux")("compiled residency launcher CLI w
       expect(fs.readFileSync(ownerFile, "utf8")).toBe(successor);
       expect(fs.readFileSync(path.join(f.root, "error.json"), "utf8")).toBe("successor diagnostic");
       expect(fs.readFileSync(path.join(f.root, "launcher.log"), "utf8")).toBe(beforeLog);
-      expect(fs.existsSync(path.join(f.root, "watchdog-custody.json"))).toBe(false);
+      // A successful direct-child join is not whole-attempt containment proof.
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")))
+        .toMatchObject({ format: 1, launcher: { pid: launcherPid }, owner: { pid: old.pid, token: old.token } });
       expect(f.launches()).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 20_000);
+
+  it("F1 owner-loss after helper reparenting stops the old native session, retains unresolved custody and never touches the live successor", async () => {
+    expect(fs.existsSync(launcherPath), "fresh build required").toBe(true);
+    const f = fixture("orphan-owner-loss", true);
+    try {
+      expect(await f.lifetime.exit).toEqual({ code: 0, signal: null }); // Real originating Main readiness + native exit.
+      const launcherPid = f.events().find(row => row.event === "launcher-started").pid;
+      await until(() => fs.existsSync(path.join(f.root, "helper-heartbeat")) && fs.existsSync(path.join(f.root, "intermediate.json")));
+      const helper = JSON.parse(fs.readFileSync(path.join(f.root, "helper.json"), "utf8"));
+      const intermediate = JSON.parse(fs.readFileSync(path.join(f.root, "intermediate.json"), "utf8"));
+      const ownerFile = path.join(f.root, "owner.json");
+      const old = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+      await until(() => {
+        const stat = fs.readFileSync(`/proc/${helper.pid}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        // A subreaper is allowed: prove loss of both ancestry edges, not PPID=1.
+        return !live(intermediate.pid) && Number(fields[1]) !== intermediate.pid && Number(fields[1]) !== old.pid;
+      });
+      const helperStat = fs.readFileSync(`/proc/${helper.pid}/stat`, "utf8");
+      const helperFields = helperStat.slice(helperStat.lastIndexOf(")") + 2).split(" ");
+      expect(Number(helperFields[3])).toBe(old.pid); // Same old session, not arbitrary setsid containment.
+      expect(live(old.pid)).toBe(true); expect(live(launcherPid)).toBe(true); expect(live(helper.pid)).toBe(true);
+      console.error("native owner-loss pre-successor", JSON.stringify({ root: f.root, launcherPid, old,
+        intermediatePid: intermediate.pid, helperPid: helper.pid, helperStat, intermediateGone: !live(intermediate.pid) }));
+
+      // Only NOW replace owner authority with a valid, birth-pinned live process.
+      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+      const successor = Buffer.from(JSON.stringify({ ...old, pid: process.pid, token: "live-successor",
+        processStartTime: stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] }));
+      const diagnostic = Buffer.from("successor diagnostic");
+      fs.writeFileSync(ownerFile, successor);
+      fs.writeFileSync(path.join(f.root, "error.json"), diagnostic);
+      const beforeLog = fs.readFileSync(path.join(f.root, "launcher.log"));
+      await until(() => !live(launcherPid));
+      expect(live(old.pid)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "ignored-eof.json"), "utf8"))).toEqual({ pid: old.pid });
+      // Neither PID absence nor PPID change substitutes for the child's native join.
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "generations", `${old.token}.exit.json`), "utf8")))
+        .toMatchObject({ generation: old.token, writer: "launcher", pid: old.pid, code: 0, signal: null });
+      const failure = JSON.parse(fs.readFileSync(path.join(f.root, "generations", `${old.token}.error.json`), "utf8"));
+      expect(JSON.parse(failure.error)).toMatchObject({ event: "launcher-exit", reason: "resident-owner-giveup",
+        pid: old.pid, nativeExit: { code: 0, signal: null }, giveupMs: 200 });
+      const unchanged = () => {
+        expect(fs.readFileSync(ownerFile)).toEqual(successor);
+        expect(fs.readFileSync(path.join(f.root, "error.json"))).toEqual(diagnostic);
+        expect(fs.readFileSync(path.join(f.root, "launcher.log"))).toEqual(beforeLog);
+      };
+      unchanged();
+      console.error("native owner-loss post-exit", JSON.stringify({ root: f.root, helperPid: helper.pid,
+        helperLive: live(helper.pid), custody: fs.existsSync(path.join(f.root, "watchdog-custody.json")),
+        launches: f.launches().length, successorBytesUnchanged: true }));
+      expect(live(helper.pid), "F1: reparented old-session helper must stop before launcher exits").toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "helper-stopped.json"), "utf8")))
+        .toEqual({ pid: helper.pid, signal: "SIGTERM" });
+      // Emptying the observed session still cannot prove absence of escaped workers.
+      const custodyFile = path.join(f.root, "watchdog-custody.json");
+      const custody = fs.readFileSync(custodyFile);
+      expect(JSON.parse(custody.toString())).toMatchObject({ format: 1,
+        launcher: { pid: launcherPid }, owner: { pid: old.pid, token: old.token } });
+      await sleep(300); // More than another shortened owner-loss budget: no replacement.
+      expect(fs.readFileSync(custodyFile)).toEqual(custody);
+      expect(f.launches()).toHaveLength(1);
+      unchanged();
     } finally { await f.close(); }
   }, 20_000);
 

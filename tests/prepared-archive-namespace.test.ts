@@ -266,12 +266,16 @@ describe.skipIf(process.platform === "win32")("prepared archive prefix: independ
     for (const phase of [0, 1, 2]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(expected));
   });
 
-  it("missing preparation batch keeps original full index/live fences", async () => {
+  it("batch borrows only its prepared prefix and keeps its after-release live fence", async () => {
     const f = await fixture(), measured = observe(f);
+    const reduced = linuxPrefixCapable(f.root);
     await f.side.publishBatch([{ event: command("batch"), held: [sender.id] }]);
-    for (const phase of [0, 1, 2]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(chain(f.leaf)));
+    const expected = reduced ? chain(f.leaf, commonDirectory(f.leaf, f.root)) : chain(f.leaf);
+    for (const phase of [0, 1, 2]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(expected));
     // Archive-coupled keyed confirmation under lock, then unconditional #finishBatch live confirmation.
-    expect(liveDirs(measured)).toEqual([...chain(f.root), ...chain(f.root)]);
+    expect(liveDirs(measured)).toEqual([...(reduced ? [f.root] : chain(f.root)), ...chain(f.root)]);
+    expect(measured.barriers.filter(b => b.directory && !b.held && b.operation !== "live").map(b => b.file))
+      .toEqual(chain(path.join(f.root, "event-receipts")));
   });
 
   it("cold unknown-creator index, direct rollback/recovery and generic atomic write remain full", async () => {

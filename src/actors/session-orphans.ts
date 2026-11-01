@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
-import { assertMeshStateReadable, censusRecordAlive, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshStore } from "../mesh/store.js";
+import { assertMeshStateReadable, censusRecordAlive, type MeshBatchOperation, type MeshBatchView, type MeshIdentity, type MeshStateEntry, type MeshStore } from "../mesh/store.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import { hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "../topology/host-leases.js";
 import { isLiveLegacyRootEntry } from "../topology/legacy-root-liveness.js";
@@ -62,7 +62,8 @@ const leaseOf = (meshRoot: string, id: string): FabricHostLease | undefined => {
 
 /** Missing presence is absence; an unreadable/invalid record or owner lease is NOT absence. */
 const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?: string,
-  settled?: (entry: MeshStateEntry) => boolean, graceMs = SESSION_ACTOR_ORPHAN_GRACE_MS): boolean => {
+  settled?: (entry: MeshStateEntry) => boolean, graceMs = SESSION_ACTOR_ORPHAN_GRACE_MS,
+  readShared: MeshBatchView["get"] = key => mesh.get(key, { fresh: true })): boolean => {
   const key = participantKey(id);
   const entries: MeshStateEntry[] = [];
   try {
@@ -73,7 +74,7 @@ const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?:
           typeof raw.version !== "number" || !record(raw.updatedBy)) return false;
       entries.push(raw as unknown as MeshStateEntry);
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
-    const shared = mesh.get(key, { fresh: true });
+    const shared = readShared(key);
     if (shared) entries.push(shared);
     for (const entry of entries) {
       // Authenticated terminal history is not renewed execution presence. Its
@@ -350,8 +351,9 @@ export class SessionActorOrphans {
     return stopped;
   }
 
-  #actorAbsent(sessionId: string, id: string): boolean {
-    const legacy = this.mesh.get(`actors/${sessionId}/${id}`, { fresh: true });
+  #actorAbsent(sessionId: string, id: string,
+    readShared: MeshBatchView["get"] = key => this.mesh.get(key, { fresh: true })): boolean {
+    const legacy = readShared(`actors/${sessionId}/${id}`);
     const value = record(legacy?.value);
     if (legacy && (!value || value.id !== id || value.rootId !== `session:${sessionId}` || !time(legacy.updatedAt) ||
         typeof value.status !== "string" || !["dormant", "idle", "stopped", "running", "queued", "preparing", "waiting", "failed", "failing-preparation"].includes(value.status))) return false;
@@ -359,7 +361,8 @@ export class SessionActorOrphans {
     // execution presence. Recent active advertisements retain the restart grace.
     if (legacy && value?.status !== "idle" && value?.status !== "stopped" &&
         Date.now() - legacy.updatedAt < SESSION_ACTOR_ORPHAN_GRACE_MS) return false;
-    return noLiveParticipant(this.mesh, id, Date.now(), `session:${sessionId}`, entry => this.validateTombstone(entry) !== undefined);
+    return noLiveParticipant(this.mesh, id, Date.now(), `session:${sessionId}`,
+      entry => this.validateTombstone(entry) !== undefined, SESSION_ACTOR_ORPHAN_GRACE_MS, readShared);
   }
 
   #terminal(row: Record<string, unknown> & { id: string }, marker: Record<string, unknown>,
@@ -441,13 +444,17 @@ export class SessionActorOrphans {
     if (!current || JSON.stringify(current.sessionOrphan) !== JSON.stringify(marker)) return false;
     row = current;
     const authority = assertNativeObserver(this.mesh.root, this.identity, this.ownSessionId, row, retire);
-    const readCopies = (): Array<MeshStateEntry | undefined> => {
-      let file: MeshStateEntry | undefined;
-      try { file = JSON.parse(fs.readFileSync(path.join(this.mesh.root, "participants", `${digest(row.id)}.json`), "utf8")); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      return [this.mesh.get(`actors/${sessionId}/${row.id}`, { fresh: true }), this.mesh.get(participantKey(row.id), { fresh: true }), file];
+    const readFileCopy = (): MeshStateEntry | undefined => {
+      try { return JSON.parse(fs.readFileSync(path.join(this.mesh.root, "participants", `${digest(row.id)}.json`), "utf8")); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return undefined; }
     };
-    const copies = readCopies(), copiesBytes = JSON.stringify(copies);
+    const directoryKeys = [`actors/${sessionId}/${row.id}`, participantKey(row.id)];
+    const copies = [...directoryKeys.map(key => this.mesh.get(key, { fresh: true })), readFileCopy()];
+    const sharedCopiesBytes = JSON.stringify(copies.slice(0, directoryKeys.length)), fileCopyBytes = JSON.stringify(copies[directoryKeys.length]);
+    const readPredecessor: MeshBatchView["get"] = key => {
+      const index = directoryKeys.indexOf(key);
+      return index < 0 ? this.mesh.get(key, { fresh: true }) : copies[index];
+    };
     const receipts = settlementReceipts(beforeReceipt);
     const beforeTerminal = beforeReceipt && this.#terminal(row, marker, beforeReceipt);
     const needsRepair = copies.some(entry => entry && (!this.validateTombstone(entry) ||
@@ -476,10 +483,10 @@ export class SessionActorOrphans {
       ? { ...item, sessionOrphan: { ...marker, directorySettlement: receipt } } : item), { durable: true }, snapshot) : undefined;
     let expected = snapshot.bytes, intentCommitted = false, applied = false;
     const underKeys = <T>(operation: () => T): T => withParticipantFilesTryLock(this.mesh, keys, incarnation, operation);
-    const assertProof = () => {
+    const assertProof = (readShared?: MeshBatchView["get"]) => {
       checkActive?.();
       if (this.#closed || store.snapshot().bytes !== expected || !sessionActorRootGone(this.mesh, rootId, this.lineageAlive) ||
-          !this.#actorAbsent(sessionId, row.id)) throw new Error("Actor orphan generation/death proof changed at commit");
+          !this.#actorAbsent(sessionId, row.id, readShared)) throw new Error("Actor orphan generation/death proof changed at commit");
       if (assertNativeObserver(this.mesh.root, this.identity, this.ownSessionId, row, retire) !== authority) {
         throw new Error("Native observer activation/launcher changed at commit");
       }
@@ -492,8 +499,13 @@ export class SessionActorOrphans {
         () => this.mesh.leaseCustody(leases[1]!, () => this.mesh.withTryLock(() => this.mesh.writeBatch({ identity: this.identity, ops: [],
           lockTiming: { operation: "session-orphan-settle" },
           prepare: view => {
+            // SQLite's beforeCommit sees its own staged puts. Fence both shared
+            // predecessors here, before either operation, under writer custody.
+            if (JSON.stringify(directoryKeys.map(key => view.get(key))) !== sharedCopiesBytes) {
+              throw new Error("Actor directory copies changed before intent commit");
+            }
             const ops: MeshBatchOperation[] = [];
-            for (const key of [`actors/${sessionId}/${row.id}`, participantKey(row.id)]) {
+            for (const key of directoryKeys) {
               const entry = view.get(key);
               if (!entry) continue; // Preserve history; don't invent advertisements that never existed.
               const value = record(entry.value);
@@ -504,11 +516,13 @@ export class SessionActorOrphans {
             return ops;
           },
           beforeCommit: () => underKeys(() => {
-            assertProof();
+            // Only the two writer-fenced shared copies use predecessors; native
+            // presence and external death/observer/outbox evidence stay fresh.
+            assertProof(readPredecessor);
             if (!intentCommitted) {
-              // Prepared provenance must still cover exactly the copies under
-              // state + participant custody before the private intent commits.
-              if (JSON.stringify(readCopies()) !== copiesBytes) throw new Error("Actor directory copies changed before intent commit");
+              // Native publication is independent of state: compare its copy
+              // under participant custody before the private intent commits.
+              if (JSON.stringify(readFileCopy()) !== fileCopyBytes) throw new Error("Actor directory copies changed before intent commit");
               if (prepared && !prepared.valid()) throw new Error("Private actor outbox generation changed");
               prepared?.commit(); intentCommitted = true; expected = store.snapshot().bytes;
             }

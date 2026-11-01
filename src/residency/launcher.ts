@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { childProcessEnvironment, meshJournalAlarmLine, writeJsonAtomic } from "../core/atomic-write.js";
+import { childProcessEnvironment, meshBackgroundGiveupMs, meshJournalAlarmLine, writeJsonAtomic } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -66,7 +66,7 @@ interface Attempt {
   logFile: string;
   firstLeaseAt?: number;
   watchdogGivenUp?: boolean;
-  watchdogDeferred?: { checks: number; nextCheckAt: number };
+  watchdogDeferred?: { checks: number; nextCheckAt: number; giveupAt: number };
   native: ResidentChildLifetime;
   stop?: Promise<void>;
   seenOwner: boolean;
@@ -77,6 +77,7 @@ interface Attempt {
   /** Whether this attempt is an attributable startup failure; decided once, at exit. */
   sharedExit?: boolean;
   closingInput: boolean;
+  closingInputGiveupAt?: number;
   processes: Map<number, OwnedProcess>;
   stderr: string;
 }
@@ -632,7 +633,11 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (owner && owner.pid === attempt.child.pid && observation.observedOwner) attempt.ownerToken = owner.token;
-    if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }
+    if (observation.closeInput && !attempt.closingInput) {
+      attempt.closingInput = true;
+      attempt.closingInputGiveupAt = performance.now() + watchdogGiveupMs;
+      attempt.child.stdin?.end();
+    }
   };
   const assertFenceFree = async (inode: fs.Stats): Promise<void> => {
     const lock = path.join(root, "host.lock");
@@ -664,6 +669,11 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   ensureResidentGenerations(root);
   let attempt = start(initial);
   let nextWatchdogAt = 0;
+  const watchdogGiveupMs = meshBackgroundGiveupMs();
+  const deferWatchdog = (candidate: Attempt): void => {
+    candidate.watchdogDeferred ??= { checks: 0, nextCheckAt: 0, giveupAt: performance.now() + watchdogGiveupMs };
+    residentUnhosted(root, "custody");
+  };
   const evidenceError = (stage: string, error: unknown): void => {
     trace("watchdog-evidence-error", { stage, reason: String(error).slice(0, 500) });
   };
@@ -766,16 +776,12 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       captureDescendants(candidate);
       const stopped = await terminateWedgedChild(candidate, options.termMs ?? 30_000, options.killWaitMs ?? 5_000, revalidate);
       if (!stopped && !candidate.native.exited) return;
-      candidate.watchdogDeferred = { checks: 0, nextCheckAt: 0 };
-      residentUnhosted(root, "custody");
+      deferWatchdog(candidate);
       retryExitProof(candidate);
     } catch (error) {
       trace("watchdog-deferred", { pid: candidate.child.pid, reason: String(error).slice(0, 500) });
       // A native exit still does not release custody of an uncertain attempt.
-      if (candidate.native.exited) {
-        candidate.watchdogDeferred ??= { checks: 0, nextCheckAt: 0 };
-        residentUnhosted(root, "custody");
-      }
+      if (candidate.native.exited) deferWatchdog(candidate);
     } finally { if (recoveryFd !== undefined) fs.closeSync(recoveryFd); }
   };
   try {
@@ -786,10 +792,39 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       while ((!attempt.native.exited || attempt.watchdogDeferred) && !stopping) {
         if (attempt.watchdogDeferred) {
           retryExitProof(attempt);
+          if (performance.now() >= attempt.watchdogDeferred.giveupAt) {
+            // The unchanged stale owner lease already authorized watchdog custody.
+            // Parent/Main exit alone never enters this path: healthy durable work
+            // keeps renewing and may outlive its originating Main. Complete exit
+            // remains unproven, so retain the durable no-replacement fence, not an
+            // otherwise idle launcher process polling it forever.
+            await stopAttempt(attempt);
+            const nativeExit = await attempt.native.exit;
+            trace("launcher-exit", { reason: "resident-watchdog-giveup", pid: attempt.child.pid,
+              generation: attempt.generation, nativeExit, custody: "retained", giveupMs: watchdogGiveupMs,
+              proofChecks: attempt.watchdogDeferred.checks });
+            process.exitCode = 1;
+            return;
+          }
           await delay(50);
           continue;
         }
         observe(attempt);
+        if (attempt.closingInputGiveupAt !== undefined && performance.now() >= attempt.closingInputGiveupAt) {
+          // owner.json already told this attempt to close: its claimed owner
+          // disappeared or another live owner won. Bound a child ignoring EOF,
+          // including watchdog-disabled/NATS children, never Main/PPID loss.
+          await stopAttempt(attempt);
+          const event = { event: "launcher-exit", reason: "resident-owner-giveup", pid: attempt.child.pid,
+            generation: attempt.generation, nativeExit: await attempt.native.exit, giveupMs: watchdogGiveupMs };
+          // A successor may own the root. Diagnose only this generation, not its
+          // shared launcher.log/owner/custody files.
+          recordResidentGenerationError(root, { format: 1, generation: attempt.generation, writer: "launcher",
+            error: JSON.stringify(event), occurredAt: Date.now(), pid: process.pid });
+          try { process.stderr.write(`${JSON.stringify(event)}\n`); } catch { /* best effort */ }
+          process.exitCode = 1;
+          return;
+        }
         const sleepingOwner = readOwner();
         if (!plan && sleepingOwner?.pid === attempt.child.pid && residentOwnerSleeping(root)) {
           // This launcher spawned the closing owner. Its native exit notification, not

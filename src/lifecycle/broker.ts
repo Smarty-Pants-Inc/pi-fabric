@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { diagnostics } from "../core/diagnostics.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue } from "../core/mesh-background-queue.js";
+import { MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
 import { DegradedObservation } from "../core/observation-watch.js";

@@ -3,7 +3,8 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MESH_ALARM_ATTEMPT_MS, MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, MeshIncarnationPendingError, MeshSnapshotRetriesExhaustedError, meshDeferredSummary, type MeshOutageAlarm } from "../src/core/atomic-write.js";
+import { MeshBackgroundQueue } from "../src/core/mesh-background-queue.js";
+import { DEFAULT_MESH_BACKGROUND_GIVEUP_MS, meshBackgroundGiveupMs, MESH_ALARM_ATTEMPT_MS, MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundRetry, MeshIncarnationPendingError, MeshSnapshotRetriesExhaustedError, meshDeferredSummary, type MeshOutageAlarm } from "../src/core/atomic-write.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshAlarmRecipient, meshOutageAlarmSink } from "../src/mesh/store.js";
 
 const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
@@ -88,6 +89,185 @@ describe("background mesh retry boundary", () => {
     expect(written).toEqual([1, 2]);
     await queue.close();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    [undefined, 600_000], ["", 600_000], ["  ", 600_000], ["invalid", 600_000], ["0", 600_000],
+    ["-1", 600_000], ["Infinity", 600_000], ["0.5", 600_000], [" 250.9 ", 250], ["1", 1],
+  ])("parses the per-job give-up budget %j as %i ms", (raw, expected) => {
+    vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", raw);
+    expect(DEFAULT_MESH_BACKGROUND_GIVEUP_MS).toBe(600_000);
+    expect(meshBackgroundGiveupMs()).toBe(expected);
+  });
+
+  // Keep: the permanent-lock failure path cannot be reached cheaply in a live user flow.
+  it("gives up a permanently locked job at its deadline once, alarms, and lets queued and fresh jobs progress", async () => {
+    vi.useFakeTimers(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "250");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const alarms: MeshOutageAlarm[] = [];
+    const queue = new MeshBackgroundQueue("bounded events").alarmsTo(alarm => { alarms.push(alarm); });
+    const attempts: number[] = [];
+    const started = performance.now();
+    const stuck = function lockedPublication() { attempts.push(performance.now() - started); throw busy(); };
+    const written: string[] = [];
+    await queue.enqueue(stuck);
+    await queue.enqueue(() => { written.push("queued"); });
+    await vi.advanceTimersByTimeAsync(249);
+    expect(attempts).toEqual([0, 50, 150]);
+    expect(error).not.toHaveBeenCalled(); expect(written).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(error).toHaveBeenCalledOnce();
+    const line = String(error.mock.calls[0]![0]);
+    expect(line.startsWith("FABRIC_MESH_BACKGROUND_GIVEUP ")).toBe(true);
+    expect(JSON.parse(line.slice(line.indexOf(" ") + 1))).toMatchObject({
+      label: "bounded events", job: "lockedPublication", jobId: 1, lock: "Fabric mesh lock",
+      attempts: 3, elapsedMs: 250, budgetMs: 250, error: expect.stringContaining("held by pid 123"),
+    });
+    expect(alarms).toEqual([expect.objectContaining({ label: "bounded events", state: "outage",
+      reason: "mesh background retry budget exhausted" })]);
+    expect(written).toEqual(["queued"]);
+    await queue.enqueue(() => { written.push("fresh"); });
+    expect(written).toEqual(["queued", "fresh"]);
+    await expect(queue.checkpointForRelease()).rejects.toThrow("unconfirmed publication");
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(attempts).toHaveLength(3); expect(error).toHaveBeenCalledOnce();
+    expect(alarms.map(alarm => alarm.state)).toEqual(["outage"]); // drops are never confirmed recovery
+    await queue.close();
+    await expect(queue.checkpointForRelease()).rejects.toThrow("unconfirmed publication");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("uses the ten-minute default and the existing growing jitter ceilings capped at 5000 ms", async () => {
+    vi.useFakeTimers(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const queue = new MeshBackgroundQueue("default budget");
+    const attempts: number[] = [];
+    const started = performance.now();
+    await queue.enqueue(() => { attempts.push(performance.now() - started); throw busy(); });
+    await vi.advanceTimersByTimeAsync(599_999);
+    expect(error).not.toHaveBeenCalled();
+    expect(attempts.slice(0, 9)).toEqual([0, 50, 150, 350, 750, 1_550, 3_150, 5_650, 8_150]);
+    expect(Math.max(...attempts)).toBeLessThan(600_000);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(error).toHaveBeenCalledOnce();
+    const count = attempts.length;
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(attempts).toHaveLength(count); expect(error).toHaveBeenCalledOnce();
+    expect(warn.mock.calls.filter(([line]) => String(line).startsWith(`${MESH_OUTAGE_ALARM_TAG} {`))).toHaveLength(1);
+    await queue.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([-86_400_000, 86_400_000])("keeps a monotonic deadline across a wall-clock jump of %i ms", async jump => {
+    vi.useFakeTimers(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "150");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const queue = new MeshBackgroundQueue("clock jump");
+    const attempts: number[] = [];
+    const started = performance.now();
+    await queue.enqueue(() => { attempts.push(performance.now() - started); throw busy(); });
+    vi.setSystemTime(Date.now() + jump);
+    await vi.advanceTimersByTimeAsync(149); expect(error).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1); expect(error).toHaveBeenCalledOnce();
+    expect(attempts.every(at => at < 150)).toBe(true);
+    const count = attempts.length;
+    await vi.advanceTimersByTimeAsync(100_000); expect(attempts).toHaveLength(count);
+    await queue.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["timeout", "success"])("lets an in-flight %s overrun the budget without starting another attempt", async outcome => {
+    vi.useFakeTimers(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const queue = new MeshBackgroundQueue("slow attempt");
+    const operation = vi.fn(() => new Promise<void>((resolve, reject) => {
+      setTimeout(() => { if (outcome === "timeout") reject(busy()); else resolve(); }, 150);
+    }));
+    const admission = queue.enqueue(operation);
+    await vi.advanceTimersByTimeAsync(100); expect(error).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(50); await admission;
+    expect(operation).toHaveBeenCalledOnce();
+    if (outcome === "timeout") {
+      expect(error).toHaveBeenCalledOnce(); expect(String(error.mock.calls[0]![0])).toContain('"elapsedMs":150');
+      await expect(queue.checkpointForRelease()).rejects.toThrow("unconfirmed publication");
+    } else {
+      expect(error).not.toHaveBeenCalled(); await expect(queue.checkpointForRelease()).resolves.toBeUndefined();
+    }
+    await vi.advanceTimersByTimeAsync(10_000); expect(operation).toHaveBeenCalledOnce();
+    await queue.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ["pending incarnation", () => new MeshIncarnationPendingError()],
+    ["snapshot exhaustion", () => new MeshSnapshotRetriesExhaustedError(3)],
+    ["WAL cap", () => new MeshStateWalCapError(120, 96, [], 0)],
+    ["lock timeout", busy],
+  ] as const)("preserves %s classification through recovery and bounded exhaustion", async (name, deferred) => {
+    vi.useFakeTimers(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "250");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const queue = new MeshBackgroundQueue("transient");
+    let written = false;
+    const operation = vi.fn(() => { if (operation.mock.calls.length < 3) throw deferred(); written = true; });
+    await queue.enqueue(operation);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(written).toBe(true); expect(operation).toHaveBeenCalledTimes(3);
+    expect(error).not.toHaveBeenCalled();
+    await expect(queue.checkpointForRelease()).resolves.toBeUndefined();
+    await queue.close();
+    const bounded = new MeshBackgroundQueue("deferred exhaustion");
+    const stuck = vi.fn(() => { throw deferred(); });
+    await bounded.enqueue(stuck);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(stuck).toHaveBeenCalledTimes(3); expect(error).toHaveBeenCalledOnce();
+    const line = String(error.mock.calls[0]![0]);
+    const terminal = JSON.parse(line.slice(line.indexOf(" ") + 1));
+    expect(terminal.error).toBe(meshDeferredSummary(deferred()));
+    expect(Object.hasOwn(terminal, "lock")).toBe(name === "lock timeout");
+    await vi.advanceTimersByTimeAsync(10_000); expect(stuck).toHaveBeenCalledTimes(3);
+    await expect(bounded.checkpointForRelease()).rejects.toThrow("unconfirmed publication");
+    await bounded.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("starts each queued job's budget at first attempt, not at admission behind another failed job", async () => {
+    vi.useFakeTimers(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const queue = new MeshBackgroundQueue("per job");
+    await queue.enqueue(() => { throw busy(); });
+    const later = vi.fn(() => { if (later.mock.calls.length === 1) throw busy(); });
+    await queue.enqueue(later);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(error).toHaveBeenCalledOnce(); expect(later).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(later).toHaveBeenCalledTimes(2); expect(error).toHaveBeenCalledOnce();
+    await queue.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds retry()'s initial backoff and cancels it on close without attempting the expired job", async () => {
+    vi.useFakeTimers(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "40");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    const queue = new MeshBackgroundQueue("seeded retry");
+    const operation = vi.fn();
+    await queue.retry(operation, busy());
+    await vi.advanceTimersByTimeAsync(40);
+    expect(operation).not.toHaveBeenCalled(); expect(error).toHaveBeenCalledOnce();
+    const closed = new MeshBackgroundQueue("cancelled retry");
+    await closed.retry(operation, busy());
+    await closed.close();
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(operation).not.toHaveBeenCalled(); expect(error).toHaveBeenCalledOnce();
+    await closed.enqueue(operation); await closed.retry(operation, busy());
+    expect(operation).not.toHaveBeenCalled();
+    await queue.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
   it("never retries an untyped/permanent failure and continues the notification queue", async () => {

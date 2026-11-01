@@ -30,6 +30,34 @@ Fabric residency client
 stdin EOF. `pi-entry.js` starts `ResidentHost` on `session_start`, aborts it on
 `session_shutdown`, and shuts Pi down after the host reaches its idle exit.
 
+A launcher is intentionally detached: the originating Main exiting or the OS
+parent PID changing does not stop healthy durable actors. In FILE mode, its
+existing watchdog instead reads the exact native child's `owner.json` generation
+and that resident host's `host-leases/<host-hash>.json`. An unchanged stale lease,
+revalidated with the owner token and native process incarnation before each
+signal, permits the existing report/TERM/KILL cleanup. Defaults remain a
+900000 ms cold-start grace, 180000 ms lease-stall threshold and 30000 ms check
+interval. This watchdog does not use FILE lease evidence in NATS mode.
+
+After watchdog cleanup, an unproven whole-attempt exit retains
+`watchdog-custody.json`, so another resident cannot be launched over unknown
+workers. The launcher itself no longer polls that custody forever: after
+600000 ms (overridden by `PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS`) it joins its
+native child stop/exit, writes one structured `launcher-exit` reason
+`resident-watchdog-giveup`, and exits unsuccessfully. Its exit does not remove
+custody, authorize replacement, erase traces or change durable actor ownership.
+A healthy resident that keeps renewing never enters this give-up path.
+
+The existing owner observation also closes the child's RPC input when its
+previously claimed `owner.json` disappears or a different live owner wins. If
+that owned child ignores EOF, the launcher now stops and joins it after the
+same monotonic give-up budget, even with the lease watchdog disabled or using
+NATS. The single structured `resident-owner-giveup` reason is written to stderr
+and the old generation's private error record, not a successor's shared
+`launcher.log`. This path never rewrites the successor's owner, custody or lock
+files. Missing startup owner/lease evidence and a changed Main PID alone do not
+arm this deadline.
+
 ## Files and responsibilities
 
 - `src/residency/client.ts` writes host configuration and starts the launcher.

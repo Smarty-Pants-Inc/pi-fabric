@@ -121,7 +121,7 @@ afterEach(() => {
 
 const clock = () => {
   // MeshStore's real setImmediate durability barrier must still finish when an exiting supervisor awaits it.
-  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
 };
 const ALARM_TOPIC = "fabric.alarm.resident-unhosted";
@@ -540,6 +540,68 @@ describe("launcher watchdog Windows contract", () => {
 });
 // These signal, incarnation and session-evidence contracts require POSIX.
 describe.skipIf(process.platform === "win32")("launcher live-child lease watchdog", () => {
+  it("exits after the custody give-up budget with a native child receipt, retaining the no-replacement fence", async () => {
+    alarmClock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "1000");
+    const f = fixture({}, true);
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      expect(f.events().filter(row => row.event === "watchdog-giving-up")).toHaveLength(1);
+      expect(returned).toBe(false); // Proof exhaustion alone cannot shorten the give-up budget.
+      const custody = fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8");
+      vi.setSystemTime(Date.now() - 86_400_000); // A backwards wall-clock jump cannot extend custody.
+      await vi.advanceTimersByTimeAsync(1000); await settleAlarms(); await f.done;
+      expect(returned).toBe(true); expect(process.exitCode).toBe(1);
+      expect(f.events().filter(row => row.event === "launcher-exit")).toEqual([expect.objectContaining({
+        reason: "resident-watchdog-giveup", pid: f.children[0]!.pid, custody: "retained", giveupMs: 1000,
+        proofChecks: 3, nativeExit: { code: null, signal: "SIGKILL" },
+      })]);
+      expect(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")).toBe(custody);
+      await supervise(path.join(f.root, "config.json"));
+      expect(f.children).toHaveLength(1); // Exiting the launcher never authorizes a successor.
+    } finally { await f.close(); }
+  });
+
+  it("does not apply the give-up deadline to a healthy renewing durable owner", async () => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "1");
+    const f = fixture();
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(returned).toBe(false); expect(f.children[0]!.signals).toEqual([]);
+      expect(f.events().some(row => row.event === "launcher-exit")).toBe(false);
+      expect(fs.existsSync(path.join(f.root, "watchdog-custody.json"))).toBe(false);
+    } finally { await f.close(); }
+  });
+
+  it("bounds a claimed owner disappearing while its watchdog-disabled child ignores EOF, using a monotonic deadline", async () => {
+    alarmClock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "1000");
+    const diagnostics = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const f = fixture({ enabled: false });
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      const child = f.children[0]!;
+      child.kill = (signal: string) => {
+        child.signals.push(signal); clearInterval(child.timer); mocks.alive.delete(child.pid);
+        child.emit("exit", null, signal); return true;
+      };
+      fs.unlinkSync(path.join(f.root, "owner.json"));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(child.stdin.end).toHaveBeenCalledOnce(); expect(child.signals).toEqual([]);
+      vi.setSystemTime(Date.now() + 86_400_000); // Wall time must not terminate the child early either.
+      await vi.advanceTimersByTimeAsync(100);
+      expect(child.signals).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1000); await settleAlarms(); await f.done;
+      expect(child.signals).toEqual(["SIGTERM"]); expect(process.exitCode).toBe(1);
+      const failure = JSON.parse(fs.readFileSync(path.join(f.root, "generations", `${child.token}.error.json`), "utf8"));
+      expect(JSON.parse(failure.error)).toMatchObject({ event: "launcher-exit", reason: "resident-owner-giveup",
+        nativeExit: { code: null, signal: "SIGTERM" }, giveupMs: 1000 });
+      expect(diagnostics.mock.calls.filter(([line]) => String(line).includes('"reason":"resident-owner-giveup"'))).toHaveLength(1);
+      expect(f.events().some(row => row.event === "launcher-exit")).toBe(false); // Never a late shared-root trace.
+      expect(f.children).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
   it("F1 captures evidence and stops the wedged child but never authorizes replacement from an empty session or sampled descendants", async () => {
     clock(); const f = fixture({}, true);
     try {

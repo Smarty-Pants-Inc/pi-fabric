@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshWriteDeferred } from "../core/atomic-write.js";
+import { MeshBackgroundQueue } from "../core/mesh-background-queue.js";
+import { MeshBackgroundRetry, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { isPlacementRunId, placementRunIdForParticipant } from "./placement-run-id.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
@@ -855,7 +856,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
     .diagnosticsTo(line => logDiagnostic("src/topology/participant-directory.ts", line))
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
-  readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
+  readonly #notifications = new MeshBackgroundQueue("participant refusal/reap")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #isolatedSources = new Set<ParticipantSnapshotSource>();
   readonly #sourceNames = new Map<ParticipantSnapshotSource, string>();

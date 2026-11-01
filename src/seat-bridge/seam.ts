@@ -100,21 +100,37 @@ const errorDetails = (error: unknown): { errorClass: string; errorMessage: strin
   const safe = redactNatsError(error);
   return { errorClass: safe.name.slice(0, 500), errorMessage: safe.message.slice(0, 500) };
 };
-// Redact BEFORE truncating: a credentials block or quoted token can extend beyond the 500-character window.
-const execText = (text: string): string => errorDetails(new Error(text)).errorMessage.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "?");
+// Redact BEFORE bounding bytes or selecting a line: a quoted credential can cross either boundary.
+const execText = (text: string): string => {
+  // A transport capture can end inside a quoted value; the shared sanitizer expects its closing quote.
+  const safe = redactNatsError(text.replace(/([=:]\s*)(?:"[^"]*$|'[^']*$)/g, "$1***")).message
+    // The shared NATS sanitizer removes credentials, not local paths. Keep only file names here.
+    .replace(/(["'])(?:[A-Za-z]:[\\/]|~[\\/]|\.{1,2}[\\/]|[\\/])(?:(?!\1)[^\r\n])*\1/g,
+      file => `${file[0]}${path.win32.basename(file.slice(1, -1)) || "[path]"}${file[0]}`)
+    .replace(/(^|[\s"'=(,:])(?:[A-Za-z]:[\\/]|~[\\/]|\.{1,2}[\\/]|[\\/])[^\s"'<>),;]*/g,
+      (file: string, prefix: string) => `${prefix}${path.win32.basename(file.slice(prefix.length)) || "[path]"}`)
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "?");
+  const bytes = Buffer.from(safe, "utf8");
+  let end = Math.min(bytes.length, 500);
+  // Never decode an incomplete UTF-8 character into a replacement that would exceed the byte budget.
+  while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+};
 const execStdout = (text: string): string => {
   const first = text.split(/\r?\n/, 1)[0] ?? "";
   try {
     const parsed: unknown = JSON.parse(first);
     // Decode the JSON error before redaction (its embedded quotes may be JSON-escaped).
     if (object(parsed) && typeof parsed.error === "string") return execText(JSON.stringify({ error: execText(parsed.error) }));
-  } catch { /* non-JSON transport output: retain the sanitized first line */ }
-  return execText(first);
+    // Unknown JSON fields can contain escaped or nested credentials: reuse the sanitizer's object allowlist.
+    return execText(redactNatsError(parsed).message);
+  } catch { /* non-JSON transport output: redact the whole capture before retaining its first line */ }
+  return execText(text).split(/\r?\n/, 1)[0] ?? "";
 };
 const execEvidence = (context: Context, value: Record<string, unknown>): Record<string, unknown> => {
   const last = context.execs.at(-1);
   if (!last) return {};
-  const failed = context.execs.findLast(read => read.execCode !== 0);
+  const failed = [...context.execs].reverse().find(read => read.execCode !== 0);
   return { measured: { ...(object(value.measured) ? value.measured : {}), ...last, execs: context.execs },
     ...(failed ? { errorClass: "KubectlExecError", errorMessage: JSON.stringify({ execCode: failed.execCode,
       stdout: failed.execStdout, stderr: failed.execStderr }) } : {}) };
@@ -250,10 +266,10 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
     context.execs.push({ execCode, execStdout: execStdout(result.stdout),
       execStderr: execText(result.stderr) });
     const rawLine = result.stdout.trim();
-    line = execCode === 0 ? rawLine : execStdout(rawLine);
+    line = execStdout(rawLine);
     let parsed: unknown;
     try { parsed = JSON.parse(rawLine); } catch { parsed = undefined; }
-    if (object(parsed) && typeof parsed.error === "string") journalError = parsed.error;
+    if (object(parsed) && typeof parsed.error === "string") journalError = execText(parsed.error);
     if (seal) {
       journal = result.code === 0 ? journalRead(parsed, seal) : null;
       if (!journal) reason = "pod-journal-unreadable";
@@ -281,6 +297,18 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
   return { before: before ?? null, after: after ?? null, identity, journal, journalError, reason, line, execCode,
     observations: measured.observations, waitedMs: measured.waitedMs };
 };
+
+// Evidence is a diagnostic copy, never the raw object (which may carry unvalidated extra fields).
+// Keep the raw identity above for route comparisons; sanitization must not change the protocol's verdict.
+const podAssertion = (read: Awaited<ReturnType<typeof podIdentity>>) => ({
+  identity: read.identity === null ? null : {
+    rootId: execText(read.identity.rootId), pid: read.identity.pid,
+    ownerHostId: execText(read.identity.ownerHostId), ownerIdentityId: execText(read.identity.ownerIdentityId),
+    ownerIncarnation: execText(read.identity.ownerIncarnation), machine: execText(read.identity.machine),
+    processStartedAt: execText(read.identity.processStartedAt), projectionKey: execText(read.identity.projectionKey),
+    projectionRevision: read.identity.projectionRevision,
+  }, podLine: read.line,
+});
 
 interface JournalRead {
   leafId: string; entries: number; sealOnBranch: boolean; truncated: boolean;
@@ -427,7 +455,7 @@ const resume = async (context: Context): Promise<number> => {
     const gap = (code: string): never => {
       outcome = { result: "unknown", gap: code,
         measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal, ...measured },
-        asserted: { identity: read.identity, podLine: read.line } };
+        asserted: podAssertion(read) };
       throw new SeamGap(code);
     };
     // Fixed reader failures with a precise byte-level cause remain UNKNOWN, never a pass.
@@ -477,7 +505,7 @@ const resume = async (context: Context): Promise<number> => {
     const passed = reason === null;
     outcome = { result: passed ? "pass" : "refused", reason,
       observed, measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal,
-        ...measured }, asserted: { identity: read.identity, podLine: read.line } };
+        ...measured }, asserted: podAssertion(read) };
     output = receipt(context.request, passed ? "pass" : "refused", observed);
   } catch (error) {
     failed = true;
@@ -592,7 +620,7 @@ const publish = async (context: Context): Promise<number> => {
     }
     let liveRead = read;
     outcome = { written: false, measured: { before: read.before, after: read.after,
-      observations: read.observations, waitedMs: read.waitedMs }, asserted: { identity: read.identity, podLine: read.line } };
+      observations: read.observations, waitedMs: read.waitedMs }, asserted: podAssertion(read) };
     if (reason) {
       intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine, plan: null,
         rollback: null, unit: context.pins.linkUnit, routesBefore, measured: measuredPod, residuals: RESIDUALS });
@@ -659,7 +687,7 @@ const publish = async (context: Context): Promise<number> => {
       observed, written, measured: { before: read.before, after: read.after, final: final ?? null, configSha256: post?.sha256 ?? null, reload,
         otherRoutes: others, gate: routed?.gate ?? null, receipt: routed?.receipt ?? null, presence, incarnationSource,
         observations: read.observations, waitedMs: read.waitedMs, ownerReadBefore: liveRead.before, ownerReadAfter: liveRead.after },
-      asserted: { identity: liveRead.identity, podLine: liveRead.line } };
+      asserted: podAssertion(liveRead) };
     output = receipt(context.request, passed ? "pass" : "refused", observed);
   } catch (error) {
     failed = true;

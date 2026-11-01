@@ -971,6 +971,49 @@ describe.skipIf(!linux)("b6 bridge exec diagnostics (a20): never discard a faile
     expect(JSON.stringify(outcome)).not.toContain("secret-value");
   });
 
+  it.each(["resume", "publish"])("%s truncates oversized non-ASCII diagnostics at 500 UTF-8 bytes", async phase => {
+    const w = await world();
+    const text = "é".repeat(300);
+    setKube(w, phase === "resume" ? RAW : MANAGED, { line: text, code: 1, stderr: text });
+    await run(w, phase, phase === "resume" ? resumeInputs : { owner });
+    const outcome = evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`);
+    for (const key of ["execStdout", "execStderr"] as const) {
+      const value = outcome.measured[key] as string;
+      expect(Buffer.byteLength(value, "utf8")).toBe(500);
+      expect(value).toBe("é".repeat(250));
+      expect(Buffer.from(value, "utf8").toString("utf8")).toBe(value);
+    }
+  });
+
+  it.each(["resume", "publish"])("%s reduces Linux and Windows host paths in JSON exec errors without hiding pods/exec", async phase => {
+    const w = await world();
+    const linuxPath = "/home/unit-test/.kube/config";
+    const windowsPath = "C:\\Users\\unit-test\\AppData\\Local\\Temp\\kubeconfig.json";
+    const secret = "seat-bridge-host-path-secret";
+    const detail = `cannot read ${linuxPath} or ${windowsPath}; cannot create resource "pods/exec"; password="${secret}"`;
+    setKube(w, phase === "resume" ? RAW : MANAGED, { line: JSON.stringify({ error: detail }), code: 1, stderr: detail });
+    await run(w, phase, phase === "resume" ? resumeInputs : { owner });
+    const outcome = evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`);
+    const failure = JSON.parse(outcome.errorMessage);
+    expect(failure).toEqual({ execCode: 1, stdout: outcome.measured.execStdout, stderr: outcome.measured.execStderr });
+    for (const text of [outcome.measured.execStdout, outcome.measured.execStderr] as string[]) {
+      expect(text).toContain("config");
+      expect(text).toContain("kubeconfig.json");
+      expect(text).toContain("pods/exec");
+      expect(text).not.toContain("/home/");
+      expect(text).not.toContain(".kube/");
+      expect(text).not.toContain("unit-test");
+      expect(text).not.toContain("C:\\Users\\");
+      expect(text).not.toContain("\\AppData\\");
+      expect(text).not.toContain("\\Local\\");
+      expect(text).not.toContain("\\Temp\\");
+    }
+    const serialized = JSON.stringify(outcome);
+    expect(serialized).not.toContain(linuxPath);
+    expect(serialized).not.toContain(windowsPath);
+    expect(serialized).not.toContain(secret);
+  });
+
   it("retains the initial publish exec failure even when a later owner read succeeds", async () => {
     const w = await world();
     setKube(w, MANAGED, { line: JSON.stringify({ error: "pod-owner-unreadable" }), code: 1, stderr: "startup projection not yet present" });
@@ -980,7 +1023,7 @@ describe.skipIf(!linux)("b6 bridge exec diagnostics (a20): never discard a faile
       return [{ id: `session:${SID}`, machine: MACHINE, ownerHostId: `session:${SID}`, ownerIdentityId: `session:${SID}`,
         ownerIncarnation: INCARNATION, live: true }] as never;
     } });
-    expect(result.receipt.result).toBe("pass");
+    expect(result.receipt?.result).toBe("pass");
     const outcome = evidenceOf(w, "fabric-v2-bridge-publish-outcome.json");
     expect(outcome.measured.execs).toHaveLength(2);
     expect(outcome.measured.execs[0]).toMatchObject({ execCode: 1, execStderr: "startup projection not yet present" });
@@ -1003,7 +1046,13 @@ describe.skipIf(!linux)("b6 bridge exec diagnostics (a20): never discard a faile
     const w = await world();
     setKube(w, phase === "resume" ? RAW : MANAGED, { line: identityLine(w), stderr: "benign kubectl warning" });
     w.receipt = routable(); w.gate = gateLive("nats", MACHINE);
-    expect(await run(w, phase, phase === "resume" ? resumeInputs : { owner })).toMatchObject({ code: 0, receipt: { result: "pass" } });
+    const result = await run(w, phase, phase === "resume" ? resumeInputs : { owner });
+    expect(result).toMatchObject({ code: 0, receipt: { result: "pass" } });
+    // cab2af43^ (b5) serializes only this receipt to stdout in this key order; compare bytes, not parsed object equality.
+    const observed = phase === "resume"
+      ? { sessionId: SID, journal: POD_JOURNAL, leafId: "e2", podUid: RAW.uid, appendedSinceSeal: [], journalSha256: sha(SEALED), suffixBase64: "" }
+      : { sessionId: SID, incarnation: MANAGED.uid, route: `v2@${MANAGED.uid}:${sha(fs.readFileSync(w.config)).slice(0, 12)}` };
+    expect(result.stdout).toBe(JSON.stringify({ schema: "d3-seam-receipt-v1", run: w.seat.run, phase, owner: "fabric-v2", result: "pass", observed }));
     expect(evidenceOf(w, `fabric-v2-bridge-${phase}-outcome.json`).measured.execs[0])
       .toMatchObject({ execCode: 0, execStderr: "benign kubectl warning" });
   });

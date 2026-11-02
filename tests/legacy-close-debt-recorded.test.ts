@@ -150,6 +150,60 @@ describe.skipIf(process.platform !== "linux")("recorded legacy passive close deb
     expect(process.kill).not.toHaveBeenCalled();
   });
 
+  it.each(["native-exit", "probe-absence"] as const)("an empty recorded execution group still owes its custody receipt (%s)", async proof => {
+    const f = await launch();
+    rows.set(pid + 1, { parent: pid, group: pid + 1, started: "23456" });
+    f.child.emit("message", { type: "fabric-execution-custody" });
+    // The execution-started receipt records a second group, but does not settle custody.
+    f.child.emit("message", { type: "fabric-execution-started", pid: pid + 1, started: "23456" });
+    await f.passiveDeadline();
+    rows.delete(pid + 1);
+    if (proof === "probe-absence") {
+      rows.delete(pid); f.close();
+      expect(f.handle.nativeExit?.()).toBeUndefined();
+      // Exercise isAlive's probe-absence branch as well as its captured-exit branch below.
+      expect(await f.handle.isAlive()).toBe(true);
+    }
+    f.exit(); f.close();
+    await f.handle.closed;
+    expect(rows.size).toBe(0);
+    expect(f.handle.nativeExit?.()).toMatchObject({ pid, processStartTime: "12345", code: 0 });
+    const debt = f.handle.lostContact();
+    expect(debt).toMatch(/native close within 7000ms/);
+    expect(f.handle.stopDebt?.()).toBe(debt);
+    expect(await f.handle.isAlive()).toBe(true);
+    expect(f.handle.remainingDescendantCount?.()).toBe(1);
+
+    let stopped = false;
+    const stopping = f.handle.stop().then(() => { stopped = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(120);
+      expect(stopped, "an empty known group cannot substitute for execution-settled").toBe(false);
+      expect(f.handle.lostContact()).toBe(debt);
+      expect(f.handle.stopDebt?.()).toBe(debt);
+      expect(await f.handle.isAlive()).toBe(true);
+      expect(f.unconfirmed).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(process.kill).mock.calls).toEqual(proof === "probe-absence" ? [[pid, 0]] : []);
+
+      f.child.emit("message", { type: "fabric-execution-settled" });
+      expect(f.handle.lostContact()).toBeUndefined();
+      expect(f.handle.stopDebt?.()).toBeUndefined();
+      expect(await f.handle.isAlive()).toBe(false);
+      expect(f.handle.remainingDescendantCount?.()).toBe(0);
+    } finally {
+      // Drain the exact stop even if an assertion fails; never leave fake timers behind.
+      f.child.emit("message", { type: "fabric-execution-settled" });
+      await vi.advanceTimersByTimeAsync(20);
+      await stopping;
+    }
+    expect(stopped).toBe(true);
+    expect(f.handle.lostContact()).toBeUndefined();
+    expect(f.handle.stopDebt?.()).toBeUndefined();
+    expect(f.unconfirmed).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(process.kill).mock.calls).toEqual(proof === "probe-absence" ? [[pid, 0]] : []);
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["census", "member", "foreign-group"] as const)("late close cannot discharge %s uncertainty", async proof => {
     const f = await launch();
     await f.passiveDeadline();

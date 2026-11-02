@@ -486,7 +486,7 @@ export const spawnDetached = async (
     // native close, then the existing birth-checked whole-tree predicate.
     if (passiveCloseDebt !== undefined && lost === undefined && process.platform === "linux" &&
         !birthUnknown && birth?.started && nativeExit?.processStartTime === birth.started && nativeClosed &&
-        !(executionPending && groups.size === 1)) {
+        !executionPending) {
       try { if (members().length === 0) passiveCloseDebt = undefined; }
       catch { /* unreadable/ambiguous census retains custody; never adopt a new handle */ }
     }
@@ -500,7 +500,7 @@ export const spawnDetached = async (
     if (process.platform === "linux") members();
     else if (process.platform !== "win32") await portableMembers();
     const settled = async (): Promise<boolean> => {
-      if (process.platform === "linux") return members().length === 0 && nativeClosed && !(executionPending && groups.size === 1);
+      if (process.platform === "linux") return members().length === 0 && nativeClosed && !executionPending;
       const remaining = process.platform === "win32" ? [] : await portableMembers();
       if (!nativeClosed || executionPending || portableUncertain) return false;
       return remaining.length === 0;
@@ -660,7 +660,7 @@ export const spawnDetached = async (
     async isAlive() {
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.
-      if (exited) return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+      if (exited) return !nativeClosed || (process.platform === "linux" ? members().length > 0 || executionPending
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
       if (processIsAlive(pid)) {
         // Retain observed descendants before a launcher can exit ahead of its Pi child.
@@ -671,7 +671,7 @@ export const spawnDetached = async (
       // Gone once is gone for good: the probe can see the exit before the "exit" event
       // (Windows), and any later answer for this number is another process.
       exited = true;
-      return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+      return !nativeClosed || (process.platform === "linux" ? members().length > 0 || executionPending
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
     },
   };

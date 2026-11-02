@@ -333,7 +333,12 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
-      const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
+      const corpusNeed = (needs ?? []).includes("corpus");
+      const corpusRemoteCandidate = corpusNeed
+        ? (await import("./placement.js")).corpusRemotePreflightEligible(placement, request.cwd)
+        : false;
+      const unmet = (needs ?? []).filter(need => need === "corpus"
+        ? !corpusRemoteCandidate : !capabilities.includes(need));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
@@ -369,10 +374,13 @@ export class ProcessTransport implements AgentTransportAdapter {
         } catch { reason = "cwd-not-shippable"; }
       }
       if (!reason) {
-        const { launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
-        const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline);
+        const { corpusRemotePreflightEligible, launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
+        const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline, undefined,
+          corpusRemoteCandidate ? placement.corpusRemoteHosts : undefined);
         if (selection && "localReason" in selection) reason = selection.localReason;
-        else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
+        else if (corpusNeed && !corpusRemotePreflightEligible(placement, request.cwd, selection?.host)) {
+          reason = `corpus target is not in the qualified host allow-list: ${selection?.host ?? "unknown"}`;
+        } else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
       }
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);

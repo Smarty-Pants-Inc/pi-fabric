@@ -68,7 +68,7 @@ export const placementLocalPathReason = (cwd: string, config: AgentPlacementConf
 const hostName = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const quote = (value: string): string => `'${value.replaceAll("'", `'"'"'`)}'`;
 const failure = (host: string, reason: string): AgentInputError => new AgentInputError("placement",
-  `Placement refused host=${host}: ${reason}; use needs:['corpus'] for caller-only corpus inputs or run locally with needs:['local']; no task started`);
+  `Placement refused host=${host}: ${reason}; use needs:['local'] for caller-only inputs; no task started`);
 
 /** Native close is the normal event; a one-shot deadline bounds stuck read-only
  * queries. Their own group includes the picker's SSH children, never a launcher.
@@ -127,6 +127,51 @@ const fleetRoot = (config: AgentPlacementConfig, cwd: string): string | undefine
     ? path.join(os.homedir(), ".local", "share", "smarty-dev", "factory", "current") : path.dirname(bin);
 };
 
+const trustedDirectoryOwner = (info: fs.Stats, uid: number): boolean =>
+  (info.uid === 0 || info.uid === uid) && (info.mode & 0o022) === 0;
+
+/** The corpus exception trusts only the pinned launcher in the active factory release. */
+const trustedFactoryLauncherRoot = (config: AgentPlacementConfig, cwd: string): string | undefined => {
+  if (process.platform === "win32" || !path.isAbsolute(config.command[0]!)) return undefined;
+  const home = path.resolve(os.homedir());
+  const factory = path.join(home, ".local", "share", "smarty-dev", "factory");
+  const current = path.join(factory, "current");
+  const configuredLauncher = path.join(current, "bin", "smarty-task-ryzen2");
+  if (config.command[0] !== configuredLauncher) return undefined;
+  try {
+    if (fs.realpathSync(home) !== home || fs.realpathSync(factory) !== factory) return undefined;
+    const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+    const currentInfo = fs.lstatSync(current);
+    if (!currentInfo.isSymbolicLink() || (currentInfo.uid !== 0 && currentInfo.uid !== uid)) return undefined;
+    const target = fs.readlinkSync(current);
+    const releaseMatch = /^releases\/([0-9a-f]{40})$/u.exec(target);
+    if (!releaseMatch) return undefined;
+    const release = path.join(factory, target);
+    if (fs.realpathSync(current) !== release) return undefined;
+    const executable = agentPlacementProbe(config, cwd).executable;
+    const launcher = path.join(release, "bin", "smarty-task-ryzen2");
+    if (executable !== configuredLauncher || fs.realpathSync(executable) !== launcher) return undefined;
+    for (let directory = path.dirname(launcher); ; directory = path.dirname(directory)) {
+      const info = fs.lstatSync(directory);
+      if (!info.isDirectory() || info.isSymbolicLink() || !trustedDirectoryOwner(info, uid)) return undefined;
+      if (directory === path.parse(directory).root) break;
+    }
+    const info = fs.lstatSync(launcher);
+    if (!info.isFile() || info.isSymbolicLink() || !trustedDirectoryOwner(info, uid) || (info.mode & 0o111) === 0) return undefined;
+    fs.accessSync(launcher, fs.constants.X_OK);
+    return release;
+  } catch { return undefined; }
+};
+
+/** Corpus can bypass local placement only with the active factory launcher and a configured host allow-list. */
+export const corpusRemotePreflightEligible = (config: AgentPlacementConfig, cwd: string, host?: string): boolean => {
+  if (!config.corpusRemoteHosts.length) return false;
+  try {
+    if (trustedFactoryLauncherRoot(config, cwd) === undefined) return false;
+    return host === undefined || config.corpusRemoteHosts.includes(host);
+  } catch { return false; }
+};
+
 const hostSlot = (command: readonly string[]): number | undefined => {
   const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
   const slots = command.slice(1, end).flatMap((entry, index) => entry === "--host" ? [index + 1] : []);
@@ -141,7 +186,7 @@ export type FleetPlacementSelection = { host: string } | { localReason: string }
  * for explicit --host. Missing/broken/slow picker safely selects the local worker.
  * An injected host-only picker opts a custom launcher into the same contract.
  */
-export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: string, signal?: AbortSignal, preflightDeadline?: number, environment: NodeJS.ProcessEnv = taskAgentEnvironment()): Promise<FleetPlacementSelection | undefined> => {
+export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: string, signal?: AbortSignal, preflightDeadline?: number, environment: NodeJS.ProcessEnv = taskAgentEnvironment(), allowedHosts?: readonly string[]): Promise<FleetPlacementSelection | undefined> => {
   try {
     const root = fleetRoot(config, cwd);
     if (!root && !config.pickerCommand) return undefined;
@@ -153,8 +198,11 @@ export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: st
     const picked = await query(picker[0]!, [...picker.slice(1), "--list-room"], deadline, environment, signal);
     const hosts = picked.stdout.trim().split(/\r?\n/u).filter(Boolean);
     if (picked.code !== 0 || !hosts.length || hosts.some(host => !hostName.test(host)) || new Set(hosts).size !== hosts.length) throw new Error(`picker refused: ${picked.stderr.trim() || "no eligible host"}`);
-    const host = requested === "auto" ? hosts[0]! : requested;
-    if (!hosts.includes(host)) throw new Error(`host ${host} is not picker-eligible${picked.stderr.trim() ? `: ${picked.stderr.trim()}` : ""}`);
+    if (requested !== "auto" && !hosts.includes(requested)) throw new Error(`host ${requested} is not picker-eligible${picked.stderr.trim() ? `: ${picked.stderr.trim()}` : ""}`);
+    if (requested !== "auto" && allowedHosts && !allowedHosts.includes(requested)) throw new Error(`host ${requested} is not in corpusRemoteHosts`);
+    const candidates = allowedHosts ? hosts.filter(candidate => allowedHosts.includes(candidate)) : hosts;
+    if (!candidates.length) throw new Error(allowedHosts ? "no corpusRemoteHosts are picker-eligible" : "no eligible host");
+    const host = requested === "auto" ? candidates[0]! : requested;
     if (!Object.hasOwn(config.sshAliases ?? {}, host) || !hostName.test(config.sshAliases![host]!)) throw new Error(`host ${host} has no trusted placement sshAliases entry`);
     return { host };
   } catch (error) {
@@ -171,14 +219,20 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
   let host = selectedHost ?? "auto";
   try {
     const root = fleetRoot(config, request.cwd);
+    const corpusNeed = request.needs?.includes("corpus") ?? false;
+    const corpusRemoteCandidate = corpusNeed && corpusRemotePreflightEligible(config, request.cwd);
+    if (!root && corpusNeed) throw new Error("corpus need has no trusted fleet preflight and qualified host allow-list");
     if (!root && !config.pickerCommand) return undefined;
     const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     if (!selectedHost) {
-      const selection = await selectFleetPlacement({ ...config, command }, request.cwd, request.signal, deadline, environment);
+      const selection = await selectFleetPlacement({ ...config, command }, request.cwd, request.signal, deadline, environment,
+        corpusRemoteCandidate ? config.corpusRemoteHosts : undefined);
       if (!selection) throw new Error("No fleet placement selection");
       if ("localReason" in selection) throw new Error(selection.localReason);
       host = selection.host;
     }
+    const corpusRemoteEligible = corpusRemoteCandidate && corpusRemotePreflightEligible(config, request.cwd, host);
+    if (corpusNeed && corpusRemoteCandidate && !corpusRemoteEligible) throw new Error(`host ${host} is not a qualified corpus target`);
     const alias = config.sshAliases?.[host];
     if (!alias || !Object.hasOwn(config.sshAliases!, host) || !hostName.test(alias)) throw new Error("host has no trusted placement sshAliases entry");
     const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
@@ -195,7 +249,9 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     if (root) {
       // Reuse installed literal-path/corpus inference, not another prompt scanner.
       const source = path.join(root, "setup/factory/task-preflight.py");
-      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || need === "corpus")], deadline, environment, request.signal, task);
+      // Only the selected allow-listed host makes an explicit corpus need placement-neutral.
+      // The helper still derives corpus isolation from task and required paths.
+      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || (need === "corpus" && !corpusRemoteEligible))], deadline, environment, request.signal, task);
       const fields = admitted.stdout.split("\0");
       if (fields.at(-1) === "") fields.pop();
       const guards = Number(fields[3]);

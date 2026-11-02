@@ -8,7 +8,7 @@ import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { normalizeAgentRequires, RequiredInputMissingError } from "../input-validation.js";
 import { preflightFleetPlacement } from "./placement-preflight.js";
-export { placementLocalPathReason, selectFleetPlacement } from "./placement-preflight.js";
+export { corpusRemotePreflightEligible, placementLocalPathReason, selectFleetPlacement } from "./placement-preflight.js";
 
 interface Receipt { rc: number | string; text: string; stderr?: string }
 

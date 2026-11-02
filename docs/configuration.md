@@ -842,6 +842,10 @@ Other agent settings:
 - `childQuestions`: `"cancel"` (default) cancels every dialog a Pi child opens; `"route"` forwards it to the parent's UI, or to a root-held [decision](decisions.md#routed-child-questions) when the parent has no UI.
 - `childQuestionTimeoutMs`: default deadline for a routed child dialog (default `600000`, bounded to 1 s..24 h); a dialog's own timeout wins.
 
+### Result-file authentication
+
+By default, manager-published result files (including previous-run results) remain readable after a trace hold creates a hard link and changes ctime, provided the publication's device/inode, size, mtime and SHA-256 still match. Symlink, regular-file, owner, private-mode and stable descriptor/path checks remain in force; scratch and prompt-file checks are unchanged. Set **`PI_FABRIC_STRICT_RESULT_AUTH=1`** in the Fabric host's environment to re-enable the legacy requirement of exactly one link and unchanged publication ctime. Only the exact value `1` enables strict mode; unset the variable or set it to `0` to restore the default. This is an environment flag, not a `fabric.json` setting, and neither mode adopts worker status or an unauthenticated disk result as a fallback.
+
 ### Usage tracking with external tools
 
 Fabric children run with `--no-session`, so token trackers that scrape session files (tokscale, ccusage, …) cannot see subagent token usage or cost. With `sessionExport` enabled (the default), every child writes one usage-only session file (tokens and cost, never transcript content) to:

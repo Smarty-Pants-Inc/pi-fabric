@@ -1086,6 +1086,16 @@ const readRecord = (filePath: string): AgentRunRecord | undefined => {
   }
 };
 
+/** Result paths alone may have trace-hold hard links; scratch/prompt rules stay strict. */
+const ownedResultStat = (file: string, strict: boolean): fs.Stats | undefined => {
+  try {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || (strict && stat.nlink !== 1) ||
+        (process.getuid && stat.uid !== process.getuid())) return undefined;
+    return stat;
+  } catch { return undefined; }
+};
+
 /** Read only the exact manager publication proved by its original descriptor. */
 const readPrivateFileBytes = (
   filePath: string,
@@ -1093,20 +1103,26 @@ const readPrivateFileBytes = (
   expected: PrivateFileFingerprint | undefined,
 ): Buffer | undefined => {
   if (!expected || path.resolve(filePath) !== path.resolve(expectedPath)) return undefined;
+  const strict = process.env.PI_FABRIC_STRICT_RESULT_AUTH === "1";
   const noFollow = fs.constants.O_NOFOLLOW ?? 0;
   const nonBlocking = fs.constants.O_NONBLOCK ?? 0;
   let fd: number | undefined;
   try {
-    // Reject a known non-regular/link entry before opening; O_NONBLOCK also
+    // Reject a known non-regular/symlink entry before opening; O_NONBLOCK also
     // closes the replacement-to-FIFO race before fstat can establish its type.
-    const candidate = ownedStat(filePath);
-    if (!candidate?.isFile()) return undefined;
+    const candidate = ownedResultStat(filePath, strict);
+    if (!candidate) return undefined;
     fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | nonBlocking);
     const before = fs.fstatSync(fd);
-    if (!before.isFile() || before.nlink !== 1 ||
+    // A pre-existing trace hold may change publication ctime, but every path
+    // and descriptor observation within this read must still agree.
+    if (!before.isFile() || (strict && before.nlink !== 1) ||
         (!NATIVE_WINDOWS_FILESYSTEM && (before.mode & 0o777) !== 0o600) ||
         before.dev !== expected.dev || before.ino !== expected.ino || before.size !== expected.size ||
-        before.mtimeMs !== expected.mtimeMs || before.ctimeMs !== expected.ctimeMs) return undefined;
+        before.mtimeMs !== expected.mtimeMs || (strict && before.ctimeMs !== expected.ctimeMs) ||
+        candidate.dev !== before.dev || candidate.ino !== before.ino || candidate.uid !== before.uid ||
+        candidate.mode !== before.mode || candidate.nlink !== before.nlink || candidate.size !== before.size ||
+        candidate.mtimeMs !== before.mtimeMs || candidate.ctimeMs !== before.ctimeMs) return undefined;
     const bytes = Buffer.allocUnsafe(before.size);
     for (let offset = 0; offset < bytes.byteLength;) {
       const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
@@ -1114,8 +1130,8 @@ const readPrivateFileBytes = (
       offset += read;
     }
     const after = fs.fstatSync(fd);
-    const current = ownedStat(filePath);
-    if (!current || !after.isFile() || after.nlink !== 1 ||
+    const current = ownedResultStat(filePath, strict);
+    if (!current || !after.isFile() || (strict && after.nlink !== 1) ||
         before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
         before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
         before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||

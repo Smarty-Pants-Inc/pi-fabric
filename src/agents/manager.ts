@@ -129,6 +129,7 @@ import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
   AgentWriteRootOverlapError,
   assertDefaultTaskWriteRoots,
+  checkWritableRootDirectories,
   checkWritePolicyRequest,
   childMeshTransportEnvironment,
   readAgentLineage,
@@ -2790,6 +2791,9 @@ export class AgentManager {
     if (worktreeSetup !== undefined && (typeof worktreeSetup !== "string" || worktreeSetup.length > 8_192)) {
       throw new Error("worktreeSetup must be a shell command of at most 8192 characters");
     }
+    // Refuse file-valued roots before admission or the resident beforeCommit fence.
+    // Worktree-relative roots depend on the future cwd; the late resolver still checks them.
+    checkWritableRootDirectories(request.writableRoots, request.worktree ? undefined : selectedCwd);
     // Fail closed before admission or budget side effects.
     const scope = launchScope(request.scope, request.inheritedScope);
     const thinkingBounds = this.childThinkingBounds(request.thinkingBounds);

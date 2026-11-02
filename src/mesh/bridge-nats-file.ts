@@ -7,7 +7,7 @@ import {
 } from "../transport/types.js";
 import type { BridgeChange } from "./change-notifier.js";
 import {
-  admitPresence, BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
+  admitPresence, BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeLinkError, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish, type BridgePublishReceipt,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
 } from "./bridge.js";
 import {
@@ -80,7 +80,9 @@ export const isNatsCarrierTransient = (error: unknown): boolean =>
   (typeof error === "object" && error !== null && TRANSIENT_CODES.has((error as { code?: unknown }).code));
 
 const deferTransient = (error: unknown): unknown =>
-  error instanceof BridgeMirrorDeferredError || !isNatsCarrierTransient(error) ? error : new NatsCarrierDeferredError(error);
+  error instanceof BridgeMirrorDeferredError || error instanceof BridgeLinkError || isMeshRetryableBusy(error) ? error
+    : isNatsCarrierTransient(error) ? new NatsCarrierDeferredError(error)
+      : new BridgeLinkError(message(error), { cause: error });
 
 export class NatsCarrierUncertainError extends Error {
   override readonly name = "NatsCarrierUncertainError";
@@ -267,6 +269,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly topics: NatsTopicTranslator;
   readonly filePresence: FileCarrierPresence;
   readonly #file: StoreBridgeSide;
+  readonly #ledger: NatsCarrierLedger;
   readonly #link: string;
   readonly #now: () => number;
   readonly #log: (line: string) => void;
@@ -299,6 +302,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   constructor(options: NatsCarrierSideOptions) {
     this.port = options.port;
     this.#file = options.file;
+    this.#ledger = options.ledger;
     this.#link = options.link;
     this.#now = options.now ?? Date.now;
     this.filePresence = new FileCarrierPresence(options.file, this.#now, options.filePresenceTtlMs);
@@ -543,8 +547,12 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   closeGracefully(error?: Error): void { this.close(error); }
 
-  /** toNats: one event MeshBridge admitted toward the NATS side. Resolves only after the PubAck. */
-  async publish(event: BridgePublish): Promise<{ sequence: number }> {
+  /** toNats: PubAck-confirmed delivery OR a durable per-event refusal receipt. */
+  async publish(event: BridgePublish): Promise<BridgePublishReceipt> {
+    const eventId = event.data.bridge.id;
+    // A crash after the receipt but before MeshBridge's cursor checkpoint must not re-evaluate
+    // this event under changed presence/policy, send it, or log the same refusal again.
+    if (this.#ledger.refusal(eventId)) return { kind: "refused", sequence: 0 };
     // Identity and the allow gate read the file side's presence: at most one TTL old, never stale.
     await this.filePresence.refresh();
     let plan: NatsOutbound;
@@ -552,9 +560,20 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       plan = event.topic === BRIDGE_NATS_CONTROL_TOPIC || event.topic === BRIDGE_NATS_ACK_TOPIC
         ? await this.carrier.outbound(event) : await this.topics.outbound(event);
     } catch (error) {
-      // A refused command from a verified file sender is answered (notRun, stable code) before MeshBridge drops it.
-      if (error instanceof NatsCarrierRefusal && error.answer) await this.#answerFileSender(error.answer);
-      throw deferTransient(error);
+      if (!(error instanceof NatsCarrierRefusal)) throw deferTransient(error);
+      // Only translation/gate refusals are event-scoped. Port send/mirror/inbox and identity or
+      // credential failures never enter this catch: defer transient ones, fail-stop unsafe ones.
+      // Reuse the ledger's fsync'd event-level seen receipts, not the owner's outcome/command claim.
+      try {
+        await this.#ledger.refuse(eventId, { kind: "refused", reason: error.reason,
+          ...(error.code !== undefined ? { code: error.code } : {}) });
+      } catch (recordError) {
+        // No durable refusal => no source progress, including a generated relay ACK's caller.
+        throw new NatsCarrierDeferredError(recordError);
+      }
+      if (error.answer) await this.#answerFileSender(error.answer);
+      this.#log(`toNats: refused ${event.topic} ${eventId}: ${error.reason.replace(/[\r\n]/g, " ")}`);
+      return { kind: "refused", sequence: 0 };
     }
     if (plan.kind === "absorb") {
       this.#log(`toNats: ${event.topic} ${event.data.bridge.id} needs no send: ${plan.reason}`);

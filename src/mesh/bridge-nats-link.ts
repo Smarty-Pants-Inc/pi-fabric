@@ -221,6 +221,8 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
       ackEventId: stored.ack.ackEventId, data: stored.ack.data } } : {}),
   });
   return {
+    refusal: eventId => ledger.seen("toNats", eventId)?.refusal,
+    async refuse(eventId, refusal) { await ledger.markSeen("toNats", eventId, { refusal }); },
     async claim(input) {
       const result = await ledger.claim({
         direction: input.direction, origin: input.origin, originalCommandId: input.sourceCommandId, commandId: input.destinationCommandId,

@@ -137,6 +137,8 @@ const validAck = (ack: unknown, commandId: string): ack is BridgeNatsAckRecord =
 
 const validSeen = (r: unknown): r is BridgeNatsSeenRecord =>
   isObject(r) && r.v === 1 && text(r.eventId) && direction(r.direction) && finite(r.seenAt) && finite(r.expiresAt) &&
+  (r.refusal === undefined || (isObject(r.refusal) && r.refusal.kind === "refused" &&
+    typeof r.refusal.reason === "string" && (r.refusal.code === undefined || typeof r.refusal.code === "string"))) &&
   (r.destinationId === undefined || text(r.destinationId)) &&
   (r.destinationSequence === undefined || (Number.isSafeInteger(r.destinationSequence) && (r.destinationSequence as number) >= 0));
 
@@ -562,14 +564,15 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
   }
 
   markSeen(dir: BridgeNatsDirection, eventId: string,
-    receipt: { readonly destinationId?: string; readonly destinationSequence?: number } = {}): Promise<BridgeNatsSeenRecord> {
+    receipt: NonNullable<Parameters<BridgeNatsLedger["markSeen"]>[2]> = {}): Promise<BridgeNatsSeenRecord> {
     return this.#mutate(() => {
       const existing = this.seen(dir, eventId);
       if (existing) return existing; // the first receipt stands
       const seenAt = this.#clock();
       const record = cloneJson({ v: 1 as const, eventId, direction: dir, seenAt, expiresAt: seenAt + BRIDGE_NATS_HORIZON_MS,
         ...(receipt.destinationId !== undefined ? { destinationId: receipt.destinationId } : {}),
-        ...(receipt.destinationSequence !== undefined ? { destinationSequence: receipt.destinationSequence } : {}) });
+        ...(receipt.destinationSequence !== undefined ? { destinationSequence: receipt.destinationSequence } : {}),
+        ...(receipt.refusal !== undefined ? { refusal: receipt.refusal } : {}) });
       if (!validSeen(record)) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_INVALID", "seen record is invalid");
       this.#append({ t: "seen", r: record });
       return this.#seen.get(seenKey(dir, eventId))!;

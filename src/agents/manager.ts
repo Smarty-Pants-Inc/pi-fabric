@@ -7947,46 +7947,6 @@ export class AgentManager {
     }
   }
 
-  async #retainTerminalPromptRecord(managed: ManagedAgent): Promise<boolean> {
-    if (!this.#managedTempRoot) return false;
-    // The manager's exact validated outcome governs retention. A worker can still
-    // have written a completed status.json after host validation failed the run.
-    const record = this.#readResult(managed) ?? managed.latestRecord;
-    if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
-    const resultFile = managed.settledResultFile;
-    const keepResult = resultFile === path.join(managed.runDirectory, MANAGER_RESULT_FILE) && this.#exactResultPresent(managed);
-    const promptFile = path.join(managed.runDirectory, "task.txt");
-    const stat = ownedStat(promptFile);
-    const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
-    const expectedBytes = managed.inputBytes ?? record.inputBytes;
-    const oversized = expectedBytes !== undefined && expectedBytes > TERMINAL_PROMPT_RETENTION_MAX_BYTES;
-    const currentMatches = !oversized && stat?.isFile() === true && expectedSha256 !== undefined && expectedBytes !== undefined &&
-      stat.size <= TERMINAL_PROMPT_RETENTION_MAX_BYTES && promptFileMatches(promptFile, expectedSha256, expectedBytes);
-    if (!currentMatches) {
-      managed.promptRetentionDropped = true;
-      // A small file that fails its current-input digest is not safe to retain.
-      // Keep the mismatch visible in status.json, but drop the unverified bytes.
-      managed.promptRetentionMismatch = !oversized;
-    }
-    // Persist the manager's authoritative metadata before removing every other
-    // artifact. A verified current task.txt and status.json are the complete
-    // retained proof; a mismatch drops task.txt. The manager's exact outcome stays
-    // beside status.json with only its task fields removed; every other field is
-    // kept uncompacted. status.json stays compact and taskless.
-    if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
-    writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
-    for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || entry === "lifecycle.jsonl" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
-      await removeTree(path.join(managed.runDirectory, entry));
-    }
-    // pi-fabric#1554 P1 (smarty-dev#15878): the loop above prunes the in-tree tmp/ such a run used before. Its short
-    // TMPDIR outside the run tree goes the same way here, or a scratch of more than 64 entries vetoes every later sweep.
-    await removeOwnedShortTmpdir(recordedShortTmpdir(managed.runDirectory, managed.id, managed.temporaryDirectory));
-    // Once an unsuccessful run has a retained status, never fall back to deleting its
-    // whole tree. Any cleanup error propagates to the close custody fence.
-    return true;
-  }
-
   /** The manager's own exact terminal result file (no replacement/mutation/symlink). */
   #exactResultPresent(managed: ManagedAgent): boolean {
     const file = this.#ownedResultFile(managed);

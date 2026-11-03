@@ -76,7 +76,8 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
   const config: ResidentHostConfig = {
     format: 1, rootId, sessionId: "stopped-writer-retention", cwd: root, projectRoot: root,
     meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
-    fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    // Explicitly request deletion so checked writer exit, not default retention, protects the run.
+    fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: false }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
@@ -218,7 +219,8 @@ it.skipIf(process.platform === "win32").each([
   const config: ResidentHostConfig = {
     format: 1, rootId, sessionId: "nested-writer-retention", cwd: root, projectRoot: root,
     meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
-    fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    // Keep the legacy deletion path under test, including its live-descendant veto.
+    fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: false }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/nested-writer-worker.ts"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
@@ -402,7 +404,8 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
   const config: ResidentHostConfig = {
     format: 1, rootId, sessionId: "durable-descendant-cleanup", cwd: root, projectRoot: root,
     meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
-    fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    // Exercise destructive cleanup once the descendant has demonstrably exited.
+    fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: false }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/nested-writer-worker.ts"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },

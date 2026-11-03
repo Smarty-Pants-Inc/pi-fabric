@@ -16,14 +16,14 @@ import * as retention from "../src/storage/retention.js";
 const hostedDelete = hostedOnly("AgentManager close deletion");
 const managers: AgentManager[] = [];
 const roots: string[] = [];
-const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
+const setup = (retainRuns?: boolean, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-test-"));
   roots.push(tempRoot);
   vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
   vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns, transport: "process", sessionExport: false }, {
+  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, ...(retainRuns === undefined ? {} : { retainRuns }), transport: "process", sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     sweepPath: path.resolve("dist/storage/sweep-main.js"), ...extra,
   });
@@ -98,7 +98,7 @@ describe("AgentManager close storage", () => {
   });
 
   it.runIf(hostedDelete)("removes empty managed roots immediately, without recreating them on repeated close", async () => {
-    const { manager, root } = setup();
+    const { manager, root } = setup(false);
     const first = manager.close();
     expect(manager.close()).toBe(first);
     await first;
@@ -184,7 +184,7 @@ describe("AgentManager close storage", () => {
     expect(fs.readFileSync(path.join(root, "unrelated"), "utf8")).toBe("not an agent artifact");
   });
 
-  it("records durable-journal close collection without deleting the run (#11199)", async () => {
+  it("records the unchanged retainRuns:false durable-journal close deletion path without deleting the run (#11199)", async () => {
     // Exercise the actual close decision, but record its removal request. The
     // existing real-delete tests below belong to hosted CI, not a fleet lane.
     vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
@@ -198,7 +198,7 @@ describe("AgentManager close storage", () => {
     fs.writeFileSync(path.join(store, "main.jsonl"), "{}\n");
     expect(retention.canRemoveTerminalRun(directory)).toBe(true);
     await manager.close();
-    expect(remove).toHaveBeenCalledWith(directory);
+    expect(remove).toHaveBeenCalledExactlyOnceWith(directory);
     expect(fs.readFileSync(path.join(store, "main.jsonl"), "utf8")).toBe("{}\n");
     expect(fs.existsSync(root)).toBe(true);
   });
@@ -215,11 +215,31 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(root)).toBe(false);
   });
 
-  it("retains closed managed run artifacts by default", async () => {
-    const { manager, root } = setup(true);
-    await manager.run({ task: "hello", runner: "pi", extensions: false });
+  it("retains byte-identical run traces after actual manager shutdown with the default config (#17038)", async () => {
+    const { manager, root } = setup(); // No retainRuns override: exercise the public default.
+    const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
+    const directory = path.join(root, result.id);
+    const store = path.join(directory, "durable", "initial", "store");
+    fs.mkdirSync(store, { recursive: true });
+    fs.writeFileSync(path.join(store, "..", "lease.sqlite"), "");
+    fs.writeFileSync(path.join(store, "main.jsonl"), '{"trace":"original bytes\\r\\n"}\n');
+    const snapshot = (directory: string): Record<string, Buffer> => Object.fromEntries(
+      fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+        const file = path.join(directory, entry.name);
+        return entry.isDirectory()
+          ? Object.entries(snapshot(file)).map(([name, bytes]) => [path.join(entry.name, name), bytes])
+          : [[entry.name, fs.readFileSync(file)]];
+      }),
+    );
+    const before = snapshot(directory);
+    expect(Object.keys(before)).toEqual(expect.arrayContaining(["task.txt", "status.json", "manager-result.json"]));
+    expect(before[path.join("durable", "initial", "store", "main.jsonl")]).toEqual(Buffer.from('{"trace":"original bytes\\r\\n"}\n'));
+    // No unknown-file or live-worker veto may conceal a broken default.
+    expect(retention.canRemoveTerminalRun(directory)).toBe(true);
     await manager.close();
-    expect(fs.existsSync(root)).toBe(true);
+    expect(snapshot(directory)).toEqual(before);
+    await manager.close();
+    expect(snapshot(directory)).toEqual(before);
     expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
   });
 
@@ -239,12 +259,12 @@ describe("AgentManager close storage", () => {
   });
 
   it.runIf(hostedDelete)("does not perform retention scans merely by constructing a manager", async () => {
-    const { manager, tempRoot } = setup();
+    const { manager, tempRoot } = setup(false);
     const sentinel = path.join(tempRoot, "pi-fabric-runs-sentinel");
     fs.mkdirSync(sentinel);
     const marker = { pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 };
     fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify(marker));
-    const second = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 });
+    const second = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: false });
     managers.push(second);
     await new Promise((resolve) => setImmediate(resolve));
     expect(fs.existsSync(sentinel)).toBe(true);
@@ -258,7 +278,7 @@ describe("AgentManager close storage", () => {
   it.runIf(hostedDelete)("starts the close sweep through a real JS runtime under a Bun-compiled Pi (smarty-dev#2010)", async () => {
     const originalExecPath = process.execPath;
     const originalOverride = process.env.PI_FABRIC_NODE_BINARY;
-    const { manager, tempRoot } = setup();
+    const { manager, tempRoot } = setup(false);
     const sentinel = path.join(tempRoot, "pi-fabric-runs-bundled");
     fs.mkdirSync(sentinel);
     fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));

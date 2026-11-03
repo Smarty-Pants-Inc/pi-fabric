@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,46 @@ import { canRemoveTerminalRun, hasUnresolvedWorker, markRunRootActive, markRunRo
 
 import { retainedProcessStates, retainedProcessWorker } from "./helpers/retained-process-worker.js";
 
+const custodyMoves = vi.hoisted(() => [] as Array<{ source: string; destination: string; receipt: string }>);
+vi.mock("../src/agents/worktree-manager.js", async original => {
+  const actual = await original<typeof import("../src/agents/worktree-manager.js")>();
+  return { ...actual, retainCleanupRoot: (...args: Parameters<typeof actual.retainCleanupRoot>) => {
+    const move = actual.retainCleanupRoot(...args);
+    if (move) custodyMoves.push(move);
+    return move;
+  } };
+});
+const custodyMoveFor = (source: string): { source: string; destination: string; receipt: string } | undefined => {
+  const observed = custodyMoves.find(move => move.source === source);
+  if (observed) return observed;
+  // WorktreeManager.cleanup calls retainCleanupRoot through its module-local
+  // binding, which a vi.mock wrapper on the imported export cannot observe.
+  // Resolve only the source's own fixture archive; never walk shared tmpdir.
+  const requestedArchive = `${path.dirname(source)}.trace-archive`;
+  let gitRoot = path.dirname(source);
+  while (gitRoot !== path.dirname(gitRoot) && !fs.existsSync(path.join(gitRoot, ".git"))) gitRoot = path.dirname(gitRoot);
+  if (!fs.existsSync(path.join(gitRoot, ".git"))) return undefined;
+  const key = createHash("sha256").update(requestedArchive).digest("hex").slice(0, 20);
+  const archive = path.join(path.dirname(gitRoot), ".pi-fabric-trace-archive", key);
+  for (const container of fs.readdirSync(archive).map(name => path.join(archive, name))) {
+    const receipt = path.join(container, "custody.json");
+    if (!fs.existsSync(receipt)) continue;
+    const row = JSON.parse(fs.readFileSync(receipt, "utf8"));
+    if (row.source === source) return { source, destination: row.destination, receipt };
+  }
+  return undefined;
+};
+const heldRoot = (source: string): string => {
+  const move = custodyMoveFor(source);
+  expect(move).toBeDefined();
+  if (!move) throw new Error(`Missing custody receipt for ${source}`);
+  const row = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
+  expect(row).toMatchObject({ source, destination: expect.any(String), id: path.basename(source), reason: expect.any(String), time: expect.any(Number) });
+  expect(JSON.parse(fs.readFileSync(path.join(row.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source, destination: row.destination, id: row.id, state: "prepared" });
+  if (process.platform !== "win32") expect(fs.statSync(row.container).mode & 0o777).toBe(0o700);
+  expect(fs.existsSync(source)).toBe(false);
+  return row.destination;
+};
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 describe("checked agent release observations", () => {
   it.each(["tmux", "screen"])("preserves terminal %s trees in resident and orphaned retention", kind => {
@@ -95,9 +136,15 @@ describe("checked agent release observations", () => {
         child.confirmExit();
         expect(canRemoveTerminalRun(run)).toBe(true);
         if (action === "cleanup") {
+          const taskBytes = fs.readFileSync(child.taskFile);
+          const inputBytes = fs.readFileSync(path.join(info.worktree!, "input.txt"));
           expect(await manager.cleanup(info.id, true)).toEqual({ cleaned: true });
-          expect(fs.existsSync(run)).toBe(false); expect(fs.existsSync(info.worktree!)).toBe(false);
-          expect(git("branch", "--list", info.branch!)).toBe("");
+          const heldRun = heldRoot(run), heldWorktree = heldRoot(info.worktree!);
+          expect(fs.readFileSync(path.join(heldRun, path.relative(run, child.taskFile)))).toEqual(taskBytes);
+          expect(fs.readFileSync(path.join(heldWorktree, "input.txt"))).toEqual(inputBytes);
+          // Registration and branch debt deliberately survive rename custody.
+          expect(git("worktree", "list", "--porcelain")).toContain(`branch refs/heads/${info.branch}`);
+          expect(git("branch", "--list", info.branch!)).toContain(info.branch);
         }
       } finally {
         await child?.stop(); await manager.close();
@@ -121,9 +168,10 @@ describe("checked agent release observations", () => {
     });
     try {
       await expect(manager.spawn({ task: "never admitted", transport: "process", worktree: true })).rejects.toThrow("rejected before worker launch");
-      expect(worktree).toBeDefined(); expect(fs.existsSync(worktree!)).toBe(false);
-      expect(git("worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
-      expect(git("branch", "--list", "pi-fabric/*")).toBe("");
+      expect(worktree).toBeDefined();
+      expect(fs.readFileSync(path.join(heldRoot(worktree!), "input.txt"), "utf8")).toBe("input");
+      expect(git("worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(2);
+      expect(git("branch", "--list", "pi-fabric/*")).toContain("pi-fabric/");
     } finally {
       launch.mockRestore(); await manager.close();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });

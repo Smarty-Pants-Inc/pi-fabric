@@ -217,7 +217,13 @@ describe("Agent prompt retention (#11663)", () => {
     await manager.close();
     expect(fs.existsSync(successfulDirectory)).toBe(false);
     expect(fs.existsSync(promptPath)).toBe(true);
-    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["lifecycle.jsonl", "manager-result.json", "status.json", "task.txt"]);
+    const retainedDirectory = path.dirname(promptPath);
+    for (const name of ["events.jsonl", "lifecycle.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(true);
+    }
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(false);
+    }
     expect(fs.readFileSync(lifecyclePath)).toEqual(lifecycleBytes);
     const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
     expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
@@ -237,6 +243,63 @@ describe("Agent prompt retention (#11663)", () => {
     expect(createHash("sha256").update(fs.readFileSync(afterClose.promptPath!)).digest("hex")).toBe(afterClose.inputSha256);
   });
 
+  it("keeps every trace byte while pruning only named prompt artifacts", async () => {
+    const manager = managedFixture("pi-fabric-prompt-traces-");
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const transport = await fakeManagerHeapWorker(request);
+      const statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = { ...JSON.parse(fs.readFileSync(statusFile, "utf8")), status: "failed", error: "retention fixture failure", exitCode: 1 };
+      fs.writeFileSync(statusFile, JSON.stringify(record), { mode: 0o600 });
+      return transport;
+    });
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\\nretained prompt\\n", transport: "process" });
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "failed" });
+    const directory = manager.runDirectory(handle.id)!;
+    const traces: Record<string, Buffer> = {
+      "events.jsonl": Buffer.from("events raw trace\\n"),
+      "events.jsonl.bak": Buffer.from("events backup trace\\n"),
+      "events.jsonl.original": Buffer.from("events original trace\\n"),
+      "steer.jsonl": Buffer.from("steer raw trace\\n"),
+      "relaunches.jsonl": Buffer.from("relaunch raw trace\\n"),
+      "session.jsonl": Buffer.from("session raw trace\\n"),
+      "route-session.jsonl": Buffer.from("route session raw trace\\n"),
+      "settlement.json": Buffer.from("settlement raw trace\\n"),
+      "reply.json": Buffer.from("reply raw trace\\n"),
+      "lifecycle.jsonl": Buffer.from("lifecycle raw trace\\n"),
+    };
+    for (const [name, bytes] of Object.entries(traces)) fs.writeFileSync(path.join(directory, name), bytes);
+    const childTrace = Buffer.from("nested child events trace\\n");
+    const nestedTrace = path.join(directory, "nested", "child", "events.jsonl");
+    fs.mkdirSync(path.dirname(nestedTrace), { recursive: true });
+    fs.writeFileSync(nestedTrace, childTrace);
+    // A terminal process receipt with a definitely exited PID lets close() pass
+    // the descendant exit veto and exercise prompt-artifact retention.
+    fs.writeFileSync(path.join(path.dirname(nestedTrace), "status.json"), JSON.stringify({
+      status: "failed", transport: "process", sessionId: "2147483647", exitCode: 1,
+    }));
+    const runIdentity = fs.readFileSync(path.join(directory, "run-identity.json"));
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json"]) {
+      fs.writeFileSync(path.join(directory, name), `${name} prompt artifact`);
+    }
+
+    await manager.close();
+    // This proves the retention loop ran rather than the descendant veto making
+    // every trace-preservation assertion vacuously pass.
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json"]) {
+      expect(fs.existsSync(path.join(directory, name)), name).toBe(false);
+    }
+    expect(fs.existsSync(path.join(directory, "task.txt"))).toBe(true);
+    for (const [name, bytes] of Object.entries(traces)) {
+      expect(fs.readFileSync(path.join(directory, name)), name).toEqual(bytes);
+    }
+    expect(fs.readFileSync(path.join(directory, "run-identity.json"))).toEqual(runIdentity);
+    expect(fs.readFileSync(nestedTrace)).toEqual(childTrace);
+    expect(fs.existsSync(path.join(directory, "nested", "child", "status.json"))).toBe(true);
+    expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true);
+    expect(fs.existsSync(path.join(directory, "manager-result.json"))).toBe(true);
+    expect(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).toContain("retained prompt");
+  });
+
   it("retains a failed continuation under its current digest while preserving the original metadata", async () => {
     const manager = managedFixture("pi-fabric-prompt-continuation-");
     const original = "RESUME_FAIL_AFTER_STOP\noriginal brief π\n";
@@ -251,7 +314,14 @@ describe("Agent prompt retention (#11663)", () => {
     expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
     expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    const retainedDirectory = path.dirname(taskPath);
+    for (const name of ["events.jsonl", "relaunches.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(true);
+    }
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(false);
+    }
+    expect(fs.existsSync(path.join(retainedDirectory, "resume-attempts"))).toBe(true);
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
@@ -272,7 +342,13 @@ describe("Agent prompt retention (#11663)", () => {
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
     fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["lifecycle.jsonl", "manager-result.json", "status.json"]);
+    const retainedDirectory = path.dirname(taskPath);
+    for (const name of ["events.jsonl", "lifecycle.jsonl", "manager-result.json", "run-identity.json", "status.json"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(true);
+    }
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json", "task.txt"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(false);
+    }
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).toMatchObject({ status: "failed" });
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;

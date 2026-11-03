@@ -42,6 +42,8 @@ const runtimeFixture = async () => {
   fs.mkdirSync(runRoot, { mode: 0o700 });
   fs.mkdirSync(tmpRoot, { mode: 0o700 });
   for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+  // These rejection fixtures exercise the opt-in legacy check; unchanged trace-hold links are valid by default (#17990).
+  vi.stubEnv("PI_FABRIC_STRICT_RESULT_AUTH", "1");
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", base);
   vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
   vi.stubEnv("PI_FABRIC_TMPDIR", tmpRoot);

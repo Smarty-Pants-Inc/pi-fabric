@@ -260,16 +260,26 @@ describe("manager handles, snapshots and receipt custody", () => {
     expect(fs.existsSync(path.join(directory, first, "status.json"))).toBe(true);
   }, 60_000);
 
-  it("evicts a cleaned handle while recording removal, retaining the exact file for the hosted delete check", async () => {
+  it("evicts a cleaned handle only after archiving its exact files with a real receipt", async () => {
     const { manager, directory } = createManager(false);
     const result = await manager.run({ task: "mock cleanup", transport: "process", extensions: false });
     const run = path.join(directory, result.id);
     expect(manager.hasRunCustody(result.id)).toBe(true);
+    const bytes = fs.readFileSync(path.join(run, "manager-result.json"));
+    const retain = vi.spyOn(await import("../src/agents/worktree-manager.js"), "retainCleanupRoot");
     await manager.cleanup(result.id);
-    expect(deletionRequests).toContain(run);
+    expect(deletionRequests).not.toContain(run);
     expect(manager.hasRunCustody(result.id)).toBe(false);
     expect(() => manager.status(result.id)).toThrow(/Unknown Fabric agent/);
-    expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8")).id).toBe(result.id);
+    const move = retain.mock.results.map(row => row.value as { source: string; receipt: string } | undefined).find(move => move?.source === run)!;
+    expect(move).toBeDefined();
+    const receipt = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
+    expect(receipt).toMatchObject({ source: run, id: result.id, state: "moved", reason: expect.any(String), time: expect.any(Number) });
+    expect(JSON.parse(fs.readFileSync(path.join(receipt.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source: run, destination: receipt.destination, id: result.id, state: "prepared" });
+    if (process.platform !== "win32") expect(fs.statSync(receipt.container).mode & 0o777).toBe(0o700);
+    expect(fs.existsSync(run)).toBe(false);
+    expect(fs.readFileSync(path.join(receipt.destination, "manager-result.json"))).toEqual(bytes);
+    expect(JSON.parse(fs.readFileSync(path.join(receipt.destination, "status.json"), "utf8")).id).toBe(result.id);
   });
 
   it("preserves full receipt-bound results and native close custody after dropping completion payload caches", async () => {

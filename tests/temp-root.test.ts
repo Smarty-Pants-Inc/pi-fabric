@@ -41,7 +41,7 @@ afterEach(async () => {
   for (const close of closers.splice(0).reverse()) await close();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  roots.splice(0); // Preserve raw fixtures for the inherited test owner.
 });
 
 describe.skipIf(process.platform === "win32")("Fabric file root override", () => {
@@ -57,7 +57,7 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     expect(fabricDataRoot()).toBe(short);
   });
 
-  it("places run, actor, budget, shell and output roots on disk and releases them after shutdown", async () => {
+  it("places roots on disk, archives run bytes with a receipt and releases empty scratch after shutdown", async () => {
     const { root, short, disk } = sandbox();
     const agents = manager();
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -75,6 +75,8 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     const output = await boundModelOutput("x".repeat(2000), 1000, undefined, outputs.write);
     const run = await agents.run({ task: "hello", runner: "pi", extensions: false });
     expect(run.status).toBe("completed");
+    const runDirectory = agents.runDirectory(run.id)!;
+    const resultBytes = fs.readFileSync(path.join(runDirectory, "manager-result.json"));
     const budget = activeBudgetState()!;
     for (const file of [agents.readLog(run.id).runDirectory, budget.file, log, output.artifactPath!]) expect(file.startsWith(disk + path.sep)).toBe(true);
     for (const prefix of ["runs", "actors", "budget", "shell", "output"]) expect(fs.readdirSync(disk).some(name => name.startsWith(`pi-fabric-${prefix}-`))).toBe(true);
@@ -82,11 +84,21 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     // Finished logs/artifacts are still readable for the live session.
     expect(fs.readFileSync(log, "utf8")).toContain("shell data");
     expect(fs.readFileSync(output.artifactPath!, "utf8")).toHaveLength(2000);
+    const retain = vi.spyOn(await import("../src/agents/worktree-manager.js"), "retainCleanupRoot");
     await actors.close();
     await agents.close();
     await jobs.close();
     await outputs.close();
-    expect(fs.readdirSync(disk).filter(name => name.startsWith("pi-fabric-"))).toEqual([]);
+    const move = retain.mock.results.map(row => row.value as { source: string; receipt: string } | undefined).find(move => move?.source === runDirectory)!;
+    expect(move).toBeDefined();
+    const receipt = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
+    // Only a custody container may remain; ordinary scratch roots were released.
+    expect(fs.readdirSync(disk).filter(name => name.startsWith("pi-fabric-") && !move.receipt.startsWith(path.join(disk, name) + path.sep))).toEqual([]);
+    expect(receipt).toMatchObject({ id: run.id, state: "moved", reason: expect.any(String), time: expect.any(Number) });
+    expect(JSON.parse(fs.readFileSync(path.join(receipt.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source: runDirectory, destination: receipt.destination, id: run.id, state: "prepared" });
+    if (process.platform !== "win32") expect(fs.statSync(receipt.container).mode & 0o777).toBe(0o700);
+    expect(fs.existsSync(runDirectory)).toBe(false);
+    expect(fs.readFileSync(path.join(receipt.destination, "manager-result.json"))).toEqual(resultBytes);
     expect(fs.readdirSync(short)).toEqual([]);
   });
 

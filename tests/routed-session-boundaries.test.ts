@@ -42,7 +42,20 @@ describe("R3 routed session boundaries", () => {
       expect(launch).not.toHaveBeenCalled();
       const rows = fs.readFileSync(path.join(root, "agent/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ type: "outcome", decisionId: route.decisionId, childSessionId: rows[0].childSessionId, status: "failed", admittedModel: null });
-      expect(git(repo, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+      // Rollback archives the never-launched tree; Git registration/branch debt is intentional.
+      const receipts = fs.readdirSync(root, { recursive: true }).map(String)
+        .filter(name => path.basename(name) === "custody.json")
+        .map(name => ({ container: path.dirname(path.join(root, name)), ...JSON.parse(fs.readFileSync(path.join(root, name), "utf8")) }))
+        .filter(row => row.source.startsWith(path.join(repo, ".pi", "fabric", "worktrees") + path.sep));
+      expect(receipts).toHaveLength(1);
+      const receipt = receipts[0]!;
+      expect(receipt).toMatchObject({ id: rows[0].childSessionId, state: "moved", reason: expect.any(String), time: expect.any(Number) });
+      expect(JSON.parse(fs.readFileSync(path.join(receipt.container, "custody.prepared.json"), "utf8"))).toMatchObject({ state: "prepared", source: receipt.source, destination: receipt.destination, id: receipt.id });
+      if (process.platform !== "win32") expect(fs.statSync(receipt.container).mode & 0o777).toBe(0o700);
+      expect(fs.existsSync(receipt.source)).toBe(false);
+      expect(fs.readFileSync(path.join(receipt.destination, "tracked.txt"), "utf8")).toBe("committed-worktree");
+      expect(git(repo, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(2);
+      expect(git(repo, "branch", "--list", "pi-fabric/*")).toContain("pi-fabric/");
     } finally { await manager.close(); vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
   it.each(["immediate", "queued", "startup-retry", "resume"])("I-1 binds every %s launch to final worktree with the same child ID", async mode => {

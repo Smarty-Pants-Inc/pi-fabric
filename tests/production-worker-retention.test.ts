@@ -221,7 +221,8 @@ describe("I-2 production-worker ingress retention", () => {
     for (const name of ["plain", "attributed"]) expect(fs.existsSync(path.join(root, name)), name).toBe(false);
   }, 90000);
 
-  it("expires actor archives with copied nested production runs but retains unsafe descendants and latest", async () => {
+  // Keep: data safety; real production archive bytes must survive automatic retention.
+  it("preserves actor archives with copied nested production runs, unsafe descendants and latest after expiry", async () => {
     const plain = await productionRun(false); const attributed = await productionRun(true);
     const root = temporary(); const actor = { sessionFile: path.join(root, "actor.jsonl"), lastRunId: "latest" };
     const base = Math.max(plain.result.finishedAt!, attributed.result.finishedAt!);
@@ -257,14 +258,33 @@ describe("I-2 production-worker ingress retention", () => {
       // an actual multiply-linked file in the archive to test the collector veto.
       if (kind === "hardlink") makeUnsafe(path.join(archive, "nested", "attributed"), kind);
     }
+    const snapshot = () => {
+      const bytes = new Map<string, Buffer>();
+      const walk = (directory: string) => {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+          const file = path.join(directory, entry.name);
+          if (entry.isDirectory()) walk(file);
+          else bytes.set(path.relative(root, file), entry.isSymbolicLink() ? Buffer.from(fs.readlinkSync(file)) : fs.readFileSync(file));
+        }
+      };
+      walk(path.join(root, "runs"));
+      return bytes;
+    };
+    const before = snapshot();
+    expect(before.has(path.join("runs", "successful", "events.jsonl"))).toBe(true);
+    expect(before.has(path.join("runs", "latest", "nested", "attributed", "events.jsonl"))).toBe(true);
     store.pruneRuns(actor, base + 99);
     expect(store.retainedRunIds(actor)).toContain("successful");
+    expect(snapshot()).toEqual(before);
     store.pruneRuns(actor, base + 60_001);
     for (const kind of ["latest", ...unsafeKinds]) {
       if (kind === "delivery-link" || kind === "sidecar-link" || kind === "directory-link") {
         expect(fs.existsSync(path.join(root, "sources", kind, "nested", "attributed", "events.jsonl"))).toBe(true);
       } else expect(store.retainedRunIds(actor), kind).toContain(kind);
     }
-    expect(store.retainedRunIds(actor)).not.toContain("successful");
+    expect(store.retainedRunIds(actor)).toContain("successful");
+    expect(snapshot()).toEqual(before);
+    store.pruneRuns(actor, base + 120_001);
+    expect(snapshot()).toEqual(before);
   }, 90000);
 });

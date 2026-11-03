@@ -225,8 +225,15 @@ describe("spawnDetached", () => {
     child.emit("message", { type: "fabric-execution-settled" });
     child.emit("exit", 0);
   });
-  it.each(["confirmed", "timeout"] as const)("bounds the independent captured-close join (%s)", async outcome => {
+  it.each(["confirmed", "timeout"] as const)("bounds the independent captured-close join with unknown birth (%s)", async outcome => {
     vi.useFakeTimers();
+    // Recorded unknown identity: never borrow an incidental host PID's birth.
+    // Late close alone cannot discharge this observer's uncertainty (#17990).
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (String(file) === "/proc/1234/stat") throw Object.assign(new Error("recorded unreadable birth"), { code: "EACCES" });
+      return Reflect.apply(read, fs, [file, ...args]);
+    }) as typeof fs.readFileSync);
     const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn() });
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
     const unconfirmed = vi.fn();
@@ -247,7 +254,7 @@ describe("spawnDetached", () => {
       expect(handle.lostContact() !== undefined).toBe(outcome === "timeout");
       child.emit("close", 0);
       await handle.waitForClose();
-      expect(handle.lostContact() !== undefined, "late close cannot erase persistent uncertainty").toBe(outcome === "timeout");
+      expect(handle.lostContact() !== undefined, "late close cannot erase unknown-birth uncertainty").toBe(outcome === "timeout");
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       child.emit("close", 0);

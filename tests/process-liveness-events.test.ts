@@ -870,18 +870,10 @@ describe.skipIf(process.platform !== "linux")("unscoped native descendant legacy
       setTimeout(() => process.exit(2), 8000);`;
     fs.writeFileSync(workerPath, `import fs from "node:fs";
       import { spawn } from "node:child_process";
-      process.on("message", message => {
-        if (message.type !== "fabric-execution-custody-ack") return;
-        const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { detached: true, stdio: "ignore" });
-        descendant.unref();
-        const fields = fs.readFileSync(\`/proc/\${descendant.pid}/stat\`, "utf8");
-        const started = fields.slice(fields.lastIndexOf(")") + 2).trim().split(/\\s+/)[19];
-        process.send({ type: "fabric-execution-started", pid: descendant.pid, started }, () => {
-          fs.writeFileSync("descendant-ready", String(descendant.pid));
-          setInterval(() => { if (fs.existsSync("exit-parent")) process.exit(0); }, 10);
-        });
-      });
-      process.send({ type: "fabric-execution-custody" });
+      const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { detached: true, stdio: "ignore" });
+      descendant.unref();
+      fs.writeFileSync("descendant-ready", String(descendant.pid));
+      setInterval(() => { if (fs.existsSync("exit-parent")) process.exit(0); }, 10);
       setTimeout(() => process.exit(2), 8000);`);
     const actualSpawn = await vi.importActual<typeof import("node:child_process")>("node:child_process");
     let child!: ChildProcess;
@@ -901,6 +893,9 @@ describe.skipIf(process.platform !== "linux")("unscoped native descendant legacy
     const handle = await manager.spawn({ task: "native descendant closes later", transport: "process" });
     try {
       await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "descendant-ready"))).toBe(true), { timeout: 3_000 });
+      // Legacy workers owe no custody IPC receipt. Retain the real descendant's birth before its parent exits;
+      // pending execution custody remains a separate refusal case in legacy-close-debt-recorded.test.ts (#17990 R2).
+      expect(await transport.isAlive()).toBe(true);
       vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
       const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
       fs.writeFileSync(path.join(directory, "exit-parent"), "");

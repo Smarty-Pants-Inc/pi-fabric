@@ -361,11 +361,23 @@ export const spawnDetached = async (
   const forcedDescendants = new Set<string>();
   let stopping: Promise<void> | undefined;
   const passiveCloseWakeups = new Set<() => void>();
+  // A passive observer's close deadline is retryable on this exact handle.
+  // Execution/termination uncertainty is separate and immutable: it must still
+  // latch (and notify the manager) if a passive deadline was reported first.
+  let passiveCloseDebt: string | undefined;
   let lost: string | undefined;
+  const notifyUnconfirmed = (reason: string): void => {
+    try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
+  };
   const unconfirmed = (reason: string): void => {
     if (lost !== undefined) return;
     lost = reason;
-    try { authority?.onUnconfirmedExit?.(reason); } catch { /* transport debt still vetoes release */ }
+    notifyUnconfirmed(reason);
+  };
+  const passiveCloseUnconfirmed = (): void => {
+    if (lost !== undefined || passiveCloseDebt !== undefined) return;
+    passiveCloseDebt = "Owned process worker did not confirm native close within 7000ms";
+    notifyUnconfirmed(passiveCloseDebt);
   };
   child.unref();
   // Bun exposes an IPC channel without Node's unref method. The child's
@@ -466,6 +478,20 @@ export const spawnDetached = async (
     }
     return current;
   };
+  const currentDebt = (): string | undefined => {
+    // Reconciliation/public stop consult debt BEFORE they can join stop(). A
+    // repair only in stop/waitForClose would leave those real paths fenced.
+    // Neither numeric PID absence, a false isAlive, nor descriptor close alone
+    // proves exit: require this captured primary exit, its original birth and
+    // native close, then the existing birth-checked whole-tree predicate.
+    if (passiveCloseDebt !== undefined && lost === undefined && process.platform === "linux" &&
+        !birthUnknown && birth?.started && nativeExit?.processStartTime === birth.started && nativeClosed &&
+        !executionPending) {
+      try { if (members().length === 0) passiveCloseDebt = undefined; }
+      catch { /* unreadable/ambiguous census retains custody; never adopt a new handle */ }
+    }
+    return lost ?? passiveCloseDebt;
+  };
   const stop = async (): Promise<void> => {
     if (stopped) return;
     // Capture group identities BEFORE TERM, while the owned leader still pins it.
@@ -474,7 +500,7 @@ export const spawnDetached = async (
     if (process.platform === "linux") members();
     else if (process.platform !== "win32") await portableMembers();
     const settled = async (): Promise<boolean> => {
-      if (process.platform === "linux") return members().length === 0 && nativeClosed && !(executionPending && groups.size === 1);
+      if (process.platform === "linux") return members().length === 0 && nativeClosed && !executionPending;
       const remaining = process.platform === "win32" ? [] : await portableMembers();
       if (!nativeClosed || executionPending || portableUncertain) return false;
       return remaining.length === 0;
@@ -534,8 +560,8 @@ export const spawnDetached = async (
     closed,
     primaryExit,
     nativeExit: () => nativeExit,
-    lostContact: () => lost,
-    stopDebt: () => stopFailed ? undefined : lost,
+    lostContact: currentDebt,
+    stopDebt: () => stopFailed ? undefined : currentDebt(),
     forcedCleanupCount: () => forcedDescendants.size,
     remainingDescendantCount: () => {
       if (process.platform !== "linux") return executionPending ? 1 : 0;
@@ -553,7 +579,7 @@ export const spawnDetached = async (
           wake = () => { clearTimeout(deadline); resolve(); };
           passiveCloseWakeups.add(wake);
           deadline = setTimeout(() => {
-            unconfirmed("Owned process worker did not confirm native close within 7000ms");
+            passiveCloseUnconfirmed();
             resolve();
           }, 7_000);
         })]);
@@ -616,7 +642,8 @@ export const spawnDetached = async (
             }),
           ]);
           // Sampling cleanup supplements, but never replaces, the confirmed-exit
-          // custody and birth-checked group drain above. Native-close debt stays latched.
+          // custody and birth-checked group drain above. Stop/termination debt
+          // stays latched; only currentDebt can discharge a passive deadline.
           if (ownedTree && treeOwner) await treeOwner.stopObservedDescendants(ownedTree, pid);
           stopped = true;
         } finally { clearTimeout(force); clearTimeout(deadline); }
@@ -633,7 +660,7 @@ export const spawnDetached = async (
     async isAlive() {
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.
-      if (exited) return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+      if (exited) return !nativeClosed || (process.platform === "linux" ? members().length > 0 || executionPending
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
       if (processIsAlive(pid)) {
         // Retain observed descendants before a launcher can exit ahead of its Pi child.
@@ -644,7 +671,7 @@ export const spawnDetached = async (
       // Gone once is gone for good: the probe can see the exit before the "exit" event
       // (Windows), and any later answer for this number is another process.
       exited = true;
-      return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+      return !nativeClosed || (process.platform === "linux" ? members().length > 0 || executionPending
         : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
     },
   };

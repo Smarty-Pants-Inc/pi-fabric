@@ -13,7 +13,7 @@ import { waitWithActorProgress } from "../src/providers/agents-progress.js";
 import type { FabricActorMessage } from "../src/actors/types.js";
 import { fakeManagerHeapWorker, heapRunResult } from "./fixtures/manager-heap-probe.js";
 
-// Keep reason: the worker/manager trust boundary reported by Astra on #1122.
+// Keep reason: incidents #1122/#17990 and the worker/manager result trust boundary.
 // All removal effects are recorded; private fixture roots are never deleted.
 const managers: AgentManager[] = [];
 const deletionRequests: string[] = [];
@@ -58,7 +58,31 @@ const refuses = async (manager: AgentManager, id: string) => {
   expect({ status, wait }).toEqual({ status: "FABRIC_MISSING_RESULT", wait: "FABRIC_MISSING_RESULT" });
 };
 
-// #17018 keep reason: a real manager publication with a hold hard-link must
+const tamperResultText = (file: string): void => {
+  const original = fs.readFileSync(file, "utf8"), { text } = JSON.parse(original) as AgentRunRecord;
+  const changed = original.replace(`"text": ${JSON.stringify(text)}`, `"text": ${JSON.stringify("!".repeat(text.length))}`);
+  expect(changed).not.toBe(original);
+  expect(Buffer.byteLength(changed)).toBe(Buffer.byteLength(original));
+  fs.writeFileSync(file, changed); // Same inode, including every trace-hold alias.
+};
+
+// Replay metadata only for this real backing's path and descriptor. All bytes,
+// publication authority and public readers still pass through the actual manager.
+const withResultStats = async (file: string, observe: (stat: fs.Stats) => fs.Stats, check: () => Promise<void>) => {
+  const identity = fs.statSync(file), lstat = vi.mocked(fs.lstatSync).getMockImplementation()!, fstat = fs.fstatSync;
+  vi.mocked(fs.lstatSync).mockImplementation(((read: fs.PathLike, ...args: unknown[]) => {
+    const stat = Reflect.apply(lstat, fs, [read, ...args]) as fs.Stats;
+    return String(read) === file ? observe(stat) : stat;
+  }) as typeof fs.lstatSync);
+  const descriptorStats = vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...args: unknown[]) => {
+    const stat = Reflect.apply(fstat, fs, [fd, ...args]) as fs.Stats;
+    return stat.dev === identity.dev && stat.ino === identity.ino ? observe(stat) : stat;
+  }) as typeof fs.fstatSync);
+  try { await check(); }
+  finally { vi.mocked(fs.lstatSync).mockImplementation(lstat); descriptorStats.mockRestore(); }
+};
+
+// #17018 keep reason: a genuinely tampered, hard-linked manager publication must
 // fail result authentication without taking task presence or the whole UI down.
 const listForPresence = (manager: AgentManager): AgentPresenceInfo[] => manager.listForPresence();
 
@@ -91,7 +115,10 @@ const hardLinkedEvictedResult = async () => {
   fs.linkSync(file, path.join(hold, "manager-result.json"));
   fs.linkSync(path.join(directory, "status.json"), path.join(hold, "status.json"));
   expect(fs.statSync(file).nlink).toBe(2);
-  // A new public run invalidates any UI-list cache after the hard-link. It is
+  // #17990: a hold link alone is legitimate. Change the actual answer through
+  // its alias so these presence/UI contracts still exercise unreadable bytes.
+  tamperResultText(path.join(hold, "manager-result.json"));
+  // A new public run invalidates any UI-list cache after the tampering. It is
   // also the healthy neighbour whose visibility an unreadable task must not kill.
   const healthy = await manager.run({ name: "healthy neighbour", task: "healthy task", transport: "process", extensions: false });
   await refuses(manager, result.id);
@@ -117,6 +144,7 @@ const enodevFixture = () => {
 };
 
 beforeEach(() => {
+  vi.stubEnv("PI_FABRIC_STRICT_RESULT_AUTH", undefined);
   deletionRequests.length = 0;
   recordedMissing.clear();
   failPublication = false;
@@ -146,13 +174,13 @@ beforeEach(() => {
 afterEach(async () => {
   failPublication = false;
   for (const release of releases.splice(0)) release();
-  await Promise.all(managers.splice(0).map(manager => manager.close()));
-  vi.restoreAllMocks();
+  try { await Promise.all(managers.splice(0).map(manager => manager.close())); }
+  finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
   // Private roots remain for the environment owner; no local cleanup deletes.
 });
 
 describe("authenticated manager terminal results", () => {
-  it("isolates presence metadata from a hard-linked byte-evicted result and all result-bearing readers (#17018)", async () => {
+  it("isolates presence metadata from a tampered hard-linked byte-evicted result and all result-bearing readers (#17018)", async () => {
     const { manager, result, healthy } = await hardLinkedEvictedResult();
     const forbidden = () => { throw new Error("presence entered a result-bearing reader"); };
     vi.spyOn(manager, "status").mockImplementation(forbidden);
@@ -345,8 +373,10 @@ describe("authenticated manager terminal results", () => {
     expect(before).toEqual([expect.objectContaining({ id: handle.id, status: "finishing", startedAt: sealed.startedAt,
       updatedAt: sealed.updatedAt, finalAnswerReceipt: sealed.finalAnswerReceipt })]);
     expect(before[0]?.finishedAt).toBeUndefined();
-    fs.linkSync(file, path.join(runRoot, "finishing-hold.json"));
+    const hold = path.join(runRoot, "finishing-hold.json");
+    fs.linkSync(file, hold);
     expect(fs.statSync(file).nlink).toBe(2);
+    tamperResultText(hold); // A legitimate hold link alone is no longer an integrity failure (#17990).
     opened.mockClear();
     expect(manager.listForPresence()).toEqual(before);
     expect(opened).not.toHaveBeenCalled();
@@ -364,7 +394,7 @@ describe("authenticated manager terminal results", () => {
     expect(manager.listForPresence()[0]).toMatchObject({ status: "failed", startedAt: sealed.startedAt, finishedAt: terminal.finishedAt });
   });
 
-  it("keeps a hard-linked byte-evicted result visible as a per-task UI integrity error, not a fabricated result (#17018)", async () => {
+  it("keeps a tampered hard-linked byte-evicted result visible as a per-task UI integrity error, not a fabricated result (#17018)", async () => {
     const { manager, result, healthy } = await hardLinkedEvictedResult();
     let records: ReturnType<AgentManager["listForUi"]> | undefined, failure: unknown;
     try { records = manager.listForUi(); } catch (error) { failure = error; }
@@ -394,7 +424,7 @@ describe("authenticated manager terminal results", () => {
     expect(await manager.wait(healthy.id)).toMatchObject(healthy);
   });
 
-  it("keeps local actor ask progress and its terminal preview alive beside an unrelated real hard-linked result (#17018 P2-2)", async () => {
+  it("keeps local actor ask progress and its terminal preview alive beside an unrelated tampered hard-linked result (#17018 P2-2)", async () => {
     const { manager, result: damaged } = await hardLinkedEvictedResult();
     let alive = true, release!: () => void;
     const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
@@ -447,6 +477,43 @@ describe("authenticated manager terminal results", () => {
     expect(manager.status(result.id)).toMatchObject(result);
     expect(await manager.wait(result.id)).toMatchObject(result);
     expect(await manager.stop(result.id)).toMatchObject(result);
+  });
+
+  it("reads the unchanged manager-published answer through status AND wait after a hard-link changes nlink/ctime (#17990)", async () => {
+    vi.mocked(ProcessTransport.prototype.launch).mockImplementation(request => fakeManagerHeapWorker(request, 32_000));
+    const runRoot = root(), manager = createManager(runRoot);
+    const result = await manager.run({ task: "preserved terminal answer", transport: "process", extensions: false });
+    expect(result.status).toBe("completed");
+    expect(result.text).toHaveLength(32_000);
+    const file = path.join(runRoot, result.id, "manager-result.json");
+    const published = fs.statSync(file), bytes = fs.readFileSync(file);
+    fs.linkSync(file, file + ".trace-hold"); // cp -al's relevant filesystem effect; never unlink the hold.
+    const linked = fs.statSync(file);
+    expect(linked.nlink).toBe(2);
+    expect(linked.ctimeMs).toBeGreaterThan(published.ctimeMs);
+    expect(linked).toMatchObject({ dev: published.dev, ino: published.ino, size: published.size,
+      mtimeMs: published.mtimeMs, mode: published.mode, uid: published.uid });
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    // Capture both public observations before the RED assertion. Neither a UI
+    // preview nor worker status may replace the full authenticated answer.
+    let status: unknown;
+    try { status = manager.status(result.id); }
+    catch (error) { status = (error as { code?: string }).code; }
+    const wait = await manager.wait(result.id).then(value => value, error => error.code);
+    expect({ status, wait }).toMatchObject({ status: result, wait: result });
+  });
+
+  it("rejects unchanged hard-linked manager results when PI_FABRIC_STRICT_RESULT_AUTH=1 (#17990)", async () => {
+    vi.stubEnv("PI_FABRIC_STRICT_RESULT_AUTH", "1");
+    const runRoot = root(), manager = createManager(runRoot);
+    const result = await manager.run({ task: "strict result authentication", transport: "process", extensions: false });
+    expect(manager.status(result.id)).toMatchObject(result);
+    expect(await manager.wait(result.id)).toMatchObject(result);
+    const file = path.join(runRoot, result.id, "manager-result.json"), bytes = fs.readFileSync(file);
+    fs.linkSync(file, file + ".trace-hold");
+    expect(fs.statSync(file).nlink).toBe(2);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    await refuses(manager, result.id);
   });
 
   it("never adopts same-ID worker outcome fields after UI eviction and recorded close collection", async () => {
@@ -752,24 +819,75 @@ describe("authenticated manager terminal results", () => {
     const runRoot = root(), manager = createManager(runRoot);
     const result = await manager.run({ task: "same bytes", transport: "process", extensions: false });
     const file = path.join(runRoot, result.id, "manager-result.json");
-    const bytes = fs.readFileSync(file);
+    const original = fs.statSync(file), bytes = fs.readFileSync(file);
     fs.renameSync(file, file + ".preserved");
     fs.writeFileSync(file, bytes, { mode: 0o600 });
+    expect(fs.statSync(file).ino).not.toBe(original.ino);
+    expect(fs.readFileSync(file)).toEqual(bytes);
     await refuses(manager, result.id);
   });
 
-  it("refuses in-place same-size mutation even with restored mtime", async () => {
+  it.each([false, true])("refuses same-inode changed answer bytes with replayed metadata (hard-linked: %s, #17990)", async hardLinked => {
+    vi.mocked(ProcessTransport.prototype.launch).mockImplementation(request => fakeManagerHeapWorker(request, 64));
     const runRoot = root(), manager = createManager(runRoot);
     const result = await manager.run({ task: "same-size", transport: "process", extensions: false });
-    const file = path.join(runRoot, result.id, "manager-result.json");
-    const original = fs.readFileSync(file, "utf8");
-    const changed = original.replace("same-size", "same-forg");
-    expect(changed).not.toBe(original);
-    expect(Buffer.byteLength(changed)).toBe(Buffer.byteLength(original));
-    const stat = fs.statSync(file);
-    fs.writeFileSync(file, changed, { mode: 0o600 });
-    fs.utimesSync(file, stat.atime, stat.mtime);
+    const file = path.join(runRoot, result.id, "manager-result.json"), published = fs.statSync(file);
+    if (hardLinked) fs.linkSync(file, file + ".trace-hold");
+    const beforeTampering = fs.statSync(file);
+    tamperResultText(file);
+    fs.utimesSync(file, published.atime, published.mtime);
+    expect(fs.statSync(file)).toMatchObject({ dev: published.dev, ino: published.ino, size: published.size });
+    // Restoring times alone can leave rounding/ctime differences. Replay every
+    // pre-tampering stat field, including the hold's legitimate nlink/ctime when
+    // present, so only the publication digest can reject the changed bytes.
+    await withResultStats(file, () => beforeTampering, () => refuses(manager, result.id));
+  });
+
+  it.skipIf(process.platform === "win32")("refuses broadened result permissions even with unchanged hard-linked bytes (#17990)", async () => {
+    const runRoot = root(), manager = createManager(runRoot);
+    const result = await manager.run({ task: "private mode", transport: "process", extensions: false });
+    const file = path.join(runRoot, result.id, "manager-result.json"), bytes = fs.readFileSync(file);
+    fs.linkSync(file, file + ".trace-hold");
+    fs.chmodSync(file, 0o644);
+    expect(fs.statSync(file).mode & 0o777).toBe(0o644);
+    expect(fs.readFileSync(file)).toEqual(bytes);
     await refuses(manager, result.id);
+  });
+
+  it.skipIf(!process.getuid)("refuses a foreign owner reported consistently by path and descriptor (#17990)", async () => {
+    const runRoot = root(), manager = createManager(runRoot);
+    const result = await manager.run({ task: "private owner", transport: "process", extensions: false });
+    const file = path.join(runRoot, result.id, "manager-result.json");
+    // No privileged chown: both observations model the same foreign-owned inode.
+    await withResultStats(file, stat => Object.assign(stat, { uid: stat.uid + 1 }), () => refuses(manager, result.id));
+  });
+
+  it.each(["status", "wait"] as const)("refuses an identical-byte inode replacement during %s's descriptor read (#17990)", async reader => {
+    const runRoot = root(), manager = createManager(runRoot);
+    const result = await manager.run({ task: "read race", transport: "process", extensions: false });
+    const file = path.join(runRoot, result.id, "manager-result.json");
+    const published = fs.statSync(file), bytes = fs.readFileSync(file), read = fs.readSync, fstat = fs.fstatSync;
+    let replaced = false;
+    const reads = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, ...args: unknown[]) => {
+      const count = Reflect.apply(read, fs, [fd, ...args]) as number;
+      const stat = fstat(fd);
+      if (!replaced && count > 0 && stat.dev === published.dev && stat.ino === published.ino) {
+        replaced = true;
+        // The descriptor returns genuine, digest-matching bytes, but the public
+        // path switches to a foreign inode before the reader's final stat.
+        fs.renameSync(file, file + ".preserved");
+        fs.writeFileSync(file, bytes, { mode: 0o600 });
+      }
+      return count;
+    }) as typeof fs.readSync);
+    let failure: unknown;
+    try { if (reader === "status") manager.status(result.id); else await manager.wait(result.id); }
+    catch (error) { failure = error; }
+    finally { reads.mockRestore(); }
+    expect(replaced).toBe(true);
+    expect(failure).toMatchObject({ code: "FABRIC_MISSING_RESULT" });
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(fs.statSync(file).ino).not.toBe(published.ino);
   });
 
   it.skipIf(process.platform === "win32")("refuses a manager-result symlink while preserving the genuine target", async () => {

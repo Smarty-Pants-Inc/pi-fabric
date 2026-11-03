@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { archiveFileName, MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
+import { RecoveryReader } from "../src/mesh/recovery-reader.js";
 import { MeshSnapshotRetriesExhaustedError } from "../src/core/atomic-write.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -81,11 +82,11 @@ const segment = (dir: string, day: string, topic: string, events: MeshEvent[]) =
   fs.writeFileSync(file, events.map(value => JSON.stringify(value) + "\n").join(""));
   return file;
 };
-const makeFixture = (bridgeStamps = false) => {
+const makeFixture = (bridgeStamps = false, dayCount = 16) => {
   const f = setup();
   const events: MeshEvent[] = [];
   const files: string[] = [];
-  for (let day = 0; day < 16; day++) {
+  for (let day = 0; day < dayCount; day++) {
     const grouped = new Map<string, MeshEvent[]>();
     for (let index = 0; index < 256; index++) {
       const sequence = day * 256 + index + 1;
@@ -98,7 +99,8 @@ const makeFixture = (bridgeStamps = false) => {
       const group = grouped.get(topic) ?? [];
       group.push(value); grouped.set(topic, group);
     }
-    for (const [topic, group] of grouped) files.push(segment(f.dir, `2026/01/${String(day + 1).padStart(2, "0")}`, topic, group));
+    const archiveDay = new Date(Date.UTC(2026, 0, day + 1)).toISOString().slice(0, 10).replaceAll("-", "/");
+    for (const [topic, group] of grouped) files.push(segment(f.dir, archiveDay, topic, group));
   }
   return { ...f, events, files, through: events.at(-1)!.sequence };
 };
@@ -808,8 +810,8 @@ describe("lossless archived-history catch-up", () => {
   });
 });
 
-const archivedStore = (bridgeStamps = false) => {
-  const f = makeFixture(bridgeStamps);
+const archivedStore = (bridgeStamps = false, dayCount = 16) => {
+  const f = makeFixture(bridgeStamps, dayCount);
   fs.writeFileSync(path.join(f.root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: f.dir }));
   fs.writeFileSync(path.join(f.dir, "MESH.json"), JSON.stringify({ version: 1, firstSequence: 1, meshRoot: f.root }));
   // A compacted real live log: the old cursor must route through archived history.
@@ -920,22 +922,67 @@ describe("real MeshStore → StoreBridgeSide archived catch-up", () => {
     expect(await store.nextEventAfterAsync(0)).toEqual(expected[0]);
   });
 
-  it("startup bridgedIds scans all archived pages asynchronously and returns exact origin/via ids", async () => {
-    const f = archivedStore(true);
-    const expected = legacyReadAfter(f.dir, 0, f.through, all, 5000).flatMap(value => {
+  it("startup bridgedIds pages archived history through the recovery reader and preserves exact origin/via ids", async () => {
+    // More than one recovery page: each page must retain the original id selected by via-or-origin.
+    const f = archivedStore(true, 50);
+    const projectIds = (events: MeshEvent[]) => events.flatMap(value => {
       const stamp = (value.data as { bridge: { from: string; via?: string; id: string } }).bridge;
       return (stamp.via ?? stamp.from) === "hub" ? [stamp.id] : [];
     });
+    const expected = projectIds(legacyReadAfter(f.dir, 0, f.through, all, f.events.length));
     const asyncReads = vi.spyOn(f.store, "readAsync");
+    const readerFactories = vi.spyOn(f.store, "createRecoveryReader");
+    const recoveryPages = vi.spyOn(RecoveryReader.prototype, "read");
     vi.spyOn(f.store, "read").mockImplementation(() => { throw new Error("bridgedIds used synchronous store.read"); });
     vi.spyOn(MeshArchive.prototype, "readAfter").mockImplementation(() => { throw new Error("bridgedIds used synchronous archive scan"); });
-    let completed = false;
-    const pending = f.side.bridgedIds(0).then(page => { completed = true; return page; });
-    await new Promise<void>(resolve => setImmediate(resolve));
-    expect(completed).toBe(false);
-    const actual = await pending;
-    expect(actual).toEqual({ ids: expected, through: f.through, done: true });
-    expect(asyncReads.mock.calls.length).toBeGreaterThan(1);
+
+    const found: string[] = [];
+    const cursors: number[] = [];
+    const costs: NonNullable<StoreBridgeSide["recoveryReadCost"]>[] = [];
+    let after = 0;
+    let done = false;
+    for (let pageNo = 0; !done && pageNo < 10; pageNo++) {
+      const cursor = after;
+      cursors.push(cursor);
+      let completed = false;
+      let yielded = false;
+      const heartbeat = new Promise<void>(resolve => setImmediate(() => { yielded = true; resolve(); }));
+      const pending = f.side.bridgedIds(cursor).then(page => { completed = true; return page; });
+      await heartbeat;
+      expect(yielded).toBe(true);
+      expect(completed).toBe(false); // A Promise wrapper around a synchronous scan would already finish here.
+
+      const page = await pending;
+      const cost = f.side.recoveryReadCost;
+      expect(cost).toBeDefined();
+      expect(page.through).toBeGreaterThan(cursor);
+      expect(page.through).toBeLessThanOrEqual(f.through);
+      expect(page.done).toBe(page.through === f.through);
+      expect(cost!.events).toBe(page.through - cursor);
+      expect(cost!.events).toBeLessThanOrEqual(10_000);
+      expect(cost!.archiveReadCalls).toBeGreaterThan(0);
+      expect(cost!.archiveReadBytes).toBeGreaterThan(0);
+      expect(cost!.sourceValidationCalls).toBeGreaterThan(0);
+      expect(page.ids).toEqual(projectIds(legacyReadAfter(f.dir, cursor, page.through, all, f.events.length)));
+      found.push(...page.ids);
+      costs.push(cost!);
+      after = page.through;
+      done = page.done;
+    }
+
+    expect(done).toBe(true);
+    expect(cursors).toEqual([0, 10_000]);
+    expect(after).toBe(f.through);
+    expect(found).toEqual(expected);
+    expect(new Set(found).size).toBe(found.length);
+    expect(found).toContain("original-4"); // selected by exact origin when via is absent
+    expect(found).toContain("original-5"); // selected by exact via when origin is another peer
+    expect(costs.reduce((total, cost) => total + cost.events, 0)).toBe(f.events.length);
+    // Heads retained across page boundaries were parsed on the preceding call.
+    expect(costs.reduce((total, cost) => total + cost.archiveParseAttempts, 0)).toBe(f.events.length);
+    expect(readerFactories).toHaveBeenCalledTimes(1);
+    expect(recoveryPages.mock.calls.map(([cursor]) => cursor)).toEqual(cursors);
+    expect(asyncReads).not.toHaveBeenCalled(); // Recovery uses createRecoveryReader, not readAsync.
     expect(await f.side.bridgedIds(f.through)).toEqual({ ids: [], through: f.through, done: true });
   });
 

@@ -24,6 +24,7 @@ import { MeshLockQueueExpiredError, withInitialMeshLockAdmission, type InitialMe
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm, type BridgeDrainPhase } from "./bridge-delivery-age.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
+import { RecoveryReadError, type RecoveryReader, type RecoveryReadCost } from "./recovery-reader.js";
 import { BridgeLegacyBaselineAlarmEpisode, supportsLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./bridge-baseline-alarms.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
@@ -913,6 +914,9 @@ export class StoreBridgeSide implements BridgeSide {
   #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
   readonly #reportedUnreadable = new Set<string>();
+  #recoveryReader: RecoveryReader | undefined;
+  /** Visible-position costs and actual native work for the last attempted recovery page, including failure. */
+  recoveryReadCost: RecoveryReadCost | undefined;
 
   constructor(
     readonly store: MeshStore,
@@ -2602,27 +2606,34 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
-    // At the saved mark there is usually no recovery work. Do not seed sequence hints
-    // by scanning a large log just to discover that its committed head is already covered.
-    if (after >= (await this.latestCursor()).through) return { ids: [], through: after, done: true };
-    const ids: string[] = [];
-    let cursor = after;
-    while (true) {
-      const page = await this.store.readAsync({ after: cursor, limit: this.store.maxReadEvents });
-      for (const event of page) {
+    this.recoveryReadCost = undefined;
+    this.#ingressAbort.signal.throwIfAborted();
+    if (!this.#recoveryReader) {
+      const prefix = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:`;
+      this.#recoveryReader = this.store.createRecoveryReader(event => {
         const stamp = bridgeStampOf(event);
-        if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);
+        if ((stamp?.via ?? stamp?.from) === this.peer) return stamp!.id;
         else if (isRelayReceipt(event)) {
-          const prefix = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:`;
           const key = event.id.startsWith(prefix) ? event.id : event.dedupeKey;
           if (key?.startsWith(prefix)) {
-            try { ids.push(decodeURIComponent(key.slice(prefix.length))); } catch { /* malformed receipt grants no recovery */ }
+            try { return decodeURIComponent(key.slice(prefix.length)); } catch { /* malformed receipt grants no recovery */ }
           }
         }
+        return undefined;
+      }, this.#ingressAbort.signal);
+    }
+    try {
+      const page = await this.#recoveryReader.read(after);
+      // Retain completed work even if fencing wins this post-await publication boundary.
+      this.recoveryReadCost = page.cost;
+      this.#ingressAbort.signal.throwIfAborted();
+      return { ids: page.ids, through: page.through, done: page.done };
+    } catch (error) {
+      if (error instanceof RecoveryReadError) {
+        this.recoveryReadCost = error.cost;
+        throw error.cause; // Preserve the public error/abort reason, not the internal envelope.
       }
-      if (page.length < this.store.maxReadEvents) return { ids, through: page.at(-1)?.sequence ?? cursor, done: true };
-      cursor = page.at(-1)!.sequence;
-      if (ids.length >= BRIDGED_IDS_PAGE) return { ids, through: cursor, done: false };
+      throw error;
     }
   }
 
@@ -3913,17 +3924,30 @@ export class MeshBridge {
         unaddressed.safety > 0 ? `; safety wakes advancing retained boundaries ${unaddressed.safety}` : ""})`);
   }
 
-  async #reconcileSeen(): Promise<void> {
+  async #reconcileSeen(budgetMs = this.options.startDeadlineMs ?? BRIDGE_START_DEADLINE_MS): Promise<void> {
     const cursor = this.#cursor!; // start() initialized it, or run() already observed readiness.
-    const [toRemote, toLocal] = await Promise.all([
-      allBridgedIds(this.options.remote, cursor.toRemote.mark),
-      allBridgedIds(this.options.local, cursor.toLocal.mark),
-    ]);
-    this.#seen = { toRemote, toLocal };
+    const started = monotonicClock.now();
+    let failed = false;
+    let recoveryWorkStarted = false;
+    const check = (recoveryWork = false): void => {
+      if (this.#stopped || failed) throw new Error("Bridge recovery cancelled");
+      if (this.#notificationError) throw this.#notificationError;
+      recoveryWorkStarted ||= recoveryWork;
+      // Head-only reconciliation still observes cancellation, but spends no recovery budget.
+      if (recoveryWork && monotonicClock.now() - started >= budgetMs) throw new Error(`Bridge recovery exceeded ${budgetMs} ms startup budget`);
+    };
+    try {
+      const [toRemote, toLocal] = await Promise.all([
+        allBridgedIds(this.options.remote, cursor.toRemote.mark, check, line => this.#log(`recovery (toRemote): ${line}`)),
+        allBridgedIds(this.options.local, cursor.toLocal.mark, check, line => this.#log(`recovery (toLocal): ${line}`)),
+      ]);
+      check(recoveryWorkStarted);
+      this.#seen = { toRemote, toLocal };
+    } finally { failed = true; }
   }
 
   /** Restore event recovery and reconcile live participants on every (re)connect. */
-  async start(): Promise<void> {
+  async start(recoveryBudgetMs = this.options.startDeadlineMs ?? BRIDGE_START_DEADLINE_MS): Promise<void> {
     if (this.#stopped) throw relayUnavailable();
     this.#ready = false;
     this.#unaddressedRefreshMs = parseBridgeUnaddressedRefreshMs(process.env.FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS);
@@ -3957,7 +3981,7 @@ export class MeshBridge {
       };
       this.#save();
     }
-    await this.#reconcileSeen();
+    await this.#reconcileSeen(recoveryBudgetMs);
     // Read CURRENT natives (including participants/ files), never a saved projection set.
     // Reconcile against the destination under its lock: unchanged digests skip state writes,
     // but lost records must be recreated and missing sources must not have their lease renewed.
@@ -3985,12 +4009,16 @@ export class MeshBridge {
     let retryMs = LOCK_RETRY_MIN_MS;
     let walCapDelay: number | undefined;
     const startedAt = this.#now();
+    const recoveryBudgetMs = Math.max(0, Math.min(deadlineMs, this.options.startDeadlineMs ?? BRIDGE_START_DEADLINE_MS));
     let attempts = 0;
     let loggedAt: number | undefined;
     let loggedKind: string | undefined;
     for (;;) {
       attempts += 1;
-      try { return await this.start(); }
+      // Keep a finite per-attempt recovery budget, capped by the caller's start bound (the CLI
+      // passes its remaining watchdog time here). Shrinking it to zero on the final attempt
+      // would replace the actual busy refusal, or prevent that attempt from succeeding.
+      try { return await this.start(recoveryBudgetMs); }
       catch (error) {
         if (this.#stopped || !isBridgeRetryable(error)) throw error;
         const now = this.#now();
@@ -5556,15 +5584,59 @@ export class MeshBridge {
   }
 }
 
-const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<string>> => {
+const allBridgedIds = async (side: BridgeSide, after: number, check: (recoveryWork?: boolean) => void, log: (line: string) => void): Promise<Set<string>> => {
   const ids = new Set<string>();
-  let cursor = after;
-  for (;;) {
-    const page = await side.bridgedIds(cursor);
-    if (!page || !Array.isArray(page.ids) || typeof page.through !== "number") throw new Error("Bridge ids page is invalid");
-    for (const id of page.ids) if (typeof id === "string") ids.add(id);
-    if (page.done || page.through <= cursor) return ids;
-    cursor = page.through;
+  let cursor = after, pages = 0, attemptedPages = 0;
+  let totalCost: RecoveryReadCost | undefined;
+  const started = monotonicClock.now();
+  check();
+  const horizon = (await (side.latestCursor?.() ?? side.latestSequence().then(through => ({ through })))).through;
+  check();
+  if (after >= horizon) return ids;
+  let completed = false;
+  try {
+    for (;;) {
+      check(true);
+      let page: BridgedIds;
+      attemptedPages++;
+      try {
+        page = await side.bridgedIds(cursor);
+        pages++;
+      } finally {
+        // Count each attempt once, even when the reader or adapter rejects before a page exists.
+        const cost = side instanceof StoreBridgeSide ? side.recoveryReadCost : undefined;
+        if (cost) {
+          if (!totalCost) totalCost = { ...cost };
+          else for (const key of Object.keys(cost) as Array<keyof RecoveryReadCost>) {
+            totalCost[key] = key === "maxSliceMs" ? Math.max(totalCost[key], cost[key]) : totalCost[key] + cost[key];
+          }
+        }
+      }
+      check(true);
+      if (!page || !Array.isArray(page.ids) || !Number.isSafeInteger(page.through) || page.through < cursor) throw new Error("Bridge ids page is invalid");
+      for (const id of page.ids) if (typeof id === "string") ids.add(id);
+      if (page.done || page.through >= horizon) { completed = true; return ids; }
+      // An incomplete, nonadvancing response must not silently grant an incomplete recovery set.
+      if (page.through <= cursor) throw new Error("Bridge ids page did not advance");
+      cursor = page.through;
+      // Also yield with old agents/adapters whose async methods resolve synchronously.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  } finally {
+    // Preserve the legacy fields/order: inspectedEvents/eventBytes count popped positions,
+    // not eager frontier work. The appended parse/native counters make that distinction explicit.
+    const cost = side instanceof StoreBridgeSide
+      ? `inspectedEvents=${totalCost?.events ?? 0} eventBytes=${totalCost?.eventBytes ?? 0} maxSliceMs=${Math.ceil(totalCost?.maxSliceMs ?? 0)}`
+      : "inspectedEvents=unavailable eventBytes=unavailable maxSliceMs=unavailable";
+    const attemptedCost = side instanceof StoreBridgeSide
+      ? ` attemptedPages=${attemptedPages} poppedEvents=${totalCost?.events ?? 0}` +
+        ` parseAttempts=${(totalCost?.archiveParseAttempts ?? 0) + (totalCost?.liveParseAttempts ?? 0) + (totalCost?.probeParseAttempts ?? 0) + (totalCost?.metadataParseAttempts ?? 0)} ` +
+        (["archiveReadBytes", "archiveReadCalls", "archiveParseAttempts", "liveReadBytes", "liveReadCalls", "liveParseAttempts",
+          "probeReadBytes", "probeReadCalls", "probeParseAttempts", "metadataReadBytes", "metadataReadCalls", "discoveryReadCalls",
+          "generationProbes", "horizonMs", "stages", "skippedRecords", "metadataParseAttempts", "sourceValidationCalls"] as const)
+          .map(key => `${key}=${totalCost?.[key] ?? 0}`).join(" ")
+      : ` attemptedPages=${attemptedPages}`;
+    log(`mark=${after} horizon=${horizon} pages=${pages} ${cost} matchingIds=${ids.size} elapsedMs=${Math.ceil(monotonicClock.now() - started)} completed=${completed} cancelled=${!completed}${attemptedCost}`);
   }
 };
 

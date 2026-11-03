@@ -21,6 +21,7 @@ import type { AgentHandleInfo, AgentRunRequest, FabricRunOutcome } from "../agen
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricScope } from "../protocol.js";
+import type { CleanupCustodyDeferredStatus } from "../agents/worktree-manager.js";
 
 export type ResidentSlotStatus = ReturnType<ReturnType<typeof slotAdmissionFor>["status"]>;
 
@@ -181,6 +182,7 @@ export class ResidentOutcomeUnknownError extends Error {
   readonly claimKey: string | undefined;
   readonly claimVersion: number | undefined;
   readonly requestKey: string | undefined;
+  readonly cleanupStatus?: CleanupCustodyDeferredStatus;
 
   constructor(command: ResidentCommand, decision: ResidentRequestDecision | undefined, cause: unknown, signal?: AbortSignal) {
     const id = decision?.id ?? ("id" in command ? command.id : undefined);
@@ -207,6 +209,8 @@ export class ResidentOutcomeUnknownError extends Error {
     this.claimKey = claim?.key;
     this.claimVersion = claim?.ifVersion;
     this.requestKey = requestKey;
+    const cleanupStatus = command.operation === "cleanup" ? residentCleanupErrorFields(cause).cleanupStatus : undefined;
+    if (cleanupStatus) this.cleanupStatus = Object.freeze(cleanupStatus);
     this.residentOutcome = Object.freeze({
       requestId: command.requestId,
       state: decision?.state === "committed" ? "committed" : "unknown",
@@ -214,6 +218,7 @@ export class ResidentOutcomeUnknownError extends Error {
       entityKind: kind,
       ...(id ? { id } : {}),
       ...(decision?.ownerHostId ? { ownerHostId: decision.ownerHostId } : {}),
+      ...(cleanupStatus ? { cleanupStatus } : {}),
     });
     recordResidentOutcome(signal, this.residentOutcome);
   }
@@ -787,6 +792,22 @@ export const residentSlotResponseError = (response: ResidentCommandResponse, sig
   return error;
 };
 
+/** Only the native custody-deferred payload crosses the authenticated exchange.
+ * Copy scalars into a new object; never serialize an arbitrary Error/cause graph. */
+export const residentCleanupErrorFields = (error: unknown): Pick<ResidentCommandResponse, "errorCode" | "cleanupStatus"> => {
+  if (!error || typeof error !== "object" || !("code" in error) || error.code !== "CLEANUP_CUSTODY_DEFERRED" || !("cleanupStatus" in error)) return {};
+  const status = error.cleanupStatus as Partial<CleanupCustodyDeferredStatus> | undefined;
+  if (!status || (status.state !== "held-in-place" && status.state !== "copy-failed") || status.originalRetained !== true ||
+      typeof status.source !== "string" || !path.isAbsolute(status.source) ||
+      typeof status.receipt !== "string" || !path.isAbsolute(status.receipt) ||
+      typeof status.destination !== "string" || !path.isAbsolute(status.destination) ||
+      (status.verifiedCopyPath !== undefined && (status.state !== "held-in-place" || typeof status.verifiedCopyPath !== "string" || !path.isAbsolute(status.verifiedCopyPath)))) return {};
+  return { errorCode: "CLEANUP_CUSTODY_DEFERRED", cleanupStatus: {
+    state: status.state, source: status.source, receipt: status.receipt, destination: status.destination, originalRetained: true,
+    ...(status.verifiedCopyPath ? { verifiedCopyPath: status.verifiedCopyPath } : {}),
+  } };
+};
+
 export interface ResidentCommandResponse {
   format: typeof RESIDENT_HOST_FORMAT;
   requestId: string;
@@ -800,10 +821,12 @@ export interface ResidentCommandResponse {
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;
+  /** Failed cleanup retained its original in place; never a cleaned result. */
+  cleanupStatus?: CleanupCustodyDeferredStatus;
   /** requeueArchived (smarty-dev#16416). */
   requeued?: import("../actors/types.js").FabricActorRequeueResult;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED" | "FABRIC_ACTOR_QUEUED_WORK" | ResidentSlotErrorCode;
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED" | "FABRIC_ACTOR_QUEUED_WORK" | "CLEANUP_CUSTODY_DEFERRED" | ResidentSlotErrorCode;
   /** Allowlisted FabricActorQueuedWorkError payload (smarty-dev#16416). */
   queuedWork?: { operation: "stop" | "setActivationFilter" | "remove"; actorId: string; counts: Record<string, number> };
   /** Narrow native slot error payload; no arbitrary Error properties cross the wire. */

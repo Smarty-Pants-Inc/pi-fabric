@@ -22,6 +22,8 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
 import { BUILT_IN_RUNNER_IDS, requireAgentRunner, requireActorRunner } from "../agents/runner-registry.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
+import { retainCleanupRoot, type CleanupRootCustody } from "../agents/worktree-manager.js";
+import { ownedShortTmpdir, recordedShortTmpdir } from "../agents/short-tmpdir.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
@@ -59,6 +61,7 @@ import {
   residentRequestExpiredOutcome,
   residentCreateMayBeProtected,
   residentSlotResponseError,
+  residentCleanupErrorFields,
   ResidentSlotError,
   type ResidentSlotStatus,
   commitResidentRequest,
@@ -137,6 +140,9 @@ const readJson = <T>(filePath: string): T | undefined => {
     return undefined;
   }
 };
+
+// Internal response provenance; message text alone must not authorize fallback.
+class ResidentCleanupUnknownAgentError extends Error {}
 
 const terminal = (status: string): status is AgentRunResult["status"] =>
   status === "completed" || status === "failed" || status === "stopped" || status === "timed_out";
@@ -251,6 +257,17 @@ export class ResidencyClient {
   #generationRecorded = false;
   readonly #releaseAbort = new AbortController();
   readonly #releaseOwners = new Set<string>();
+  // A committed rename ends ownership of that source pathname, even when a
+  // later move/receipt fails. Keep the original TMPDIR binding before moving run.
+  // Retain only a route admitted from canonical metadata before dispatch. A
+  // partial host cleanup may move that metadata; neither its replacement nor a
+  // new owner generation can acquire the original retry through this client.
+  readonly #cleanupRoutes = new Map<string, { metadata: ResidentAgentMetadata; owner: ResidentHostOwner }>();
+  readonly #terminalCleanup = new Map<string, {
+    temporary?: { directory: string; dev: number; ino: number };
+    completed: Set<string>;
+    custody: CleanupRootCustody[];
+  }>();
 
   constructor(readonly options: ResidencyClientOptions) {
     this.hostId = residentHostId(options.config.rootId);
@@ -713,7 +730,7 @@ export class ResidencyClient {
 
   /** Operational ownership excludes recovered/journal-only ordinary runs. */
   ownsAgent(id: string): boolean {
-    return AGENT_ID_PATTERN.test(id) && fs.existsSync(this.#metadataPath(id));
+    return AGENT_ID_PATTERN.test(id) && (this.#cleanupRoutes.has(id) || fs.existsSync(this.#metadataPath(id)));
   }
 
   statusAgent(id: string): AgentRunRecord | AgentHandleInfo | CompletionSummary {
@@ -849,9 +866,16 @@ export class ResidencyClient {
 
   async cleanupAgent(id: string, deleteBranch = false, signal?: AbortSignal): Promise<{ cleaned: boolean }> {
     throwIfAborted(signal);
-    const metadata = this.#metadata(id);
+    const prior = this.#cleanupRoutes.get(id);
+    const metadata = prior?.metadata ?? this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
-    if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
+    const owner = this.#liveOwner();
+    if (prior && (!owner || owner.token !== prior.owner.token || owner.pid !== prior.owner.pid ||
+        owner.processStartTime !== prior.owner.processStartTime)) {
+      throw new Error(`Resident cleanup owner generation changed for ${id}; original retry remains pending. Do not retry or reassign to a replacement host.`);
+    }
+    if (!owner) return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
+    const route = prior ?? { metadata: structuredClone(metadata), owner: structuredClone(owner) };
     let response: ResidentCommandResponse;
     try {
       response = await this.#command({
@@ -862,15 +886,24 @@ export class ResidencyClient {
         id,
         deleteBranch,
         createdAt: Date.now(),
-      }, signal);
+      }, signal, () => this.#cleanupRoutes.set(id, route), route.owner);
     } catch (error) {
-      if (!(error instanceof ResidentOutcomeUnknownError) && error instanceof Error && /Unknown Fabric agent/.test(error.message)) {
-        return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
+      if (!prior && error instanceof ResidentCleanupUnknownAgentError) {
+        try {
+          return await this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
+        } catch (fallbackError) {
+          // A pre-commit tree veto must not pin a rejected host request forever.
+          // Partial/uncertain offline custody still owns the original route.
+          if (!(fallbackError instanceof ResidentOutcomeUnknownError) && !this.#terminalCleanup.has(id) &&
+              this.#cleanupRoutes.get(id) === route) this.#cleanupRoutes.delete(id);
+          throw fallbackError;
+        }
       }
       throw error;
     }
     if (!response.ok) throw new Error(response.error ?? `Failed to clean durable Fabric agent ${id}`);
     this.#completions.forget(id);
+    this.#cleanupRoutes.delete(id);
     this.options.onResultConsumed?.(id);
     return { cleaned: true };
   }
@@ -897,6 +930,15 @@ export class ResidencyClient {
     }
     const command: ResidentCommand = { format: RESIDENT_EXPIRING_COMMAND_FORMAT, operation: "cleanup", requestId: newResidentRequestId(),
       rootId: this.options.config.rootId, id: metadata.id, deleteBranch, createdAt: Date.now() };
+    const prior = this.#terminalCleanup.get(metadata.id);
+    const temporaryDirectory = prior ? undefined : recordedShortTmpdir(metadata.runDirectory, metadata.id);
+    const temporaryStat = temporaryDirectory ? ownedShortTmpdir(temporaryDirectory) : undefined;
+    const cleanup = prior ?? {
+      ...(temporaryDirectory && temporaryStat ? { temporary: { directory: temporaryDirectory, dev: temporaryStat.dev, ino: temporaryStat.ino } } : {}),
+      completed: new Set<string>(), custody: [] as CleanupRootCustody[],
+    };
+    const custody = cleanup.custody;
+    const deferred: string[] = [];
     let commitAttempted = false;
     const commit = (): void => {
       throwIfAborted(signal);
@@ -905,49 +947,78 @@ export class ResidencyClient {
       commitResidentRequest(this.options.config.residencyRoot, command, metadata.id, this.hostId);
     };
     try {
-      if (metadata.handle.worktree) {
-        const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
-        const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
-        commit();
-        await executeFile(
-          "git",
-          ["worktree", "remove", "--force", worktree],
-          { cwd: gitRoot, timeoutMs: 60_000 },
-        );
-        if (deleteBranch && metadata.handle.branch) {
-          throwIfAborted(signal);
-          await executeFile(
-            "git",
-            ["branch", "-D", metadata.handle.branch],
-            { cwd: gitRoot, timeoutMs: 30_000 },
-          );
-        }
-      } else if (deleteBranch) {
+      const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
+      const worktree = metadata.handle.worktree ? await registeredWorktree(gitRoot, metadata.handle.worktree) : undefined;
+      if (!worktree && deleteBranch) {
         throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
-      } else {
-        commit();
       }
+      if (worktree) {
+        deferred.push(`Git worktree registration cleanup deferred: ${JSON.stringify(gitRoot)} still registers ${JSON.stringify(worktree)}; no remove or prune was attempted.`);
+        if (deleteBranch && metadata.handle.branch) deferred.push(`Git branch deletion deferred: ${metadata.handle.branch} was not deleted.`);
+      }
+      // The helper durably receipts and renames whole roots, including files.
+      // Commit before its first effect; EXDEV is visible, never copy-and-delete.
+      // Keep prior held roots on every partial failure, without rollback over a
+      // replacement at a canonical source path. Git registration remains debt.
+      commit();
+      this.#terminalCleanup.set(metadata.id, cleanup);
+      const archive = `${this.options.config.residencyRoot}.trace-archive`;
+      const retain = (source: string, kind: string): void => {
+        throwIfAborted(signal);
+        if (cleanup.completed.has(source)) return;
+        try {
+          const move = retainCleanupRoot(source, archive, metadata.id, `durable agent cleanup whole-root custody: ${kind}`);
+          if (move) custody.push(move);
+          cleanup.completed.add(source); // Proven absence is not authority to adopt a later replacement.
+        } catch (error) {
+          const moved = error instanceof Error && "retainedRoot" in error ? error.retainedRoot as CleanupRootCustody | undefined : undefined;
+          if (moved?.source === source) { custody.push(moved); cleanup.completed.add(source); }
+          throw error;
+        }
+      };
+      if (runDirectoryPresent || (prior && !cleanup.completed.has(metadata.runDirectory))) retain(metadata.runDirectory, "run");
+      if (cleanup.temporary && !cleanup.completed.has(cleanup.temporary.directory)) {
+        const current = ownedShortTmpdir(cleanup.temporary.directory);
+        if (current && (current.dev !== cleanup.temporary.dev || current.ino !== cleanup.temporary.ino)) {
+          throw new Error(`Recorded private TMPDIR changed identity: ${cleanup.temporary.directory}`);
+        }
+        if (current) retain(cleanup.temporary.directory, "private TMPDIR");
+        else cleanup.completed.add(cleanup.temporary.directory);
+      }
+      if (worktree) retain(worktree, "worktree");
+      retain(this.#metadataPath(metadata.id), "agent metadata");
+      retain(residentResultPath(this.options.config.residencyRoot, metadata.id), "resident result");
+      if (deferred.length) diagnostics.warn("src/residency/client.ts", `[pi-fabric] resident cleanup ${metadata.id}: ${deferred.join(" ")}`);
+      // Consumption is last, including cancellation that arrived during the
+      // final move. A failed/cancelled move never acknowledges partial cleanup.
       throwIfAborted(signal);
-      if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
-      fs.rmSync(this.#metadataPath(metadata.id), { force: true });
-      fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.#completions.forget(metadata.id);
+      this.#cleanupRoutes.delete(metadata.id);
       this.options.onResultConsumed?.(metadata.id);
       acknowledgeResidentResponse(this.options.config.residencyRoot, { format: 1, requestId: command.requestId, ok: true, completedAt: Date.now() }, Date.now(), command.format);
       return { cleaned: true };
     } catch (error) {
-      if (!commitAttempted) throw error;
+      const detail = new Error(`Resident cleanup refused for ${metadata.id}: ${error instanceof Error ? error.message : String(error)}. ` +
+        `Custody paths: ${JSON.stringify(custody)}. ${deferred.join(" ")} No root rollback or source-path deletion was attempted.`, { cause: error });
+      const deferredFailure = residentCleanupErrorFields(error);
+      if (deferredFailure.cleanupStatus) Object.assign(detail, { code: deferredFailure.errorCode, cleanupStatus: deferredFailure.cleanupStatus });
+      diagnostics.warn("src/residency/client.ts", `[pi-fabric] ${detail.message}`);
+      if (!commitAttempted) throw detail;
       let decision;
       try { decision = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unknown fence */ }
-      if (decision?.state === "abandoned") throw error;
+      if (decision?.state === "abandoned") throw detail;
       // Partial cleanup or an unreadable fence is not a proved rejection either.
-      throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      throw new ResidentOutcomeUnknownError(command, decision, detail, signal);
     }
   }
 
-  async #command(command: ResidentCommand, signal?: AbortSignal, onDispatched?: () => void): Promise<ResidentCommandResponse> {
+  async #command(command: ResidentCommand, signal?: AbortSignal, onDispatched?: () => void, cleanupOwner?: ResidentHostOwner): Promise<ResidentCommandResponse> {
     const owner = this.#liveOwner();
     if (!owner) throw new Error("Root resident host is not live");
+    if (cleanupOwner && (owner.token !== cleanupOwner.token || owner.pid !== cleanupOwner.pid ||
+        owner.processStartTime !== cleanupOwner.processStartTime)) {
+      throw new Error("Resident cleanup owner generation changed before dispatch; original retry remains pending");
+    }
     assertResidentCommandSupported(owner, command.operation);
     assertResidentDropQueuedSupported(owner, command);
     if (owner.requestFence !== 1) {
@@ -991,7 +1062,19 @@ export class ResidencyClient {
               throw new FabricModelDeniedError(response.modelDenied.model,
                 typeof response.modelDenied.replacement === "string" ? response.modelDenied.replacement : undefined);
             }
-            throw new Error(response.error ?? "Fabric resident host rejected request");
+            const cleanupFailure = command.operation === "cleanup"
+              ? residentCleanupErrorFields({ code: response.errorCode, cleanupStatus: response.cleanupStatus }) : {};
+            if (cleanupOwner && command.operation === "cleanup" && response.error === `Unknown Fabric agent: ${command.id}` &&
+                response.errorCode === undefined && response.outcome === undefined && response.cleanupStatus === undefined) {
+              const responseOwner = this.#liveOwner();
+              if (responseOwner && responseOwner.token === cleanupOwner.token && responseOwner.pid === cleanupOwner.pid &&
+                  responseOwner.processStartTime === cleanupOwner.processStartTime) {
+                // The catch below must also prove abandonment before this tag escapes.
+                throw new ResidentCleanupUnknownAgentError(response.error);
+              }
+            }
+            throw Object.assign(new Error(response.error ?? "Fabric resident host rejected request"),
+              cleanupFailure.cleanupStatus ? { code: cleanupFailure.errorCode, cleanupStatus: cleanupFailure.cleanupStatus } : {});
           }
           if ((command.operation === "spawnBound" && !response.handle) || (command.operation === "createActor" && !response.actor)) {
             throw new Error("Fabric resident host returned no created entity");
@@ -1002,6 +1085,10 @@ export class ResidencyClient {
         }
         const owner = this.#liveOwner();
         if (!owner) throw new Error("Fabric resident host exited while processing a request");
+        if (cleanupOwner && (owner.token !== cleanupOwner.token || owner.pid !== cleanupOwner.pid ||
+            owner.processStartTime !== cleanupOwner.processStartTime)) {
+          throw new Error("Resident cleanup owner generation changed while processing a request");
+        }
         await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
       }
       const note = this.hostStateNote();
@@ -1023,7 +1110,11 @@ export class ResidencyClient {
         // No proven abandonment: never report a safe-to-retry rejection.
         let known;
         try { known = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unreadable fence */ }
-        throw new ResidentOutcomeUnknownError(command, known, fenceError, signal);
+        // Fence failure must not erase an authenticated custody failure/status.
+        const failure = residentCleanupErrorFields(error).cleanupStatus
+          ? Object.assign(new Error(`${error instanceof Error ? error.message : String(error)}; fence read failed: ${String(fenceError)}`, { cause: error }),
+            { code: "CLEANUP_CUSTODY_DEFERRED", cleanupStatus: residentCleanupErrorFields(error).cleanupStatus }) : fenceError;
+        throw new ResidentOutcomeUnknownError(command, known, failure, signal);
       }
       if (decision.state === "committed" || (dispatched && residentCreateMayBeProtected(command))) {
         throw new ResidentOutcomeUnknownError(command, decision, error, signal);

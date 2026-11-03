@@ -13,7 +13,7 @@ import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
-import type { AgentWorktreeResult } from "./worktree-manager.js";
+import type { AgentWorktreeResult, CleanupCustodyDeferredStatus } from "./worktree-manager.js";
 import type { AgentUndeliveredMessage } from "./terminal-target.js";
 import type { FabricActorActivationIdentity } from "../actors/activation-identity.js";
 
@@ -331,6 +331,8 @@ export interface AgentRunRecord {
    * CONTEXT_OVERFLOW is set only from a structured overflow signal, never free error text. */
   errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW" | "CUSTODY_UNCONFIRMED";
   executionCustody?: { state: "unconfirmed"; descendantsMayRemain: number; reason: string };
+  /** Cleanup deferred: original remains owned; never a cleaned/consumed receipt. */
+  cleanupStatus?: CleanupCustodyDeferredStatus;
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;
@@ -415,6 +417,8 @@ export interface AgentHandleInfo {
   error?: string;
   /** A tiny explicit shortening was ignored to protect real work. */
   timeoutNote?: AgentTimeoutIgnoredNote;
+  /** Cleanup deferred: original remains owned; never a cleaned/consumed receipt. */
+  cleanupStatus?: CleanupCustodyDeferredStatus;
   /** Policy switch/audit diagnostics are present on receipts and final results. */
   warnings?: string[];
   /** Spawn admission: unavailable discovery never blocks launch, but is explicit in the receipt. */

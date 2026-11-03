@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,13 +20,30 @@ vi.mock("../src/agents/worktree-manager.js", async original => {
     return move;
   } };
 });
-const fixtureNamespace = os.tmpdir();
+const custodyMoveFor = (source: string): { source: string; destination: string; receipt: string } | undefined => {
+  const observed = custodyMoves.find(move => move.source === source);
+  if (observed) return observed;
+  // WorktreeManager.cleanup calls retainCleanupRoot through its module-local
+  // binding, which a vi.mock wrapper on the imported export cannot observe.
+  // Resolve only the source's own fixture archive; never walk shared tmpdir.
+  const requestedArchive = `${path.dirname(source)}.trace-archive`;
+  let gitRoot = path.dirname(source);
+  while (gitRoot !== path.dirname(gitRoot) && !fs.existsSync(path.join(gitRoot, ".git"))) gitRoot = path.dirname(gitRoot);
+  if (!fs.existsSync(path.join(gitRoot, ".git"))) return undefined;
+  const key = createHash("sha256").update(requestedArchive).digest("hex").slice(0, 20);
+  const archive = path.join(path.dirname(gitRoot), ".pi-fabric-trace-archive", key);
+  for (const container of fs.readdirSync(archive).map(name => path.join(archive, name))) {
+    const receipt = path.join(container, "custody.json");
+    if (!fs.existsSync(receipt)) continue;
+    const row = JSON.parse(fs.readFileSync(receipt, "utf8"));
+    if (row.source === source) return { source, destination: row.destination, receipt };
+  }
+  return undefined;
+};
 const heldRoot = (source: string): string => {
-  const move = custodyMoves.find(move => move.source === source) ?? fs.readdirSync(fixtureNamespace, { recursive: true }).map(String)
-    .filter(name => path.basename(name) === "custody.json")
-    .map(name => ({ ...JSON.parse(fs.readFileSync(path.join(fixtureNamespace, name), "utf8")), receipt: path.join(fixtureNamespace, name) }))
-    .find(row => row.source === source);
+  const move = custodyMoveFor(source);
   expect(move).toBeDefined();
+  if (!move) throw new Error(`Missing custody receipt for ${source}`);
   const row = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
   expect(row).toMatchObject({ source, destination: expect.any(String), id: path.basename(source), reason: expect.any(String), time: expect.any(Number) });
   expect(JSON.parse(fs.readFileSync(path.join(row.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source, destination: row.destination, id: row.id, state: "prepared" });

@@ -8,7 +8,7 @@ import { meshStateDocumentProblem } from "../mesh/state-file.js";
 import { setWindowsVerifiedRemoval, startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
 import { sweepResidentGenerationRecords } from "../residency/generation-retention.js";
-import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
+import { compactTerminalRunEvents, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { diagnostics } from "../core/diagnostics.js";
 
@@ -570,13 +570,8 @@ const sweep = async (meshRoot: string, options: {
       });
     }
     if (options.runRetentionMs !== undefined) {
-      // Mesh-wide, independent of any owner being alive (smarty-dev#3252, #5652): the owning
-      // manager's own pruneRuns rule (terminal, safe exit-proven tree, not the latest run),
-      // plus every registry's latest, in-flight, preparing and pending-removal runs, re-read when a
-      // registry changes. The final pre-delete check stamp-validates the cached references and re-parses changed registries;
-      // an unreadable or vanished registry is a wildcard veto (pi-fabric#645 review round 1).
-      // Early skips judge only from the first read's ids; the final pre-delete check is referencedNow with this registry
-      // as the candidate's own (smarty-dev#7916, #9058).
+      // Actor run directories contain raw traces and are never pruned by mesh retention.
+      // Keep session-backup archival below: it moves backups into the actor's session archive without deleting them.
       for (const registryRoot of [...registries]) {
         try {
           const rows = new Map<string, Record<string, any>>();
@@ -587,16 +582,6 @@ const sweep = async (meshRoot: string, options: {
             // whole actor directory into its archive (smarty-dev#9058: its runs leave actors/ with it).
             if (!/^[A-Za-z0-9_-]+$/.test(id) || row?.removal !== undefined || !absent(path.join(registryRoot, `removal-${id}.json`)) ||
                 !absent(path.join(registryRoot, `offline-removal-${id}.json`))) continue;
-            const inFlight = typeof row?.inFlightRun?.id === "string" ? row.inFlightRun.id : undefined;
-            pruneActorRunArchives({
-              runsDirectory: path.join(actorRoot, "runs"), retentionMs: options.runRetentionMs, now, dryRun, acceptPidReuse: true,
-              ...(typeof row?.lastRunId === "string" ? { latestRunId: row.lastRunId } : {}),
-              isRetained: (run, final) => gate() || run === inFlight || (final ? referencedNow(run, registryRoot) : early.has(run)),
-              // Sized before the final check; check and delete back to back (review round 4).
-              measure: treeBytes,
-              onRemove: (run, bytes) => { changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }); removedRuns.push(run); },
-              onCompact: change => changes.push(change),
-            });
             // Rotation history of an actor whose writer is joined: the newest backup stays, older ones move into its
             // session-archive/ (smarty-dev#16444: archive, never delete; nothing is freed).
             if (row && row.inFlightRun === undefined && row.preparing === undefined && ["idle", "stopped"].includes(row.status) &&

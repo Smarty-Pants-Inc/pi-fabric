@@ -453,7 +453,8 @@ describe("safe run roots", () => {
       expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true })).toEqual([]);
       expect(sweep(tempRoot)).toEqual({ removedRuns: [], removedRoots: [] });
       expect(canRemoveTerminalRun(run, undefined, true)).toBe(true);
-      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true, acceptPidReuse: true })).toEqual([run]);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true, acceptPidReuse: true })).toEqual([]);
+      expect(fs.existsSync(run)).toBe(true);
       expect(fs.existsSync(writer)).toBe(true);
     } finally { birth.mockRestore(); }
   });
@@ -940,7 +941,8 @@ describe("temporal retention", () => {
     expect(canRemoveTerminalRun(directory, kind === "expired walk" ? () => true : undefined)).toBe(eligible);
     // Even a dead process is vetoed when the walk stops before reaching the journal.
     const dryRun = pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: 100 * DAY, dryRun: true });
-    expect(dryRun).toEqual(kind === "expired walk" || eligible ? [directory] : []);
+    expect(dryRun).toEqual([]);
+    expect(fs.existsSync(directory)).toBe(true);
     expect(fs.readFileSync(path.join(directory, "status.json"), "utf8")).toBe(before);
     expect(fs.readFileSync(path.join(store, "main.jsonl"), "utf8")).toBe("{}\n");
     if (kind === "link" || kind === "hardlink") expect(fs.readFileSync(target, "utf8")).toBe("preserve");
@@ -1050,7 +1052,7 @@ describe("temporal retention", () => {
     } else expect(result.removedRoots).toEqual([runRoot]);
   });
 
-  it("expires actor archives after seven days while preserving the latest run", () => {
+  it("keeps actor archives, including expired runs and the latest run", () => {
     const root = temporaryDirectory();
     const runsDirectory = path.join(root, "runs");
     const expired = path.join(runsDirectory, "expired");
@@ -1067,8 +1069,8 @@ describe("temporal retention", () => {
       now: 8 * DAY + 1,
     });
 
-    expect(removed).toEqual([expired]);
-    expect(fs.existsSync(expired)).toBe(false);
+    expect(removed).toEqual([]);
+    expect(fs.existsSync(expired)).toBe(true);
     expect(fs.existsSync(latest)).toBe(true);
     expect(fs.existsSync(fresh)).toBe(true);
   });

@@ -1090,42 +1090,8 @@ export const pruneActorRunArchives = (options: {
    * not the run's writer. Every other caller keeps the strict live-PID veto. */
   acceptPidReuse?: boolean;
 }): string[] => {
-  const now = options.now ?? Date.now();
-  const removed: string[] = [];
-  if (!ownedStat(options.runsDirectory)?.isDirectory()) return removed;
-  let entries: fs.Dirent[];
-  try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const directory = path.join(options.runsDirectory, entry.name);
-    // Reported refusals carry their size (the CLI's report only; in-process sweeps measure nothing).
-    const refuse = (reason: string) => countRefusal("pruneActorRunArchives", reason, directory, removalTallyOn() ? options.measure?.(directory) ?? 0 : 0);
-    if (entry.name === options.latestRunId || options.isRetained?.(entry.name)) { refuse("latest or referenced run"); continue; }
-    // The judged stat, before the judgment reads anything; the removal requires it unchanged.
-    const judged = ownedStat(directory);
-    const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    if (!record?.status || !TERMINAL_STATUSES.has(record.status)) { refuse(`status is ${record ? String(record.status) : "unreadable"}`); continue; }
-    if (!safeRunTree(directory, false, 0, noDeadline, options.acceptPidReuse === true)) {
-      if (removalTallyOn()) refuse(runTreeRefusal(directory, options.acceptPidReuse === true));
-      continue;
-    }
-    if (now - recordAgeReference(record, judged?.mtimeMs ?? now) < options.retentionMs) {
-      compactTerminalRunEvents(directory, {
-        ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
-        ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
-        now, isRetained: () => !!options.isRetained?.(entry.name),
-        ...(options.dryRun !== undefined ? { dryRun: options.dryRun } : {}),
-        ...(options.onCompact ? { onCompact: options.onCompact } : {}),
-      });
-      continue;
-    }
-    const bytes = options.measure?.(directory) ?? 0;
-    const isRetained = options.isRetained;
-    if (!removeUnreferencedRun(directory, judged, isRetained && (() => isRetained(entry.name, true)), options.dryRun, "pruneActorRunArchives", bytes)) continue;
-    removed.push(directory);
-    options.onRemove?.(directory, bytes);
-  }
-  return removed;
+  // Actor run archives are traces. Retention may archive session backups, but it must never delete runs.
+  return [];
 };
 
 /** The final pre-delete check and the delete, back to back (pi-fabric#645 review round 4), through the one verified

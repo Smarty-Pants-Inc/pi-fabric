@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  claimMeshRetentionSweep, FABRIC_RUN_ROOT_PREFIX, pruneActorRunArchives, pruneActorSessionBackups,
+  claimMeshRetentionSweep, FABRIC_RUN_ROOT_PREFIX, pruneActorSessionBackups,
   removeEmptyRunRoot,
 } from "../src/storage/retention.js";
 import { sweepResidentRuns } from "../src/residency/retention.js";
@@ -11,8 +11,8 @@ import { closeScratch, createScratch, sweepScratch } from "../src/storage/scratc
 import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
 
 // smarty-dev#7916 acceptance: for each actual verified deleter, a swap between judgment and deletion deletes nothing;
-// no getuid deletes nothing; a future-dated backup name never costs the newest backup. Temp-run retention is no longer
-// a deleter: its whole-root path is covered by retention-runroot-swaps.test.ts and retention-dead-owner.test.ts.
+// no getuid deletes nothing; a future-dated backup name never costs the newest backup. Actor run archives are kept
+// outright; temp-run retention's whole-root path is covered by retention-runroot-swaps.test.ts and retention-dead-owner.test.ts.
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const DEAD = "2147483647";
@@ -84,11 +84,6 @@ const armSwap = async (target: string, swap: Swap): Promise<() => Record<string,
 
 interface Fixture { target: string; act: () => unknown }
 const FIXTURES: Record<string, () => Fixture> = {
-  pruneActorRunArchives: () => {
-    const runs = tmp("fabric-vr-archives-");
-    const target = run(path.join(runs, "old"));
-    return { target, act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
-  },
   sweepResidentRuns: () => {
     const residency = tmp("fabric-vr-resident-");
     const target = old(run(path.join(residency, "runs", "old")));
@@ -169,7 +164,8 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     const { root, target } = meshPass();
     const before = shape(target);
     const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-    expect(plan.removedRuns).toEqual([target]);
+    expect(plan.removedRuns).toEqual([]);
+    expect(fs.existsSync(target)).toBe(true);
     expect(shape(target)).toEqual(before);
     const { verifiedRemoveTestHooks: hooks } = await import("../src/storage/verified-remove.js");
     const seen: string[] = [];

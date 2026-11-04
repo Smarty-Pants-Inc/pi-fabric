@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -62,6 +63,22 @@ const addDeadResidentRun = (host: string, id: string) => {
   fs.utimesSync(candidate, (NOW - 2 * DAY) / 1000, (NOW - 2 * DAY) / 1000);
   return candidate;
 };
+const residentTreeHash = (root: string): string => {
+  const hash = createHash("sha256");
+  const visit = (directory: string, prefix = "") => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const file = path.join(directory, name), relative = prefix ? `${prefix}/${name}` : name;
+      const stat = fs.lstatSync(file);
+      hash.update(`${relative}\0${stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other"}\0`);
+      if (stat.isDirectory()) visit(file, relative);
+      else if (stat.isFile()) hash.update(fs.readFileSync(file));
+      else if (stat.isSymbolicLink()) hash.update(fs.readlinkSync(file));
+      hash.update("\0");
+    }
+  };
+  visit(root);
+  return hash.digest("hex");
+};
 const deadResidentMesh = (mesh = deadRootMesh(), id = "old-resident") => {
   const fixture = deadResidentRoot(mesh);
   return { ...fixture, resident: addDeadResidentRun(fixture.host, id) };
@@ -85,17 +102,55 @@ describe("mesh-wide age-based run retention", () => {
     expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toHaveLength(3);
   });
 
-  // Actor archives are retained regardless of age or unfamiliar files within a run.
-  it("keeps actor run archives with unfamiliar contents out of the retention plan", async () => {
-    const mesh = deadRootMesh();
-    write(path.join(mesh.old, "status.json"), JSON.stringify({ status: "completed", finishedAt: NOW - 8 * DAY }));
-    write(path.join(mesh.orphan, "surprise.bin"), "x".repeat(1000));
-    const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-    for (const kept of [mesh.old, mesh.orphan]) {
-      expect(plan.removedRuns).not.toContain(kept);
-      expect(fs.existsSync(path.join(kept, "reply.json"))).toBe(true);
-    }
-    expect(fs.existsSync(path.join(mesh.orphan, "surprise.bin"))).toBe(true);
+  it("keeps an expired dead-resident run with an unknown root identity out of the plan", async () => {
+    const { mesh, host } = deadResidentRoot(deadRootMesh());
+    const rejected = addDeadResidentRun(host, "unknown-root-identity");
+    const valid = addDeadResidentRun(host, "eligible-control");
+    write(path.join(rejected, "status.json"), JSON.stringify({
+      transport: "process", status: "completed", finishedAt: NOW - 2 * DAY,
+    }));
+    const hash = residentTreeHash(rejected);
+    const plan = await sweepMeshRetention(mesh.root, {
+      now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY,
+    });
+    expect(plan.removedRuns).not.toContain(rejected);
+    expect(plan.removedRuns).toContain(valid);
+    expect(fs.existsSync(rejected)).toBe(true);
+    expect(residentTreeHash(rejected)).toBe(hash);
+  });
+
+  it("keeps an expired dead-resident run with running status out of the plan", async () => {
+    const { mesh, host } = deadResidentRoot(deadRootMesh());
+    const rejected = addDeadResidentRun(host, "running-status");
+    const valid = addDeadResidentRun(host, "eligible-control");
+    // Match the eligible record's age and exited worker identity; running status is the only changed fence.
+    const status = JSON.parse(fs.readFileSync(path.join(valid, "status.json"), "utf8")) as Record<string, unknown>;
+    status.status = "running";
+    write(path.join(rejected, "status.json"), JSON.stringify(status));
+    const hash = residentTreeHash(rejected);
+    const plan = await sweepMeshRetention(mesh.root, {
+      now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY,
+    });
+    expect(plan.removedRuns).not.toContain(rejected);
+    expect(plan.removedRuns).toContain(valid);
+    expect(fs.existsSync(rejected)).toBe(true);
+    expect(residentTreeHash(rejected)).toBe(hash);
+  });
+
+  it("keeps an expired dead-resident run with an unfamiliar entry out of the plan", async () => {
+    const { mesh, host } = deadResidentRoot(deadRootMesh());
+    const rejected = addDeadResidentRun(host, "unfamiliar-entry");
+    const valid = addDeadResidentRun(host, "eligible-control");
+    write(path.join(rejected, "surprise.bin"), "x".repeat(1000));
+    fs.utimesSync(rejected, (NOW - 2 * DAY) / 1_000, (NOW - 2 * DAY) / 1_000);
+    const hash = residentTreeHash(rejected);
+    const plan = await sweepMeshRetention(mesh.root, {
+      now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY,
+    });
+    expect(plan.removedRuns).not.toContain(rejected);
+    expect(plan.removedRuns).toContain(valid);
+    expect(fs.existsSync(rejected)).toBe(true);
+    expect(residentTreeHash(rejected)).toBe(hash);
   });
 
   // smarty-dev#9058 item 1: an offline removal (`fabric-actors remove --main-stopped`) moves the whole actor directory

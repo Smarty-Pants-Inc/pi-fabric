@@ -2439,10 +2439,21 @@ describe("ActorManager", () => {
     );
     actorManagers.push(peer);
     const registryPath = path.join(owner.root, "actors", "actors.json");
-    const registryBeforeBindings = fs.readFileSync(registryPath, "utf8");
+    const registryBeforeBindings = JSON.parse(fs.readFileSync(registryPath, "utf8")) as {
+      actors: Array<{ id: string; resolvedBinding?: unknown }>;
+    };
 
     await owner.actors.setModel(actor.id, "provider/session-a");
     await owner.actors.setThinking(actor.id, "high");
+    // Owner publication persists the admitted live binding (#18491), not project defaults.
+    const registryAfterOwnerBindings = fs.readFileSync(registryPath, "utf8");
+    expect(JSON.parse(registryAfterOwnerBindings)).toEqual({
+      ...registryBeforeBindings,
+      actors: registryBeforeBindings.actors.map(record => record.id === actor.id ? {
+        ...record,
+        resolvedBinding: { modelSource: "explicit", model: "provider/session-a", thinking: "high" },
+      } : record),
+    });
     await peer.setModel(actor.id, "provider/session-b");
     await peer.setThinking(actor.id, "low");
 
@@ -2484,7 +2495,8 @@ describe("ActorManager", () => {
       "owned by another host",
     );
 
-    expect(fs.readFileSync(registryPath, "utf8")).toBe(registryBeforeBindings);
+    // Peer setters and all reader views must leave the owner's published bytes untouched.
+    expect(fs.readFileSync(registryPath, "utf8")).toBe(registryAfterOwnerBindings);
     const bindingDirectory = path.join(owner.root, "actors", "bindings");
     const bindingFiles = fs.readdirSync(bindingDirectory);
     expect(bindingFiles).toHaveLength(2);

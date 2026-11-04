@@ -39,9 +39,23 @@ it.skipIf(!linux)("compiled drain routes a session supervisor through either dir
       try {
         // Use the production build, not installedSeam's test-local esbuild bundle.
         const exe = path.join(seat.base, "fabric-seat-drain");
-        const installed = spawnSync("node", [path.resolve("dist/seat-drain/fabric-seat-drain.cjs"), "--install", "--out", exe], { encoding: "utf8" });
+        // rootOwned measures the interpreter's filesystem owner, NOT the Main's lease.
+        // setup-node's hosted toolcache can be runner-owned. Provision the same root-owned,
+        // non-writable interpreter this production-path fixture asserts instead of waiting for a lease.
+        let node = fs.realpathSync(process.execPath);
+        const nodeStat = fs.statSync(node);
+        if (nodeStat.uid !== 0 || (nodeStat.mode & 0o022) !== 0) {
+          const provisioned = path.join(seat.base, "node");
+          const provision = spawnSync("sudo", ["-n", "install", "-o", "root", "-g", "root", "-m", "0755", "--", node, provisioned], { encoding: "utf8" });
+          expect(provision.status, `Root-owned Node fixture provisioning failed: ${provision.error ?? provision.stderr}`).toBe(0);
+          node = provisioned;
+        }
+        const installed = spawnSync(node, [path.resolve("dist/seat-drain/fabric-seat-drain.cjs"), "--install", "--out", exe], { encoding: "utf8" });
         expect(installed.status, installed.stderr).toBe(0);
-        expect(JSON.parse(installed.stdout)).toMatchObject({ owner: "fabric-v2", interpreter: { rootOwned: true } });
+        expect(JSON.parse(installed.stdout)).toMatchObject({ owner: "fabric-v2", interpreter: {
+          execPath: node, uid: 0, rootOwned: true,
+          sha256: createHash("sha256").update(fs.readFileSync(node)).digest("hex"),
+        } });
         const actor = await actors.create({ name: "supervisor", scope: "session", residency: "session",
           instructions: "Supervise this Main and preserve the complete configuration across drain.",
           responseMode: "directive", events: ["agent_settled"], delivery: "steer", triggerTurn: true, tools: ["read"], nice: 3,
@@ -61,7 +75,7 @@ it.skipIf(!linux)("compiled drain routes a session supervisor through either dir
           return { ...result, receipt: JSON.parse(result.stdout) };
         };
         seat.native.state.busy = true; seat.native.state.idle = false;
-        busy = spawn("node", ["-e", "process.stdout.write('busy\\n'); setTimeout(() => {}, 400)"], { stdio: ["ignore", "pipe", "pipe"] });
+        busy = spawn(node, ["-e", "process.stdout.write('busy\\n'); setTimeout(() => {}, 400)"], { stdio: ["ignore", "pipe", "pipe"] });
         busyEnded = once(busy, "close").then(([code]) => {
           seat.native.state.busy = false; seat.native.state.idle = true;
           expect(code).toBe(0);

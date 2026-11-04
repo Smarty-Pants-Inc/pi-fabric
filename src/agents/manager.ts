@@ -1290,6 +1290,25 @@ const writeRecord = (filePath: string, record: AgentRunRecord): void => {
   writeJsonAtomic(filePath, record, { space: 2 });
 };
 
+/** The terminal monitor writers share the retry trace fence without changing their on-disk formats. */
+export function writeTimedOutStatusTrace(
+  target: { statusFile: string; statusTraceRenameFailed?: boolean },
+  record: AgentRunRecord,
+): boolean {
+  if (target.statusTraceRenameFailed) return false;
+  writeJsonAtomic(target.statusFile, record, { space: 2, durable: true });
+  return true;
+}
+
+export function writeLostContactStatusTrace(
+  target: { statusFile: string; statusTraceRenameFailed?: boolean },
+  record: AgentRunRecord,
+): boolean {
+  if (target.statusTraceRenameFailed) return false;
+  writeRecord(target.statusFile, record);
+  return true;
+}
+
 // pi-fabric#1034 round 7: a manager-made result (timeout, stop, lost worker) keeps the child's last stored write
 // receipt. Unless the worker itself wrote a terminal record, what ran after that checkpoint is unknown, so the receipt
 // is marked truncated; a Pi child with no stored receipt gets an empty truncated one, never none.
@@ -3972,7 +3991,10 @@ export class AgentManager {
       if (!this.#saveSettledResult(managed, recovered)) return false;
       managed.recoveredSaved = true;
     }
-    try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
+    // The separately saved result remains delivery authority; never rewrite a still-live prior attempt trace.
+    if (!managed.statusTraceRenameFailed) {
+      try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
+    }
     managed.recoveredAnswer = true;
     managed.latestRecord = compactUiRecord(recovered);
     managed.latestUiRecord = managed.latestRecord;
@@ -5376,8 +5398,11 @@ export class AgentManager {
     const fingerprint = writePrivateJsonAtomic(resultFile, result);
     this.#rememberPreviousRun(result, resultFile, fingerprint);
     // Pin peek's finishedAt and truncated receipt in the secondary status record
-    // so settle's later observation cannot select a different terminal timestamp.
-    writeJsonAtomic(path.join(pending.directory, "status.json"), result, { durable: true });
+    // so settle's later observation cannot select a different terminal timestamp. A prior
+    // attempt's status remains raw evidence if its supersede rename failed in this manager.
+    if (!this.#runs.get(runId)?.statusTraceRenameFailed) {
+      writeJsonAtomic(path.join(pending.directory, "status.json"), result, { durable: true });
+    }
     if (!settleEnodevRun(pending.directory, pending.actorId, pending.activationId)) return false;
     this.#enodevSettledHere.add(runId);
     this.#enodevCommits.delete(runId);
@@ -5548,7 +5573,7 @@ export class AgentManager {
     if (managed.settled) {
       const settled = readRecord(managed.statusFile);
       const stopIntent = readRunStopIntent(managed.runDirectory);
-      if (settled && terminalStatuses.has(settled.status) && stopIntent) {
+      if (settled && terminalStatuses.has(settled.status) && stopIntent && !managed.statusTraceRenameFailed) {
         writeJsonAtomic(managed.statusFile, { ...settled, stopIntent }, { space: 2, durable: true });
         if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
       }
@@ -5577,9 +5602,11 @@ export class AgentManager {
         : this.#withTransportMetadata(failedRecord(managed, "stopped", "Agent stopped"), managed) as AgentRunResult;
     const stopIntent = readRunStopIntent(managed.runDirectory);
     if (stopIntent) record.stopIntent = stopIntent;
-    // Re-publish even a worker terminal answer durably before discharging intent.
-    writeJsonAtomic(managed.statusFile, record, { space: 2, durable: true });
-    if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
+    // Re-publish even a worker terminal answer durably before discharging intent, unless the prior raw trace is fenced.
+    if (!managed.statusTraceRenameFailed) {
+      writeJsonAtomic(managed.statusFile, record, { space: 2, durable: true });
+      if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
+    }
     await this.#captureWorktree(managed);
     this.#settle(managed, record);
     if (!managed.settled) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained`);
@@ -7497,7 +7524,7 @@ export class AgentManager {
         if (completed?.status === "stopped" && completed.exitCode !== undefined) {
           timedOut.exitCode = completed.exitCode;
         }
-        writeJsonAtomic(managed.statusFile, timedOut, { space: 2, durable: true });
+        writeTimedOutStatusTrace(managed, timedOut);
         await this.#captureWorktree(managed);
         this.#settle(managed, timedOut);
         return;
@@ -7544,7 +7571,7 @@ export class AgentManager {
                 "failed",
                 `Lost track of the worker: ${lost}. Fabric does not relaunch it or delete its files.`,
               );
-              writeRecord(managed.statusFile, failed);
+              writeLostContactStatusTrace(managed, failed);
               this.#settle(managed, failed);
               return;
             }

@@ -14,6 +14,8 @@ import {
   effectiveAgentTimeoutMs,
   AgentManager,
   AgentLaunchPreparationTimeoutError,
+  writeLostContactStatusTrace,
+  writeTimedOutStatusTrace,
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
@@ -1942,6 +1944,39 @@ describe("AgentManager", () => {
       expect(fs.readFileSync(lifecycleFile!)).toEqual(Buffer.from("fresh replacement lifecycle\n"));
     } finally { archive.mockRestore(); launch.mockRestore(); }
   }, 30_000);
+
+  it.each([
+    ["timeout", writeTimedOutStatusTrace, "timed_out"],
+    ["lost-contact", writeLostContactStatusTrace, "failed"],
+  ] as const)("keeps previous status bytes when %s publication follows a failed trace rename", (branch, writeTrace, status) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-status-fence-"));
+    roots.push(root);
+    const statusFile = path.join(root, "status.json");
+    const archive = `${statusFile}.attempt-2-startup-retry`;
+    const previous = Buffer.from('{\n  "status": "running",\n  "attempt": "previous",\n  "sentinel": "preserve these exact bytes"\n}\n');
+    fs.writeFileSync(statusFile, previous);
+    const rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(source) === statusFile && String(destination) === archive) {
+        throw Object.assign(new Error("trace rename denied"), { code: "EIO" });
+      }
+      return rename(source, destination);
+    });
+    let statusTraceRenameFailed = false;
+    try { fs.renameSync(statusFile, archive); }
+    catch (error) { statusTraceRenameFailed = (error as NodeJS.ErrnoException).code === "EIO"; }
+    expect(statusTraceRenameFailed, "the test must exercise the failed status rename").toBe(true);
+
+    const record = { status, error: `${branch} terminal result` } as AgentRunRecord;
+    // Exercise the exact writer called by each monitor branch; both must keep the prior bytes after EIO.
+    expect(writeTrace({ statusFile, statusTraceRenameFailed }, record)).toBe(false);
+    expect(fs.readFileSync(statusFile)).toEqual(previous);
+    expect(fs.existsSync(archive)).toBe(false);
+
+    const freshStatusFile = path.join(root, "fresh-status.json");
+    expect(writeTrace({ statusFile: freshStatusFile, statusTraceRenameFailed: false }, record)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(freshStatusFile, "utf8"))).toMatchObject({ status });
+  });
 
   // Judge prototype: the rename-failure fence, on startup-retry AND resume (F2's new early preserve).
   it.each(["startup-retry", "resume"] as const)("leaves the live status trace untouched and aborts when preserving it fails on %s", async recovery => {

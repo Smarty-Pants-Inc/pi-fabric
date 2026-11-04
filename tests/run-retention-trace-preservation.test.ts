@@ -13,6 +13,7 @@ import {
 const roots: string[] = [];
 const HOUR = 3_600_000;
 const now = 10 * HOUR;
+// This fixture exercises the ESRCH branch only; it does not assert platform-specific behavior for a synthetic PID.
 const mockDeadPid = () => {
   const processKill = process.kill.bind(process);
   vi.spyOn(process, "kill").mockImplementation((pid, signal) => {

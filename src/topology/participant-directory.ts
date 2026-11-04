@@ -1014,7 +1014,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #natsView(): KvParticipantDirectory {
     const view = this.#participantView;
-    if (!view?.ready) throw new DirectoryNotReadyError();
+    if (!view) throw new DirectoryNotReadyError(`NATS participant view has not been created; sinceMs=${this.#startedAt}`);
+    if (!view.ready) throw view.readinessError();
     return view;
   }
 

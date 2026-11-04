@@ -159,15 +159,15 @@ describe("NATS KV watch retry classification", () => {
   });
 });
 
-// Keep: terminal watch failures are a readiness/data-safety boundary and are
+// Keep: watch failures are a readiness/data-safety boundary and are
 // cheaper to inject deterministically here than through broker permissions/data.
-describe("participant watch terminal diagnostics", () => {
+describe("participant watch failure diagnostics", () => {
   it.each([
     { bucket: "presence" as const, code: "FABRIC_TRANSPORT_INVALID", expectedCode: "FABRIC_TRANSPORT_INVALID", retryFirst: false },
     { bucket: "leases" as const, code: "FABRIC_TRANSPORT_DENIED", expectedCode: "FABRIC_TRANSPORT_DENIED", retryFirst: true },
     { bucket: "presence" as const, code: "nats://user:secret@broker/$KV.private.client", expectedCode: "UNKNOWN", retryFirst: false },
     { bucket: "leases" as const, code: undefined, expectedCode: "UNKNOWN", retryFirst: false },
-  ])("logs one safe terminal warning for $bucket ($expectedCode, retry=$retryFirst)", async ({ bucket, code, expectedCode, retryFirst }) => {
+  ])("logs one safe failure warning for $bucket ($expectedCode, retry=$retryFirst)", async ({ bucket, code, expectedCode, retryFirst }) => {
     const releaseFailure = deferred<void>();
     const failure = Object.assign(new Error("nats://user:secret@broker $KV.private.client confidential payload"), {
       code, subject: "$KV.private.client", client: { credential: "secret", data: "confidential payload" },
@@ -210,12 +210,15 @@ describe("participant watch terminal diagnostics", () => {
         .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_NOT_READY" });
       releaseFailure.resolve();
       releaseFailure.resolve();
-      await bounded(changed, "terminal participant watch failure");
+      while (directory.ready) await wait(1);
       expect(directory.ready).toBe(false);
       expect(() => directory.resolve("missing")).toThrowError(expect.objectContaining({ code: "FABRIC_DIRECTORY_NOT_READY" }));
-      await expect(directory.whenChanged("missing", leaseAbort.signal)).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_NOT_READY" });
+      // Recoverable watch failures no longer latch every future waiter into an
+      // immediate rejection. Its caller's signal still bounds a readiness wait.
+      await expect(directory.whenChanged("missing", AbortSignal.timeout(25))).rejects.toMatchObject({ name: "TimeoutError" });
       directory.start(); // Repeated lifecycle/readiness handling must not log again.
       await directory.close();
+      await bounded(changed, "closing the failed participant watch");
 
       expect(attempts[bucket]).toBe(retryFirst ? 2 : 1);
       expect(diagnostic.mock.calls).toEqual([[`[fabric:participants:kv-watch] ${JSON.stringify({

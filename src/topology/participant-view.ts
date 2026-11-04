@@ -14,6 +14,8 @@ export interface ParticipantView {
 
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { emitMeshJournalAlarm, MESH_OUTAGE_ALARM_AFTER_MS } from "../core/atomic-write.js";
+import { retryDelayMs } from "../core/retry-backoff.js";
 import {
   DirectoryNotReadyError,
   TransportInvalidError,
@@ -40,9 +42,9 @@ export interface KvParticipantDirectoryOptions {
   identityId: string;
   ownerIncarnation: string;
   rootId: string;
-  /** Bounds each KV operation, including reconciliation and best-effort cleanup. */
+  /** Bounds each KV operation and each initial/reset snapshot, including best-effort cleanup. */
   operationTimeoutMs?: number;
-  /** Independent refresh and cleanup-retry jitter samples; defaults to Math.random. */
+  /** Independent refresh, watch-retry and cleanup-retry jitter samples; defaults to Math.random. */
   random?: () => number;
   onError?: (error: unknown) => void;
 }
@@ -192,8 +194,12 @@ export class KvParticipantDirectory implements ParticipantView {
   #started = false;
   #closed = false;
   #watchFailed = false;
-  readonly #failedWatches = new Set<TransportBucket>();
+  readonly #failedWatches = new Map<TransportBucket, string>();
   readonly #watchTasks = new Set<Promise<void>>();
+  readonly #watchRetryWakes = new Map<TransportBucket, () => void>();
+  #notReadySince: number | undefined;
+  #readinessAlarm: ReturnType<typeof setTimeout> | undefined;
+  #readinessAlarmRaised = false;
   #stopVerifiedReconnect: (() => void) | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #refreshPass: Promise<void> | undefined;
@@ -222,12 +228,15 @@ export class KvParticipantDirectory implements ParticipantView {
 
   /** Starts both explicit snapshot watches. Readiness is observed through resolve/whenChanged. */
   start(): void {
-    if (this.#closed) throw new DirectoryNotReadyError();
+    if (this.#closed) throw this.readinessError();
     if (this.#started) return;
     this.options.lease.signal.throwIfAborted();
     this.#started = true;
     this.options.lease.signal.addEventListener("abort", this.#leaseLost, { once: true });
-    this.#stopVerifiedReconnect = this.options.transport.onVerifiedReconnect?.(() => this.#restartFailedWatches());
+    this.#stopVerifiedReconnect = this.options.transport.onVerifiedReconnect?.(() => {
+      for (const wake of this.#watchRetryWakes.values()) wake();
+    });
+    this.#observeReadiness();
     this.#launchWatch("presence");
     this.#launchWatch("leases");
   }
@@ -251,24 +260,57 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#watchTasks.add(task);
   }
 
-  #restartFailedWatches(): void {
-    if (this.#closed || !this.#started) return;
-    for (const bucket of [...this.#failedWatches]) {
-      this.#failedWatches.delete(bucket);
-      if (bucket === "presence") {
-        this.#presenceReady = false;
-        this.#records.clear();
-        this.#presenceRevisions.clear();
-      } else {
-        this.#leasesReady = false;
-        this.#hosts.clear();
-        this.#leaseRevisions.clear();
-      }
-      this.#launchWatch(bucket);
-    }
+  /** Safe context for callers that gate access before resolve/list (no broker error text or row data). */
+  readinessError(): DirectoryNotReadyError {
+    const state = (bucket: TransportBucket, ready: boolean): string => ready ? "ready" :
+      this.#failedWatches.has(bucket) ? `watch-failed:${this.#failedWatches.get(bucket)}; retrying` : "snapshot-pending";
+    return new DirectoryNotReadyError(`NATS participant directory not ready: ` +
+      `presence=${state("presence", this.#presenceReady)}, leases=${state("leases", this.#leasesReady)}; ` +
+      `sinceMs=${this.#notReadySince ?? "not-started"}; started=${this.#started}; closed=${this.#closed}`);
   }
 
-  #assertReady(): void { if (!this.ready) throw new DirectoryNotReadyError(); }
+  #observeReadiness(): void {
+    if (this.ready) {
+      if (this.#readinessAlarm) clearTimeout(this.#readinessAlarm);
+      this.#readinessAlarm = undefined;
+      if (this.#readinessAlarmRaised && this.#notReadySince !== undefined) {
+        emitMeshJournalAlarm({ label: "NATS participant directory snapshots", state: "recovered",
+          sinceMs: this.#notReadySince, durationMs: Date.now() - this.#notReadySince });
+      }
+      this.#notReadySince = undefined;
+      this.#readinessAlarmRaised = false;
+      return;
+    }
+    if (this.#closed || this.#notReadySince !== undefined) return;
+    this.#notReadySince = Date.now();
+    this.#readinessAlarm = setTimeout(() => {
+      this.#readinessAlarm = undefined;
+      if (this.#closed || this.ready || this.#notReadySince === undefined) return;
+      this.#readinessAlarmRaised = true;
+      emitMeshJournalAlarm({ label: "NATS participant directory snapshots", state: "outage",
+        sinceMs: this.#notReadySince, durationMs: Date.now() - this.#notReadySince, reason: this.readinessError().message });
+    }, MESH_OUTAGE_ALARM_AFTER_MS);
+    this.#readinessAlarm.unref?.();
+  }
+
+  #waitWatchRetry(bucket: TransportBucket, delayMs: number): Promise<void> {
+    return new Promise(resolve => {
+      const signal = this.#abort.signal;
+      const finish = (): void => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        this.#watchRetryWakes.delete(bucket);
+        resolve();
+      };
+      const timer = setTimeout(finish, delayMs);
+      timer.unref?.();
+      this.#watchRetryWakes.set(bucket, finish);
+      signal.addEventListener("abort", finish, { once: true });
+      if (signal.aborted) finish();
+    });
+  }
+
+  #assertReady(): void { if (!this.ready) throw this.readinessError(); }
   #assertWritable(): void {
     if (!this.#started || !this.leaseLive()) throw new TransportUnavailableError("Participant owner lease is not live");
   }
@@ -285,6 +327,8 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#hosts.clear();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    if (this.#readinessAlarm) clearTimeout(this.#readinessAlarm);
+    this.#readinessAlarm = undefined;
     this.#clearCleanupRetry();
     this.options.lease.signal.removeEventListener("abort", this.#leaseLost);
     this.#stopVerifiedReconnect?.();
@@ -296,24 +340,44 @@ export class KvParticipantDirectory implements ParticipantView {
   async #watch(bucket: TransportBucket): Promise<void> {
     const presence = bucket === "presence";
     const kv = presence ? this.#presence : this.#leases;
-    let attempt = 0;
+    let attempt = 0, failures = 0;
     while (!this.#closed && !this.#abort.signal.aborted) {
       attempt++;
-      let retryAfterReconnect = false;
       let failureCode = "WATCH_ENDED";
+      const controller = new AbortController();
+      const signal = AbortSignal.any([this.#abort.signal, controller.signal]);
+      let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      // READY/reset are the normal event source. This deadline is only a safety net
+      // for a watch that stays open without completing its initial/replacement snapshot.
+      const armSnapshotDeadline = (): void => {
+        if (snapshotTimer !== undefined) return;
+        snapshotTimer = setTimeout(() => {
+          timedOut = true;
+          controller.abort(new DirectoryNotReadyError(`NATS ${bucket} snapshot did not become ready within ${this.#timeoutMs}ms`));
+        }, this.#timeoutMs);
+        snapshotTimer.unref?.();
+      };
+      armSnapshotDeadline();
       try {
-        for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
-          if (this.#closed) break;
+        for await (const event of kv.watch<unknown>(">", signal)) {
+          if (this.#closed || signal.aborted) break;
           if (event.type === "reset") {
             if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
             else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
+            this.#observeReadiness();
+            armSnapshotDeadline();
             continue;
           }
           if (event.type === "ready") {
+            clearTimeout(snapshotTimer);
+            snapshotTimer = undefined;
+            failures = 0;
             const wasReady = this.ready;
             if (presence) this.#presenceReady = true; else this.#leasesReady = true;
             this.#failedWatches.delete(bucket);
             if (this.#presenceReady && this.#leasesReady) this.#watchFailed = false;
+            this.#observeReadiness();
             if (!wasReady && this.ready) for (const waiter of [...this.#waiters]) waiter.changed();
             if (presence) this.#requestCleanup();
             continue;
@@ -345,32 +409,34 @@ export class KvParticipantDirectory implements ParticipantView {
           if (presence && this.#pendingCleanup.has(key)) this.#requestCleanup();
         }
       } catch (error) {
-        if (!this.#closed && errorCode(error) === "FABRIC_TRANSPORT_UNAVAILABLE") {
-          retryAfterReconnect = true;
-          this.#report(error);
-        } else if (!this.#closed) {
+        if (!this.#closed && !signal.aborted) {
           const code = errorCode(error);
           failureCode = typeof code === "string" && [
             "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_CAPACITY",
             "FABRIC_TRANSPORT_UNCERTAIN", "FABRIC_TRANSPORT_UNSUPPORTED", "FABRIC_KV_CONFLICT",
-            "FABRIC_DIRECTORY_NOT_READY",
+            "FABRIC_DIRECTORY_NOT_READY", "FABRIC_TRANSPORT_UNAVAILABLE",
           ].includes(code) ? code : "UNKNOWN";
           this.#report(error);
         }
-      }
+      } finally { clearTimeout(snapshotTimer); }
       if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
       else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
       if (this.#closed || this.#abort.signal.aborted) return;
-      if (retryAfterReconnect) continue;
+      if (timedOut) { failureCode = "SNAPSHOT_TIMEOUT"; this.#report(controller.signal.reason); }
       this.#watchFailed = true;
-      if (!this.#failedWatches.has(bucket)) {
-        this.#failedWatches.add(bucket);
+      this.#observeReadiness();
+      const alreadyReported = this.#failedWatches.has(bucket);
+      this.#failedWatches.set(bucket, failureCode);
+      if (!alreadyReported && failureCode !== "FABRIC_TRANSPORT_UNAVAILABLE") {
         try {
           console.warn(`[fabric:participants:kv-watch] ${JSON.stringify({ outcome: "failed", code: failureCode, bucket, attempt })}`);
         } catch { /* diagnostic only */ }
       }
-      for (const waiter of [...this.#waiters]) waiter.fail(new DirectoryNotReadyError());
-      return;
+      // A connected broker need never reconnect. Retry even a failed/ended watch,
+      // retaining fail-closed admission until BOTH fresh snapshots have said READY.
+      // Waiters stay pending (bounded by their own signals), so startup can recover too.
+      await this.#waitWatchRetry(bucket, Math.max(250,
+        retryDelayMs(failures++, 250, 5_000, Infinity, this.options.random ?? Math.random)));
     }
   }
 
@@ -517,7 +583,7 @@ export class KvParticipantDirectory implements ParticipantView {
 
   whenChanged(participantId: string, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
-    if (this.#closed || this.#watchFailed) return Promise.reject(new DirectoryNotReadyError());
+    if (this.#closed) return Promise.reject(this.readinessError());
     return new Promise<void>((resolve, reject) => {
       const finish = (error?: unknown): void => {
         this.#waiters.delete(waiter);

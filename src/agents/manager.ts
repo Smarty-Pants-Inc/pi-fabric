@@ -844,6 +844,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lastRetriedTransportFailure?: AgentRunResult;
   /** Set when a relaunch failed; the run settles with it, not the attempt it replaced. */
   relaunchFailure?: AgentRunRecord;
+  /** A failed status-trace rename must not let terminal publication overwrite its still-live raw file. */
+  statusTraceRenameFailed?: boolean;
   /** A retry launch owns custody until its exact replacement handle is installed. */
   relaunchPending?: Promise<boolean>;
   /** Terminal results do not discharge execution custody or admission permits. */
@@ -1287,6 +1289,25 @@ const summarizeRunLog = (runDirectory: string, lines: number): string => {
 const writeRecord = (filePath: string, record: AgentRunRecord): void => {
   writeJsonAtomic(filePath, record, { space: 2 });
 };
+
+/** The terminal monitor writers share the retry trace fence without changing their on-disk formats. */
+export function writeTimedOutStatusTrace(
+  target: { statusFile: string; statusTraceRenameFailed?: boolean },
+  record: AgentRunRecord,
+): boolean {
+  if (target.statusTraceRenameFailed) return false;
+  writeJsonAtomic(target.statusFile, record, { space: 2, durable: true });
+  return true;
+}
+
+export function writeLostContactStatusTrace(
+  target: { statusFile: string; statusTraceRenameFailed?: boolean },
+  record: AgentRunRecord,
+): boolean {
+  if (target.statusTraceRenameFailed) return false;
+  writeRecord(target.statusFile, record);
+  return true;
+}
 
 // pi-fabric#1034 round 7: a manager-made result (timeout, stop, lost worker) keeps the child's last stored write
 // receipt. Unless the worker itself wrote a terminal record, what ran after that checkpoint is unknown, so the receipt
@@ -3970,7 +3991,10 @@ export class AgentManager {
       if (!this.#saveSettledResult(managed, recovered)) return false;
       managed.recoveredSaved = true;
     }
-    try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
+    // The separately saved result remains delivery authority; never rewrite a still-live prior attempt trace.
+    if (!managed.statusTraceRenameFailed) {
+      try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
+    }
     managed.recoveredAnswer = true;
     managed.latestRecord = compactUiRecord(recovered);
     managed.latestUiRecord = managed.latestRecord;
@@ -4070,17 +4094,15 @@ export class AgentManager {
         delete queued.routeSaveFailure;
         if (queued.routeOutcome || this.#onSettled) this.#commitArchive(path.join(this.#runRoot, queued.info.id), queued.terminal);
         // Recordless prelaunch sources are not worker runs. Persist their safe
-        // archived state before best-effort deletion, so a Windows sharing error
+        // archived state before best-effort retention, so a Windows sharing error
         // cannot make this committed source uncollectible on a later sweep.
         const directory = path.join(this.#runRoot, queued.info.id);
         if ((!fs.existsSync(path.join(directory, "status.json")) ||
             (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeRemovalVeto(directory)) {
           writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
-          try {
-            fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
-            fs.rmSync(directory, { recursive: true, force: true });
-          } catch { /* Its committed terminal state is collectible later. */ }
+          // Custody moves synchronously; a refusal keeps the committed source collectible later.
+          void this.#removeRunTree(directory, queued.info.id).catch(() => undefined);
         }
         queued.outcomeSaved = true;
         return true;
@@ -5374,8 +5396,11 @@ export class AgentManager {
     const fingerprint = writePrivateJsonAtomic(resultFile, result);
     this.#rememberPreviousRun(result, resultFile, fingerprint);
     // Pin peek's finishedAt and truncated receipt in the secondary status record
-    // so settle's later observation cannot select a different terminal timestamp.
-    writeJsonAtomic(path.join(pending.directory, "status.json"), result, { durable: true });
+    // so settle's later observation cannot select a different terminal timestamp. A prior
+    // attempt's status remains raw evidence if its supersede rename failed in this manager.
+    if (!this.#runs.get(runId)?.statusTraceRenameFailed) {
+      writeJsonAtomic(path.join(pending.directory, "status.json"), result, { durable: true });
+    }
     if (!settleEnodevRun(pending.directory, pending.actorId, pending.activationId)) return false;
     this.#enodevSettledHere.add(runId);
     this.#enodevCommits.delete(runId);
@@ -5546,7 +5571,7 @@ export class AgentManager {
     if (managed.settled) {
       const settled = readRecord(managed.statusFile);
       const stopIntent = readRunStopIntent(managed.runDirectory);
-      if (settled && terminalStatuses.has(settled.status) && stopIntent) {
+      if (settled && terminalStatuses.has(settled.status) && stopIntent && !managed.statusTraceRenameFailed) {
         writeJsonAtomic(managed.statusFile, { ...settled, stopIntent }, { space: 2, durable: true });
         if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
       }
@@ -5575,9 +5600,11 @@ export class AgentManager {
         : this.#withTransportMetadata(failedRecord(managed, "stopped", "Agent stopped"), managed) as AgentRunResult;
     const stopIntent = readRunStopIntent(managed.runDirectory);
     if (stopIntent) record.stopIntent = stopIntent;
-    // Re-publish even a worker terminal answer durably before discharging intent.
-    writeJsonAtomic(managed.statusFile, record, { space: 2, durable: true });
-    if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
+    // Re-publish even a worker terminal answer durably before discharging intent, unless the prior raw trace is fenced.
+    if (!managed.statusTraceRenameFailed) {
+      writeJsonAtomic(managed.statusFile, record, { space: 2, durable: true });
+      if (managed.executionExited) clearRunStopIntent(managed.runDirectory);
+    }
     await this.#captureWorktree(managed);
     this.#settle(managed, record);
     if (!managed.settled) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained`);
@@ -6122,7 +6149,7 @@ export class AgentManager {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
             if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
-                !fs.existsSync(path.join(directory, "status.json")) && !runTreeRemovalVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeRemovalVeto(directory)) await this.#removeRunTree(directory, result.id);
           }
           break;
         }
@@ -6774,6 +6801,7 @@ export class AgentManager {
   ): Promise<boolean> {
     let presenceAttempted = false;
     let nativeLaunchReturned = false;
+    let statusTraceRenameFailed = false;
     try {
       const policyRole = managed.actorName ? `actor:${managed.actorName}` : "task";
       const cancelled = () => this.#actorWorkerGone(managed) || managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
@@ -6806,6 +6834,22 @@ export class AgentManager {
           delete managed.model;
         }
       }
+      const attemptKind = resume ? "resume" : "startup-retry";
+      const attemptNumber = resume ? managed.resumeAttempts : managed.startupAttempts;
+      const supersedeTrace = (file: string): void => {
+        for (let collision = 0; ; collision++) {
+          const target = `${file}.attempt-${attemptNumber}-${attemptKind}${collision ? `-${collision}` : ""}`;
+          try { fs.lstatSync(target); continue; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          try { fs.renameSync(file, target); return; }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") return;
+            if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+            throw error;
+          }
+        }
+      };
       if (resume) {
         // A continuation rewrites the run's input in place. The prompt metadata
         // stays bound to the original spawn brief; it is never recomputed from
@@ -6813,6 +6857,9 @@ export class AgentManager {
         const currentInput = promptMetadata(resume.task, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
         managed.inputSha256 = currentInput.inputSha256;
         managed.inputBytes = currentInput.inputBytes;
+        // Preserve the previous worker's bytes before publishing the continuation's identity.
+        try { supersedeTrace(managed.statusFile); }
+        catch (error) { statusTraceRenameFailed = true; throw error; }
         // Publish the new input identity before replacing the bytes. A host death
         // between these writes leaves a detectable mismatch, never a false match.
         writeRecord(managed.statusFile, this.#withTransportMetadata(record, managed, false));
@@ -6857,7 +6904,7 @@ export class AgentManager {
         path.join(managed.runDirectory, "relaunches.jsonl"),
         `${JSON.stringify({
           at: Date.now(),
-          kind: resume ? "resume" : "startup-retry",
+          kind: attemptKind,
           startupAttempts: managed.startupAttempts,
           resumeAttempts: managed.resumeAttempts,
           previousStatus: record.status,
@@ -6875,7 +6922,7 @@ export class AgentManager {
       if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
 
       if (managed.runner === "pi") {
-        // status.json must be removed to fence the new attempt from the old
+        // status.json must be absent to fence the new attempt from the old
         // terminal verdict. Hand off its native-session joins separately, after
         // confirmed exit so the previous worker's final observations are included.
         const ids = [record, managed.latestRecord, readRecord(managed.statusFile)]
@@ -6887,12 +6934,13 @@ export class AgentManager {
         }
       }
 
-      fs.rmSync(managed.statusFile, { force: true });
+      try { supersedeTrace(managed.statusFile); }
+      catch (error) { statusTraceRenameFailed = true; throw error; }
       // Reset the superseded journal before launching its replacement. A launch
       // already accepted before PREPARE may finish without deleting new output.
       managed.lifecycleOffset = 0;
       managed.lifecycleRemainder = Buffer.alloc(0);
-      fs.rmSync(managed.lifecycleFile, { force: true });
+      supersedeTrace(managed.lifecycleFile);
       if (cancelled()) return false;
       if (this.#meshTransport?.transport === "nats") {
         presenceAttempted = true;
@@ -6934,6 +6982,7 @@ export class AgentManager {
       this.#unregisteredTransports.delete(transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
+      delete managed.statusTraceRenameFailed;
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
         // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
         // Release the child we just started so it cannot outlive the monitor and the
@@ -6982,7 +7031,8 @@ export class AgentManager {
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       }, managed, false);
-      writeRecord(managed.statusFile, failed);
+      managed.statusTraceRenameFailed = statusTraceRenameFailed;
+      if (!statusTraceRenameFailed) writeRecord(managed.statusFile, failed);
       managed.latestRecord = compactUiRecord(failed);
       managed.relaunchFailure = failed;
       return false;
@@ -7241,7 +7291,7 @@ export class AgentManager {
       try { if (managed.onActorRunLost?.() === false) return true; }
       catch { return true; }
       managed.actorRunLost = true;
-      writeRecord(managed.statusFile, result);
+      if (!managed.statusTraceRenameFailed) writeRecord(managed.statusFile, result);
     }
     this.#settle(managed, result);
     return true;
@@ -7472,7 +7522,7 @@ export class AgentManager {
         if (completed?.status === "stopped" && completed.exitCode !== undefined) {
           timedOut.exitCode = completed.exitCode;
         }
-        writeJsonAtomic(managed.statusFile, timedOut, { space: 2, durable: true });
+        writeTimedOutStatusTrace(managed, timedOut);
         await this.#captureWorktree(managed);
         this.#settle(managed, timedOut);
         return;
@@ -7519,7 +7569,7 @@ export class AgentManager {
                 "failed",
                 `Lost track of the worker: ${lost}. Fabric does not relaunch it or delete its files.`,
               );
-              writeRecord(managed.statusFile, failed);
+              writeLostContactStatusTrace(managed, failed);
               this.#settle(managed, failed);
               return;
             }
@@ -7547,7 +7597,7 @@ export class AgentManager {
             if (managed.transport !== watchedTransport) continue;
             await this.#noteUnconfirmedExit(managed);
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
-            writeRecord(managed.statusFile, settled);
+            if (!managed.statusTraceRenameFailed) writeRecord(managed.statusFile, settled);
             await this.#captureWorktree(managed);
             this.#settle(managed, settled);
             return;
@@ -7637,9 +7687,9 @@ export class AgentManager {
       // Supervisor-only attribution must not mutate the last retained result
       // when archival fails. Persist only a changed outcome or cleanup warning.
       const current = readRecord(managed.statusFile);
-      if (!current || current.status !== result.status || result.errorCode === "CUSTODY_UNCONFIRMED") {
+      if (!managed.statusTraceRenameFailed && (!current || current.status !== result.status || result.errorCode === "CUSTODY_UNCONFIRMED")) {
         writeRecord(managed.statusFile, result);
-      } else if (forcedCleanup > 0) {
+      } else if (!managed.statusTraceRenameFailed && current && forcedCleanup > 0) {
         writeRecord(managed.statusFile, { ...current, warnings: result.warnings ?? [] });
       }
     }
@@ -7739,7 +7789,7 @@ export class AgentManager {
     }
     const stopIntent = readRunStopIntent(managed.runDirectory);
     if (stopIntent) result.stopIntent = stopIntent;
-    if (this.#saveSettledResult(managed, result)) {
+    if (this.#saveSettledResult(managed, result) && !managed.statusTraceRenameFailed) {
       try {
         // A native deadline receipt can settle before worker exit. Keep its fence
         // until both terminal status and native execution custody are resolved.

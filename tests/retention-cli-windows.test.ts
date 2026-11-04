@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+// test-affected edge: 'src/storage/retention-cli.ts' (built to dist/storage/retention-cli.js).
 
 // smarty-dev#7858 (Windows proof): the real retention CLI refuses --apply as policy, before it reads the mesh
 // (pi-fabric#1014, until smarty-dev#10678). Windows only: Linux covers the CLI in tests/retention-cli.test.ts.

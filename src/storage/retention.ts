@@ -828,7 +828,14 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
         !!marker && retentionStamp(marker) === retentionStamp(markerStat) && (closed || runRootOwnerGone(owner));
     };
     if (!closed) {
-      if (!time(options.orphanedTempRunRetentionMs) || !runRootOwnerGone(owner)) continue;
+      if (!runRootOwnerGone(owner)) continue;
+      if (options.orphanedTempRunRetentionMs === undefined) {
+        // No trace policy still permits retiring a dead owner's metadata-only
+        // root. The empty-root check refuses every run, log or unknown entry.
+        if (!options.dryRun && ownerUnchanged() && removeEmptyRunRoot(root)) result.removedRoots.push(root);
+        continue;
+      }
+      if (!time(options.orphanedTempRunRetentionMs)) continue;
       const inventory = tempTreeSnapshot(root, expired);
       // Use the last observed activity, NOT the first maintenance pass. No
       // synthetic closedAt/childrenStopped or refreshed orphan marker is written.

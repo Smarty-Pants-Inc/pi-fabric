@@ -61,8 +61,28 @@ describe("unset trace deletion policies", () => {
       const result = sweepTempRunRoots({ tempRoot, now: NOW,
         orphanedTempRunRetentionMs: explicit ? DAY : retention.orphanedTempRunMs,
         oneShotRunRetentionMs: explicit ? DAY : retention.oneShotRunMs });
-      if (explicit) expect(fs.existsSync(directory)).toBe(false);
+      // Match #1800's Linux-only orphan collection expectations; Windows retains this fixture.
+      if (explicit && (kind !== "orphan" || process.platform === "linux")) expect(fs.existsSync(directory)).toBe(false);
       else { expect(result).toEqual({ removedRoots: [], removedRuns: [] }); kept(directory); }
+    });
+
+  it.skipIf(process.platform !== "linux").each(["dead", "live", "unknown", "dry-run", "unknown content"])(
+    "empty config: metadata-only orphan cleanup keeps the trace fence (%s)", kind => {
+      const tempRoot = temporary(), root = path.join(tempRoot, "pi-fabric-runs-empty");
+      write(path.join(root, ".fabric-owner.json"), { pid: kind === "live" ? process.pid : 2147483647,
+        startedAt: OLD - DAY, heartbeatAt: OLD, orphanedAt: OLD });
+      if (kind === "unknown content") write(path.join(root, "output.log"), TRACE);
+      if (kind === "unknown") vi.spyOn(process, "kill").mockImplementation(() => {
+        throw Object.assign(new Error("owner exit unconfirmed"), { code: "EPERM" });
+      });
+      const ownerBefore = fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8");
+      const result = sweepTempRunRoots({ tempRoot, now: NOW, dryRun: kind === "dry-run" });
+      expect(result.removedRoots).toEqual(kind === "dead" ? [root] : []);
+      expect(result.removedRuns).toEqual([]);
+      if (kind === "dead") expect(fs.existsSync(root)).toBe(false);
+      else expect(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8")).toBe(ownerBefore);
+      if (kind === "unknown content") expect(fs.readFileSync(path.join(root, "output.log"), "utf8")).toBe(TRACE);
+      if (kind === "dry-run") expect(result.candidates).toEqual([]);
     });
 
   it.each(POLICIES)("$policy: two-year-old actor raw archive", ({ explicit }) => {

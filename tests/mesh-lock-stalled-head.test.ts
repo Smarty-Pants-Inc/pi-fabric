@@ -248,6 +248,50 @@ describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIF
     expect(receipts(root)).toEqual([]);
   }, 20_000);
 
+  it("ready waiters escape early when both the head and its own follower are parked with .lock free", async () => {
+    const root = scratch();
+    const holder = new MeshLock(root, { lockTimeoutMs: 2500 }, noop);
+    let release = noop;
+    let entered = noop;
+    const held = new Promise<void>(resolve => { entered = resolve; });
+    const holding = holder.withLockAcrossAwait(() => new Promise<void>(resolve => { release = resolve; entered(); }));
+    await held;
+
+    const parked = [spawn(root, 10_000), spawn(root, 10_000)];
+    for (const child of parked) {
+      await child.next("ready");
+      child.send({ cmd: "enqueue" });
+      await child.next("queued");
+      child.send({ cmd: "block", ms: 1800 });
+      await child.next("blocked");
+    }
+    const order: number[] = [];
+    const ready = Array.from({ length: 3 }, (_, index) => new MeshLock(root, { lockTimeoutMs: 2500 }, noop).withLock(() => {
+      fs.writeFileSync(path.join(root, "inside"), String(process.pid), { flag: "wx" });
+      order.push(index);
+      fs.unlinkSync(path.join(root, "inside"));
+    }));
+    expect(receipts(root)).toHaveLength(6);
+    const releasedAt = Date.now();
+    release();
+    await holding;
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+    await Promise.all(ready);
+    const elapsedMs = Date.now() - releasedAt;
+    console.info(`STALLED_HEAD_AND_FOLLOWER ready=${order.length} elapsedMs=${elapsedMs}`);
+    expect(elapsedMs).toBeLessThan(1000); // not the ~2 s fallback and not either parked process's 1.8 s stall
+    expect(order).toHaveLength(3);
+    expect(receipts(root).map(pidOf)).toEqual(parked.map(child => child.process.pid)); // bypass never reaps them
+    for (const child of parked) {
+      await child.next("acquired");
+      await child.next("done");
+      expect(child.messages.some(message => "error" in message)).toBe(false);
+    }
+    expect(receipts(root)).toEqual([]);
+    expect(reclaimFences(root)).toEqual([]);
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+  }, 20_000);
+
   it("never bypasses a live slow .lock holder, even when its receipt looks stalled", async () => {
     const root = scratch();
     const h = spawn(root, 10_000);

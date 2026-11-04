@@ -491,10 +491,14 @@ describe("retained manager outcome at close", () => {
     const blocker = await manager.spawn({ task: "HANG", transport: "process", extensions: false });
     const queued = await manager.spawn({ task: "queued finalization", transport: "process", extensions: false });
     expect(queued.status).toBe("queued");
+    const run = path.join(root, queued.id);
+    const original = Buffer.from("queued original raw\n");
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, "raw.before.jsonl"), original);
     await manager.stop(queued.id);
     await manager.stop(blocker.id);
     consumed.mockClear();
-    const run = path.join(root, queued.id);
+    // Stop retains the original tree; this same-name directory is a replacement.
     fs.mkdirSync(run, { recursive: true }); fs.writeFileSync(path.join(run, "raw.JSONL"), "queued raw");
     const finalize = vi.fn(() => { throw new Error("queued resident copy failed"); });
     await expect(manager.cleanup(queued.id, false, finalize)).rejects.toThrow("queued resident copy failed");
@@ -510,7 +514,8 @@ describe("retained manager outcome at close", () => {
     fs.renameSync(child, path.join(path.dirname(held), "retired-synthetic-child"));
     await manager.cleanup(queued.id, false, () => {});
     expect(consumed).toHaveBeenCalledExactlyOnceWith(queued.id); expect(manager.hasRunCustody(queued.id)).toBe(false);
-    expect(fs.readFileSync(path.join(held, "raw.JSONL"), "utf8")).toBe("queued raw");
+    expect(fs.readFileSync(path.join(held, "raw.before.jsonl"))).toEqual(original);
+    expect(fs.readFileSync(path.join(run, "raw.JSONL"), "utf8")).toBe("queued raw");
   });
 
   it("never invokes staged finalization before descendant exit proof", async () => {

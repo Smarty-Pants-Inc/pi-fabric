@@ -97,7 +97,8 @@ const inspectLegacyRunTree = async (directory: string, now: number, ageMs: numbe
       await yieldTurn();
       const file = path.join(dir, entry.name), stat = await owned(file);
       identities.push([path.relative(directory, file), stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeMs, stat.ctimeMs]);
-      if (stat.isFile() && (files.has(entry.name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(entry.name))) continue;
+      if (stat.isFile() && (files.has(entry.name) || /^oversized-event-prefix(-\d+)?\.txt$/.test(entry.name) ||
+          /^(?:status\.json|lifecycle\.jsonl)\.attempt-\d+-(?:startup-retry|resume)(?:-\d+)?$/.test(entry.name))) continue;
       if (stat.isDirectory() && ["deliveries", "follow-ups"].includes(entry.name)) {
         // Even final-looking receipts are custody until the normal replay has
         // discharged them. Empty worker ingress directories are normal.

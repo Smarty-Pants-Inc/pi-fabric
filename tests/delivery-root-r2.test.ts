@@ -26,6 +26,7 @@ afterEach(async () => {
   for (const close of cleanups.splice(0).reverse()) await close();
   vi.unstubAllEnvs();
 });
+const DAY = 86_400_000;
 const original = "session:22222222-2222-4222-8222-222222222222";
 const successor = "session:33333333-3333-4333-8333-333333333333";
 const identity = (id: string): MeshIdentity => ({ id, name: "main", kind: "main", sessionId: id.slice(8) });
@@ -131,6 +132,8 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
       fullCodeMode: true, mcp: { enabled: false, cache: { enabled: false } }, memory: { enabled: false },
       agents: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
       mesh: { enabled: true, actorScope: "project", actorPollMs: 50 },
+      // This publication-fence test requires an explicitly eligible archive sweep.
+      retention: { actorRunArchiveMs: DAY },
     }));
     const unused = path.join(root, "unused.mjs"); fs.writeFileSync(unused, "export default {};");
     let command!: (text: string, context: ExtensionContext) => Promise<void>;
@@ -175,6 +178,7 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
     expect(process.pid).toBe(pid); expect(context.sessionManager.getSessionId()).toBe(session);
     const next = new ActorManager(successor.slice(8), identity(successor), mesh, config.mesh, host.agents, () => {}, {
       actorRoot: config.actorRoot, persistent: true, rootId: successor, claimResidency: "session", project: config.project, role: "project-agent", adoptionGraceMs: 0,
+      retention: { ...DEFAULT_FABRIC_CONFIG.retention, actorRunArchiveMs: DAY },
       canManageActor: id => { const p = host.participants.get(id, Date.now(), { fresh: true }); return p ? p.ownerHostId === successor : undefined; },
       lineageAlive: id => host.participants.lineageAlive(id),
     });

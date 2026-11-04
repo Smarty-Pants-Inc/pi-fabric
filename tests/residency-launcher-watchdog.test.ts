@@ -728,12 +728,18 @@ describe.skipIf(process.platform === "win32")("launcher live-child lease watchdo
       expect(f.events().find(row => row.event === "watchdog-aborted")).toMatchObject({ signal: "SIGUSR2", reason: expect.stringContaining("incarnation changed") });
     } finally { await f.close(); }
   });
-  it("retains five evidence directories without removing reports", async () => {
+  it("retains every old evidence directory and its raw child-log tail without an explicit policy", async () => {
     clock(); const f = fixture({}, true);
     try {
-      for (let i = 1; i <= 7; i++) fs.mkdirSync(path.join(f.root, "wedges", `2025-01-0${i}T00:00:00.000Z`));
+      for (let i = 1; i <= 7; i++) {
+        const directory = path.join(f.root, "wedges", `2025-01-0${i}T00:00:00.000Z`);
+        fs.mkdirSync(directory);
+        fs.writeFileSync(path.join(directory, "child-log-tail"), `old raw tail ${i}\n`);
+      }
       await vi.advanceTimersByTimeAsync(200);
-      expect(fs.readdirSync(path.join(f.root, "wedges")).filter(name => /^20/.test(name))).toHaveLength(5);
+      expect(fs.readdirSync(path.join(f.root, "wedges")).filter(name => /^20/.test(name))).toHaveLength(8);
+      for (let i = 1; i <= 7; i++) expect(fs.readFileSync(path.join(f.root, "wedges", `2025-01-0${i}T00:00:00.000Z`, "child-log-tail"), "utf8"))
+        .toBe(`old raw tail ${i}\n`);
       expect(fs.statSync(path.join(f.root, "wedges", "reports")).isDirectory()).toBe(true);
     } finally { await f.close(); }
   });

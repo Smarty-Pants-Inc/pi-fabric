@@ -1451,7 +1451,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // agents.modelRouting.perCall.mode is "shadow"; never changes the model or the context.
   registerLazyPerCallRouter(pi, () => {
     const config = state.cwd ? state.config : state.provisionalConfig();
-    return { perCall: config.agents.modelRouting?.perCall, jev: config.jev };
+    return { perCall: config.agents.modelRouting?.perCall, jev: config.jev, retention: config.retention };
   });
 
   // No extractive module import, branch read or model call until explicit opt-in

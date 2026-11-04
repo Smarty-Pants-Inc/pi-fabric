@@ -59,8 +59,9 @@ const deadResidentRoot = (mesh = deadRootMesh()) => {
   return { mesh, host };
 };
 const addDeadResidentRun = (host: string, id: string) => {
-  const candidate = run(path.join(host, "runs", id), { status: "completed", finishedAt: NOW - 2 * DAY });
-  fs.utimesSync(candidate, (NOW - 2 * DAY) / 1000, (NOW - 2 * DAY) / 1000);
+  // An explicit seven-day CLI policy also governs resident runs; there is no hidden one-day default.
+  const candidate = run(path.join(host, "runs", id), { status: "completed", finishedAt: NOW - 8 * DAY });
+  fs.utimesSync(candidate, (NOW - 8 * DAY) / 1000, (NOW - 8 * DAY) / 1000);
   return candidate;
 };
 const addDeadResidentCandidates = (host: string, rejectedId: string, controlId: string) => {
@@ -355,9 +356,9 @@ describe("mesh-wide age-based run retention", () => {
     const host = path.join(mesh.root, "residency", "host");
     write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
     write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:dead-host", residencyRoot: host, meshRoot: mesh.root }));
-    const old = run(path.join(host, "runs", "old-resident"), { status: "completed", finishedAt: NOW - 2 * DAY });
+    const old = run(path.join(host, "runs", "old-resident"), { status: "completed", finishedAt: NOW - 8 * DAY });
     const young = run(path.join(host, "runs", "young-resident"), { status: "completed", finishedAt: NOW - 1_000 });
-    fs.utimesSync(old, (NOW - 2 * DAY) / 1000, (NOW - 2 * DAY) / 1000);
+    fs.utimesSync(old, (NOW - 8 * DAY) / 1000, (NOW - 8 * DAY) / 1000);
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(applied.removedRuns).toContain(old);
     expect(applied.removedRuns).not.toContain(young);
@@ -536,8 +537,8 @@ describe("final pre-delete check fences", () => {
     const host = path.join(mesh.root, "residency", "host");
     write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
     write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:dead-host", residencyRoot: host, meshRoot: mesh.root }));
-    const resident = run(path.join(host, "runs", "old-resident"), { status: "completed", finishedAt: NOW - 2 * DAY });
-    fs.utimesSync(resident, (NOW - 2 * DAY) / 1000, (NOW - 2 * DAY) / 1000);
+    const resident = run(path.join(host, "runs", "old-resident"), { status: "completed", finishedAt: NOW - 8 * DAY });
+    fs.utimesSync(resident, (NOW - 8 * DAY) / 1000, (NOW - 8 * DAY) / 1000);
     return { mesh, host, resident };
   };
   const newRoot = (root: string, rows: unknown[]) =>
@@ -937,6 +938,7 @@ describe("mesh retention sweep claim", () => {
       { ...DEFAULT_FABRIC_CONFIG.mesh, enabled: true }, agents, () => {}, {
         actorRoot, persistent: true, canConsumeMesh: () => true, reapDeadSessionPresence: false,
         meshRetentionSweepPath: script, retentionSweepMs: 20, closeGraceMs: 0,
+        retention: { ...DEFAULT_FABRIC_CONFIG.retention, actorRunArchiveMs: 7 * DAY },
       });
     try {
       await vi.waitFor(() => expect(published.some((event) => event.topic === FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC)).toBe(true), { timeout: 5_000 });

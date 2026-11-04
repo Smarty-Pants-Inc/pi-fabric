@@ -15,7 +15,7 @@ import type { PerCallRoutingConfig } from "./per-call-config.js";
 /** The gateway use that budgets, validates and meters these questions (see the PR notes). */
 export const PER_CALL_GATEWAY_USE = "percall_route" satisfies JevGatewayUse;
 export const PER_CALL_LEDGER = "per-call-routing.jsonl";
-export const PER_CALL_RETENTION_DAYS = 7;
+export const PER_CALL_RETENTION_DAYS: number | undefined = undefined;
 const CACHE_LIMIT = 256;
 
 export type PerCallDecision = "simple" | "main";
@@ -23,7 +23,7 @@ export type PerCallRule =
   | "user-message" | "no-tool-results" | "author-phase" | "context-over-limit" | "read-only-tools"
   | "ambiguous-jev-off" | "ambiguous-jev-budget" | "ambiguous-jev-error" | "ambiguous-jev-timeout"
   | "jev-noul" | "jev-cache";
-export interface PerCallSettings { perCall?: PerCallRoutingConfig | undefined; jev: FabricJevConfig }
+export interface PerCallSettings { perCall?: PerCallRoutingConfig | undefined; jev: FabricJevConfig; retention?: { perCallLedgerDays?: number } }
 
 interface ToolCallLike { type?: unknown; name?: unknown; arguments?: unknown }
 interface MessageLike {
@@ -161,7 +161,7 @@ const utcDay = (date: Date): string => date.toISOString().slice(0, 10);
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** Daily rotation by the active file's last-write UTC day; rotated files older than `keepDays` are removed. */
-export function rotatePerCallLedger(file: string, now: Date, keepDays = PER_CALL_RETENTION_DAYS, prune = true): boolean {
+export function rotatePerCallLedger(file: string, now: Date, keepDays: number | undefined = PER_CALL_RETENTION_DAYS, prune = true): boolean {
   const directory = path.dirname(file);
   const base = path.basename(file, ".jsonl");
   let rotated = false;
@@ -174,7 +174,7 @@ export function rotatePerCallLedger(file: string, now: Date, keepDays = PER_CALL
     fs.renameSync(file, target);
     rotated = true;
   }
-  if (!prune && !rotated) return false;
+  if (keepDays === undefined || (!prune && !rotated)) return rotated;
   const cutoff = utcDay(new Date(now.getTime() - keepDays * 86_400_000));
   const pattern = new RegExp(`^${escapeRegExp(base)}\\.(\\d{4}-\\d{2}-\\d{2})(?:\\.\\d+)?\\.jsonl$`);
   let names: string[] = [];
@@ -305,7 +305,7 @@ export class PerCallShadowRouter {
         const now = this.options.now?.() ?? new Date();
         fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
         // Prune on the first write of this process and whenever the day turns over.
-        rotatePerCallLedger(file, now, PER_CALL_RETENTION_DAYS, !this.#pruned);
+        rotatePerCallLedger(file, now, this.options.settings()?.retention?.perCallLedgerDays, !this.#pruned);
         this.#pruned = true;
         appendRouteRecord(file, record);
       } catch { /* shadow only */ }

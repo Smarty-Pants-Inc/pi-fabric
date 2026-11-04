@@ -97,7 +97,7 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
     const nativeExitChecks = vi.spyOn(process, "kill");
     const recover = vi.fn();
     const custody = { run: vi.fn((id: string) => id === "owned"), reference: vi.fn(() => false) };
-    const collector = new ResidentRequestRetention(root, [actorRoot], { retainRuns }, recover, custody);
+    const collector = new ResidentRequestRetention(root, [actorRoot], { retainRuns, residentRunMs: DAY }, recover, custody);
     try {
       collector.sweep(now, new Set(), 10_000);
       expect(collector.due(now)).toBe(false);
@@ -136,7 +136,7 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
       writeJson(statusFile, { ...status, sessionId: String(process.pid) });
     });
     const ownedBefore = snapshot(owned);
-    const collector = new ResidentRequestRetention(root, [actorRoot], { retainRuns }, recover,
+    const collector = new ResidentRequestRetention(root, [actorRoot], { retainRuns, residentRunMs: DAY }, recover,
       { run: id => id === "owned", reference: () => false });
     try { collector.sweep(now, new Set(), 10_000); } finally { collector.close(); }
     expect(recover.mock.calls.map(([run]) => run)).toEqual([unrelated]);

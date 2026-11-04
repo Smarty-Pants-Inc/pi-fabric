@@ -11,7 +11,8 @@ import { canRemoveTerminalRun, hasUnresolvedWorker, markUnresolvedWorker } from 
 import { processAlive } from "../src/storage/scratch.js";
 import { cancellationError } from "../src/async-settlement.js";
 import { ResidencyClient } from "../src/residency/client.js";
-import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
+import { ResidentHost } from "../src/residency/host.js";
+const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1000; // Explicit fixture age.
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { RESIDENT_REQUEST_RETENTION_MS } from "../src/residency/request-expiry.js";
 import { readResidentRequestDecision, registerResidentCancellation, residentRoot, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -219,7 +220,7 @@ it.skipIf(process.platform === "win32").each([
     format: 1, rootId, sessionId: "nested-writer-retention", cwd: root, projectRoot: root,
     meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
-    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/nested-writer-worker.ts"),
+    retention: { ...DEFAULT_FABRIC_CONFIG.retention, residentRunMs: RESIDENT_RUN_RETENTION_MS }, workerPath: path.resolve("tests/fixtures/nested-writer-worker.ts"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
@@ -403,7 +404,7 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
     format: 1, rootId, sessionId: "durable-descendant-cleanup", cwd: root, projectRoot: root,
     meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
-    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/nested-writer-worker.ts"),
+    retention: { ...DEFAULT_FABRIC_CONFIG.retention, residentRunMs: RESIDENT_RUN_RETENTION_MS }, workerPath: path.resolve("tests/fixtures/nested-writer-worker.ts"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };

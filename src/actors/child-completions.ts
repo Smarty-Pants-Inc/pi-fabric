@@ -611,7 +611,8 @@ export class ActorChildCompletionStore {
   }
 
   /** On the existing retention sweep, bound unread archives and receipt tombstones. */
-  prune(retentionMs: number, now = Date.now(), keepIds: ReadonlySet<string> = new Set()): void {
+  prune(retentionMs: number | undefined, now = Date.now(), keepIds: ReadonlySet<string> = new Set()): void {
+    if (retentionMs === undefined) return;
     // smarty-dev#7916: each file's owned stat is taken at judgment; only that inode is removed.
     const groups = new Map<string, { files: { file: string; stat: fs.Stats | undefined }[]; newest: number }>();
     try {
@@ -644,7 +645,7 @@ export class ActorChildCompletionStore {
   }
 
   /** Admission uses the same newest-file TTL as pruning, without deleting active context. */
-  retained(id: string, retentionMs: number, now = Date.now()): boolean {
+  retained(id: string, retentionMs: number | undefined, now = Date.now()): boolean {
     if (!ID.test(id)) return false;
     try {
       // A handoff must still have its full outcome. Missing/unreadable evidence
@@ -654,7 +655,7 @@ export class ActorChildCompletionStore {
         try { newest = Math.max(newest, fs.statSync(path.join(this.directory, `${id}${suffix}`)).mtimeMs); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
       }
-      return now - newest < retentionMs;
+      return retentionMs === undefined || now - newest < retentionMs;
     } catch { return false; }
   }
 

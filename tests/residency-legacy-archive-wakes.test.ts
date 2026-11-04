@@ -12,6 +12,8 @@ import { LEGACY_ARCHIVE_DEADLINE_MS, ResidentLegacyRunArchive } from "../src/res
 // timer; one unref'd one-shot is armed only for the earliest real due item (age
 // eligibility, held custody, evicted/failed run watch) or the degraded/disabled
 // slow fallback. Archive is rename-only; no test here deletes product bytes.
+// Watch/deadline tests use an explicit short archive age, not production defaults.
+const shortPolicy = { legacyRunArchiveAgeMs: 48 * 60 * 60 * 1000 };
 const roots: string[] = [];
 const temporary = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-archive-wakes-"));
@@ -70,7 +72,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     tree(path.join(root, "runs", "open"), { status: "running", finishedAt: undefined });
     tree(path.join(root, "runs", "mystery"), {});
     fs.writeFileSync(path.join(root, "runs", "mystery", "unknown.bin"), "x", { mode: 0o600 });
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -132,7 +134,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     fs.writeFileSync(path.join(root, "runs", "unresolved", "unresolved-worker.json"), "{}", { mode: 0o600 });
     tree(path.join(root, "runs", "mystery"), {});
     fs.writeFileSync(path.join(root, "runs", "mystery", "unknown.bin"), "x", { mode: 0o600 });
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -174,7 +176,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       return contents;
     }) as typeof fsp.readFile);
     const release = () => { if (!released) { released = true; releaseRead(); } };
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -251,7 +253,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
   it("degraded (absent runs namespace) keeps the bounded slow full-pass fallback, then goes idle once watched", async () => {
     fakeTimers();
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-archive-wakes-")); roots.push(root);
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -276,7 +278,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
   it("disabled policy: empty namespace arms nothing; a held run keeps the slow re-enable check", async () => {
     fakeTimers();
     const root = temporary();
-    const policy = { legacyRunArchiveEnabled: false };
+    const policy = { ...shortPolicy, legacyRunArchiveEnabled: false };
     const archive = new ResidentLegacyRunArchive(root, policy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
@@ -305,7 +307,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
   it("a run moved into root/runs is archived by its watch event, without any timer firing", async () => {
     fakeTimers();
     const root = temporary();
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -323,7 +325,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
   it("a per-run status.json close replacement causes a sweep of that run", async () => {
     fakeTimers();
     const root = temporary();
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -366,7 +368,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     const root = temporary();
     tree(path.join(root, "runs", "early"), { status: "running", finishedAt: undefined });
     const { byRun } = recordWatches(root);
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -389,7 +391,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     const root = temporary();
     for (let i = 0; i < 65; i++) tree(path.join(root, "runs", `r${i}`), { status: "running", finishedAt: undefined });
     const { byRun, closed } = recordWatches(root);
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     try {
       archive.start();
       // Exactly one due item (the evicted run) arms the only timer.
@@ -413,7 +415,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     const root = temporary();
     tree(path.join(root, "runs", "flaky"), { status: "running", finishedAt: undefined });
     const { byRun } = recordWatches(root);
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -446,7 +448,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     const root = temporary();
     tree(path.join(root, "runs", "held"), {});
     let held = true;
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: id => held && id === "held" });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: id => held && id === "held" });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -470,7 +472,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     tree(path.join(root, "runs", "fenced"), {});
     fs.mkdirSync(path.join(root, "requests"), { mode: 0o700 });
     fs.writeFileSync(path.join(root, "requests", "pending.json"), "{}", { mode: 0o600 });
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     try {
       archive.start();
@@ -496,7 +498,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       if (args[0] === path.join(root, "runs")) watchers.push(watcher);
       return watcher;
     }) as typeof fs.watch);
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweep = vi.spyOn(archive, "sweep");
     try {
       archive.start();
@@ -677,7 +679,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
   it("close disposes timers and watchers; later events do nothing", async () => {
     fakeTimers();
     const root = temporary();
-    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const archive = new ResidentLegacyRunArchive(root, shortPolicy, { isRetained: () => false });
     const sweeps = track(archive);
     archive.start();
     await settle(() => sweeps.done() >= 1);

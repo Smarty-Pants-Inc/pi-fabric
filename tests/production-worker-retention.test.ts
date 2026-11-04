@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { processAlive } from "../src/storage/scratch.js";
-import { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "../src/residency/host.js";
+import { sweepResidentRuns } from "../src/residency/host.js";
+const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1000; // Explicit fixture policy, not a production default.
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { decideModelRoute } from "../src/agents/model-route.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
@@ -211,7 +212,7 @@ describe("I-2 production-worker ingress retention", () => {
     const aged = new Date(Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000);
     fs.utimesSync(parent, aged, aged);
     // Strict resident startup collection still accepts this checked-exited native tree.
-    expect(sweepResidentRuns(runs, Date.now(), 10_000)).toEqual([parent]);
+    expect(sweepResidentRuns(runs, Date.now(), 10_000, { retentionMs: RESIDENT_RUN_RETENTION_MS })).toEqual([parent]);
     expect(fs.existsSync(parent)).toBe(false);
   }, 45000);
   it.each([false, true])("collects default-root close with principal provenance=%s", async principal => {

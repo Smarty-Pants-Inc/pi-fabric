@@ -52,6 +52,7 @@ const setup = async (residency: "session" | "durable", notifyOnComplete = true, 
     name: "owner", kind: "main", sessionId: "root-main",
   }, mesh, meshConfig, ownerAgents, rootDeliveries, {
     persistent: true, actorRoot: actorScopeRoot, claimResidency: residency, rootId, resolvePiModel: resolveModel,
+    retention: { ...DEFAULT_FABRIC_CONFIG.retention, actorRunArchiveMs: 7 * 86_400_000 },
   });
   const owner = makeOwner();
   cleanups.push(() => owner.close());
@@ -848,7 +849,7 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
     }, { timeout: 5000 });
     expect(fs.existsSync(store.resultFile(child.id))).toBe(true);
     await h.owner.close();
-    const old = new Date(Date.now() - DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs - 1000);
+    const old = new Date(Date.now() - 7 * 86_400_000 - 1000);
     for (const file of fs.readdirSync(store.directory)) fs.utimesSync(path.join(store.directory, file), old, old);
     const restarted = h.makeOwner(); // Maintenance yields; activation must still reject expired context.
     cleanups.push(() => restarted.close());

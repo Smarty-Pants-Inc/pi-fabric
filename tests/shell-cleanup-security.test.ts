@@ -62,7 +62,12 @@ describe("review F1: shell cleanup requires confirmed exit", () => {
       await execution;
       await close;
     }
+    const logBefore = spilled ? fs.readFileSync(job.logPath!) : undefined;
     await sweepScratch({ tempRoot: root, released: new Set([directory]) });
+    // Confirmed exit permits empty allocation cleanup, not implicit deletion of transcript-linked logs.
+    expect(fs.existsSync(directory)).toBe(spilled);
+    if (spilled) expect(fs.readFileSync(job.logPath!)).toEqual(logBefore);
+    await sweepScratch({ tempRoot: root, released: new Set([directory]), maxAgeMs: 0 });
     expect(fs.existsSync(directory)).toBe(false);
   });
 

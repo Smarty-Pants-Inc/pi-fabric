@@ -8887,7 +8887,7 @@ export class ActorManager {
     const script = this.#meshRetentionSweepPath;
     const meshRoot = this.mesh.root;
     const relative = path.relative(path.join(meshRoot, "actors"), this.#actorRoot);
-    if (!script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing || this.#releaseStrict) return;
+    if (this.#logs.retention.actorRunArchiveMs === undefined || !script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing || this.#releaseStrict) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));

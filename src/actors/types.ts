@@ -574,6 +574,8 @@ export interface FabricActorInfo extends FabricActorBatching {
   thinking?: FabricThinking;
   routeClass?: "status-groom";
   protected?: boolean;
+  /** Owner-resolved live/last activation pin, distinct from this reader's overlay and project defaults. */
+  resolvedBinding?: FabricActorRunBinding;
   binding?: FabricActorBindingView;
   projectDefaults?: FabricActorProjectDefaults;
   tools?: string[];

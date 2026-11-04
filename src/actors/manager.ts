@@ -2311,6 +2311,14 @@ export class ActorManager {
     return worker ? { runId, pid: worker.pid, startTime: worker.startTime } : undefined;
   }
 
+  /** Private drain evidence: the complete registry spec plus the owner's resolved live binding. */
+  drainSpec(id: string): Record<string, unknown> {
+    const actor = this.#requireOwnedActor(id);
+    // A protected slot needs a fresh authority claim, not a replay of its old creation inputs.
+    if (this.#slotEnforced(actor.topics)) throw new Error("ACTOR_SPEC_UNRESTORABLE");
+    return structuredClone(this.#serializedActor(actor));
+  }
+
   /** Dormancy releases runtime references, not identity, subscriptions or the durable transcript. */
   async dormantIdleActors(protectedIds: ReadonlySet<string> = new Set()): Promise<number> {
     if (!this.#persistent || this.#closing || this.#releasePaused) return 0;
@@ -9354,6 +9362,13 @@ export class ActorManager {
   async #publishBindingView(actor: ManagedActor): Promise<void> {
     this.#emitChange();
     if (!this.#canManage(actor.id)) return;
+    // An idle owner's overlay is its live binding too, not just a private display value (#18491).
+    // An activation in flight keeps the exact pin it already launched with.
+    if (!actor.inFlightRun && !actor.preparing && !actor.draining) {
+      const effective = this.#runBinding(actor);
+      this.#rememberResolvedBinding(actor, await this.#resolvedRunBinding(actor, effective));
+      await this.#saveActors(new Set(), { requiredActor: actor, durable: true });
+    }
     await this.#writePresence(actor.id);
   }
 
@@ -9644,6 +9659,11 @@ export class ActorManager {
       ...(actor.exceptionLane ? { exceptionLane: { rootId: actor.exceptionLane.rootId, lane: actor.exceptionLane.lane } } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.resolvedBinding ? { resolvedBinding: { ...actor.resolvedBinding } } : {}),
+      projectDefaults: {
+        ...(actor.model ? { model: actor.model } : {}),
+        ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
+        ...(actor.thinking ? { thinking: actor.thinking } : {}),
+      },
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
       ...(typeof actor.protected === "boolean" ? { protected: actor.protected } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
@@ -11436,6 +11456,7 @@ export class ActorManager {
       ...(effective.model ? { model: effective.model } : {}),
       ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
+      ...(actor.resolvedBinding ? { resolvedBinding: { ...actor.resolvedBinding } } : {}),
       ...(!registryView ? { binding: {
         scope: "session" as const,
         sessionId: this.sessionId,

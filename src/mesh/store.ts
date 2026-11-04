@@ -10,9 +10,13 @@ import type { LockTimingContext } from "./commit-stats.js";
 import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
+import { bindPrefixObservation, PrefixObservationCache, unknownPrefixObservation,
+  type PrefixObservation, type PrefixWitness } from "./prefix-observation.js";
+export type { DeepReadonly, PrefixEntries, PrefixObservation, PrefixWitness } from "./prefix-observation.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics, type StateChangeExceptions } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
+import type { RecoveryReader } from "./recovery-reader.js";
 import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
@@ -422,6 +426,8 @@ export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
   readonly #events: EventLog;
+  readonly #prefixObservations = new PrefixObservationCache<PrefixWitness>();
+  #prefixObservationClosed = false;
   readonly #canWakeResidents: () => boolean;
   readonly #schedulesPath: string;
   #scheduleCache:
@@ -441,7 +447,10 @@ export class MeshStore {
   ) {
     this.#canWakeResidents = options.canWakeResidents ?? (() => true);
     // A failed operation under the lock drops the parsed state (see MeshLock.withLock).
-    this.#lock = new MeshLock(root, options, () => this.#state.dropCache());
+    this.#lock = new MeshLock(root, options, () => {
+      this.#prefixObservations.clear();
+      this.#state.dropCache();
+    });
     const context: MeshStoreContext = { root, maxEventBytes, maxReadEvents, lock: this.#lock };
     this.#state = createStateBackend(context, options);
     this.#events = new EventLog(context, options, event => {
@@ -488,6 +497,8 @@ export class MeshStore {
     void this.#eventPublisher?.close();
     closeResidentWakeRetryCursor(this.root);
     this.#wakeRouteCache.clear();
+    this.#prefixObservationClosed = true;
+    this.#prefixObservations.clear();
     this.#state.close();
     // A closed sqlite backend cannot reopen and a closed shadow writes only through .lock: this
     // store no longer needs the record. Another open store of this process keeps it.
@@ -860,6 +871,11 @@ export class MeshStore {
     return this.#events.readAsync(input);
   }
 
+  /** Internal recovery reader; each bridge side owns its own continuation and cancellation. */
+  createRecoveryReader(project: (event: MeshEvent) => string | undefined, signal: AbortSignal): RecoveryReader {
+    return this.#events.createRecoveryReader(project, signal);
+  }
+
   /**
    * Durability barrier (smarty-dev#9313): resolves once every event AND every keyed-state commit
    * made on this root before the call, by any process, is on disk; otherwise it throws, for SQLite
@@ -942,6 +958,28 @@ export class MeshStore {
 
   listAllShared(prefix = "", options: MeshReadOptions = {}): readonly Readonly<MeshStateEntry>[] {
     return this.#state.listAllShared(prefix, options);
+  }
+
+  /**
+   * Optional selection only, never authority to deliver/adopt/delete. Keep a caller's witness and
+   * sequence as ONE pair; replay ALL entries even after an aborted pass. On UNKNOWN discard both
+   * and call exactly today's listAll(prefix), with today's options/errors (not fresh:true).
+   * An absent backend capability remains UNKNOWN, never known-empty or accelerated. Live errors
+   * propagate; after close, UNKNOWN leaves the legacy result/error to that ONE caller fallback.
+   */
+  observePrefix(prefix: string, previous?: PrefixWitness): PrefixObservation {
+    if (this.#prefixObservationClosed) {
+      // closeState already retired every pair. Do not probe: FILE/Shadow still permit legacy reads,
+      // and the caller's ONE listAll fallback owns the post-close selection or canonical error.
+      return unknownPrefixObservation("closed-prefix-observation-facade");
+    }
+    const observe = this.#state.observePrefix;
+    if (typeof observe !== "function") {
+      this.#prefixObservations.delete(prefix);
+      return unknownPrefixObservation("unsupported-prefix-observation-backend");
+    }
+    return bindPrefixObservation(this.#prefixObservations, prefix, previous,
+      (handle) => observe.call(this.#state, prefix, handle));
   }
 
   put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<MeshStateEntry> {

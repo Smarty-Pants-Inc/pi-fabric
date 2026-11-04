@@ -56,7 +56,7 @@ describe("terminal-answer retention custody", () => {
     fs.writeFileSync(owner, `${token}\n${pid}\n${Date.now() - 60_000}\n`);
     expect(canRemoveTerminalRun(f.run)).toBe(true);
     const collected = pruneActorRunArchives({ runsDirectory: f.root, retentionMs: 0, now: Date.now() + 1, dryRun: true });
-    expect(collected).toEqual([f.run]);
+    expect(collected).toEqual([]);
     expect(fs.existsSync(f.run)).toBe(true);
   });
   it("keeps a live old lock and fails closed for ownerless, malformed, extra, and linked lock contents", () => {

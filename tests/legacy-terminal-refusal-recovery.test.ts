@@ -148,7 +148,7 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     expect(readTerminalAdmission(directory, sent.messageId)).toEqual({ id: sent.messageId, delivery: "steer", sender });
     expect(canRemoveTerminalRun(directory)).toBe(collectible);
     const swept = pruneActorRunArchives({ runsDirectory: root, retentionMs: 0, now: Date.now() + 1_000, dryRun: true });
-    expect(swept.includes(directory)).toBe(collectible);
+    expect(swept).toEqual([]);
     expect(fs.existsSync(directory)).toBe(true);
   });
 

@@ -47,8 +47,8 @@ describe.skipIf(process.platform !== "linux")("mesh retention at fleet scale (sm
     const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     const dryMs = performance.now() - started;
     expect(plan.summary.registries).toEqual({ count: REGISTRIES, parses: REGISTRIES, maxParsesPerRegistry: 1, rootRewalks: 0 });
-    expect(plan.removedRuns).toHaveLength(REGISTRIES);
-    expect(plan.summary.deleters.pruneActorRunArchives?.removed).toBe(REGISTRIES);
+    expect(plan.removedRuns).toEqual([]);
+    expect(plan.summary.deleters.pruneActorRunArchives?.removed ?? 0).toBe(0);
     expect(plan.summary.deleters.pruneActorSessionBackups?.removed).toBe(REGISTRIES);
     // Apply is disabled at the public boundary (pi-fabric#1014 SEC P2-1): it rejects before any registry or mesh read.
     const reads: string[] = [];

@@ -50,6 +50,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { processIsAlive, scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { TRANSPORT_HOST_LEASE_RENEW_MS, TRANSPORT_HOST_LEASE_TTL_MS } from "../topology/host-leases.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT, type ActorRunArchiveResult } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, FabricActorBatchPolicyError, FabricActorQueuedWorkError, type FabricActorQueueCounts, type FabricActorRequeueResult, type FabricActorStopOptions, type FabricActorStoppedQueue, MAX_ACTOR_BATCH_EVENTS, DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, parseEventsStartAt, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { ACTOR_ACTIVATION_HEADER } from "../agents/enodev-recovery.js";
@@ -284,6 +285,8 @@ interface ManagedActor extends FabricActorBatching {
   eventsDropped?: { since: number; count: number; at: number; reason: string; runId?: string; eventRef: Record<string, string | number> };
   /** When the actor last stopped (smarty-dev#9332: the actor-stopped alarm's episode). */
   stoppedAt?: number;
+  /** Stop episode whose alarm reached Main; durable dedupe independent of mesh claim retention. */
+  stoppedAlarmSince?: number;
   validWhile?: FabricActorValidWhileSource;
   records?: FabricActorRecordsOptions;
   /** The creating principal's scope; absent for unscoped actors. */
@@ -642,6 +645,10 @@ export const ACTOR_STOPPED_ALARM_AFTER_MS = 10 * 60 * 1000;
 export const ACTOR_UNKNOWN_BLOCK_ALARM_AFTER_MS = 30 * 60 * 1000;
 /** An in-flight run is stuck past max(this, 2x the actor's p95 run time) when its worker is gone. */
 export const ACTOR_RUN_STUCK_MIN_MS = 30 * 60 * 1000;
+/** Start checked dead-worker reconciliation after one owner lease TTL. The
+ * existing 5s maintenance wake and native exit grace fit in the second TTL;
+ * neither this age nor an expired lease is evidence a worker died. */
+export const ACTOR_DEAD_WORKER_RECONCILE_AFTER_MS = TRANSPORT_HOST_LEASE_TTL_MS;
 /**
  * Bounds of an actor's dead-letter file (smarty-dev#816): past either, ordinary routed entries are trimmed, oldest first,
  * to 90% of both; each drop is counted and alarmed. Filter-held entries and accepted requeue spills are never trimmed.
@@ -936,6 +943,10 @@ export class ActorManager {
   readonly #cancelledPredecessors = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
+  /** A fallback resumes only the exact drain generation that launched this run. */
+  readonly #runReconciliations = new Map<string, {
+    runId: string; settle: (result: AgentRunResult) => void; pending?: Promise<void>; retryAt?: number;
+  }>();
   /**
    * smarty-dev#6337: the open stuck-preparing episode per actor, notified at most once. Preparation
    * time accrues across phase transitions of one activation; an admission-permit wait pauses it.
@@ -1126,7 +1137,8 @@ export class ActorManager {
     readonly mesh: MeshStore,
     readonly meshConfig: FabricMeshConfig,
     readonly agents: AgentManager,
-    readonly onDeliver: (request: FabricActorDeliveryRequest) => void,
+    /** Legacy void/incidental returns are accepted; false/rejection means not admitted for opted-in stopped confirmation. */
+    readonly onDeliver: (request: FabricActorDeliveryRequest) => unknown,
     options: {
       /** Staged resident successor: no business activation before launcher commitment. */
       releasePaused?: boolean;
@@ -1301,6 +1313,7 @@ export class ActorManager {
         this.#refreshOwnership(undefined, false);
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) {
+            this.#reconcileActorRun(this.#runningActor(actor.id) ?? actor, Date.now());
             this.#expireActivationFilter(actor);
             // Retry our admitted retirement after cursor progress, not an arbitrary shared
             // backlog discovered by a same-root creator's residency fallback (#11107).
@@ -6455,6 +6468,7 @@ export class ActorManager {
         // Stops and recovered durable terminal stops are interrupted, not failing.
         // Ordinary deadlines still fail; recovery provenance is host-only object identity.
         let runStopped = false;
+        let runLost = false;
         let capabilityLease: FabricCapabilityViewLease | undefined;
         let committedRefs: string[] | undefined;
         let preLaunch = true;
@@ -6553,7 +6567,9 @@ export class ActorManager {
           }
           preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           if (this.#slotEnforced(actor.topics)) this.#slotLaunchUnknown.add(actor.id);
-          const result = await this.agents.run(
+          let settleReconciled!: (result: AgentRunResult) => void;
+          const reconciled = new Promise<AgentRunResult>(resolve => { settleReconciled = resolve; });
+          const result = await Promise.race([this.agents.run(
             { ...this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
               ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
@@ -6577,6 +6593,7 @@ export class ActorManager {
               this.#endPreparationClock(actor.id, item.id);
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
+              this.#runReconciliations.set(actor.id, { runId: handle.id, settle: settleReconciled });
               void this.#publishPresence(actor).catch(() => undefined);
             },
             // The controller identity is this activation's generation token. A
@@ -6603,8 +6620,17 @@ export class ActorManager {
               actor.preparing = { phase: "launch", startedAt: admittedAt, attempts: item.preparationAttempts ?? 0 };
               void this.#publishPresence(actor).catch(() => undefined);
             } },
-          );
+            () => {
+              // AgentManager calls this synchronously BEFORE publishing synthetic
+              // proven loss, including when its normal monitor wins the race.
+              // This lineage still records custody after an ownership change;
+              // restore/adoption consumes the existing terminal queue tombstone.
+              for (const event of this.#batchItems(actor.id, item)) event.terminalFailed = true;
+              return !this.#persistent || this.#persistQueue(actor.id, true, false, undefined, false, true);
+            },
+          ), reconciled]);
           runId = result.id;
+          runLost = this.agents.actorRunLost(result.id);
           this.#noteSlotRun(actor, result.id);
           runEvidence = result.warnings;
           // Error-only turns and a spawned handle do not prove inference consumed context.
@@ -6620,7 +6646,7 @@ export class ActorManager {
             this.#cancelledInFlight.get(actor.id)?.has(event.id));
           const mayRedrive = !handoffConsumed && retryIdentity !== undefined && !actor.removal &&
             (actor.status as string) !== "stopped" && actor.stopReason === undefined && actor.ownershipAbort !== abortController &&
-            !explicitlyCancelled && this.#canManage(actor.id) && !result.launchPreparationTimeoutMs && !result.launchDenial &&
+            !explicitlyCancelled && !runLost && this.#canManage(actor.id) && !result.launchPreparationTimeoutMs && !result.launchDenial &&
             result.errorCode !== "CONTEXT_OVERFLOW";
           if (mayRedrive) {
             if (!item.unstartedRedrive) item.unstartedRedrive = { replayId: retryIdentity!, firstRunId: result.id };
@@ -6634,7 +6660,7 @@ export class ActorManager {
             this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
             continue;
           }
-          if (actor.ownershipAbort === abortController && result.status !== "completed") {
+          if (actor.ownershipAbort === abortController && result.status !== "completed" && !runLost) {
             // An ownership change stopped this run; the event runs again under its owner.
             delete actor.ownershipAbort;
             this.#park(actor, [item], `Fabric actor ${actor.name} (${actor.id}) ownership moved during a run`);
@@ -6839,7 +6865,7 @@ export class ActorManager {
             (!workerLaunched && preparationKind === "lane-unresolved")) {
             this.#slotLaunchUnknown.delete(actor.id);
           }
-          if (!this.#slotCurrent(actor) && !runCompleted) {
+          if (!this.#slotCurrent(actor) && !runCompleted && !runLost) {
             // Authority loss during async preparation cannot consume accepted input.
             // Unlike ownership-transfer #park, retain callback asks too: a slot
             // outage is not permission to reject-and-forget an accepted activation.
@@ -6866,7 +6892,7 @@ export class ActorManager {
             // the next owner run instead of lost (smarty-dev#442); one whose run already
             // completed is recorded, not rerun, so its side effects do not repeat.
             // A recovered ENODEV answer was never run here: park it, and the next owner recovers it (marker kept).
-            if (runCompleted && !enodevRecovered) this.#drop(actor, [item], message);
+            if ((runCompleted && !enodevRecovered) || runLost) this.#drop(actor, [item], message);
             else {
               // #912 round 4: a resumed item refused before any launch spends no restart attempt, so count the
               // refusals: from the cap on it loses its parked-queue exemption, and its owner hears it once.
@@ -6990,6 +7016,7 @@ export class ActorManager {
             delete actor.preparing;
             this.#endPreparationClock(actor.id, item.id);
             delete actor.inFlightRun;
+            this.#runReconciliations.delete(actor.id);
           }
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
@@ -8946,42 +8973,100 @@ export class ActorManager {
    * smarty-dev#9332: actor states that cannot act raise the same owner alarm as a blocked activation
    * (fabric.alarm.actor-activation records ownerRoot; onDeliver reaches the owner's Main),
    * evaluated on the existing retention sweep, no new timer:
-   * - actor-stopped: a durable or supervisor actor stopped for over 10 min and not removed;
-   * - actor-run-stuck: an in-flight run older than max(30 min, 2x the actor's p95 run time) whose run directory is
-   *   missing or whose worker is gone;
+   * - actor-stopped: once per stop episode, for a durable or supervisor actor stopped for over 10 min and not removed;
+   * - actor-run-stuck: unfinished work older than max(30 min, 2x the actor's p95 run time) warns when its
+   *   directory/status/worker is unverified; worker-gone/reused additionally requires an exact native exit >5 s old;
+   *   warnings alone never authorize loss settlement or NEXT;
    * - actor-event-dropped: re-alarmed here while its episode lasts (raised first at the drop itself).
    */
   #alarmActorStates(actor: ManagedActor, now: number): void {
     this.#alarmOrphanOwner(actor, now);
+    this.#reconcileActorRun(this.#runningActor(actor.id) ?? actor, now);
     if (actor.status === "stopped" && !actor.removal && (actor.residency === "durable" || actor.supervisorFor)) {
       const since = actor.stoppedAt;
-      if (since !== undefined) {
+      if (since !== undefined && actor.stoppedAlarmSince !== since && now - since >= ACTOR_STOPPED_ALARM_AFTER_MS) {
         const stopKind = actor.stopReason === "host-exit" ? "relaunch" : actor.stopReason ? "stop" : actor.lastError ? "error" : "stop";
-        this.#alarmActorState(actor, "actor-stopped", since, actorAlarmSlot(now, since, ACTOR_STOPPED_ALARM_AFTER_MS), now, () => ({
+        this.#alarmActorState(actor, "actor-stopped", since, 0, now, () => ({
           actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: stopKind,
           ...(actor.stopReason ? { stopReason: actor.stopReason } : {}),
           ...(actor.lastError ? { lastErrorCode: classifyActivationFailure({ lastError: actor.lastError, error: actor.lastError }).code } : {}),
           since, stoppedForMs: now - since, residency: actor.residency, ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}) }),
           () => { const current = this.#actors.get(actor.id); return current?.status === "stopped" && !current.removal &&
-            current.stoppedAt === since; });
+            current.stoppedAt === since && current.stoppedAlarmSince !== since && !this.#closing && !this.#releaseStrict &&
+            this.#canConsumeMesh?.() !== false && this.#ownershipDecision(current.id) && this.#slotCurrent(current); });
       }
     }
     const run = actor.inFlightRun;
-    if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
+    if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS &&
+        this.agents.actorRunUnfinished(run.id, actor.id) !== false) {
       const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
       const gone = now - run.startedAt > threshold ? this.#runGone(run.id) : undefined;
-      if (gone) {
+      const native = gone === "worker-gone" || gone === "worker-pid-reused";
+      const exit = native ? this.agents.actorWorkerExit(run.id, actor.id) : undefined;
+      // Missing/unreadable state remains a warning even without native proof.
+      // A gone/reused notice must not borrow that uncertainty policy as proof of death.
+      if (gone && (!native || (exit?.unfinished === true && now - exit.exitedAt > 5_000))) {
         this.#alarmActorState(actor, "actor-run-stuck", run.startedAt, actorAlarmSlot(now, run.startedAt, threshold), now, () => ({
           actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: gone, runId: run.id,
           since: run.startedAt, runningForMs: now - run.startedAt, thresholdMs: threshold, ...this.#runStatusHint(run.id) }),
-          () => this.#actors.get(actor.id)?.inFlightRun?.id === run.id);
+          () => this.#actorRunAlarmCurrent(actor, run, exit?.exitedAt) && this.#runGone(run.id) === gone);
       }
     }
     const dropped = actor.eventsDropped;
     if (dropped) this.#alarmDroppedEvents(actor, dropped, now);
   }
 
-  /** Why an in-flight run's worker is gone, or undefined while it can still be running. */
+  // Alarm claims and publication await the mesh. Recheck the exact episode and
+  // owner, not just its run ID: a settled actor continuation may still hold it.
+  // Native notices must also retain the exact host observation and strict age;
+  // unknown long-runtime warnings carry no native authority.
+  #actorRunAlarmCurrent(actor: ManagedActor, run: NonNullable<ManagedActor["inFlightRun"]>, exitedAt?: number): boolean {
+    if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false || !this.#actors.has(actor.id) ||
+        !this.#canManage(actor.id) || this.#runningActor(actor.id)?.inFlightRun !== run ||
+        this.agents.actorRunUnfinished(run.id, actor.id) === false) return false;
+    if (exitedAt === undefined) return true;
+    const exit = this.agents.actorWorkerExit(run.id, actor.id);
+    return exit?.unfinished === true && exit.exitedAt === exitedAt && Date.now() - exit.exitedAt > 5_000;
+  }
+
+  /**
+   * Native close/status monitoring is the normal path. The existing mesh event
+   * wake plus its 5s idle maintenance safety net recover a lost continuation;
+   * archive retention's 15-minute cadence is not the recovery clock (#17191).
+   */
+  #reconcileActorRun(actor: ManagedActor, now: number): void {
+    const run = actor.inFlightRun;
+    const recovery = this.#runReconciliations.get(actor.id);
+    if (!run || !recovery || recovery.runId !== run.id || recovery.pending || now < (recovery.retryAt ?? 0) ||
+        now - run.startedAt < ACTOR_DEAD_WORKER_RECONCILE_AFTER_MS || this.#closing || this.#releaseStrict ||
+        this.#canConsumeMesh?.() === false || !this.#canManage(actor.id)) return;
+    const exit = this.agents.actorWorkerExit(run.id, actor.id);
+    if (!exit || now - exit.exitedAt <= 5_000) return;
+    const current = () => !this.#closing && this.#actors.has(actor.id) && this.#canManage(actor.id) &&
+      this.#runningActor(actor.id)?.inFlightRun === run;
+    // Known-terminal results may have a stranded original continuation too, but
+    // are not stuck work. Recheck both classification and captured episode after
+    // the asynchronous alarm claim; NEXT must never inherit the old notice.
+    if (exit.unfinished) {
+      const reason = this.#runGone(run.id) === "worker-pid-reused" ? "worker-pid-reused" : "worker-gone";
+      this.#alarmActorState(actor, "actor-run-stuck", run.startedAt, 0, now, () => ({
+        actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, runId: run.id,
+        since: run.startedAt, runningForMs: now - run.startedAt, thresholdMs: ACTOR_DEAD_WORKER_RECONCILE_AFTER_MS,
+        ...this.#runStatusHint(run.id),
+      }), () => this.#actorRunAlarmCurrent(actor, run, exit.exitedAt));
+    }
+    const pending = this.agents.reconcileActorRun(run.id, actor.id).then(result => {
+      // Never clear an in-flight marker or start a second drain here. Hand the
+      // manager-validated result back through the original serial finalizer.
+      if (result && current() && this.#runningActor(actor.id)?.inFlightRun === run &&
+          this.#runReconciliations.get(actor.id) === recovery) recovery.settle(result);
+    }).catch(() => undefined).finally(() => {
+      if (recovery.pending === pending) delete recovery.pending;
+      recovery.retryAt = Date.now() + TRANSPORT_HOST_LEASE_RENEW_MS;
+    });
+    recovery.pending = pending;
+  }
+
   /**
    * Why a run past its stuck threshold is not proven to be running (a fixed reason code), or undefined while it is.
    * Liveness comes only from this host's own record of the launched worker (AgentManager.workerIdentity: the pid and
@@ -9053,9 +9138,21 @@ export class ActorManager {
       () => this.#actors.get(actor.id)?.eventsDropped?.since === dropped.since);
   }
 
+  /** Record confirmed Main admission for the current owned stop episode, never on a stale async actor object. */
+  #rememberStoppedAlarm(actorId: string, since: number): void {
+    const actor = this.#actors.get(actorId);
+    if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false || actor?.status !== "stopped" ||
+        actor.removal || actor.stoppedAt !== since || actor.stoppedAlarmSince === since ||
+        !this.#ownershipDecision(actor.id) || !this.#slotCurrent(actor)) return;
+    actor.stoppedAlarmSince = since;
+    // Start the existing durable save immediately: its revision also vetoes an older in-flight registry snapshot.
+    void this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: actor })
+      .catch((error: unknown) => this.#retryRegistrySave(error, true));
+  }
+
   // One durable mesh claim per actor and kind gates each 6 h slot of an episode (since), across managers,
   // owner handoffs and restarts: only the manager whose compare-and-swap takes the slot publishes (smarty-dev#7782).
-  // Slots: see actorAlarmSlot.
+  // Stopped episodes use only slot 0 and retry until Main admission is confirmed; other slots: see actorAlarmSlot.
   #alarmActorState(actor: ManagedActor, kind: ActorAlarmKind, since: number, slot: number | undefined, now: number,
     describe: () => Record<string, unknown>, current: () => boolean): void {
     if (slot === undefined) return;
@@ -9063,8 +9160,11 @@ export class ActorManager {
     // A `pending` claim whose publish is overdue no longer covers its slot (smarty-dev#7905).
     const covers = (entry: MeshStateEntry | undefined): boolean => {
       const claimed = entry?.value as { since?: unknown; slot?: unknown; state?: unknown; at?: unknown } | undefined;
-      return claimed?.since === since && typeof claimed.slot === "number" && claimed.slot >= slot &&
-        !(claimed.state === "pending" && typeof claimed.at === "number" && now - claimed.at > ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS);
+      if (claimed?.since !== since || typeof claimed.slot !== "number" || !(claimed.slot >= slot)) return false;
+      // Publication is not Main admission. Only a fresh pending claim serializes unconfirmed stop delivery.
+      if (kind === "actor-stopped") return claimed.state === "pending" && typeof claimed.at === "number" &&
+        now - claimed.at <= ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS;
+      return !(claimed.state === "pending" && typeof claimed.at === "number" && now - claimed.at > ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS);
     };
     if (covers(this.mesh.get(key))) return;
     const data = describe();
@@ -9122,14 +9222,15 @@ export class ActorManager {
         return;
       }
       // Blocked slot -1 is the early unknown-block notice, only if the live streak still has no notice.
-      // Blocked slot 0 remains allowed; other state kinds only repeat after slot 0.
+      // Blocked slot 0 remains allowed; stopped episodes and run-stuck warnings notify on slot 0 too.
       const live = this.#actors.get(actor.id);
       const repeat = kind === "actor-activation-blocked"
         ? slot >= 0 || (slot === -1 && data.early === true && live !== undefined && !live.failureStreak?.notified)
-        : slot > 0;
-      // At-most-once Main delivery: receipt replay returns the original id, never this attempt's id.
-      // ponytail: a crash after publish but before onDeliver loses this slot's notice; the next slot re-alarms.
-      if (!orphanOwner && repeat && event.id === attemptId && current() && this.mesh.get(key)?.version === claim.version) {
+        : kind === "actor-stopped" || kind === "actor-run-stuck" || slot > 0;
+      // Stopped episodes retry the stable notice even on receipt replay: the host confirms Main admission.
+      // Other kinds retain at-most-once callbacks per slot; later recurring slots recover a lost notice.
+      if (!orphanOwner && repeat && (kind === "actor-stopped" || event.id === attemptId) &&
+          current() && this.mesh.get(key)?.version === claim.version) {
         const reason = actorAlarmReason(data.reason);
         const notice: FabricActorMessage = {
           id: dedupeKey, actorId: actor.id, actorName: actor.name, direction: "out",
@@ -9138,9 +9239,19 @@ export class ActorManager {
           text: `Fabric host notice: ${kind}; reason: ${reason}. Inspect it with agents.actorStatus and agents.log.`,
         };
         try {
-          this.onDeliver({ actor: this.#alarmInfo(live ?? actor), message: notice, delivery: "followUp", triggerTurn: true });
-        } catch { /* Best effort: the mesh alarm remains, and the slot is still marked published below. */ }
+          if (kind === "actor-stopped") {
+            const admitted = await this.onDeliver({ actor: this.#alarmInfo(live ?? actor), message: notice,
+              delivery: "followUp", triggerTurn: true, requireConfirmation: "main" });
+            // Synchronous legacy adapters return void on acceptance; false or rejection leaves the episode retryable.
+            if (admitted !== false && current() && this.mesh.get(key)?.version === claim.version) {
+              this.#rememberStoppedAlarm(actor.id, since);
+            }
+          } else {
+            this.onDeliver({ actor: this.#alarmInfo(live ?? actor), message: notice, delivery: "followUp", triggerTurn: true });
+          }
+        } catch { /* No stop marker without admission; the stable notice is retried on the next maintenance pass. */ }
       }
+      // Even an unconfirmed/failed callback completed this publish attempt: do not impose the pending-claim timeout.
       await this.mesh.put({ key, identity: this.identity, value: { ...claimed, state: "published" }, ifVersion: claim.version })
         .catch(() => undefined);
     })();
@@ -9510,6 +9621,8 @@ export class ActorManager {
       status: actor.status,
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.status === "stopped" && actor.stoppedAt !== undefined ? { stoppedAt: actor.stoppedAt } : {}),
+      ...(actor.status === "stopped" && actor.stoppedAlarmSince !== undefined && actor.stoppedAlarmSince === actor.stoppedAt
+        ? { stoppedAlarmSince: actor.stoppedAlarmSince } : {}),
       events: actor.events,
       ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
       topics: actor.topics,
@@ -9754,7 +9867,14 @@ export class ActorManager {
           !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id) &&
           (actor.removal !== undefined || this.#slotCurrent(actor)));
         if (options?.requiredActor && !owned.includes(options.requiredActor)) throw new ActorRegistryOwnershipError();
+        const currentById = new Map(current.map(row => [row.id, row]));
         const rows = owned.map(actor => {
+          const stored = currentById.get(actor.id);
+          // A stale owned object must not erase a committed marker during a metadata save. Only the same stop counts.
+          if (actor.status === "stopped" && actor.stoppedAt !== undefined && stored?.status === "stopped" &&
+              stored.stoppedAt === actor.stoppedAt && stored.stoppedAlarmSince === actor.stoppedAt) {
+            actor.stoppedAlarmSince = actor.stoppedAt;
+          }
           const row: Record<string, unknown> = { ...this.#serializedActor(actor),
             ...(actor === options?.requiredActor ? options?.filterUpdate : undefined) };
           // Only this setter's save carries the staged filter; other saves still serialize the live value.
@@ -10215,6 +10335,9 @@ export class ActorManager {
         ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
         ...(stopReason ? { stopReason } : {}),
         ...(stoppedAt !== undefined ? { stoppedAt } : {}),
+        ...(typeof source.stoppedAlarmSince === "number" && Number.isFinite(source.stoppedAlarmSince) &&
+            source.stoppedAlarmSince >= 0 && source.stoppedAlarmSince === stoppedAt
+          ? { stoppedAlarmSince: source.stoppedAlarmSince } : {}),
         ...(status === "stopped" && record.sessionOrphan && record.sessionOrphan.oldRoot === record.rootId &&
             typeof record.sessionOrphan.oldHost === "string" && typeof record.sessionOrphan.reason === "string" &&
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)
@@ -10765,10 +10888,20 @@ export class ActorManager {
         const item = refRecord(raw) as Partial<ActorQueueItem> | undefined;
         if (!item) continue;
         items.push(item);
-        const send = this.#restoredSend(actor, item);
-        if (send && (item.terminalFailed === true || hasDeliveryOutcome(this.mesh.root, send, "failed"))) add({ ...send, outcome: "failed",
-          reason: "activation ended before inference consumed this event", at: Date.now() });
       }
+    }
+    items.push(...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []), ...this.#inFlightItems(actor.id));
+    // An adopter can encounter an older copy BEFORE the lineage that fenced
+    // loss. Import exact queue-item tombstones across ALL snapshots first, even
+    // for callerless tell/host inputs with no addressed delivery receipt. These
+    // parsed snapshots are private restore inputs, not a new persistent format.
+    const terminalIds = new Set(items.filter(item => item.terminalFailed === true &&
+      !(item.source === "child-completion" && item.deferredHandoff === true)).map(item => item.id));
+    for (const item of items) {
+      if (terminalIds.has(item.id) && !(item.source === "child-completion" && item.deferredHandoff === true)) item.terminalFailed = true;
+      const send = this.#restoredSend(actor, item);
+      if (send && (item.terminalFailed === true || hasDeliveryOutcome(this.mesh.root, send, "failed"))) add({ ...send, outcome: "failed",
+        reason: "activation ended before inference consumed this event", at: Date.now() });
     }
     if (pending.length) this.#pendingDeliveryOutcomes.set(actor.id, pending);
     const failed = new Set(pending.filter(record => record.outcome === "failed").map(record => this.#sendKey(record)));
@@ -10784,7 +10917,6 @@ export class ActorManager {
       if (kept?.length) queue.set(actor.id, kept);
       else queue.delete(actor.id);
     }
-    items.push(...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []), ...this.#inFlightItems(actor.id));
     // The mesh cursor's old event-only cache must not turn a terminal send into
     // evidence against a distinct tuple that happens to share its event id.
     const liveEvents = new Set(items.filter(item => !terminal(item) && typeof item.source === "string" && item.source.startsWith("mesh:"))

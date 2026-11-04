@@ -157,6 +157,7 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
     fs.mkdirSync(expiredRun, { recursive: true });
     fs.writeFileSync(path.join(expiredRun, "status.json"), JSON.stringify({ status: "completed",
       transport: "process", sessionId: "2147483646", finishedAt: 1 }));
+    const expiredRunStatus = fs.readFileSync(path.join(expiredRun, "status.json"));
     registerFabricCommand(pi, { state, capturedTools, fabricUi: { stop: vi.fn() } as unknown as FabricUiController, applyFabricMode: vi.fn(), suspendToolCapture: vi.fn() });
     const registry = path.join(config.actorRoot, "actors.json");
     const entered = deferred(), release = deferred();
@@ -215,8 +216,9 @@ describe("Security R2 S2 terminal lineage versus runtime disposal", () => {
       expect(retained || admitted).toBe(true);
       if (!fail) expect(admitted).toBe(true); // Exercise the previously missed destination.
     });
-    if (!fail) await vi.waitFor(() => expect(fs.existsSync(expiredRun)).toBe(false));
-    else expect(fs.existsSync(expiredRun)).toBe(true);
+    // Expired actor traces remain in place under keep-all-traces on both success and failure.
+    await vi.waitFor(() => expect(fs.existsSync(expiredRun)).toBe(true));
+    expect(fs.readFileSync(path.join(expiredRun, "status.json"))).toEqual(expiredRunStatus);
     expect(mesh.listAll(residentDeliveryPrefix(successor), { fresh: true })).toHaveLength(0);
     expect(host.participants.lineageAlive(original)).toBe(true);
     expect(mesh.get(key("topology/lineage-closures/"), { fresh: true })).toBeUndefined();

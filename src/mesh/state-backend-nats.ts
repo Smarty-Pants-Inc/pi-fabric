@@ -15,7 +15,7 @@ import path from "node:path";
 import { captureStorageDelete, captureStoragePut, storageRevision } from "../verified/storage.js";
 import type { MeshIdentity } from "./event-log.js";
 import type {
-  MeshCommitEffects, StateBackend, StateBackendBatchInput, StateBackendDeleteInput, StateBackendDiagnostics,
+  MeshCommitEffects, PrefixObservation, PrefixWitness, StateBackend, StateBackendBatchInput, StateBackendDeleteInput, StateBackendDiagnostics,
   StateBackendPutInput,
 } from "./state-backend.js";
 import {
@@ -41,6 +41,13 @@ export class NatsWrongLastSequenceError extends Error {
 
 /** One stored stream message. */
 export interface NatsStreamMessage { seq: number; data: Uint8Array; msgID?: string }
+
+/** Optional proof about THIS consumer/connection lifetime, never about unseen remote writes. */
+export interface NatsProjectionConsumer {
+  stop(): Promise<void>;
+  /** Synchronous, network-free identity; undefined while continuity is uncertain. Old ports remain unsupported. */
+  observationBinding?(): object | undefined;
+}
 
 /**
  * The JetStream operations this backend uses. The real implementation wraps the official nats.js v3 client
@@ -75,7 +82,7 @@ export interface JetStreamPort {
    */
   publish(subject: string, data: Uint8Array, options: { expectLastSequence: number; msgID: string; timeoutMs?: number }): Promise<{ seq: number; duplicate: boolean }>;
   /** Delivers every message after `afterSeq`, in order, then each new one as it is stored; a broken delivery calls `onError`. */
-  consume(stream: string, afterSeq: number, onMessage: (message: NatsStreamMessage) => void, onError?: (error: unknown) => void): Promise<{ stop(): Promise<void> }>;
+  consume(stream: string, afterSeq: number, onMessage: (message: NatsStreamMessage) => void, onError?: (error: unknown) => void): Promise<NatsProjectionConsumer>;
   close(): Promise<void>;
 }
 
@@ -362,7 +369,12 @@ export class MeshStateNatsNotDurableError extends MeshSyncNotDurableError {
 export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMessage, maxTombstones: number,
   limits: Pick<NatsSnapshotLimits, "maxBytes" | "maxEntries" | "maxChunks"> = natsSnapshotLimits({})): NatsSnapshot => {
   if (message.seq <= snapshot.seq) return snapshot;
-  const record = decode(message.data);
+  return applyNatsRecord(snapshot, message, decode(message.data), maxTombstones, limits);
+};
+
+/** Decode once, sharing the successfully applied record with prefix invalidation. */
+const applyNatsRecord = (snapshot: NatsSnapshot, message: NatsStreamMessage, record: NatsRecord, maxTombstones: number,
+  limits: Pick<NatsSnapshotLimits, "maxBytes" | "maxEntries" | "maxChunks">): NatsSnapshot => {
   if (record.type === "retire" || record.type === "import-begin" || record.type === "import-commit") return lifecycle(snapshot, record, message.seq);
   if (snapshot.status === "retired") throw new MeshStateNatsRefusedError(`stream message ${message.seq} (${record.type}) is after the stream was retired`);
   // A snapshot's records change no state; a complete one (its end) marks where a later host may start.
@@ -486,6 +498,15 @@ const singleWriteContract = <T>(write: Promise<T>): Promise<T> => write.catch((e
 });
 
 type NatsBootstrap = { active: boolean; generation: number };
+type NatsPrefixSelection = { witness: PrefixWitness };
+const PREFIX_SELECTION_LIMIT = 32;
+
+/** Only called on a newly cloned JSON selection, never on the projection or the legacy shared-read graph. */
+const freezePrefixSelection = (value: unknown): void => {
+  if (value === null || typeof value !== "object") return;
+  for (const child of Object.values(value)) freezePrefixSelection(child);
+  Object.freeze(value);
+};
 
 export class NatsStateBackend implements StateBackend {
   readonly kind = "nats" as const;
@@ -499,7 +520,13 @@ export class NatsStateBackend implements StateBackend {
   #knownSeq = 0;
   #waiters: { seq: number; resolve: () => void; reject: (error: unknown) => void }[] = [];
   #failure: unknown;
-  #consumer: { stop(): Promise<void> } | undefined;
+  #consumer: NatsProjectionConsumer | undefined;
+  #initialized = false;
+  /** Frozen at projector start, not a fresh-read/catch-up request made by observation. */
+  #observationReadySeq: number | undefined;
+  #observationBinding: object | undefined;
+  /** Private, bounded handle registry. Selection graphs belong to the borrower, not this registry. */
+  readonly #prefixSelections = new Map<string, NatsPrefixSelection>();
   #closed = false;
   #casRetries = 0;
   /** Bumped per projector start: deliveries of a stopped consumer are ignored. */
@@ -538,6 +565,7 @@ export class NatsStateBackend implements StateBackend {
       await backend.#startProjector();
       const head = backend.#knownSeq;
       await backend.#appliedThrough(head, undefined, true);
+      backend.#initialized = true;
       return backend;
     } catch (error) {
       const consumer = backend.#retireProjector();
@@ -553,6 +581,8 @@ export class NatsStateBackend implements StateBackend {
    * during the load count), and a backlog over `maxReplay` loads a newer snapshot once, then refuses (LIMIT).
    */
   async #startProjector(): Promise<void> {
+    this.#invalidatePrefixObservations();
+    this.#observationReadySeq = undefined;
     this.#retireBootstrap();
     const generation = ++this.#generation;
     const current = () => !this.#closed && this.#failure === undefined && generation === this.#generation;
@@ -561,12 +591,21 @@ export class NatsStateBackend implements StateBackend {
         const loaded = await this.#loadSnapshot();
         if (!current()) return;
         // A newer snapshot replaces the model: one state-change hint per install (none at open: no listener yet).
-        if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); this.#notifyStateChanged(); }
+        if (loaded && loaded.seq > this.#snapshot.seq) {
+          this.#invalidatePrefixObservations();
+          this.#snapshot = loaded;
+          this.#settle();
+          this.#notifyStateChanged();
+        }
         const last = await this.#options.port.lastSequence(this.#options.stream);
         if (!current()) return;
         this.#knownSeq = Math.max(this.#knownSeq, last);
         const backlog = last - this.#snapshot.seq;
-        if (backlog <= this.#limits.maxReplay) break;
+        if (backlog <= this.#limits.maxReplay) {
+          // A regressed stream head cannot prove initialization of this model. Keep legacy reads unchanged.
+          this.#observationReadySeq = backlog < 0 ? undefined : last;
+          break;
+        }
         if (attempt >= 2) {
           throw new MeshStateNatsLimitError(`the projector would replay ${backlog} messages after sequence ${this.#snapshot.seq} (limit ${this.#limits.maxReplay})`);
         }
@@ -671,6 +710,7 @@ export class NatsStateBackend implements StateBackend {
    */
   #resync(): void {
     if (this.#closed || this.#failure !== undefined) return;
+    this.#invalidatePrefixObservations();
     // P1-3: a gap during a running re-sync (a second purge) is recorded, never dropped.
     if (this.#resyncing) { this.#gapPending = true; return; }
     this.#resyncing = true;
@@ -775,6 +815,7 @@ export class NatsStateBackend implements StateBackend {
   /** The projector stopped (a protocol violation, a broken delivery): every later read and write fails closed. */
   #fail(error: unknown): void {
     if (this.#failure !== undefined || this.#closed) return;
+    this.#invalidatePrefixObservations();
     this.#retireBootstrap();
     this.#failure = redactNatsError(error);
     for (const waiter of this.#waiters.splice(0)) waiter.reject(this.#failure);
@@ -786,8 +827,20 @@ export class NatsStateBackend implements StateBackend {
     // Stream sequences are contiguous until a purge: a gap means a snapshot purged what this model still needed.
     if (message.seq > this.#snapshot.seq + 1) { this.#resync(); return; }
     const before = this.#snapshot;
-    try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES, this.#limits); }
-    catch (error) { this.#fail(error); return; }
+    try {
+      if (message.seq > before.seq) {
+        const record = decode(message.data);
+        this.#snapshot = applyNatsRecord(before, message, record, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES, this.#limits);
+        // Invalidate BEFORE any existing waiter, outbox, or state-change callback can observe the new projection.
+        this.#syncObservationBinding();
+        if (this.#snapshot.epoch !== before.epoch || this.#snapshot.status !== before.status) this.#invalidatePrefixObservations();
+        else if (record.type === "batch") {
+          for (const prefix of this.#prefixSelections.keys()) {
+            if (record.changes.some(change => change.key.startsWith(prefix))) this.#prefixSelections.delete(prefix);
+          }
+        }
+      }
+    } catch (error) { this.#fail(error); return; }
     this.#settle();
     if (this.#snapshot !== before) this.#notifyStateChanged();
   }
@@ -913,6 +966,50 @@ export class NatsStateBackend implements StateBackend {
     const snapshot = this.#readable(options);
     return sortedKeys([...snapshot.entries.keys()].filter(key => key.startsWith(prefix))).map(key => snapshot.entries.get(key)!);
   }
+  #invalidatePrefixObservations(): void {
+    this.#prefixSelections.clear();
+    this.#observationBinding = undefined;
+  }
+
+  #syncObservationBinding(): object | undefined {
+    let binding: object | undefined;
+    // An optional proof accessor is not a canonical read. Its absence/failure must not change legacy reads.
+    try { binding = this.#consumer?.observationBinding?.(); } catch { binding = undefined; }
+    if (binding === null || typeof binding !== "object") binding = undefined;
+    if (binding !== this.#observationBinding) {
+      this.#prefixSelections.clear();
+      this.#observationBinding = binding;
+    }
+    return binding;
+  }
+
+  /** Complete local applied projection only; never asks JetStream to catch up or strengthens listAll semantics. */
+  observePrefix(prefix: string, previous?: PrefixWitness): PrefixObservation {
+    if (prefix) validateMeshStateKey(prefix);
+    const snapshot = this.#readable(); // closed, retired and fatal projector errors stay canonical errors
+    const binding = this.#syncObservationBinding();
+    if (!this.#initialized || this.#resyncing || this.#observationReadySeq === undefined ||
+        snapshot.seq < this.#observationReadySeq || snapshot.status !== "ready" || binding === undefined) {
+      this.#prefixSelections.clear();
+      return { kind: "unknown", reason: "nats-projection-continuity-unavailable" };
+    }
+    const saved = this.#prefixSelections.get(prefix);
+    if (saved !== undefined && saved.witness === previous) {
+      // LRU bookkeeping only: no entry/key walk, sort, decode, clone or freeze on a hit.
+      this.#prefixSelections.delete(prefix);
+      this.#prefixSelections.set(prefix, saved);
+      return { kind: "unchanged", witness: saved.witness };
+    }
+    const entries = sortedKeys([...snapshot.entries.keys()].filter(key => key.startsWith(prefix)))
+      .map(key => jsonClone(snapshot.entries.get(key)!));
+    freezePrefixSelection(entries);
+    const witness: PrefixWitness = Object.freeze({});
+    this.#prefixSelections.delete(prefix);
+    this.#prefixSelections.set(prefix, { witness });
+    if (this.#prefixSelections.size > PREFIX_SELECTION_LIMIT) this.#prefixSelections.delete(this.#prefixSelections.keys().next().value!);
+    return { kind: "snapshot", witness, entries };
+  }
+
   stateToken(options?: MeshReadOptions): object { return this.#readable(options); }
   stateStamp(): string | undefined { return `nats:${this.#streamId}:${this.#snapshot.seq}`; }
   cachedStateStamp(): string | undefined { return this.stateStamp(); }
@@ -1118,7 +1215,7 @@ export class NatsStateBackend implements StateBackend {
     if (this.#options.syncAlways !== true) throw new MeshStateNatsNotDurableError(this.#options.syncAlways);
   }
 
-  dropCache(): void { /* the model is the stream's projection: nothing to drop */ }
+  dropCache(): void { this.#invalidatePrefixObservations(); /* retain the stream's projection */ }
 
   diagnostics(): StateBackendDiagnostics {
     return { kind: "nats", nats: { stream: this.#options.stream, appliedSeq: this.#snapshot.seq, knownSeq: this.#knownSeq,
@@ -1126,7 +1223,9 @@ export class NatsStateBackend implements StateBackend {
       resyncs: this.#resyncs, ...(this.#failure ? { failure: redactNatsUrls(String(this.#failure)) } : {}) } } as StateBackendDiagnostics;
   }
 
-  #retireProjector(): { stop(): Promise<void> } | undefined {
+  #retireProjector(): NatsProjectionConsumer | undefined {
+    this.#invalidatePrefixObservations();
+    this.#initialized = false;
     this.#closed = true;
     this.#generation++;
     this.#retireBootstrap();

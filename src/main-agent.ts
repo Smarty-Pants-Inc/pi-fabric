@@ -6,6 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
 import { withConfirmedSessionFile } from "./core/session-receipts.js";
+import type { NativeRecoveryCustodyReader, NativeRecoveryCustodyResult, NativeRecoverySessionRef } from "./core/session-receipts.js";
+import { readNativeRecoveryCustody, nativeRecoveryCarrierCustody, type NativeRecoveryCarrierCustody } from "./core/native-recovery.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import type { FabricIsolatedSourceFailure } from "./topology/types.js";
@@ -540,6 +542,9 @@ export class MainAgentController implements FabricMainAgentTarget {
   #sessionFileIdentity: string | undefined;
   #journal: string | undefined;
   #inboxFence: { owns(id: string): boolean; active(): boolean } | undefined;
+  #readNativeCustody: NativeRecoveryCustodyReader | undefined;
+  #nativeSessionRef: NativeRecoverySessionRef | undefined;
+  #nativeJournalUnknown = false;
   // Delivery ids whose message the session holds, or that will never go (replaced, dropped):
   // persisted beside the journal, bounded, oldest first. This index also retains the owner halt
   // after the message journal is empty. With the journal's own items they make
@@ -718,6 +723,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     // D3 seat drain (smarty-dev#15310): dashboard/composer input is refused too, before Pi sees it.
     assertMainInboxOpen(this.id, { path: "dashboard.composer", text: message });
+    this.#assertNativeAdmission();
     const text = message.trim();
     if (!text) throw new Error("Main agent message must not be empty");
     const messageId = randomUUID();
@@ -753,6 +759,24 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   deliverAgent(request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
+    return this.#deliverAgent(this.id, request);
+  }
+
+  /** Host-only adapter after the router's original-recipient authorization. This grants no
+   * new sender authority: only a fresh native committed chain may change the delivery owner. */
+  deliverNativeRecoveryAgent(originalTargetId: string, request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
+    const view = this.#nativeView();
+    if (view.status === "hold") throw new Error(view.reason);
+    if (view.status !== "validated" || originalTargetId === this.id) throw new Error("No committed native Main recipient chain");
+    const start = view.transfers.findIndex(transfer => `session:${transfer.source.sessionId}` === originalTargetId);
+    if (start < 0 || view.transfers.slice(start).some(transfer => transfer.phase !== "received") ||
+      `session:${view.transfers.at(-1)!.target.sessionId}` !== this.id) {
+      throw new Error("Native Main recipient chain is unrelated, PREPARED, or the current source is sealed");
+    }
+    return this.#deliverAgent(originalTargetId, request);
+  }
+
+  #deliverAgent(recipientId: string, request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult {
     assertSteerPriority(request.priority, request.delivery);
     if (request.priority && request.triggerTurn === false) throw new Error("interrupt priority requires a triggering steer");
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
@@ -764,9 +788,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (request.priority === "interrupt") {
       const verified = request.verification === "mesh" || request.verification === "bridge";
       const session = (id: string): string => id.startsWith("session:") ? id.slice(8) : id;
-      const ownRoot = sender.kind === "main" && session(sender.id) === session(this.id);
-      if (!verified || !(ownRoot || this.interruptAuthority.isSupervisor?.(sender, this.id) === true)) {
-        throw new FabricInterruptNotAuthorizedError(sender.id, this.id);
+      const ownRoot = sender.kind === "main" && session(sender.id) === session(recipientId);
+      if (!verified || !(ownRoot || this.interruptAuthority.isSupervisor?.(sender, recipientId) === true)) {
+        throw new FabricInterruptNotAuthorizedError(sender.id, recipientId);
       }
     }
     const deliveryId = typeof request.deliveryId === "string" && request.deliveryId ? request.deliveryId : undefined;
@@ -963,6 +987,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
     if (this.#inboxFence && !this.#inboxFence.active()) throw new Error("Main root rotated; address its successor");
     assertMainInboxOpen(this.id, admission);
+    this.#assertNativeAdmission();
   }
 
   /** D3 seat drain dry run (smarty-dev#15310): would a NEW delivery pass the gates now? No journal write, no message. */
@@ -975,10 +1000,26 @@ export class MainAgentController implements FabricMainAgentTarget {
   receiveInboxItem(original: HeldAgentMessage): void {
     if (!this.#journal || !this.local) throw new Error("Main inbox is not open");
     if (this.#inboxFence && (!this.#inboxFence.active() || !this.#inboxFence.owns(original.id))) throw new Error("Main inbox claim belongs elsewhere");
+    const native = this.#nativeItem(original);
+    if (native.status === "hold" || native.status === "reserved") {
+      throw new Error(native.reason ?? "Native recovery PREPARED reserves this carrier; no target admission yet");
+    }
+    if (native.status === "received" || native.status === "consumed") {
+      // Native owns release. Import the ORIGINAL outcome/policy/provenance bookkeeping,
+      // even if the restored input has no Main journal row yet. Never enqueue it again.
+      if (![...this.#held, ...this.#sent, ...this.#unverified].some(item => item.id === original.id)) {
+        const retained = structuredClone(original);
+        this.#unverified.push(retained);
+        try { this.#save(); } catch (error) { this.#unverified.pop(); throw error; }
+      } else this.#save();
+      this.#confirm();
+      return;
+    }
     const deliveryId = original.deliveryId ?? `inbox:${original.id}`;
     if (this.#admitted(deliveryId) || this.#refreshDelivered(true).has(original.id)) return;
     // A draining root claims no new rotation carrier; it stays with its predecessor (smarty-dev#15310).
     assertMainInboxOpen(this.id, { path: "rotation-carrier", from: original.from, deliveryId, text: original.message });
+    this.#assertNativeAdmission();
     const { handed: _handed, ...item } = original;
     const retained = { ...item, deliveryId };
     this.#admit(retained);
@@ -1038,8 +1079,42 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
   }
 
+  /** Never cache native authority: even an unchanged projection owes native barriers again. */
+  #nativeView(): NativeRecoveryCustodyResult {
+    if (!this.#readNativeCustody) return { status: "none" };
+    if (this.#nativeJournalUnknown) return { status: "hold", reason: "Native recovery Main journal is unreadable; preserving original bookkeeping" };
+    const manager = this.#context?.sessionManager as {
+      getSessionId?(): string; getSessionFile?(): string | undefined; isPersisted?(): boolean;
+    } | undefined;
+    const sessionId = manager?.getSessionId?.(), sessionFile = manager?.getSessionFile?.();
+    const scope = this.#nativeSessionRef;
+    if (!scope || manager?.isPersisted?.() === false || sessionId !== scope.sessionId || sessionFile !== scope.sessionFile ||
+      sessionId !== this.sessionId || this.id !== `session:${sessionId}`) {
+      return { status: "hold", reason: "Native recovery Main session identity/path changed or is unavailable" };
+    }
+    return readNativeRecoveryCustody(scope, this.#readNativeCustody);
+  }
+
+  #nativeItem(item: HeldAgentMessage): NativeRecoveryCarrierCustody {
+    return nativeRecoveryCarrierCustody(this.#nativeView(), { carrierId: item.id, chain: item.chain, deliveryId: item.deliveryId });
+  }
+
+  #assertNativeAdmission(): void {
+    const view = this.#nativeView();
+    if (view.status === "hold") throw new Error(view.reason);
+    if (view.status === "validated" && (view.transfers.some(transfer => transfer.source.sessionId === this.sessionId) ||
+      view.transfers.at(-1)!.phase === "prepared" || view.transfers.some(transfer =>
+        transfer.occurrences.some(occurrence => occurrence.state === "ambiguous")))) {
+      throw new Error("Native recovery source is sealed, target is still PREPARED, or dispatch outcome is ambiguous");
+    }
+  }
+
   /** The message id under which Main already admitted this delivery id, if it did. */
   #admitted(deliveryId: string): string | undefined {
+    const native = nativeRecoveryCarrierCustody(this.#nativeView(), { deliveryId });
+    if (native.status === "hold" || native.status === "reserved") {
+      throw new Error(native.reason ?? "Native recovery PREPARED is not an admission receipt");
+    }
     const item = [...this.#unverified, ...this.#sent, ...this.#held].find((item) =>
       item.deliveryId === deliveryId || item.supersedes?.includes(deliveryId));
     if (item) {
@@ -1050,6 +1125,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#save();
       return item.id;
     }
+    if (native.status === "received" || native.status === "consumed") return native.messageId ?? deliveryId;
     if (this.#consumed.has(deliveryId)) {
       // The same uncertainty applies to a recovered consumed-ID replacement, even
       // with no payload journal left. Force its own barriers, not just the journal's.
@@ -1103,6 +1179,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Write the held and unconfirmed followUps (0600), or remove the journal when none are left. */
   #save(probeAdmission?: { commandId: string; messageId: string }): void {
     if (!this.#journal) return;
+    if (this.#nativeJournalUnknown) throw new Error("Cannot overwrite unreadable native recovery Main journal");
     // Before the journal: an item leaves the journal only once its id is recorded as consumed.
     this.#saveIndex();
     const items = [...this.#unverified, ...this.#sent, ...this.#held];
@@ -1148,6 +1225,12 @@ export class MainAgentController implements FabricMainAgentTarget {
         { getEntries?: () => readonly unknown[]; getSessionFile?: () => string | undefined; isPersisted?: () => boolean } | undefined;
       const file = manager?.isPersisted?.() === false ? undefined : manager?.getSessionFile?.();
       if (file) { this.#indexSessionFile(file); return this.#delivered; }
+      if (this.#readNativeCustody) {
+        // A recovery-capable persistent host cannot turn deferred/missing storage into
+        // a receipt by falling back to Pi's pre-write memory index.
+        this.#restartIndex("");
+        return new Set();
+      }
       const entries = manager?.getEntries?.() ?? [];
       if (this.#source !== "" || this.#scanned === undefined || entries.length < this.#scanned) this.#restartIndex("");
       for (let index = this.#scanned!; index < entries.length; index++) addDelivered(this.#delivered, entries[index] as SessionEntryLike);
@@ -1172,6 +1255,18 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Read the complete lines appended to the session file since the last call, in 1 MiB chunks. */
   #indexSessionFile(file: string): void {
     if (!withConfirmedSessionFile(file, (fd, stat) => {
+      if (this.#readNativeCustody) {
+        const scope = this.#nativeSessionRef;
+        if (!scope || file !== scope.sessionFile || this.#context?.sessionManager.getSessionId() !== scope.sessionId) {
+          throw new Error("Native recovery receipt session/path mismatch");
+        }
+        const header = Buffer.alloc(Math.min(stat.size, 64 * 1024));
+        const count = fs.readSync(fd, header, 0, header.length, 0);
+        const newline = header.subarray(0, count).indexOf(10);
+        if (newline < 0) throw new Error("Native recovery receipt has no complete session header");
+        const value = JSON.parse(header.subarray(0, newline).toString("utf8")) as { type?: unknown; id?: unknown };
+        if (value.type !== "session" || value.id !== scope.sessionId) throw new Error("Native recovery receipt header mismatch");
+      }
       const size = stat.size;
       const identity = `${stat.dev}:${stat.ino}`;
       if (this.#source !== file || this.#scanned === undefined || size < this.#scanned || this.#sessionFileIdentity !== identity) {
@@ -1227,6 +1322,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     // not sent again in this process; it stays journalled and a restart replays it.
     const seen = this.#source !== "" && this.#unverified.some((item) => !delivered.has(item.id)) ? this.#inMemory() : new Set<string>();
     for (const item of [...this.#unverified]) {
+      // Native may have restored this input before it is visible in any Pi queue.
+      // PREPARED/RECEIVED/ambiguous and reader errors all retain the original row.
+      if (this.#nativeItem(item).status !== "none") continue;
       if (delivered.has(item.id)) {
         this.#unverified.splice(this.#unverified.indexOf(item), 1);
         this.#recordSuperseded(item);
@@ -1275,9 +1373,29 @@ export class MainAgentController implements FabricMainAgentTarget {
     return pending.length !== before;
   }
 
+  /** Retire native bookkeeping only on the accessor's all-history appended/handled evidence.
+   * Ordinary receipts cannot override native pending/ambiguous custody. */
+  #confirmNative(): void {
+    let changed = false;
+    for (const queue of [this.#unverified, this.#sent, this.#held]) {
+      for (const item of [...queue]) {
+        const native = this.#nativeItem(item);
+        if (native.status !== "consumed" && native.status !== "none") continue;
+        const consumed = native.status === "consumed" || this.#refreshDelivered().has(item.id);
+        changed = this.#recordSuperseded(item) || changed;
+        if (!consumed || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", this.#deliveryReason(item))) continue;
+        this.#consume(item);
+        queue.splice(queue.indexOf(item), 1);
+        changed = true;
+      }
+    }
+    if (changed) this.#trySave();
+  }
+
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
     this.#retryPendingHalt();
+    if (this.#readNativeCustody) { this.#confirmNative(); return; }
     let outcomesChanged = false;
     for (const item of this.#held) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
     if (!this.#sent.length) { if (outcomesChanged) this.#trySave(); return; }
@@ -1335,12 +1453,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     let items: HeldAgentMessage[] = [];
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.#journal, "utf8")) as { items?: unknown };
+      const parsed = JSON.parse(fs.readFileSync(this.#journal, "utf8")) as { version?: unknown; items?: unknown };
+      if (this.#readNativeCustody && (parsed?.version !== 1 || !Array.isArray(parsed.items))) throw new Error("Malformed native recovery Main journal");
       if (Array.isArray(parsed.items)) {
         // An older runtime journalled nameless senders (smarty-dev#1826): they go under their id.
         for (const item of parsed.items as HeldAgentMessage[]) {
           const sender = senderIdentity(item?.from);
           if (typeof item?.id !== "string" || typeof item.message !== "string" || typeof item.sentAt !== "number" || !sender) {
+            if (this.#readNativeCustody) throw new Error("Malformed native recovery Main carrier bookkeeping");
             diagnostics.warn("src/main-agent.ts", `[pi-fabric] dropped a malformed followUp from the journal: ${String((item as { id?: unknown } | null)?.id)}`);
             continue;
           }
@@ -1374,9 +1494,13 @@ export class MainAgentController implements FabricMainAgentTarget {
           });
         }
       }
-    } catch {
+    } catch (error) {
+      if (this.#readNativeCustody && (error as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.#nativeJournalUnknown = true;
+        diagnostics.warn("src/main-agent.ts", "[pi-fabric] cannot read native recovery Main journal; retaining original bookkeeping", error);
+      }
       this.#retryPendingHalt();                          // owner state survives an empty journal
-      return;                                            // no journal
+      return;                                            // no journal, or held unreadable bookkeeping
     }
     // The owner rule (dev-lead on pi-fabric#102): skip every id the session holds; a handoff
     // may still sit in Pi's queue, so it waits for a boundary to check; the rest is held again.
@@ -1393,6 +1517,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     }
     for (const item of items.sort((a, b) => a.sentAt - b.sentAt)) {
       if (this.#inboxFence && !this.#inboxFence.owns(item.id)) continue;
+      const native = this.#nativeItem(item);
+      if (native.status !== "none") {
+        // Preserve even held and unverified payloads exactly; native is the release
+        // owner, not another Pi handoff. Do not manufacture handed/delivered evidence.
+        this.#replayed.add(item.id);
+        this.#unverified.push(item);
+        continue;
+      }
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
         this.#recordSuperseded(item);
@@ -1408,6 +1540,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#replayed.add(item.id);
       (item.handed ? this.#unverified : this.#held).push(item);
     }
+    if (this.#readNativeCustody) this.#confirmNative();
     this.#trySave();
   }
 
@@ -1417,7 +1550,7 @@ export class MainAgentController implements FabricMainAgentTarget {
    * completion inboxes use). flushMs 0 keeps Pi's followUp queue, as before.
    */
   attachFollowUpDrain(context: ExtensionContext, flushMs: number, journal?: string, stallSeconds = 600,
-    inboxFence?: { owns(id: string): boolean; active(): boolean }): void {
+    inboxFence?: { owns(id: string): boolean; active(): boolean }, readNativeCustody?: NativeRecoveryCustodyReader): void {
     this.closeFollowUpDrain();
     if (!this.local) return;
     this.#stallS = stallSeconds;
@@ -1430,6 +1563,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#haltIndexUnknown = false;
     this.#journal = journal === undefined ? undefined : path.resolve(journal);
     this.#inboxFence = inboxFence;
+    // Install before either replay branch or an idle drain can run.
+    this.#readNativeCustody = readNativeCustody;
+    this.#nativeJournalUnknown = false;
+    const sessionManager = context.sessionManager;
+    const sessionFile = sessionManager?.getSessionFile?.();
+    const sessionId = sessionManager?.getSessionId?.();
+    this.#nativeSessionRef = readNativeCustody && sessionId && sessionFile
+      ? { sessionId, sessionFile } : undefined;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);
@@ -1731,6 +1872,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#sessionFileIdentity = undefined;
     this.#journal = undefined;
     this.#context = undefined;
+    this.#readNativeCustody = undefined;
+    this.#nativeSessionRef = undefined;
+    this.#nativeJournalUnknown = false;
     this.#providerReleaseUntil = undefined;
     this.#stopProviderDeadTimer();
     this.#stopProviderDeadDeadline();
@@ -1792,6 +1936,16 @@ export class MainAgentController implements FabricMainAgentTarget {
     // holds every later followUp. It leaves the queue, with a report; the rest go. A failure of
     // Pi's queue itself keeps them all for the next boundary.
     const delivery: FabricMainAgentDelivery = flushed ? "followUp" : deliverAs;
+    // Remove native-owned children from the candidate batch BEFORE render/handed
+    // bookkeeping. Unrelated Fabric-only children still follow the ordinary path.
+    for (let index = 0; index < Math.min(count, this.#held.length);) {
+      const item = this.#held[index]!;
+      if (this.#nativeItem(item).status === "none") { index++; continue; }
+      this.#held.splice(index, 1);
+      this.#unverified.push(item);
+      count--;
+    }
+    if (count <= 0) { this.#trySave(); return false; }
     for (let index = 0; index < Math.min(count, this.#held.length);) {
       const item = this.#held[index]!;
       try {
@@ -2372,6 +2526,10 @@ export class MainAgentController implements FabricMainAgentTarget {
   ): boolean | undefined {
     items = items.filter(item => !this.#inboxFence || this.#inboxFence.owns(item.id));
     if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
+    this.#assertNativeAdmission();
+    if (items.some(item => this.#nativeItem(item).status !== "none")) {
+      throw new Error("Native recovery owns this carrier; Fabric must not send it");
+    }
     const interrupt = this.#context?.isIdle() === true && items.every(item => this.#interrupts.has(item.id));
     triggerTurn &&= (peerSteer || !this.#halted) && !this.#providerHeld() && (!this.#context?.signal?.aborted || interrupt);
     // Capture the actual handoff decision before native admission, not at delayed

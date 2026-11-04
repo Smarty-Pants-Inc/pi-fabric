@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { observeActorOwnership, ownershipPointReads } from "../src/topology/publication-generation.js";
@@ -220,6 +220,36 @@ describe.each(["file", "sqlite"] as const)("fv2-11107 %s poll ownership stamp ga
     expect(rebuilds()).toBe(armed);
     writeHostLease(meshRoot, { ...lease, expiresAt: Date.now() + 300_000 });
     poll();
+    expect(rebuilds()).toBe(armed + 1);
+  });
+
+  it("point-checks only the armed owner and sees its in-place expiry before a watch callback", async () => {
+    const { poll, putHost, meshRoot, rebuilds } = await setup(backend);
+    await putHost(SELF, { expiresAt: Date.now() - 1 });
+    const lease = { id: `host:${SELF.id}`, rootId: SELF.id, identityId: SELF.id, startedAt: 1,
+      updatedAt: Date.now(), expiresAt: Date.now() + 120_000 };
+    writeHostLease(meshRoot, lease);
+    const unrelated = new Set<string>();
+    for (let index = 0; index < 32; index++) {
+      const id = `retained:${index}`;
+      unrelated.add(hostLeasePath(meshRoot, id));
+      writeHostLease(meshRoot, { ...lease, id, rootId: id, identityId: id });
+    }
+    expect(poll().get("actor:a")).toBe(true);
+    const armed = rebuilds();
+    const stats = vi.spyOn(fs, "statSync");
+    const reads = vi.spyOn(fs, "readFileSync");
+    const lists = vi.spyOn(fs, "readdirSync");
+    expect(poll().get("actor:a")).toBe(true);
+    expect(poll().get("actor:b")).toBe(true);
+    expect(rebuilds()).toBe(armed);
+    expect([...stats.mock.calls, ...reads.mock.calls].filter(([file]) => unrelated.has(String(file)))).toEqual([]);
+    expect(lists.mock.calls.filter(([file]) => String(file) === path.join(meshRoot, "host-leases"))).toEqual([]);
+    const file = hostLeasePath(meshRoot, lease.id);
+    const stamp = fs.statSync(path.dirname(file)).mtimeMs;
+    fs.writeFileSync(file, JSON.stringify({ format: 1, ...lease, expiresAt: Date.now() - 1 }));
+    expect(fs.statSync(path.dirname(file)).mtimeMs).toBe(stamp);
+    expect(poll().get("actor:a")).toBeUndefined();
     expect(rebuilds()).toBe(armed + 1);
   });
 

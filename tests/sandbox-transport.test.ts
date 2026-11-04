@@ -57,14 +57,14 @@ const result = (runId: string, status: SandboxSpawnResult["status"], overrides: 
   };
 };
 
-const bindingFor = (intent: SandboxSpawnIntent): SandboxBinding => {
+const bindingFor = (intent: SandboxSpawnIntent, namespace = "smarty-island"): SandboxBinding => {
   const admittedAt = new Date(BASE_NOW).toISOString().replace(".000Z", "Z");
   const rawDeadline = intent.deadline ? Date.parse(intent.deadline) : Number.POSITIVE_INFINITY;
   const executionDeadline = new Date(Math.min(BASE_NOW + intent.expectedSeconds * 1_000, rawDeadline)).toISOString().replace(".000Z", "Z");
   return {
     runId: intent.runId,
     status: "admitted",
-    claimRef: { namespace: "smarty-island", name: `spawn-${intent.runId}`, uid: "claim-uid-1" },
+    claimRef: { namespace, name: `spawn-${intent.runId}`, uid: "claim-uid-1" },
     claimUID: "claim-uid-1",
     podUID: "pod-uid-1",
     podName: "sandbox-pod-1",
@@ -188,7 +188,7 @@ const taskResult = (status: SandboxTaskResult["status"] = "completed", text = "s
   exitCode: status === "completed" ? 0 : 1,
 });
 
-const config = (enabled = true, readyTimeoutMs = 90_000, placementUrl?: string): SandboxTransportConfig => ({ enabled, template: "smarty-proof-agent", ...(placementUrl ? { placementUrl } : {}), readyTimeoutMs });
+const config = (enabled = true, readyTimeoutMs = 90_000, placementUrl?: string, namespace?: string): SandboxTransportConfig => ({ enabled, template: "smarty-proof-agent", ...(placementUrl ? { placementUrl } : {}), ...(namespace !== undefined ? { namespace } : {}), readyTimeoutMs });
 
 const launchRequest = (directory: string, overrides: Partial<Parameters<SandboxTransport["launch"]>[0]> = {}): Parameters<SandboxTransport["launch"]>[0] => {
   const taskFile = path.join(directory, "task.txt");
@@ -223,8 +223,18 @@ const meshFor = (resultValue = taskResult()): SandboxMesh & { delivered: Array<{
   };
 };
 
+const transportForNamespace = (api: Awaited<ReturnType<typeof fakePlacementServer>>, namespace?: string) => {
+  const mesh = meshFor();
+  const terminal = new FakeTerminal();
+  const transport = new SandboxTransport(config(true, 90_000, undefined, namespace), {
+    placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+    resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
+  });
+  return { transport, mesh, terminal };
+};
+
 describe("sandbox agent transport", () => {
-  it("admits, binds by run id, delivers via the mesh, returns the final answer, and writes finished KV", async () => {
+  it("accepts the default smarty-island claim namespace and completes the sandbox round-trip", async () => {
     const directory = scratch();
     const api = await fakePlacementServer({ post: intent => result(intent.runId, "admitted"), watch: () => [] });
     const mesh = meshFor(taskResult("completed", "exact sandbox-result"));
@@ -242,6 +252,7 @@ describe("sandbox agent transport", () => {
     expect(api.intents[0]).toMatchObject({ runId: RUN_ID, kind: "sandbox", org: "smarty-dev", parentSession: PARENT, role: "task-agent", profile: "task", model: MODEL, thinking: "high", repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "src/agents", expectedSeconds: 60, timeoutSeconds: 60 });
     expect(api.intents[0]).not.toHaveProperty("labels");
     expect(api.intents[0]).not.toHaveProperty("task");
+    expect(api.bindingReads).toBe(1);
     expect(mesh.presenceRunIds).toEqual([RUN_ID]);
     expect(mesh.delivered).toHaveLength(1);
     expect(mesh.delivered[0]).toMatchObject({ childSession: CHILD });
@@ -254,6 +265,66 @@ describe("sandbox agent transport", () => {
     expect(handle.sessionId).toBe(CHILD);
     expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", text: "exact sandbox-result", exitCode: 0, transport: "sandbox" });
     expect(terminal.records.get(RUN_ID)).toMatchObject({ placementRunId: RUN_ID, state: "finished", exitCode: 0, at: "2026-02-01T00:00:00Z" });
+  });
+
+  // Keep: #17551 records the namespace trust-boundary failure; check both Placement projections against the requested namespace.
+  it("accepts the configured org-ex2r1 claim namespace returned by spawn and binding", async () => {
+    const directory = scratch();
+    const namespace = "org-ex2r1";
+    const api = await fakePlacementServer({
+      post: intent => result(intent.runId, "admitted", { claimRef: { namespace, name: `spawn-${intent.runId}`, uid: "claim-uid-1" } }),
+      watch: () => [],
+      binding: intent => bindingFor(intent, namespace),
+    });
+    const { transport, mesh } = transportForNamespace(api, namespace);
+
+    const handle = await transport.launch(launchRequest(directory));
+    await handle.closed;
+    expect(api.bindingReads).toBe(1);
+    expect(mesh.delivered).toHaveLength(1);
+  });
+
+  it("rejects an unsolicited org namespace when the default smarty-island namespace was requested", async () => {
+    const api = await fakePlacementServer({
+      post: intent => result(intent.runId, "admitted", { claimRef: { namespace: "org-ex2r1", name: `spawn-${intent.runId}`, uid: "claim-uid-1" } }),
+      watch: () => [],
+    });
+    const { transport, mesh, terminal } = transportForNamespace(api);
+
+    await expect(transport.launch(launchRequest(scratch()))).rejects.toMatchObject({
+      name: "SandboxProtocolError", code: "sandbox.protocol.invalid", message: expect.stringContaining("spawn result field claimRef.namespace"),
+    });
+    expect(api.bindingReads).toBe(0);
+    expect(mesh.delivered).toHaveLength(0);
+    expect(terminal.records.get(RUN_ID)?.state).toBe("never-started");
+  });
+
+  it("rejects a spawn namespace that differs from the configured org namespace", async () => {
+    const api = await fakePlacementServer({ post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const { transport, mesh, terminal } = transportForNamespace(api, "org-ex2r1");
+
+    await expect(transport.launch(launchRequest(scratch()))).rejects.toMatchObject({
+      name: "SandboxProtocolError", code: "sandbox.protocol.invalid", message: expect.stringContaining("spawn result field claimRef.namespace"),
+    });
+    expect(api.bindingReads).toBe(0);
+    expect(mesh.delivered).toHaveLength(0);
+    expect(terminal.records.get(RUN_ID)?.state).toBe("never-started");
+  });
+
+  it("rejects a mismatched binding namespace even when the admitted spawn claimRef is null", async () => {
+    const api = await fakePlacementServer({
+      post: intent => result(intent.runId, "admitted", { claimRef: null, claimUID: null, podUID: null }),
+      watch: () => [],
+      binding: intent => bindingFor(intent, "smarty-island"),
+    });
+    const { transport, mesh, terminal } = transportForNamespace(api, "org-ex2r1");
+
+    await expect(transport.launch(launchRequest(scratch()))).rejects.toMatchObject({
+      name: "SandboxProtocolError", code: "sandbox.protocol.invalid", message: expect.stringContaining("binding field claimRef.namespace"),
+    });
+    expect(api.bindingReads).toBe(1);
+    expect(mesh.delivered).toHaveLength(0);
+    expect(terminal.records.get(RUN_ID)?.state).toBe("never-started");
   });
 
   it("waits for the admitted Pod UID to appear before spawning and delivering", async () => {
@@ -574,9 +645,15 @@ describe("sandbox agent transport", () => {
     expect(fallbackLog).toEqual([]);
   });
 
-  it("runs a manager sandbox spawn through the HTTP adapter, NATS mesh, and terminal result", async () => {
+  it("passes the configured namespace through a manager sandbox spawn to Placement", async () => {
     const directory = scratch();
-    const api = await fakePlacementServer({ allowAnyRunId: true, post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const namespace = "org-ex2r1";
+    const api = await fakePlacementServer({
+      allowAnyRunId: true,
+      post: intent => result(intent.runId, "admitted", { claimRef: { namespace, name: `spawn-${intent.runId}`, uid: "claim-uid-1" } }),
+      watch: () => [],
+      binding: intent => bindingFor(intent, namespace),
+    });
     const terminal = new FakeTerminal();
     const mesh = meshFor();
     mesh.awaitResult = async (childSession, runId, deadline) => {
@@ -586,7 +663,7 @@ describe("sandbox agent transport", () => {
     const manager = new AgentManager(process.cwd(), {
       ...DEFAULT_FABRIC_CONFIG.agents,
       budgetUsd: 0,
-      sandbox: { enabled: true, template: "smarty-proof-agent", placementUrl: api.base, readyTimeoutMs: 90_000 },
+      sandbox: config(true, 90_000, api.base, namespace),
     }, {
       runRoot: directory,
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -603,6 +680,8 @@ describe("sandbox agent transport", () => {
     const final = await manager.wait(handle.id);
     expect(final).toMatchObject({ id: handle.id, status: "completed", text: "manager round-trip result", transport: "sandbox" });
     expect(api.intents[0]).toMatchObject({ runId: handle.id, profile: "lead", branch: "feature/manager-import", sessionImport: imported });
+    expect(api.requestBodies[0]).not.toHaveProperty("namespace");
+    expect(api.bindingReads).toBe(1);
     expect(mesh.presenceRunIds).toEqual([handle.id]);
     expect(mesh.delivered[0]?.text).toContain(`FABRIC-RESULT ${handle.id}\\n`);
     expect(terminal.records.get(handle.id)).toMatchObject({ placementRunId: handle.id, state: "finished", exitCode: 0 });
@@ -954,4 +1033,16 @@ describe("sandbox agent transport", () => {
       expect(() => normalizeFabricConfig({ agents: { sandbox: { placementUrl } } })).toThrow(expectedError);
     }
   });
+
+  it("normalizes explicitly configured one- and 63-character DNS-1123 sandbox namespaces", () => {
+    for (const namespace of ["a", "a".repeat(63)]) {
+      const normalized = normalizeFabricConfig({ agents: { sandbox: { namespace, placementUrl: "http://127.0.0.1:18080" } } }).agents.sandbox;
+      expect(normalized).toEqual({ enabled: false, template: "smarty-proof-agent", placementUrl: "http://127.0.0.1:18080", namespace, readyTimeoutMs: 90_000 });
+    }
+  });
+
+  it.each(["A", "org.example", "org_example", "-org", "org-", "a".repeat(64), "", "\n", 7, null])(
+    "refuses malformed sandbox namespace %j",
+    namespace => expect(() => normalizeFabricConfig({ agents: { sandbox: { namespace } } })).toThrow(/agents\.sandbox\.namespace/),
+  );
 });

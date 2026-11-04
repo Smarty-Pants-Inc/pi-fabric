@@ -27,6 +27,8 @@ import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathB
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError, TransportUnsupportedError, type FabricTransport, type TransportDelivery, type TransportDrainState, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import type { ParticipantRoute, ParticipantView } from "./participant-view.js";
 import { assertNatsDrainReceiptForRelease, readNatsDrainReceipt } from "./nats-drain-receipt.js";
+import type { NativeRecoveryCustodyReader } from "../core/session-receipts.js";
+import { resolveNativeMainSuccessor } from "./stall-alarms.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 /** D3 seat drain (smarty-dev#15310 r2 N7): a draining Main's typed, retryable pre-admission refusal (main-drain/gate.ts). */
@@ -407,6 +409,8 @@ class MirrorLeaseAdmissionRequired extends Error {
 }
 
 export interface FabricControlPlaneOptions {
+  /** Native host accessor installed before any drain; absent preserves ordinary routing. */
+  readNativeCustody?: NativeRecoveryCustodyReader;
   /** Injected carrier; caller owns its lifetime. File remains the default. */
   transport?: FabricTransport;
   /** Exposed for carrier-aware callers; file-mode admission retains its existing gates. */
@@ -537,6 +541,8 @@ interface PendingControlRequest {
   ownerIncarnation?: string | undefined;
   operation: FabricControlOperation;
   targetId: string;
+  /** Effective native delivery root; targetId and all wire correlation remain original. */
+  routingTargetId?: string;
   commandPublished: boolean;
   readonly requestCreatedAt: number;
   readOwnerExpiry?: () => number;
@@ -650,6 +656,7 @@ type OwnedControlCommand = ClaimedControlCommand | SavedControlAcknowledgement;
 
 export class FabricControlPlane {
   readonly incarnation: string;
+  #readNativeCustody: NativeRecoveryCustodyReader | undefined;
   readonly #pending = new Map<string, PendingControlRequest>();
   // Insertion order bounds sender-local key/fingerprint bindings; retain no request body.
   readonly #originIdempotency = new Map<string, OriginIdempotencyRecord>();
@@ -912,6 +919,40 @@ export class FabricControlPlane {
     // The file reader replays the retained log from its current generation. Durable claims
     // recover unclaimed commands and make interrupted outcomes explicit without re-execution.
     this.#lastSequence = transport instanceof FileTransport ? transport.reader.lastSequence : 0;
+    this.setNativeRecoveryReader(options.readNativeCustody);
+  }
+
+  /** Install before start: advancing the FILE cursor cannot later be undone by a new alias. */
+  setNativeRecoveryReader(readNativeCustody: NativeRecoveryCustodyReader | undefined): void {
+    if (this.#started) throw new Error("Native recovery reader must be installed before control drain");
+    this.#readNativeCustody = readNativeCustody;
+    if (this.#transport instanceof FileTransport) {
+      this.#transport.reader.setNativeCommandRoute(readNativeCustody && this.identity.kind === "main"
+        ? { readNativeCustody, ownerIdentityId: this.identity.id, ownerIncarnation: this.incarnation } : undefined);
+    }
+  }
+
+  #routingTarget(targetId: string, operation: FabricControlOperation): string {
+    if (!this.#readNativeCustody || !targetId.startsWith("session:") ||
+        (operation !== "steer" && operation !== "followUp")) return targetId;
+    let outgoingNative = false, uncertain = false;
+    const successor = resolveNativeMainSuccessor(this.mesh.root, targetId, scope => {
+      try {
+        const custody = this.#readNativeCustody!(scope);
+        outgoingNative ||= custody.status === "validated" && custody.transfers.some(edge =>
+          `session:${edge.source.sessionId}` === targetId);
+        uncertain ||= custody.status === "hold";
+        return custody;
+      } catch (error) { uncertain = true; throw error; }
+    });
+    if (!successor) {
+      if (outgoingNative || uncertain) throw new Error(`Native control routing HOLD for ${targetId}`);
+      return targetId;
+    }
+    if (successor.bindings.length === 0 || successor.bindings.some(binding => binding.phase !== "received")) {
+      throw new Error(`Native control routing HOLD for ${targetId}: uncommitted chain`);
+    }
+    return successor.rootId;
   }
 
   get transportKind(): FabricTransport["kind"] { return this.#transport.kind; }
@@ -950,7 +991,7 @@ export class FabricControlPlane {
     // Clone semantic JSON plus normalized attribution before publication or any retry yields.
     input = snapshotControlInput(input);
     const natsOwner = this.#transport.kind === "nats"
-      ? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation) : undefined;
+      ? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation, operation) : undefined;
     // One logical message key survives both observation retries and a proven-notRun resend.
     options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID(),
       mirrorLeaseWaitBudget: options.mirrorLeaseWaitBudget ?? {} };
@@ -1082,13 +1123,14 @@ export class FabricControlPlane {
     const ownerIncarnation = input.ownerIncarnation;
     options.signal?.throwIfAborted();
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
+    const routingTargetId = this.#routingTarget(targetId, operation);
     let mirroredOwner: PendingControlRequest["mirroredOwner"];
     const unavailable = (host: string): Error => new Error(
       `Fabric mesh bridge routing to remote host ${host} is unavailable for ${targetId}; ` +
         "the routed owner could not be revalidated; this attempt was not published.",
     );
     try {
-      mirroredOwner = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+      mirroredOwner = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, routingTargetId);
     } catch (error) {
       if (typeof destination.remoteHost === "string") throw unavailable(destination.remoteHost);
       throw error;
@@ -1137,7 +1179,7 @@ export class FabricControlPlane {
     if (mirroredOwner && destinationRemoteHost === mirroredOwner.remoteHost) {
       const entry = this.mesh.get(HOST_PREFIX + createHash("sha256").update(ownerHostId).digest("hex"), { fresh: true });
       const host = entry?.value;
-      if (isObject(host) && host.format === 1 && host.id === ownerHostId && host.rootId === targetId &&
+      if (isObject(host) && host.format === 1 && host.id === ownerHostId && host.rootId === routingTargetId &&
           isObject(host.identity) && host.identity.id === ownerIdentityId && entry?.updatedBy.id === ownerIdentityId &&
           host.remoteHost === mirroredOwner.remoteHost && typeof host.bridgeVia === "string" &&
           /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(host.bridgeVia) && host.bridgeVia !== host.remoteHost) {
@@ -1152,7 +1194,8 @@ export class FabricControlPlane {
         "a fresh bridge sample proves the source lease lapsed); this attempt was not published.");
     const capturedMirror = mirroredOwner;
     const readMirror = (): MirroredControlOwner | undefined => {
-      const current = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+      if (this.#routingTarget(targetId, operation) !== routingTargetId) throw unavailable(destinationRemoteHost ?? ownerHostId);
+      const current = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, routingTargetId);
       if (!current || current.remoteHost !== destinationRemoteHost) return undefined;
       if (current.ownerIncarnation !== capturedMirror?.ownerIncarnation ||
         ownerIncarnation !== undefined && current.ownerIncarnation !== undefined && current.ownerIncarnation !== ownerIncarnation) {
@@ -1196,7 +1239,7 @@ export class FabricControlPlane {
     // One budget drives admission and ACK timing. A validated fresh native owner gets
     // a bounded busy-owner window; bridges and explicit caller deadlines retain their policy.
     const readOwnerExpiry = typeof destinationRemoteHost === "string" ? undefined :
-      this.options.captureOwnerLease?.(ownerHostId, ownerIdentityId, targetId);
+      this.options.captureOwnerLease?.(ownerHostId, ownerIdentityId, routingTargetId);
     const now = this.options.now ?? Date.now;
     const ownerExpiry = readOwnerExpiry?.();
     if (messageRequest && ownerExpiry !== undefined && now() - ownerExpiry > participantLeaseGraceMs(this.options.leaseGraceMs)) {
@@ -1233,6 +1276,7 @@ export class FabricControlPlane {
         ownerIncarnation,
         operation,
         targetId,
+        routingTargetId,
         commandPublished: false,
         requestCreatedAt,
         idempotencyKey,
@@ -1314,6 +1358,9 @@ export class FabricControlPlane {
           // append and its best-effort cancellation rather than turning it into a preflight refusal.
           if (this.#pending.get(commandId) === pendingRequest!) {
             options.signal?.throwIfAborted();
+            if (this.#routingTarget(targetId, operation) !== routingTargetId) {
+              throw new Error(`Native control routing changed for ${targetId}; this attempt was not published`);
+            }
             if (mirroredOwner) {
               const current = readMirror();
               if (!current) throw unavailable(mirroredOwner.remoteHost);
@@ -1523,7 +1570,7 @@ export class FabricControlPlane {
         }
         let current: PendingControlRequest["mirroredOwner"];
         try {
-          current = this.options.readMirroredOwner?.(pending.ownerHostId, pending.ownerIdentityId, pending.targetId);
+          current = this.options.readMirroredOwner?.(pending.ownerHostId, pending.ownerIdentityId, pending.routingTargetId ?? pending.targetId);
         } catch {
           // A failed read is not evidence of a lapse. The independent request timer stays armed.
           continue;
@@ -2140,8 +2187,9 @@ export class FabricControlPlane {
   // the file reader, bridgeMatches, captureOwnerLease, shared claims, relayHub, timeout
   // withdrawal, file-log cleanup or file ACK readback (I-LOCK).
 
-  #captureNatsOwner(ownerHostId: string, ownerIdentityId: string, targetId: string, epoch?: string): Readonly<ParticipantRoute> {
-    const route = this.options.participants!.resolve(targetId);
+  #captureNatsOwner(ownerHostId: string, ownerIdentityId: string, targetId: string, epoch?: string,
+    operation?: FabricControlOperation): Readonly<ParticipantRoute> {
+    const route = this.options.participants!.resolve(operation ? this.#routingTarget(targetId, operation) : targetId);
     if (!route?.live || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(route.machine)) {
       throw Object.assign(new TransportUnavailableError(`Unknown or unavailable NATS Fabric participant: ${targetId}`), { notRun: true });
     }
@@ -2170,7 +2218,7 @@ export class FabricControlPlane {
     if (!this.options.enabled) throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     if (this.#paused) throw Object.assign(new TransportUnavailableError("NATS control admission is draining"), { code: "FABRIC_TRANSPORT_DRAINING", notRun: true });
     options.signal?.throwIfAborted();
-    const owner = captured ?? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation);
+    const owner = captured ?? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation, operation);
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
     const commandBody = { targetId, operation, ownerIncarnation: owner.ownerIncarnation,
       ...(input.message !== undefined ? { message: input.message } : {}),

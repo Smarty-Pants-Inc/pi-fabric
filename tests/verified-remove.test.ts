@@ -3,18 +3,16 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  claimMeshRetentionSweep, FABRIC_RUN_ROOT_PREFIX, pruneActorRunArchives, pruneActorSessionBackups,
+  claimMeshRetentionSweep, FABRIC_RUN_ROOT_PREFIX, pruneActorSessionBackups,
   removeEmptyRunRoot, sweepTempRunRoots,
 } from "../src/storage/retention.js";
 import { sweepResidentRuns } from "../src/residency/retention.js";
 import { closeScratch, createScratch, sweepScratch } from "../src/storage/scratch.js";
 import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
 
-// smarty-dev#7916 acceptance: for each routed deleter, a swap between the judgment and the delete (file to symlink,
-// a replaced inode, a foreign owner, a refreshed mtime) deletes nothing; no getuid deletes nothing; a future-dated
-// backup name never costs the newest backup. The file runs unchanged on main for the RED evidence: there the swap is
-// triggered by main's own removal call (rmSync/unlinkSync/renameSync/promises.rm on the target), on the head by the
-// helper's seam right before its first open. Either way the swap lands after the judgment and before the delete.
+// smarty-dev#7916 acceptance: for each actual verified deleter, a swap between judgment and deletion deletes nothing;
+// no getuid deletes nothing; a future-dated backup name never costs the newest backup. Actor run archives are kept
+// outright; temp-run root routes are covered here and by retention-runroot-swaps.test.ts and retention-dead-owner.test.ts.
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const DEAD = "2147483647";
@@ -86,29 +84,23 @@ const armSwap = async (target: string, swap: Swap): Promise<() => Record<string,
 
 interface Fixture { target: string; act: () => unknown }
 const FIXTURES: Record<string, () => Fixture> = {
-  pruneActorRunArchives: () => {
-    const runs = tmp("fabric-vr-archives-");
-    const target = run(path.join(runs, "old"));
-    return { target, act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
-  },
   sweepResidentRuns: () => {
     const residency = tmp("fabric-vr-resident-");
     const target = old(run(path.join(residency, "runs", "old")));
     return { target, act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
   },
+  // Temp-root retention archives run trees separately; these fixtures target its verified empty-root deletion.
   "pruneClosedRunRoot (sweepTempRunRoots)": () => {
     const tempRoot = tmp("fabric-vr-closed-");
-    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
-    const target = run(path.join(root, "old"));
-    write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    const target = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
+    write(path.join(target, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
+    return { target, act: () => sweepTempRunRoots({ tempRoot, now: NOW + 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   "sweepTempRunRoots (orphaned root)": () => {
     const tempRoot = tmp("fabric-vr-orphan-");
-    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
-    const target = run(path.join(root, "old"));
-    write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    const target = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
+    write(path.join(target, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    return { target, act: () => sweepTempRunRoots({ tempRoot, now: NOW + 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   removeEmptyRunRoot: () => {
     const tempRoot = tmp("fabric-vr-empty-");
@@ -135,7 +127,7 @@ const FIXTURES: Record<string, () => Fixture> = {
   },
 };
 // The public mesh pass is not in FIXTURES: its apply rejects at the boundary until smarty-dev#10678 (pi-fabric#1014 SEC
-// P2-1), so no helper seam can fire through it. The deleter it calls (pruneActorRunArchives) keeps the swap matrix above.
+// P2-1), so no helper seam can fire through it. Actor-run archives are keep-all; the swap matrix covers dead resident runs and temp-run root routes. pruneActorSessionBackups only renames/moves backups; it is not a deleter.
 const meshPass = () => {
   const root = tmp("fabric-vr-mesh-");
   const registry = path.join(root, "actors", "project");
@@ -185,7 +177,8 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     const { root, target } = meshPass();
     const before = shape(target);
     const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-    expect(plan.removedRuns).toEqual([target]);
+    expect(plan.removedRuns).toEqual([]);
+    expect(fs.existsSync(target)).toBe(true);
     expect(shape(target)).toEqual(before);
     const { verifiedRemoveTestHooks: hooks } = await import("../src/storage/verified-remove.js");
     const seen: string[] = [];

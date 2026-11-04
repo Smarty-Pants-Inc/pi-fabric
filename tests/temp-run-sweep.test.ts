@@ -13,6 +13,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { scriptSpawnArgs } from "../src/agents/transports/process-utils.js";
 import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import { FABRIC_RUN_ROOT_PREFIX, RUN_ROOT_SWEEP_MARKER, UNRESOLVED_WORKER_FILE, sweepTempRunRoots, type TempRunSweepRequest } from "../src/storage/retention.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
 
 // Exercise the real built sweep entry with Node, not the .ts/Bun entry: every
 // deletion stays behind the inherited test-deletion guard on fleet and CI.
@@ -99,7 +100,10 @@ describe("configured detached temp sweep", () => {
       await manager.close();
       expect(launches).toHaveLength(count + 1);
       const launch = launches.at(-1)!;
-      expect(launch).toMatchObject({ status: 0, stderr: sweepStderr, env: { TMPDIR: privateA } });
+      expect(launch).toMatchObject({ status: 0, env: { TMPDIR: privateA } });
+      expect(launch.stderr.startsWith(sweepStderr)).toBe(true);
+      expect(launch.stderr).not.toMatch(/refused|failed/);
+      expect(launch.stderr).not.toMatch(/refused|failed/);
       expect(launch.env?.PI_FABRIC_TMPDIR).toBe(override);
       const request = JSON.parse(launch.args[1]!) as TempRunSweepRequest;
       expect(request).toMatchObject({ tempRoot: override ?? privateA, orphanedTempRunRetentionMs: grace });
@@ -131,12 +135,10 @@ describe("configured detached temp sweep", () => {
     const before = snapshot(run), ownerFile = path.join(sibling, ".fabric-owner.json");
     expect(JSON.parse(fs.readFileSync(ownerFile, "utf8"))).not.toHaveProperty("closedAt");
     expect(JSON.parse(fs.readFileSync(ownerFile, "utf8"))).not.toHaveProperty("orphanedAt");
-    const observedAfter = Date.now();
     await sweepFromA(shared);
     const owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
     expect(owner.closedAt).toBeUndefined();
-    expect(owner.orphanedAt).toBeGreaterThanOrEqual(observedAfter);
-    expect(owner.orphanedAt).toBeLessThanOrEqual(Date.now());
+    expect(owner.orphanedAt).toBeUndefined(); // Maintenance never forges closure or refreshes a grace marker.
     expect(snapshot(run)).toEqual(before);
     await noDelivery();
 
@@ -147,8 +149,9 @@ describe("configured detached temp sweep", () => {
     expect(fs.existsSync(path.join(run, UNRESOLVED_WORKER_FILE))).toBe(true);
     await noDelivery();
 
-    // The real detached entry owns Date.now(). Age only this synthetic fixture after observing its fresh stamp.
-    fs.writeFileSync(ownerFile, JSON.stringify({ ...owner, orphanedAt: owner.orphanedAt - grace - HOUR }));
+    // The real detached entry owns Date.now(). Age all synthetic filesystem
+    // activity too; a stale heartbeat alone no longer proves an idle tree.
+    ageRunRoot(sibling, Date.now() - grace - HOUR);
     ageSweepClaim(shared); await sweepFromA(shared);
     const settled = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
     expect(settled).toMatchObject({ status: "completed", settledLost: true });
@@ -162,7 +165,8 @@ describe("configured detached temp sweep", () => {
     expect(snapshot(run)).toEqual(settledOnce); // No second settlement/status rewrite, despite another eligible sweep.
     await noDelivery();
 
-    fs.unlinkSync(hold); // Remove only our preservation fixture; the real entry must collect the now-safe tree.
+    fs.unlinkSync(hold); // Remove only our preservation fixture, then age its activity.
+    ageRunRoot(sibling, Date.now() - grace - HOUR);
     ageSweepClaim(shared); await sweepFromA(shared);
     expect(fs.existsSync(run)).toBe(false); expect(fs.existsSync(sibling)).toBe(false);
     expect(snapshot(privateRun)).toEqual(privateBefore); // Shared discovery never widens to private/nested parents.
@@ -185,6 +189,7 @@ describe("configured detached temp sweep", () => {
     const linked = path.join(shared, FABRIC_RUN_ROOT_PREFIX + "linked"); fs.symlinkSync(linkedTarget, linked, "dir");
     const nestedRoot = abandonedRoot(shared, "nested", aged), parent = unconfirmedTask(nestedRoot, "c".repeat(32));
     const nested = unconfirmedTask(path.join(parent, "nested"), "d".repeat(32));
+    ageRunRoot(nestedRoot, Date.now() - 48 * HOUR);
     const retained = [ownerRun, workerRun, malformedRun, linkedRun, nested];
     const before = retained.map(snapshot);
     const ownerBefore = fs.readFileSync(path.join(liveOwner, ".fabric-owner.json"), "utf8");
@@ -192,7 +197,9 @@ describe("configured detached temp sweep", () => {
       sweepPath: entry, retention: { ...DEFAULT_FABRIC_CONFIG.retention, orphanedTempRunMs: 6 * HOUR },
     }); managers.push(manager);
     await manager.close();
-    expect(launches).toHaveLength(1); expect(launches[0]).toMatchObject({ status: 0, stderr: sweepStderr });
+    expect(launches).toHaveLength(1); expect(launches[0]).toMatchObject({ status: 0 });
+    expect(launches[0]!.stderr.startsWith(sweepStderr)).toBe(true);
+    expect(launches[0]!.stderr).not.toMatch(/refused|failed/);
     expect(JSON.parse(launches[0]!.args[1]!).tempRoot).toBe(shared);
     expect(retained.map(snapshot)).toEqual(before);
     expect(fs.readFileSync(path.join(liveOwner, ".fabric-owner.json"), "utf8")).toBe(ownerBefore);
@@ -218,12 +225,14 @@ describe("configured detached temp sweep", () => {
     }); managers.push(manager);
     await manager.close();
     expect(launches).toHaveLength(1);
-    expect(launches[0]).toMatchObject({ status: 0, stderr: sweepStderr });
+    expect(launches[0]).toMatchObject({ status: 0 });
+    expect(launches[0]!.stderr.startsWith(sweepStderr)).toBe(true);
+    expect(launches[0]!.stderr).not.toMatch(/refused|failed/);
     expect(JSON.parse(launches[0]!.args[1]!)).toMatchObject({ terminalRunEventsAgeMs: 24 * HOUR, terminalRunEventsMaxBytes: 1024 });
     expect(snapshot(run)).toEqual(before);
   });
 
-  it("preserves the full log on both sides of the legacy age threshold without restarting expiry", async () => {
+  it("keeps full raw logs regardless of the old compaction cap, then archives at expiry", async () => {
     const tempRoot = temp();
     const { root, run, log } = seed(tempRoot, Date.now() - 7 * HOUR);
     const request = { tempRoot, orphanedTempRunRetentionMs: 48 * HOUR, oneShotRunRetentionMs: 48 * HOUR,
@@ -247,11 +256,14 @@ describe("configured detached temp sweep", () => {
     expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(JSON.stringify({ ...record, finishedAt }));
     expect(sweepTempRunRoots({ ...request, now: finishedAt + 48 * HOUR - 1 }).removedRuns).toEqual([]);
     expect(sweepTempRunRoots({ ...request, now: finishedAt + 48 * HOUR }).removedRuns).toEqual([run]);
+    const archive = `${root}.trace-archive`;
+    const receipt = JSON.parse(fs.readFileSync(path.join(archive, fs.readdirSync(archive)[0]!, "custody.json"), "utf8"));
+    expect(fs.readFileSync(path.join(receipt.destination, "events.jsonl"), "utf8")).toBe(log);
     // Keep the serialized request type part of this entry-point regression.
     const typed: TempRunSweepRequest = request; expect(typed.tempRoot).toBe(tempRoot);
   });
 
-  it("preserves every original byte despite a configured cap after the default age", async () => {
+  it("does not truncate raw traces in the entry even after the configured compaction age", async () => {
     const tempRoot = temp(); const { run, log } = seed(tempRoot, Date.now() - 25 * HOUR);
     const request = { tempRoot, orphanedTempRunRetentionMs: 48 * HOUR, oneShotRunRetentionMs: 48 * HOUR,
       terminalRunEventsAgeMs: 24 * HOUR, terminalRunEventsMaxBytes: 1024 };
@@ -263,7 +275,7 @@ describe("configured detached temp sweep", () => {
     expect(fs.statSync(run).mtimeMs).toBe(mtime);
   });
 
-  it("preserves every original byte even with a legacy age shorter than six hours", async () => {
+  it("does not truncate young raw traces even with a shorter configured compaction age", async () => {
     const tempRoot = temp(); const finishedAt = Date.now() - 2 * HOUR;
     const { run, log } = seed(tempRoot, finishedAt);
     // Compare the filesystem timestamp, not the input rounded through utimes.

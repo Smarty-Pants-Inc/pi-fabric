@@ -473,6 +473,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,
       ...(processHandle.primaryExit ? { primaryExit: processHandle.primaryExit } : {}),
+      ...(processHandle.nativeExit ? { nativeExit: processHandle.nativeExit } : {}),
       ...(processHandle.treeClosed ? { treeClosed: processHandle.treeClosed } : {}),
       stop: processHandle.stop,
     };

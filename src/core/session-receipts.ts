@@ -2,6 +2,52 @@ import fs from "node:fs";
 import { syncPathNamespace } from "./atomic-write.js";
 import { SessionEntryCursor, type SessionEntryCursorManager } from "./preview.js";
 
+export interface NativeRecoverySessionRef {
+  sessionId: string; // native UUID, WITHOUT session: prefix
+  sessionFile: string;
+}
+export interface NativeRecoveryBindingBase {
+  version: 1;
+  operationId: string;
+  preparedDigest: string; // lowercase SHA-256, 64 hex chars
+  preparedEntryId: string;
+  source: NativeRecoverySessionRef;
+  target: NativeRecoverySessionRef;
+}
+export type NativeRecoveryPreparedBinding = NativeRecoveryBindingBase & {
+  phase: "prepared";
+  receivedEntryId?: never;
+};
+export type NativeRecoveryReceivedBinding = NativeRecoveryBindingBase & {
+  phase: "received";
+  receivedEntryId: string;
+};
+export type NativeRecoveryBinding = NativeRecoveryPreparedBinding | NativeRecoveryReceivedBinding;
+export interface NativeRecoveryParkIntent {
+  version: 1;
+  operationId: string;
+  source: NativeRecoverySessionRef;
+  target: NativeRecoverySessionRef;
+}
+export interface NativeRecoveryOccurrence {
+  ordinal: number; // nonnegative safe integer, unique within operation
+  state: "pending" | "appended" | "handled" | "ambiguous";
+  // Generic native custom-message projection, not a Fabric-only native parser.
+  // Exact original details, including nested items[], chain/delivery IDs and
+  // inbox event receipts. No message bodies needed by C. Absent for noncustom input.
+  customMessage?: { customType: string; details: unknown };
+}
+export type NativeRecoveryTransfer = NativeRecoveryBinding & {
+  occurrences: readonly NativeRecoveryOccurrence[];
+};
+export type NativeRecoveryCustodyResult =
+  | { status: "none" }
+  | { status: "hold"; reason: string; operationId?: string }
+  | { status: "validated"; transfers: readonly NativeRecoveryTransfer[] };
+export type NativeRecoveryCustodyReader = (
+  scope: NativeRecoverySessionRef,
+) => NativeRecoveryCustodyResult;
+
 /** A missing (including deferred-first-write) file is no receipt. All other uncertainty throws.
  * Reconfirm every barrier even when callers already cached this inode's entries. */
 export const withConfirmedSessionFile = (

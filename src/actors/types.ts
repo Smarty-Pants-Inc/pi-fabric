@@ -701,6 +701,8 @@ export interface FabricActorDeliveryRequest {
   message: FabricActorMessage;
   delivery: Exclude<FabricActorDelivery, "mailbox">;
   triggerTurn: boolean;
+  /** Host-owned stopped alarms only: require Main's journaled consumption before marking delivered. */
+  requireConfirmation?: "main";
 }
 
 /**

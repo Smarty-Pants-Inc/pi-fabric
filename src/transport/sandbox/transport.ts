@@ -10,6 +10,7 @@ import { sandboxResultPrefix, sandboxTaskMessage } from "../../agents/sandbox-au
 const EMPTY_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } as const;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$/u;
 const HOST = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u;
+const DNS_1123_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u;
 const SANDBOX_POD_PENDING_POLL_MS = 250;
 const isTimestamp = (value: unknown): value is string => typeof value === "string" && TIMESTAMP.test(value) && Number.isFinite(Date.parse(value)) && new Date(Date.parse(value)).toISOString().replace(".000Z", "Z") === value;
@@ -47,6 +48,7 @@ export class SandboxProtocolError extends Error {
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const isDns1123Label = (value: unknown): value is string => typeof value === "string" && DNS_1123_LABEL.test(value);
 const abortIfNeeded = (signal?: AbortSignal): void => signal?.throwIfAborted();
 
 const timeoutSleep = (milliseconds: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
@@ -63,7 +65,7 @@ const protocolField = (field: string, detail = "is invalid"): SandboxProtocolErr
 
 type BindingCheck = { ready: true; binding: SandboxBinding } | { ready: false; field: string; binding: SandboxBinding };
 
-const validateSpawnResult = (value: unknown, runId: string): SandboxSpawnResult => {
+const validateSpawnResult = (value: unknown, runId: string, namespace: string): SandboxSpawnResult => {
   const keys = ["runId", "status", "code", "detail", "retryAfterSeconds", "host", "claimRef", "claimUID", "podUID"];
   if (!isObject(value)) throw protocolField("spawn result response");
   const missing = keys.find(key => !Object.hasOwn(value, key));
@@ -90,7 +92,7 @@ const validateSpawnResult = (value: unknown, runId: string): SandboxSpawnResult 
     if (refMissing) throw protocolField(`spawn result field claimRef.${refMissing}`, "is missing");
     const refExtra = Object.keys(ref).find(key => !["namespace", "name", "uid"].includes(key));
     if (refExtra) throw protocolField(`spawn result field claimRef.${refExtra}`, "is unexpected");
-    if (ref.namespace !== "smarty-island") throw protocolField("spawn result field claimRef.namespace");
+    if (!isDns1123Label(ref.namespace) || ref.namespace !== namespace) throw protocolField("spawn result field claimRef.namespace");
     if (ref.name !== `spawn-${runId}`) throw protocolField("spawn result field claimRef.name", "does not match runId");
     if (typeof ref.uid !== "string" || !NAME.test(ref.uid)) throw protocolField("spawn result field claimRef.uid");
     if (value.claimUID !== ref.uid) throw protocolField("spawn result field claimUID", "does not match claimRef.uid");
@@ -104,7 +106,7 @@ const validateSpawnResult = (value: unknown, runId: string): SandboxSpawnResult 
   return value as unknown as SandboxSpawnResult;
 };
 
-const validateBinding = (value: unknown, intent: SandboxSpawnIntent, admitted: SandboxSpawnResult): BindingCheck => {
+const validateBinding = (value: unknown, intent: SandboxSpawnIntent, admitted: SandboxSpawnResult, namespace: string): BindingCheck => {
   const fields = ["runId", "status", "claimRef", "claimUID", "podUID", "podName", "host", "org", "role", "model", "provider", "thinking", "expectedSeconds", "deadline", "executionDeadline", "admittedAt"];
   if (!isObject(value)) throw protocolField("binding response");
   const missing = fields.find(field => !Object.hasOwn(value, field));
@@ -142,7 +144,7 @@ const validateBinding = (value: unknown, intent: SandboxSpawnIntent, admitted: S
     if (claimMissing) throw protocolField(`binding field claimRef.${claimMissing}`, "is missing");
     const claimExtra = Object.keys(claim).find(field => !claimFields.includes(field));
     if (claimExtra) throw protocolField(`binding field claimRef.${claimExtra}`, "is unexpected");
-    if (claim.namespace !== "smarty-island") throw protocolField("binding field claimRef.namespace");
+    if (!isDns1123Label(claim.namespace) || claim.namespace !== namespace) throw protocolField("binding field claimRef.namespace");
     if (claim.name !== `spawn-${intent.runId}`) throw protocolField("binding field claimRef.name", "does not match runId");
     if (typeof claim.uid !== "string" || !NAME.test(claim.uid)) throw protocolField("binding field claimRef.uid");
     if (value.claimUID !== claim.uid) throw protocolField("binding field claimUID", "does not match claimRef.uid");
@@ -206,9 +208,14 @@ export class SandboxTransport implements AgentTransportAdapter {
   readonly kind = "sandbox" as const;
   readonly #now: () => number;
   readonly #sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+  readonly #namespace: string;
 
   readonly dependencies: SandboxTransportDependencies;
   constructor(readonly config: SandboxTransportConfig, dependencies: SandboxTransportDependencies = {}) {
+    const configuredNamespace = config.namespace;
+    const namespace = configuredNamespace === undefined ? "smarty-island" : configuredNamespace;
+    if (!isDns1123Label(namespace)) throw new SandboxProtocolError("Sandbox config namespace must be a DNS-1123 label");
+    this.#namespace = namespace;
     this.dependencies = { ...dependencies, placement: dependencies.placement ?? new SandboxPlacementHttp(config.placementUrl) };
     this.#now = dependencies.now ?? Date.now;
     this.#sleep = dependencies.sleep ?? timeoutSleep;
@@ -459,7 +466,7 @@ export class SandboxTransport implements AgentTransportAdapter {
         const snapshot = hasSpawnResult
           ? await placement.getSpawn(intent.runId, operationSignal)
           : await placement.requestSpawn(intent, operationSignal);
-        last = validateSpawnResult(snapshot, intent.runId);
+        last = validateSpawnResult(snapshot, intent.runId, this.#namespace);
         hasSpawnResult = true;
       } catch (error) {
         if (!responseErrorIsRetryable(error)) throw error;
@@ -471,7 +478,7 @@ export class SandboxTransport implements AgentTransportAdapter {
       try {
         for await (const snapshot of placement.watchSpawn(intent.runId, operationSignal)) {
           abortIfNeeded(signal);
-          last = validateSpawnResult(snapshot, intent.runId);
+          last = validateSpawnResult(snapshot, intent.runId, this.#namespace);
           if (last.status === "refused") throw new SandboxPlacementRefusedError(last.code);
           if (last.status === "admitted") return last;
           if (this.#now() >= deadline) break;
@@ -503,7 +510,7 @@ export class SandboxTransport implements AgentTransportAdapter {
         if (timeoutSignal.aborted || this.#now() >= deadline) throw new SandboxPodPendingTimeoutError(intent.runId, timeoutMs, pendingField);
         throw protocolField("binding field response", "could not be read");
       }
-      const checked = validateBinding(response, intent, admitted);
+      const checked = validateBinding(response, intent, admitted, this.#namespace);
       deadline = Math.min(deadline, Date.parse(checked.binding.executionDeadline!));
       if (checked.ready) return checked.binding;
       pendingField = checked.field;

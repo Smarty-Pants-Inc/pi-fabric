@@ -2,7 +2,7 @@
 
 import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { diagnostics } from "../core/diagnostics.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { detachedPreview } from "../core/preview.js";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -84,6 +84,7 @@ import { FabricActorQueuedWorkError } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager, rootRecordLastSeenMs } from "../agents/manager.js";
+import { retainCleanupRoot, type CleanupRootCustody } from "../agents/worktree-manager.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
@@ -126,6 +127,7 @@ import {
   type ResidentCommand,
   type ResidentCommandResponse,
   residentSlotErrorFields,
+  residentCleanupErrorFields,
   residentCreateMayBeProtected,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
@@ -311,6 +313,9 @@ export class ResidentHost {
   readonly #processingPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
+  // Only helper-returned custody (including a committed move's receipt error)
+  // ends canonical ownership. Never capture a late replacement on retry.
+  readonly #cleanupResidentCustody = new Map<string, Map<string, CleanupRootCustody | undefined>>();
   readonly #removalsPath: string;
   readonly #deliveryOutboxPath: string;
   readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery")
@@ -798,11 +803,16 @@ export class ResidentHost {
       this.mesh,
       config.mesh,
       this.agents,
-      ({ actor, message, delivery, triggerTurn }) => {
+      ({ actor, message, delivery, triggerTurn, requireConfirmation }) => {
         if (!message.text) return;
         const mode = delivery === "steer" ? "steer" : "followUp";
         const triggers = delivery === "nextTurn" ? false : triggerTurn;
-        this.#trackPublication(this.#queueDelivery(
+        // Only host-generated stopped alarms opt into Main confirmation. Other actor
+        // output and alarms keep their existing UUID and tracked, void publication.
+        const stableId = requireConfirmation === "main" && message.source === "fabric-host" &&
+          /^actor-alarm:[a-f0-9]{64}$/.test(message.id) && message.text.startsWith("Fabric host notice: actor-stopped;")
+          ? createHash("sha256").update(message.id).digest("hex") : undefined;
+        const publication = this.#queueDelivery(
           { id: actor.id, name: actor.name, kind: "actor" },
           message.text,
           mode,
@@ -818,7 +828,14 @@ export class ResidentHost {
           fabricWakeCause(message.source === "fabric-host" ? this.identity : { id: actor.id, name: actor.name, kind: "actor" },
             message.source === "fabric-host" ? "host-event" : "actor",
             message.source.startsWith("mesh:") || message.source.startsWith("host:") ? message.source.slice(5) : undefined, message.id),
-        ));
+          stableId,
+        );
+        if (stableId) {
+          const confirmed = publication.then(result => result === true);
+          this.#trackPublication(confirmed);
+          return confirmed;
+        }
+        this.#trackPublication(publication);
       },
       {
         // Restoration must not launch queued work until owner and readiness publication commit.
@@ -1533,8 +1550,9 @@ export class ResidentHost {
     principal?: FabricPrincipal,
     source?: ResidentDeliveryRecord["source"],
     wakeCause?: FabricWakeCause,
-  ): Promise<void> {
-    const id = randomUUID();
+    stableId?: string,
+  ): Promise<boolean | void> {
+    const id = stableId ?? randomUUID();
     const diagnostic = copyFabricWakeCause(wakeCause);
     const record = (target: string): ResidentDeliveryRecord => ({
         format: RESIDENT_HOST_FORMAT,
@@ -1555,6 +1573,41 @@ export class ResidentHost {
     // Agent completions use the fixed creating root and still persist before yielding.
     const persist = (target: string): void =>
       writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record(target), { durable: true });
+    if (stableId) {
+      if (typeof rootId !== "string") throw new Error("Confirmed resident delivery requires a fixed root");
+      const key = `${residentDeliveryPrefix(rootId)}${id}`;
+      const inspect = async (): Promise<{ written: boolean; confirmed: boolean } | undefined> => {
+        let written = false;
+        let confirmed = false;
+        // A retained tombstone, not an outbox write or mesh put, proves Main has
+        // synchronously journaled the notice and deleted its delivery key.
+        try {
+          await this.mesh.writeBatch({ identity: this.identity, ops: [],
+            lockTiming: { operation: "resident-delivery-confirmation" },
+            prepare: view => {
+              written = view.version(key) > 0;
+              confirmed = written && view.get(key) === undefined;
+              return [];
+            } });
+        } catch {
+          // Probe uncertainty does not establish failed producer custody.
+          return undefined;
+        }
+        return { written, confirmed };
+      };
+      // Inspect BEFORE staging: retries must not rewrite either a pending mesh
+      // record or a consumed tombstone (including an ack-before-marker crash).
+      const before = await inspect();
+      if (!before) return false;
+      if (before.confirmed) return true;
+      if (!before.written && !fs.existsSync(path.join(this.#deliveryOutboxPath, `${id}.json`))) persist(rootId);
+      this.#scheduleIdleCheck();
+      const flushed = await this.#retryDeliveries();
+      // The existing retry owner contains flush errors. Never turn that failed
+      // attempt into confirmation, even if Main consumes concurrently.
+      if (flushed === "retry" || flushed === "failed" || flushed === "skipped") return false;
+      return (await inspect())?.confirmed ?? false;
+    }
     if (typeof rootId === "function") {
       // Serialize proof+absence and target selection with resumed-root proof
       // invalidation: resumeLineage() invalidates the proof with a shared-state delete,
@@ -1625,7 +1678,7 @@ export class ResidentHost {
       try {
         await this.mesh.put({ key, value: publish, identity: this.identity, ifVersion: 0 });
       } catch (error) {
-        // A restart after put but before unlink replays the SAME private UUID. A CAS
+        // A restart after put but before unlink replays the SAME private delivery id. A CAS
         // conflict (including a consumed tombstone) means it was handed off already.
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
           if (isMeshWriteDeferred(error)) throw error; // no truncated rewrite for a refused write
@@ -2731,6 +2784,24 @@ export class ResidentHost {
     } catch { return undefined; } // Attribution never supplies launch authority or a new launch veto.
   }
 
+  #retainAgentCleanupTraces(id: string): void {
+    let custody = this.#cleanupResidentCustody.get(id);
+    if (!custody) { custody = new Map(); this.#cleanupResidentCustody.set(id, custody); }
+    const archive = `${this.config.residencyRoot}.trace-archive`;
+    for (const [source, reason] of [
+      // Keep the live client's routing metadata until saved-result custody succeeds.
+      [residentResultPath(this.config.residencyRoot, id), "resident cleanup saved result"],
+      [path.join(this.#agentsPath, `${id}.json`), "resident cleanup agent metadata"],
+    ] as const) {
+      if (custody.has(source)) continue;
+      try { custody.set(source, retainCleanupRoot(source, archive, id, reason)); }
+      catch (error) {
+        if (error instanceof Error && "retainedRoot" in error) custody.set(source, error.retainedRoot as CleanupRootCustody);
+        throw error;
+      }
+    }
+  }
+
   async #executeRequest(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     const requestId = command.requestId;
     let response: ResidentCommandResponse;
@@ -2815,9 +2886,11 @@ export class ResidentHost {
         // must preserve the background completion notification as well as files.
         await this.agents.join(command.id);
         commit(command.id);
-        await this.agents.cleanup(command.id, command.deleteBranch);
-        fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
-        fs.rmSync(residentResultPath(this.config.residencyRoot, command.id), { force: true });
+        // The manager's queued/managed exit and result-authentication gates run
+        // FIRST. Only then may resident trace custody prepare final consumption.
+        // A failure keeps the manager's run, signal and original-held result map.
+        await this.agents.cleanup(command.id, command.deleteBranch, () => this.#retainAgentCleanupTraces(command.id));
+        this.#cleanupResidentCustody.delete(command.id);
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
@@ -2992,6 +3065,9 @@ export class ResidentHost {
           } catch { /* Attribution is advisory, not a replacement for the native error. */ }
         }
       }
+      const cleanupFailure = command.operation === "cleanup" ? residentCleanupErrorFields(error) : {};
+      if (command.operation === "cleanup" && cleanupFailure.cleanupStatus) diagnostics.warn("src/residency/host.ts",
+        `[pi-fabric] resident cleanup ${command.id}: original retained in place; ${JSON.stringify(cleanupFailure.cleanupStatus)}; ${errorMessage(error)}`);
       const drain = command.operation === "releaseDrain" ? this.#drainRefusal(command, error) : undefined;
       let slotFailure = residentSlotErrorFields(error);
       if (command.operation === "createActor" && (residentCreateMayBeProtected(command) ||
@@ -3026,6 +3102,7 @@ export class ResidentHost {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),
         ...slotFailure,
+        ...cleanupFailure,
         completedAt: Date.now(),
       };
     }

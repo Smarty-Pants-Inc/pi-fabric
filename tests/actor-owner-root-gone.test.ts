@@ -131,6 +131,85 @@ const providerFor = (f: Awaited<ReturnType<typeof fixture>>) => {
 };
 
 describe("persistent old-root settlement (#12785)", () => {
+  it.each(["file", "sqlite"] as const)("settles a dead root's leftover session actor once on %s, then never fences or stages again", async stateBackend => {
+    const f = await fixture(true, { stateBackend });
+    expect(f.mesh.stateBackend).toBe(stateBackend);
+    expect(f.store.records()[0]).toMatchObject({ status: "running", residency: "session", rootId: f.old.id });
+    const batches = vi.spyOn(f.mesh, "writeBatch");
+    expect(await f.repair.reconcile()).toBe(1);
+    const settlementAttempts = batches.mock.calls.flatMap(([input], index) =>
+      input.lockTiming?.operation === "session-orphan-settle" ? [batches.mock.results[index]!.value] : []);
+    expect(settlementAttempts).toHaveLength(1);
+    // The real batch must apply both state repairs on this FIRST attempt, not merely stop the private actor.
+    await expect(settlementAttempts[0]).resolves.toEqual([
+      { key: f.legacy, applied: true, version: expect.any(Number) },
+      { key: keyOf(f.id), applied: true, version: expect.any(Number) },
+    ]);
+    const copies = persisted(f), registry = f.store.snapshot().bytes;
+    for (const copy of copies) {
+      expect(f.repair.validateTombstone(copy)).toEqual(copy.value);
+      expect(copy.value).toMatchObject({ status: "stopped", stopReason: "owner-root-gone", capabilities: [] });
+    }
+    expect(f.store.records()[0]).toMatchObject({ status: "stopped", stopReason: "host-exit",
+      sessionOrphan: { directorySettlement: { by: f.current.id }, alarmPublishedAt: expect.any(Number) } });
+    const prepare = vi.spyOn(ActorRegistryStore.prototype, "prepare");
+    const fence = vi.spyOn(f.mesh, "withTryLock");
+    const custody = vi.spyOn(participantFiles, "withParticipantFilesTryLock");
+    const sqlite = stateBackend === "sqlite"
+      ? (f.mesh.stateBackendHandle as unknown as { store: { stats(): { transactions: number } } }).store : undefined;
+    const transactions = sqlite?.stats().transactions;
+    batches.mockClear();
+    for (let pass = 0; pass < 3; pass++) expect(await f.repair.reconcile()).toBe(0);
+    expect(batches).not.toHaveBeenCalled();
+    expect(fence).not.toHaveBeenCalled();
+    expect(custody).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+    if (sqlite) expect(sqlite.stats().transactions).toBe(transactions);
+    expect(f.store.snapshot().bytes).toBe(registry);
+    expect(persisted(f)).toEqual(copies);
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
+  describe.each(["file", "sqlite"] as const)("pre-operation settlement snapshot on %s", stateBackend => {
+    it.each(["legacy", "participant"] as const)("refuses a concurrent %s state-copy change without committing the private intent", async copy => {
+      const f = await fixture(true, { stateBackend });
+      const orphanedAt = f.actor.updatedAt + 1;
+      f.store.write([{ ...f.actor, status: "stopped", stopReason: "host-exit", updatedAt: orphanedAt,
+        sessionOrphan: { oldRoot: f.old.id, orphanedAt, alarmPublishedAt: orphanedAt } }]);
+      const registry = f.store.snapshot().bytes, originalCopies = persisted(f);
+      const writer = new MeshStore(f.root, 65536, 100, { stateBackend });
+      cleanups.push(async () => { writer.closeState(); });
+      const key = copy === "legacy" ? f.legacy : keyOf(f.id);
+      const original = writer.get(key, { fresh: true })!;
+      const batch = f.mesh.writeBatch.bind(f.mesh);
+      let attempts = 0, beforeCommits = 0, failure: unknown;
+      vi.spyOn(f.mesh, "writeBatch").mockImplementation(async input => {
+        if (input.lockTiming?.operation !== "session-orphan-settle") return batch(input);
+        attempts++;
+        // A separate real connection commits after copies were captured but before prepare's transaction.
+        // Keep the original dead owner and stale timestamp so liveness/owner checks cannot mask the race.
+        const clock = vi.spyOn(Date, "now").mockReturnValue(f.actor.updatedAt);
+        try { await writer.put({ identity: f.old, key, value: { ...(original.value as object), changedByConcurrentWriter: true } }); }
+        finally { clock.mockRestore(); }
+        try {
+          return await batch({ ...input, beforeCommit: () => { beforeCommits++; input.beforeCommit?.(); } });
+        } catch (error) { failure = error; throw error; }
+      });
+      expect(await f.repair.reconcile()).toBe(0);
+      expect(attempts).toBe(1);
+      expect(beforeCommits).toBe(0);
+      expect(failure).toEqual(new Error("Actor directory state copy changed before intent commit"));
+      expect(f.store.snapshot().bytes).toBe(registry);
+      expect(f.store.records()[0]!.sessionOrphan).not.toHaveProperty("directorySettlement");
+      const copies = persisted(f), changedIndex = copy === "legacy" ? 0 : 1;
+      expect(copies[changedIndex]).toEqual(writer.get(key, { fresh: true }));
+      expect(copies[changedIndex].version).toBeGreaterThan(original.version);
+      expect(copies[changedIndex].value).toMatchObject({ changedByConcurrentWriter: true });
+      for (const index of [0, 1, 2]) if (index !== changedIndex) expect(copies[index]).toEqual(originalCopies[index]);
+      expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+    });
+  });
+
   it.each(["native", "win32"] as const)("repairs raw legacy, native state and participant file on %s; keeps history and host-exit restart reason", async platform => {
     const original = Object.getOwnPropertyDescriptor(process, "platform")!;
     if (platform === "win32") Object.defineProperty(process, "platform", { ...original, value: "win32" });
@@ -342,14 +421,22 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(f.mesh.get(f.legacy)?.value).toMatchObject({ status: "running" });
   });
 
-  it.each(["old-lease", "current-identity", "current-activation", "registry"] as const)("rechecks %s at the actual settlement commit boundary", async mode => {
-    const f = await fixture();
-    const batch = f.mesh.writeBatch.bind(f.mesh); let fired = false;
+  it.each((["file", "sqlite"] as const).flatMap(stateBackend =>
+    (["old-lease", "current-identity", "current-activation", "registry", "participant-file"] as const).map(mode => ({ stateBackend, mode }))))(
+    "rechecks $mode at the actual settlement commit boundary on $stateBackend", async ({ stateBackend, mode }) => {
+    const f = await fixture(true, { stateBackend });
+    const batch = f.mesh.writeBatch.bind(f.mesh); let fired = false, failure: unknown;
     vi.spyOn(f.mesh, "writeBatch").mockImplementation(input => batch(input.beforeCommit ? { ...input, beforeCommit: () => {
       if (!fired) {
         fired = true;
         if (mode === "old-lease") writeHostLease(f.root, { ...f.lease, expiresAt: Date.now() + 60000 });
         if (mode === "registry") f.store.write([{ ...f.store.records()[0], updatedAt: Date.now(), name: "successor" }]);
+        if (mode === "participant-file") {
+          const file = path.join(f.root, "participants", `${hash(f.id)}.json`);
+          const entry = JSON.parse(fs.readFileSync(file, "utf8"));
+          // Keep valid stale/dead ownership: only the exact file-generation check can reject this.
+          fs.writeFileSync(file, JSON.stringify({ ...entry, value: { ...entry.value, changedByConcurrentWriter: true } }));
+        }
         if (mode === "current-identity" || mode === "current-activation") {
           const owner = JSON.parse(fs.readFileSync(f.newOwner, "utf8"));
           fs.writeFileSync(f.newOwner, JSON.stringify({ ...owner,
@@ -357,11 +444,12 @@ describe("persistent old-root settlement (#12785)", () => {
               : { activationId: "different-activation" }) }));
         }
       }
-      input.beforeCommit!();
+      try { input.beforeCommit!(); } catch (error) { failure = error; throw error; }
     } } : input));
     await f.repair.reconcile();
     expect(fired).toBe(true);
-    expect(f.mesh.get(f.legacy)?.value).toMatchObject({ status: "running" });
+    if (mode === "participant-file") expect(failure).toEqual(new Error("Actor directory file copy changed before intent commit"));
+    expect(f.mesh.get(f.legacy, { fresh: true })?.value).toMatchObject({ status: "running" });
     expect(f.store.records()[0]!.sessionOrphan).not.toHaveProperty("directorySettlement");
   });
 
@@ -767,6 +855,9 @@ describe("persistent old-root settlement (#12785)", () => {
       writeParticipantFile(f.root, native!);
     }
     expect(f.mesh.stateBackend).toBe("sqlite");
+    // A different live native Main must also leave an existing observer's settlement untouched.
+    // Run this with the source fix stashed to prove old-code compatibility, not just fixed-code idempotency.
+    const otherObserver = observer(f, "unpatched-observer");
     const copies = f.orphanIds.map(id => persistedFor(f, id));
     for (const set of copies) for (const copy of set) {
       expect(copy).toBeDefined();
@@ -777,7 +868,9 @@ describe("persistent old-root settlement (#12785)", () => {
     const before = sqlite.stats();
     const batches = vi.spyOn(f.mesh, "writeBatch");
     const custody = vi.spyOn(participantFiles, "withParticipantFilesTryLock");
-    for (let heartbeat = 0; heartbeat < K; heartbeat++) await f.repair.reconcile();
+    const fence = vi.spyOn(f.mesh, "withTryLock");
+    const preparations = vi.spyOn(ActorRegistryStore.prototype, "prepare");
+    for (let heartbeat = 0; heartbeat < K; heartbeat++) await otherObserver.reconcile();
     const after = sqlite.stats();
     const writeBatches = batches.mock.calls.length;
     const transactionDelta = after.transactions - before.transactions;
@@ -791,7 +884,11 @@ describe("persistent old-root settlement (#12785)", () => {
       expectedWriteBatches, writeBatches, transactionDelta, holdDeltaMs, custodyReceipts }));
     expect(writeBatches).toBe(expectedWriteBatches);
     expect(transactionDelta).toBe(expectedWriteBatches);
-    if (expectedWriteBatches === 0) expect(custodyReceipts).toBe(0);
+    if (expectedWriteBatches === 0) {
+      expect(custodyReceipts).toBe(0);
+      expect(fence).not.toHaveBeenCalled();
+      expect(preparations).not.toHaveBeenCalled();
+    }
     expect(f.store.snapshot().bytes).toBe(registry);
     expect(f.orphanIds.map(id => persistedFor(f, id))).toEqual(copies);
     expect(fs.readFileSync(f.history, "utf8")).toBe(history);

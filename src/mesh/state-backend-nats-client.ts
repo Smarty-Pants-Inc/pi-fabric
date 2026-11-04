@@ -176,6 +176,21 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     throw redactNatsError(error);
   }
   const js = jetstream(nc);
+  // SDK-local status fanout only: status() does not subscribe/request on NATS or create a timer. This loop lives
+  // until this port's existing connection closes; it never reconnects, resets, or changes native recovery policy.
+  let connectionBinding: object | undefined;
+  try {
+    const statuses = nc.status();
+    connectionBinding = {};
+    void (async () => {
+      for await (const status of statuses) {
+        if (status.type === "reconnect") connectionBinding = {};
+        else if (status.type === "disconnect" || status.type === "reconnecting" || status.type === "staleConnection" ||
+          status.type === "forceReconnect" || status.type === "close") connectionBinding = undefined;
+      }
+      connectionBinding = undefined;
+    })().catch(() => { connectionBinding = undefined; });
+  } catch { /* Older/injected clients without local status evidence cannot certify observations. */ }
   // Every ensure grants only its first consumer the existing readiness deadline. Freshness alone grants 10059
   // tolerance (#12900); observing an existing stream never does, even though its initial get is also bounded.
   const streamReadiness = new Map<string, { deadline: number; fresh: boolean }>();
@@ -438,10 +453,63 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         : await bootstrapConsumer(stream, request, readiness.deadline, readiness.fresh,
           () => { abandonPendingGet(); consumerOptions = { ...consumerOptions, name_prefix: randomUUID() }; });
       const messages = await consumer.consume({ idle_heartbeat: CONSUMER_IDLE_HEARTBEAT_MS });
-      void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
-        .catch(error => onError?.(error));
-      return { stop: async () => { await messages.close(); } };
+      let consumerBinding: object | undefined;
+      let consumerName: string | undefined;
+      let stopped = false;
+      let observable = false;
+      try {
+        const statuses = messages.status(); // Local fanout from the EXISTING ordered consumer; no new subscription.
+        observable = true;
+        consumerBinding = {};
+        void (async () => {
+          for await (const status of statuses) {
+            if (stopped) break;
+            if (status.type === "ordered_consumer_recreated") { consumerName = status.name; consumerBinding = {}; }
+            else if (status.type === "heartbeat") consumerBinding ??= {};
+            else if (status.type === "reset" || status.type === "consumer_deleted" || status.type === "consumer_not_found" ||
+              status.type === "stream_not_found" || status.type === "no_responders" || status.type === "heartbeats_missed") {
+              consumerBinding = undefined;
+            }
+          }
+          observable = false;
+          consumerBinding = undefined;
+        })().catch(() => { observable = false; consumerBinding = undefined; });
+      } catch { /* Optional proof only; preserve the original delivery/error path for unsupported ports. */ }
+      let boundConnection: object | undefined;
+      let boundConsumer: object | undefined;
+      let binding: object | undefined;
+      void (async () => {
+        for await (const message of messages) {
+          // Check the actual delivered consumer identity BEFORE the backend applies/notifies. Native status events
+          // cover empty resets/reconnects; message identity also prevents a recreated consumer's data racing its hint.
+          if (observable && !stopped) {
+            try {
+              const name = message.info.consumer;
+              if (typeof name !== "string" || name.length === 0) consumerBinding = undefined;
+              else {
+                if (consumerName !== undefined && consumerName !== name) consumerBinding = {};
+                consumerName = name;
+                consumerBinding ??= {};
+              }
+            } catch { consumerBinding = undefined; }
+          }
+          onMessage({ seq: message.seq, data: message.data });
+        }
+      })().catch(error => onError?.(error))
+        .finally(() => { stopped = true; consumerBinding = undefined; });
+      return {
+        observationBinding: () => {
+          if (stopped || !observable || connectionBinding === undefined || consumerBinding === undefined) return undefined;
+          if (boundConnection !== connectionBinding || boundConsumer !== consumerBinding) {
+            boundConnection = connectionBinding;
+            boundConsumer = consumerBinding;
+            binding = {};
+          }
+          return binding;
+        },
+        stop: async () => { stopped = true; consumerBinding = undefined; await messages.close(); },
+      };
     },
-    close: async () => { await nc.drain(); },
+    close: async () => { connectionBinding = undefined; await nc.drain(); },
   });
 };

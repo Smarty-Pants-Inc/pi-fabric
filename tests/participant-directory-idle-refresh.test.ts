@@ -91,9 +91,10 @@ describe.each(["file", "sqlite"] as const)("ParticipantDirectory idle heartbeat 
     const real = Date.now;
     const clock = vi.spyOn(Date, "now").mockImplementation(() => real() + LEASE.leaseMs);
     reads.reset();
+    listings.mockClear();                           // exclude the explicit public listing above
     await alpha.refresh();
     expect(reads.hostScans()).toBeGreaterThanOrEqual(1);   // the legacy-renewal derivation
-    expect(listings).toHaveBeenCalledWith({ scope: "project", kinds: ["root"] });   // the collision pass
+    expect(listings).not.toHaveBeenCalled();             // candidate-only collision pass, never fleet list()
     expect(reads.copies()).toBe(0);
     clock.mockRestore();
   });
@@ -125,7 +126,7 @@ describe.each(["file", "sqlite"] as const)("ParticipantDirectory idle heartbeat 
     await directory("delta", "alpha").start();
     await mesh.put({ key: "bench/churn", value: { tick: 4 }, identity: churn });
     await alpha.refresh();
-    expect(listings).toHaveBeenCalledWith({ scope: "project", kinds: ["root"] });
+    expect(listings).not.toHaveBeenCalled();        // changed collision candidates, still no fleet list()
     expect(collisions).toEqual([expect.objectContaining({ reason: "duplicate-session", ids: ["session:alpha", "session:delta"] })]);
   });
 

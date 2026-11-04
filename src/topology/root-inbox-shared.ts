@@ -44,6 +44,14 @@ export interface RootInboxEvent extends MeshEvent {
   deliveredLate?: true;
 }
 
+/** Locator for the existing recipient-scoped ledger, never a native custody grant. */
+export interface NativeRecoveryInboxHandoff {
+  version: 1;
+  rootId: string;
+  key: string;
+  after: number;
+}
+
 export interface RootInboxBatch {
   events: RootInboxEvent[];
   /** End of the contiguous durable prefix; priority lookahead may include higher sequences. */
@@ -74,10 +82,13 @@ export type RootInboxReceiptVerifier = (
   details: unknown, carrier: unknown, accepted: Set<string>,
 ) => RootInboxReceiptSnapshot | undefined;
 
+const inboxObject = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
+
 // Only the trusted raw-content projection can populate this cache; public digest fields are ignored.
 const projectedInboxDigests = new WeakMap<object, string>();
 export const rootInboxCarrierDigest = (carrier: unknown): string => {
-  const fields = carrier && typeof carrier === "object" ? carrier as { content?: unknown } : {};
+  const fields = inboxObject(carrier) ?? {};
   const cached = projectedInboxDigests.get(fields);
   if (cached && !("content" in fields)) return cached;
   // Native string content and its single text-block context representation render identically.
@@ -97,22 +108,64 @@ export interface RootInboxReceiptIssuer {
   turn: number;
 }
 const ISSUERS_KEY = Symbol.for("pi-fabric.rootInboxReceiptIssuers.v1");
-/** Only same-manager/session reloads inherit custody. Omitted identity releases old authority. */
+declare const rootInboxReceiptAuthorityBrand: unique symbol;
+/** Opaque process object: serialized details/nonces cannot reconstruct this authority. */
+export interface RootInboxReceiptAuthority { readonly [rootInboxReceiptAuthorityBrand]: true }
+// Keep manager keys in the existing resident map; issuer provenance and opaque
+// capabilities have separate namespaces, shared across extension reloads.
+interface IssuerRegistry extends WeakMap<object, RootInboxReceiptIssuer> {
+  issuers?: WeakSet<RootInboxReceiptIssuer>;
+  authorities?: WeakMap<object, { issuer: RootInboxReceiptIssuer; manager?: object; sessionId?: string }>;
+  adopted?: WeakMap<object, string>;
+}
+const issuerRegistry = (): IssuerRegistry => {
+  const host = globalThis as typeof globalThis & { [ISSUERS_KEY]?: IssuerRegistry };
+  return host[ISSUERS_KEY] ??= new WeakMap();
+};
+/** R retains this exact object in its capsule, after closing source delivery. */
+export const retainRootInboxReceiptIssuer = (issuer: RootInboxReceiptIssuer): RootInboxReceiptAuthority => {
+  const custody = issuerRegistry();
+  if (!custody.issuers?.has(issuer)) throw new Error("Unknown root inbox receipt issuer");
+  const authority = Object.freeze({}) as RootInboxReceiptAuthority;
+  (custody.authorities ??= new WeakMap()).set(authority, { issuer });
+  return authority;
+};
+/** R calls only after its native RECEIVED claim, before target receipt verification/drains. */
+export const adoptRootInboxReceiptIssuer = (
+  manager: object, sessionId: string, authority: RootInboxReceiptAuthority,
+): RootInboxReceiptIssuer => {
+  const custody = issuerRegistry();
+  const retained = authority && custody.authorities?.get(authority);
+  if (!sessionId || !retained || (retained.manager && (retained.manager !== manager || retained.sessionId !== sessionId))) {
+    throw new Error("Invalid root inbox receipt issuer adoption");
+  }
+  custody.set(manager, retained.issuer);
+  retained.manager = manager;
+  retained.sessionId = sessionId;
+  (custody.adopted ??= new WeakMap()).set(manager, sessionId);
+  return retained.issuer;
+};
+/** Ordinary reloads stay manager/session scoped; only an explicit process-object adoption crosses sessions. */
 export const rootInboxReceiptIssuer = (manager?: object, sessionId = "", reload = false): RootInboxReceiptIssuer => {
-  const host = globalThis as typeof globalThis & { [ISSUERS_KEY]?: WeakMap<object, RootInboxReceiptIssuer> };
-  const resident = host[ISSUERS_KEY] ??= new WeakMap();
+  const resident = issuerRegistry();
   const previous = manager ? resident.get(manager) : undefined;
-  if (reload && previous?.sessionId === sessionId) return previous;
-  const issuer = { sessionId, receipts: new Map(), consumed: new WeakSet(), queued: new Map(), turn: 0 };
-  if (manager) resident.set(manager, issuer);
+  const issuer: RootInboxReceiptIssuer = previous &&
+    ((reload && previous.sessionId === sessionId) || (manager && resident.adopted?.get(manager) === sessionId))
+    ? previous : { sessionId, receipts: new Map(), consumed: new WeakSet(), queued: new Map(), turn: 0 };
+  (resident.issuers ??= new WeakSet()).add(issuer);
+  if (manager) {
+    resident.set(manager, issuer);
+    if (issuer !== previous) resident.adopted?.delete(manager);
+  }
   return issuer;
 };
+const receiptStrings = (value: unknown): string[] => Array.isArray(value)
+  ? value.filter((item): item is string => typeof item === "string") : [];
+
 export const registerRootInboxReceipt = (issuer: RootInboxReceiptIssuer, details: object, content: unknown): void => {
-  const strings = (value: unknown): string[] => Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string") : [];
   const fields = details as { ids?: unknown; receipts?: unknown; nonce?: unknown };
   const snapshot: RootInboxReceiptSnapshot = Object.freeze({
-    ids: Object.freeze(strings(fields.ids)), receipts: Object.freeze(strings(fields.receipts)),
+    ids: Object.freeze(receiptStrings(fields.ids)), receipts: Object.freeze(receiptStrings(fields.receipts)),
     digest: rootInboxCarrierDigest({ content }),
   });
   const nonce = randomUUID();
@@ -124,8 +177,7 @@ export const registerRootInboxReceipt = (issuer: RootInboxReceiptIssuer, details
 export const verifyRootInboxReceipt = (
   issuer: RootInboxReceiptIssuer, details: unknown, carrier: unknown, accepted: Set<string>,
 ): RootInboxReceiptSnapshot | undefined => {
-  if (!details || typeof details !== "object") return undefined;
-  const nonce = (details as { nonce?: unknown }).nonce;
+  const nonce = inboxObject(details)?.nonce;
   if (typeof nonce !== "string" || accepted.has(nonce)) return undefined;
   const snapshot = issuer.receipts.get(nonce);
   if (!snapshot || snapshot.digest !== rootInboxCarrierDigest(carrier)) return undefined;
@@ -134,7 +186,7 @@ export const verifyRootInboxReceipt = (
 };
 
 const trimmedField = (data: unknown, field: string): string | undefined => {
-  const value = data && typeof data === "object" ? (data as Record<string, unknown>)[field] : undefined;
+  const value = inboxObject(data)?.[field];
   return typeof value === "string" ? value.trim() || undefined : undefined;
 };
 export const workKey = (data: unknown): string | undefined => trimmedField(data, "key");
@@ -144,9 +196,10 @@ const receipt = (fromId: string, kind: string, value: string): string =>
 
 /** Delivery identity precedence: deliveryId > messageId > commandId > work-key/ref fallbacks. */
 export const deliveryIdentity = (data: unknown): { kind: string; value: string } | undefined => {
-  if (!data || typeof data !== "object") return undefined;
+  const fields = inboxObject(data);
+  if (!fields) return undefined;
   for (const field of ["deliveryId", "messageId", "commandId"]) {
-    const value = (data as Record<string, unknown>)[field];
+    const value = fields[field];
     if (typeof value === "string" && value) return { kind: field === "messageId" ? "id" : "delivery", value };
   }
   return undefined;
@@ -207,21 +260,19 @@ export interface RootInboxSession {
 /** Only receipt identity and a private raw-content digest survive the canonical-file scan.
  * Delivered bodies and arbitrary metadata stay durable in Pi, not duplicated in this cache. */
 export const projectRootInboxReceipt = (value: unknown): unknown => {
-  const object = (item: unknown): Record<string, unknown> | undefined =>
-    item !== null && typeof item === "object" ? item as Record<string, unknown> : undefined;
   const carried = (item: unknown): Record<string, unknown> | undefined => {
-    const row = object(item);
+    const row = inboxObject(item);
     if (!row) return undefined;
-    const from = object(row.from), data = object(row.data);
+    const from = inboxObject(row.from), data = inboxObject(row.data);
     return {
       id: row.id, chain: row.chain, deliveryId: row.deliveryId,
       ...(from ? { from: { id: from.id } } : {}),
       ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId, commandId: data.commandId } } : {}),
     };
   };
-  const entry = object(value);
+  const entry = inboxObject(value);
   if (!entry) return value;
-  const details = object(entry.details);
+  const details = inboxObject(entry.details);
   const projected = {
     type: entry.type, id: entry.id, timestamp: entry.timestamp, customType: entry.customType,
     ...(details ? { details: {
@@ -239,14 +290,14 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
 const matchesInboxReceipt = (line: string): boolean =>
   line.includes(ROOT_INBOX_CUSTOM_TYPE) || line.includes(AGENT_MESSAGE_CUSTOM_TYPE);
 const matchesInboxReceiptEntry = (value: unknown): boolean => {
-  const entry = value && typeof value === "object" ? value as { type?: unknown; customType?: unknown } : undefined;
+  const entry = inboxObject(value);
   return entry?.type === "custom_message" &&
     (entry.customType === ROOT_INBOX_CUSTOM_TYPE || entry.customType === AGENT_MESSAGE_CUSTOM_TYPE);
 };
 
 const matchesMainReceipt = (line: string): boolean => line.includes(AGENT_MESSAGE_CUSTOM_TYPE) || line.includes('\"session\"');
 const matchesMainReceiptEntry = (value: unknown): boolean => {
-  const entry = value && typeof value === "object" ? value as { type?: unknown; customType?: unknown } : undefined;
+  const entry = inboxObject(value);
   return entry?.type === "session" || (entry?.type === "custom_message" && entry.customType === AGENT_MESSAGE_CUSTOM_TYPE);
 };
 /** Original native carrier IDs, for a retired/dead Main's inbox rotation. This uses
@@ -279,8 +330,8 @@ const verifiedInboxReceipt = (
   if (!snapshot || !Array.isArray(snapshot.ids) || !Array.isArray(snapshot.receipts)) return undefined;
   // Do not let a verifier's mutable return value become shared reader state.
   return Object.freeze({
-    ids: Object.freeze(snapshot.ids.filter((id): id is string => typeof id === "string")),
-    receipts: Object.freeze(snapshot.receipts.filter((id): id is string => typeof id === "string")),
+    ids: Object.freeze(receiptStrings(snapshot.ids)),
+    receipts: Object.freeze(receiptStrings(snapshot.receipts)),
     digest: snapshot.digest,
   });
 };
@@ -421,7 +472,7 @@ const bounded = (text: string, sequence: number): string => {
 };
 
 const renderEvent = (event: MeshEvent): string => {
-  const data = (event.data && typeof event.data === "object" ? event.data : {}) as { ref?: unknown; key?: unknown };
+  const data = inboxObject(event.data) ?? {};
   const attributes = [
     `id="${event.id}"`, `sequence="${event.sequence}"`, `topic="${escapeXml(event.topic)}"`, `kind="${escapeXml(event.kind)}"`,
     `from_name=${JSON.stringify(event.from.name)}`, `from_id=${JSON.stringify(event.from.id)}`,
@@ -500,8 +551,8 @@ export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly M
   const seen = new Set<string>();
   const unique = (list: readonly MeshEvent[]) => list.filter(event => !seen.has(event.id) && !!seen.add(event.id));
   const batch = unique(input);
-  const overflow = extra === undefined ? undefined : unique(extra);
-  const { shown: events, overflow: rest } = overflow === undefined ? rootInboxBudget(batch) : { shown: [...batch], overflow: [...overflow] };
+  const { shown: events, overflow: rest } = extra === undefined
+    ? rootInboxBudget(batch) : { shown: batch, overflow: unique(extra) };
   const all = [...events, ...rest];
   return {
   customType: ROOT_INBOX_CUSTOM_TYPE,

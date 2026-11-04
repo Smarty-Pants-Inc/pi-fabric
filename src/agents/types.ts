@@ -13,7 +13,7 @@ import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
-import type { AgentWorktreeResult } from "./worktree-manager.js";
+import type { AgentWorktreeResult, CleanupCustodyDeferredStatus } from "./worktree-manager.js";
 import type { AgentUndeliveredMessage } from "./terminal-target.js";
 import type { FabricActorActivationIdentity } from "../actors/activation-identity.js";
 
@@ -331,6 +331,8 @@ export interface AgentRunRecord {
    * CONTEXT_OVERFLOW is set only from a structured overflow signal, never free error text. */
   errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW" | "CUSTODY_UNCONFIRMED";
   executionCustody?: { state: "unconfirmed"; descendantsMayRemain: number; reason: string };
+  /** Cleanup deferred: original remains owned; never a cleaned/consumed receipt. */
+  cleanupStatus?: CleanupCustodyDeferredStatus;
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;
@@ -415,6 +417,8 @@ export interface AgentHandleInfo {
   error?: string;
   /** A tiny explicit shortening was ignored to protect real work. */
   timeoutNote?: AgentTimeoutIgnoredNote;
+  /** Cleanup deferred: original remains owned; never a cleaned/consumed receipt. */
+  cleanupStatus?: CleanupCustodyDeferredStatus;
   /** Policy switch/audit diagnostics are present on receipts and final results. */
   warnings?: string[];
   /** Spawn admission: unavailable discovery never blocks launch, but is explicit in the receipt. */
@@ -622,6 +626,21 @@ export type AgentTransportObservation =
   | { state: "alive" | "absent" }
   | { state: "unknown"; reason: string };
 
+/** Host-native primary exit evidence only; neither native close nor whole-tree exit proof. */
+export interface AgentNativeExitDiagnostic {
+  readonly scope: "primary";
+  readonly pid: number;
+  /** Linux /proc start-time ticks captured at launch; absent when unavailable/unsupported. */
+  readonly processStartTime?: string;
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly exitedAt: number;
+  /** Diagnostic membership only, NEVER an admitted kill boundary or an OOM attribution. */
+  readonly cgroup:
+    | { readonly state: "observed"; readonly source: "procfs"; readonly observedAt: number; readonly membership: string }
+    | { readonly state: "unavailable" | "unsupported"; readonly reason: string };
+}
+
 export interface AgentTransportHandle {
   /** Actual worker release, not the parent manager's loaded generation. */
   fabricRelease?: string;
@@ -660,8 +679,12 @@ export interface AgentTransportHandle {
   /** Bounded join of the captured process worker's native close (not PID absence). */
   waitForClose?(): Promise<void>;
   /** Captured primary-worker exit notification, NOT native close or tree-exit proof.
-   * Windows uses this only to begin its bounded native-close join after natural exit. */
+   * Native process launches publish this on every platform for diagnostics; Windows
+   * also uses it to begin its bounded native-close join after natural exit. */
   primaryExit?: Promise<void>;
+  /** Retained host snapshot, available before primaryExit/closed resolves. Undefined
+   * until native exit was observed; reading it performs no I/O or custody checks. */
+  nativeExit?(): AgentNativeExitDiagnostic | undefined;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
   /** Scoped-only tree-empty receipt: the live PID and admission record agree

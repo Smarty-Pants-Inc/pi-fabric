@@ -157,6 +157,8 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     await backend.put({ key: "x/a", value: 1, identity });
     server.breakDelivery(new Error("consumer deleted"));
     expect(() => backend.get("x/a")).toThrow(/consumer deleted/);
+    // Optional uncertainty must never downgrade a canonical projector failure to UNKNOWN/empty.
+    expect(() => backend.observePrefix("x/", {})).toThrow(/consumer deleted/);
     await expect(backend.put({ key: "x/b", value: 1, identity })).rejects.toThrow(/consumer deleted/);
     expect(backend.diagnostics().nats?.failure).toMatch(/consumer deleted/);
   });
@@ -338,6 +340,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
       server.append(encode({ format: 1, type: "retire", epoch: 2 }));
       await settle();
       expect(() => backend.get("r/a")).toThrow(MeshStateNatsRefusedError);
+      expect(() => backend.observePrefix("r/", {})).toThrow(MeshStateNatsRefusedError);
       await expect(backend.put({ key: "r/b", value: 1, identity })).rejects.toThrow(MeshStateNatsRefusedError);
       await expect(open(server)).rejects.toThrow(/retired/);
     });
@@ -454,6 +457,34 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
       expect(fs.existsSync(`${meshRoot}/state.json`)).toBe(false);
       await expectSyncDurableOrRefused(store.sync(), { through: expect.any(Number) });
     } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
+  });
+
+  // Supplemental recorded fake writes only: real JetStream acceptance is in prefix-observation.test.ts.
+  // Keep reason: a tombstone or same-key recreation must revoke the old negative/positive witness.
+  it("prefix observation invalidates on a recorded delete/recreate without granting stale CAS authority", async () => {
+    const server = fakeJetStream();
+    const port = server.port();
+    const consume = port.consume;
+    const binding = {};
+    port.consume = async (...args) => ({ ...await consume(...args), observationBinding: () => binding });
+    const backend = await open(server, { port });
+    const entry = await backend.put({ key: "observed/a", value: { nested: [1] }, identity });
+    const first = backend.observePrefix("observed/");
+    expect(first.kind).toBe("snapshot");
+    if (first.kind !== "snapshot") throw new Error("missing complete selection");
+    const deleted = await backend.delete({ key: entry.key, ifVersion: entry.version });
+    const empty = backend.observePrefix("observed/", first.witness);
+    expect(empty.kind).toBe("snapshot");
+    if (empty.kind !== "snapshot") throw new Error("missing deletion snapshot");
+    expect(empty.entries).toEqual([]);
+    expect(backend.observePrefix("observed/", empty.witness).kind).toBe("unchanged");
+    await backend.put({ key: entry.key, value: { nested: [2] }, identity, ifVersion: deleted.version! });
+    const recreated = backend.observePrefix("observed/", empty.witness);
+    expect(recreated.kind).toBe("snapshot");
+    if (recreated.kind !== "snapshot") throw new Error("missing recreation snapshot");
+    expect(recreated.entries[0]).toMatchObject({ value: { nested: [2] } });
+    expect(first.entries[0]).toMatchObject({ value: { nested: [1] } });
+    await expect(backend.put({ key: entry.key, value: "stale", identity, ifVersion: entry.version })).rejects.toThrow(/compare-and-swap failed/);
   });
 
   it("loads no NATS client unless a backend is opened without a port", async () => {

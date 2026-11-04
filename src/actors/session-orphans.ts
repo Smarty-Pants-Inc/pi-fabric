@@ -441,13 +441,16 @@ export class SessionActorOrphans {
     if (!current || JSON.stringify(current.sessionOrphan) !== JSON.stringify(marker)) return false;
     row = current;
     const authority = assertNativeObserver(this.mesh.root, this.identity, this.ownSessionId, row, retire);
-    const readCopies = (): Array<MeshStateEntry | undefined> => {
-      let file: MeshStateEntry | undefined;
-      try { file = JSON.parse(fs.readFileSync(path.join(this.mesh.root, "participants", `${digest(row.id)}.json`), "utf8")); }
+    const readFileCopy = (): MeshStateEntry | undefined => {
+      try { return JSON.parse(fs.readFileSync(path.join(this.mesh.root, "participants", `${digest(row.id)}.json`), "utf8")); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      return [this.mesh.get(`actors/${sessionId}/${row.id}`, { fresh: true }), this.mesh.get(participantKey(row.id), { fresh: true }), file];
     };
-    const copies = readCopies(), copiesBytes = JSON.stringify(copies);
+    const copies = [this.mesh.get(`actors/${sessionId}/${row.id}`, { fresh: true }),
+      this.mesh.get(participantKey(row.id), { fresh: true }), readFileCopy()];
+    const fileBytes = JSON.stringify(copies[2]);
+    const assertFileCopy = () => {
+      if (JSON.stringify(readFileCopy()) !== fileBytes) throw new Error("Actor directory file copy changed before intent commit");
+    };
     const receipts = settlementReceipts(beforeReceipt);
     const beforeTerminal = beforeReceipt && this.#terminal(row, marker, beforeReceipt);
     const needsRepair = copies.some(entry => entry && (!this.validateTombstone(entry) ||
@@ -476,10 +479,10 @@ export class SessionActorOrphans {
       ? { ...item, sessionOrphan: { ...marker, directorySettlement: receipt } } : item), { durable: true }, snapshot) : undefined;
     let expected = snapshot.bytes, intentCommitted = false, applied = false;
     const underKeys = <T>(operation: () => T): T => withParticipantFilesTryLock(this.mesh, keys, incarnation, operation);
-    const assertProof = () => {
+    const assertProof = (checkActorState = true) => {
       checkActive?.();
       if (this.#closed || store.snapshot().bytes !== expected || !sessionActorRootGone(this.mesh, rootId, this.lineageAlive) ||
-          !this.#actorAbsent(sessionId, row.id)) throw new Error("Actor orphan generation/death proof changed at commit");
+          (checkActorState && !this.#actorAbsent(sessionId, row.id))) throw new Error("Actor orphan generation/death proof changed at commit");
       if (assertNativeObserver(this.mesh.root, this.identity, this.ownSessionId, row, retire) !== authority) {
         throw new Error("Native observer activation/launcher changed at commit");
       }
@@ -493,22 +496,28 @@ export class SessionActorOrphans {
           lockTiming: { operation: "session-orphan-settle" },
           prepare: view => {
             const ops: MeshBatchOperation[] = [];
-            for (const key of [`actors/${sessionId}/${row.id}`, participantKey(row.id)]) {
+            for (const [index, key] of [`actors/${sessionId}/${row.id}`, participantKey(row.id)].entries()) {
               const entry = view.get(key);
+              // prepare reads the pre-operation entries; beforeCommit can already see our own puts.
+              if (JSON.stringify(entry) !== JSON.stringify(copies[index])) throw new Error("Actor directory state copy changed before intent commit");
               if (!entry) continue; // Preserve history; don't invent advertisements that never existed.
               const value = record(entry.value);
               if (value?.id !== row.id || value.rootId !== rootId ||
                   (entry.updatedBy.id !== rootId && !this.validateTombstone(entry))) throw new Error("Actor advertisement owner changed");
               if (!same(entry)) ops.push({ kind: "put", key, value: terminal, ifVersion: entry.version });
             }
+            // Both backends hold exclusive state custody here. Fresh reads still see the
+            // pre-operation state; SQLite beforeCommit instead sees our unreceipted puts.
+            // Prove absence under participant custody against the selected file too.
+            // State custody + CAS and the commit-time file check keep that proof valid.
+            underKeys(() => { assertProof(); assertFileCopy(); });
             return ops;
           },
           beforeCommit: () => underKeys(() => {
-            assertProof();
+            assertProof(false);
             if (!intentCommitted) {
-              // Prepared provenance must still cover exactly the copies under
-              // state + participant custody before the private intent commits.
-              if (JSON.stringify(readCopies()) !== copiesBytes) throw new Error("Actor directory copies changed before intent commit");
+              // State copies were checked before our puts; only the unwritten file must still match.
+              assertFileCopy();
               if (prepared && !prepared.valid()) throw new Error("Private actor outbox generation changed");
               prepared?.commit(); intentCommitted = true; expected = store.snapshot().bytes;
             }

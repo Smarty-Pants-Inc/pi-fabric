@@ -83,13 +83,15 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
   }
   const direction = overRpc ? "toLocal" : "toRemote";
   const logs: Array<{ message: string; at: number }> = [];
-  let didRecover!: () => void;
+  let didRecover!: () => void, didInitialRetry!: () => void;
   const recovered = new Promise<void>(done => { didRecover = done; });
+  const initialRetry = new Promise<void>(done => { didInitialRetry = done; });
   const cursorPath = path.join(base, "cursor.json");
   const bridge = new MeshBridge({ local, remote, localName: "hub", remoteName: "far", cursorPath,
     clock: now, stopMs: 50, log: message => {
       logs.push({ message, at: now() - epoch });
       if (message.startsWith(`bridge busy streak recovered (${direction})`)) didRecover();
+      if (message.includes(`(${direction}); retrying in`) && message.includes("failed direction attempts")) didInitialRetry();
       log?.(message);
     } });
   let running: Promise<void> | undefined, failure: unknown;
@@ -109,7 +111,10 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
     bridge, hub, far, local, agent, remote, sent, attempts, recovered, logs,
     launch: async () => {
       running = bridge.run().catch(error => { failure = error; });
-      await vi.advanceTimersByTimeAsync(0);
+      // Native recovery/subscription I/O can outlive a zero-time fake-timer flush. Wait for the
+      // first real direction retry log; the injected tail attempt is timestamped before this signal,
+      // while fake time is still exactly zero and no retry timer has been advanced.
+      await initialRetry;
       expect(attempts[0]).toBe(0);
     },
     jumpWall(delta: number) { wallCorrection += delta; vi.setSystemTime(Date.now() + delta); },

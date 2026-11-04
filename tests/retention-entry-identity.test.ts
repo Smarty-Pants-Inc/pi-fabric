@@ -18,8 +18,8 @@ const run = (directory: string, finishedAt: number) => {
   write(path.join(directory, "reply.json"), '{"text":"done"}');
   return directory;
 };
-/** A dead session registry with two expired candidates (old, then orphan) and an entry actors/s of the given kind. */
-const mesh = (kind: "file" | "directory") => {
+/** A dead session registry with two expired resident candidates and an entry actors/s of the given kind. */
+const mesh = (kind: "file" | "directory", runOrder: "normal" | "reversed" = process.env.PI_FABRIC_RETENTION_RUN_ORDER === "reverse" ? "reversed" : "normal") => {
   const root = tmp("fabric-9160-");
   const registry = path.join(root, "actors", "01a0cd9c-dead-session");
   const actor = path.join(registry, "actor");
@@ -27,41 +27,112 @@ const mesh = (kind: "file" | "directory") => {
     id: "actor", rootId: "session:01a0cd9c-dead-session", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest",
   }] }));
   write(path.join(actor, "session.jsonl"), "live");
-  run(path.join(actor, "runs", "latest"), NOW - 9 * DAY);
-  const old = run(path.join(actor, "runs", "old"), NOW - 8 * DAY);
-  const orphan = run(path.join(registry, "removed-actor", "runs", "orphan"), NOW - 10 * DAY);
+  const actorRun = run(path.join(actor, "runs", "latest"), NOW - 9 * DAY);
+  const host = path.join(root, "residency", "host");
+  write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
+  write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:01a0cd9c-dead-session", residencyRoot: host, meshRoot: root }));
+  const createResidentRun = (name: "old" | "orphan") => {
+    const age = name === "old" ? 8 : 10;
+    const candidate = run(path.join(host, "runs", name), NOW - age * DAY);
+    fs.utimesSync(candidate, (NOW - age * DAY) / 1_000, (NOW - age * DAY) / 1_000);
+    return candidate;
+  };
+  const runs: Record<"old" | "orphan", string> = { old: "", orphan: "" };
+  const creationOrder = runOrder === "normal" ? ["old", "orphan"] as const : ["orphan", "old"] as const;
+  for (const name of creationOrder) runs[name] = createResidentRun(name);
+  const { old, orphan } = runs;
   const entry = path.join(root, "actors", "s");
   if (kind === "file") fs.writeFileSync(entry, "not a registry"); else fs.mkdirSync(entry);
-  return { root, old, orphan, entry, away: path.join(tmp("fabric-9160-away-"), "s") };
+  return { root, old, orphan, actorRun, entry, away: path.join(tmp("fabric-9160-away-"), "s") };
 };
-const onStatusRead = (changes: Record<string, () => void>) => {
+const onStatusRead = (changes: Record<string, () => unknown>) => {
   const original = fs.readFileSync;
   const done = new Set<string>();
+  let injected = 0;
   vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
     for (const [candidate, change] of Object.entries(changes)) {
-      if (!done.has(candidate) && file === path.join(candidate, "status.json")) { done.add(candidate); change(); }
+      if (!done.has(candidate) && file === path.join(candidate, "status.json")) {
+        done.add(candidate);
+        if (change() !== false) injected++;
+      }
     }
     return (original as (...args: unknown[]) => unknown)(file, ...rest);
   }) as typeof fs.readFileSync);
-  return () => done.size;
+  return () => injected;
 };
 const toRegistry = (entry: string, away: string, runId: string) => {
   fs.renameSync(entry, away);
   write(path.join(entry, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: runId }] }));
 };
-const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+let shuffleSeedLogged = false;
+const shuffleWithSeed = (entries: fs.Dirent[], seed: string) => {
+  const parsedSeed = Number(seed);
+  let state = (Number.isFinite(parsedSeed) ? Math.trunc(parsedSeed) : [...seed].reduce((hash, char) => Math.imul(hash ^ char.charCodeAt(0), 16777619), 2166136261)) >>> 0;
+  state = (state + 0x9e3779b9) >>> 0;
+  const random = () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+  };
+  for (let index = entries.length - 1; index > 0; index--) {
+    const swapIndex = Math.floor(random() * (index + 1));
+    const current = entries[index]!;
+    entries[index] = entries[swapIndex]!;
+    entries[swapIndex] = current;
+  }
+};
+const sweep = (root: string) => {
+  const opendir = fs.opendirSync as unknown as (...args: unknown[]) => fs.Dir;
+  vi.spyOn(fs, "opendirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+    const directory = opendir(file, ...rest) as fs.Dir;
+    if (String(file) !== path.join(root, "residency", "host", "runs")) return directory;
+    const entries: fs.Dirent[] = [];
+    let entry: fs.Dirent | null;
+    while ((entry = directory.readSync()) !== null) entries.push(entry);
+    directory.closeSync();
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    const seed = process.env.PI_FABRIC_RETENTION_OPENDIR_SHUFFLE_SEED;
+    if (seed !== undefined) {
+      if (!shuffleSeedLogged) {
+        process.stderr.write(`[retention-entry-identity] opendirSync shuffle seed=${seed}\n`);
+        shuffleSeedLogged = true;
+      }
+      shuffleWithSeed(entries, seed);
+    }
+    let index = 0;
+    return { readSync: () => entries[index++] ?? null, closeSync: () => undefined } as fs.Dir;
+  }) as typeof fs.opendirSync);
+  return sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
+};
 const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
+const assertActorRunRetained = (m: ReturnType<typeof mesh>, plan: { removedRuns: string[] }) => {
+  expect(plan.removedRuns).not.toContain(m.actorRun);
+  expect(fs.existsSync(m.actorRun)).toBe(true);
+};
 
-describe("sweep fences each direct actors/ entry's type and identity (#9160)", () => {
-  it("file becomes a same-named registry referencing the candidate: kept, and the stop is sticky after a restore", async () => {
-    const m = mesh("file");
+describe.skipIf(process.platform !== "linux")("sweep fences each direct actors/ entry's type and identity (#9160)", () => {
+  it.each(["normal", "reversed"] as const)("file becomes a same-named registry referencing the candidate: kept, and the stop is sticky after a restore (%s run creation order)", async runOrder => {
+    const m = mesh("file", runOrder);
     const moved = path.join(path.dirname(m.away), "s-dir");
+    let replaced = false;
+    const replaceThenRestore = (runId: string) => () => {
+      if (!replaced) {
+        replaced = true;
+        toRegistry(m.entry, m.away, runId);
+      } else {
+        fs.renameSync(m.entry, moved);
+        fs.renameSync(m.away, m.entry);
+      }
+    };
     const injected = onStatusRead({
-      [m.old]: () => toRegistry(m.entry, m.away, "old"),
-      [m.orphan]: () => { fs.renameSync(m.entry, moved); fs.renameSync(m.away, m.entry); },
+      [m.old]: replaceThenRestore("old"),
+      [m.orphan]: replaceThenRestore("orphan"),
     });
     const plan = await sweep(m.root);
     expect(injected()).toBe(2);
+    assertActorRunRetained(m, plan);
     expect(fs.lstatSync(m.entry).isFile()).toBe(true);
     expect(plan.removedRuns).not.toContain(m.old);
     expect(plan.removedRuns).not.toContain(m.orphan);
@@ -74,9 +145,16 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
     ["a file replaced by a directory without a registry", "file", (e: string, a: string) => { fs.renameSync(e, a); fs.mkdirSync(e); }],
   ] as const)("stops on %s", async (_name, kind, change) => {
     const m = mesh(kind);
-    const injected = onStatusRead({ [m.old]: () => change(m.entry, m.away) });
+    let changed = false;
+    const changeFirstCandidate = () => {
+      if (changed) return false;
+      changed = true;
+      change(m.entry, m.away);
+    };
+    const injected = onStatusRead({ [m.old]: changeFirstCandidate, [m.orphan]: changeFirstCandidate });
     const plan = await sweep(m.root);
     expect(injected()).toBe(1);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).not.toContain(m.old);
     expect(plan.removedRuns).not.toContain(m.orphan);
     expect(plan.skipped).toContainEqual(stopped(m.root));
@@ -85,6 +163,7 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
   it.each(["file", "directory"] as const)("plans eligible runs when an unchanged %s entry stays", async kind => {
     const m = mesh(kind);
     const plan = await sweep(m.root);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).toEqual(expect.arrayContaining([m.old, m.orphan]));
     expect(plan.skipped).not.toContainEqual(stopped(m.root));
   });
@@ -97,6 +176,7 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
     });
     const plan = await sweep(m.root);
     expect(injected()).toBe(2);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).toEqual(expect.arrayContaining([m.old, m.orphan]));
     expect(plan.skipped).not.toContainEqual(stopped(m.root));
   });
@@ -112,7 +192,7 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
         if (new Error().stack?.includes("discover")) walked = true;
         else if (walked) {
           swapped = true;
-          write(path.join(m.away, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "old" }] }));
+          write(path.join(m.away, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "orphan" }] }));
           fs.renameSync(m.entry, path.join(path.dirname(m.away), "s-file"));
           fs.symlinkSync(m.away, m.entry);
         }
@@ -121,7 +201,19 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
     }) as typeof fs.readdirSync);
     const plan = await sweep(m.root);
     expect(swapped).toBe(true);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).not.toContain(m.old);
+    expect(plan.removedRuns).not.toContain(m.orphan);
     expect(plan.skipped).toContainEqual(stopped(m.root));
   });
+});
+
+it.skipIf(process.platform === "linux")("retains actor and resident reply files outside Linux", async () => {
+  const m = mesh("file");
+  const plan = await sweep(m.root);
+  expect(plan.removedRuns).toEqual([]);
+  assertActorRunRetained(m, plan);
+  for (const directory of [m.actorRun, m.old, m.orphan]) {
+    expect(fs.existsSync(path.join(directory, "reply.json"))).toBe(true);
+  }
 });

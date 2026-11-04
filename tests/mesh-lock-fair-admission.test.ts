@@ -19,8 +19,8 @@ const scratch = () => {
   roots.push(root);
   return root;
 };
-const ticket = (root: string, budgetMs: number) => {
-  const created = new MeshLockTicket(root, randomUUID(), budgetMs);
+const ticket = (root: string, budgetMs: number, options: ConstructorParameters<typeof MeshLockTicket>[3] = {}) => {
+  const created = new MeshLockTicket(root, randomUUID(), budgetMs, options);
   tickets.push(created);
   return created;
 };
@@ -146,6 +146,112 @@ describe("fair mesh lock admission", () => {
     expect(waiter.mayContend()).toBe(true);
     expect(waiter.queued).toBe(false);
     expect(names(root)).toHaveLength(1); // the live stalled head's receipt is never reaped early
+  });
+
+  it("any ready waiter escapes a stalled head and its stalled follower early only while .lock is absent", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const root = scratch();
+    const options = { stalledHeadBypassLock: path.join(root, ".lock") };
+    const head = ticket(root, 10_000, options);
+    const parkedFollower = ticket(root, 10_000, options);
+    const ready = [ticket(root, 10_000, options), ticket(root, 10_000, options)];
+    expect(head.mayContend()).toBe(true);
+    const initial = names(root);
+    for (const waiter of ready) expect(waiter.mayContend()).toBe(false);
+    vi.advanceTimersByTime(1000);
+    for (const waiter of ready) expect(waiter.mayContend()).toBe(false); // the existing stall bound, not 80% (8 s)
+    vi.advanceTimersByTime(60); // also beyond the existing 50 ms head-check throttle
+    for (const waiter of ready) {
+      expect(waiter.mayContend()).toBe(true);
+      expect(waiter.queued).toBe(false); // existing plain-contest escape, not arbitrary ticket reaping
+    }
+    expect(names(root)).toEqual(initial.slice(0, 2));
+    expect(head.queued && parkedFollower.queued).toBe(true);
+  });
+
+  it("does not escape early when a live canonical holder's receipt stalls", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const root = scratch();
+    const canonical = path.join(root, ".lock");
+    const options = { stalledHeadBypassLock: canonical };
+    const holder = ticket(root, 10_000, options);
+    const follower = ticket(root, 10_000, options);
+    const waiter = ticket(root, 10_000, options);
+    expect(holder.mayContend()).toBe(true);
+    fs.mkdirSync(canonical);
+    const owner = `live-holder\n${process.pid}\n${Date.now()}\n`;
+    fs.writeFileSync(path.join(canonical, "owner"), owner);
+    const initial = names(root);
+    expect(follower.mayContend()).toBe(false);
+    expect(waiter.mayContend()).toBe(false);
+    vi.advanceTimersByTime(1100);
+    expect(follower.mayContend()).toBe(false);
+    expect(waiter.mayContend()).toBe(false);
+    vi.advanceTimersByTime(1100);
+    expect(follower.mayContend()).toBe(false);
+    expect(waiter.mayContend()).toBe(false);
+    expect(names(root)).toEqual(initial);
+    expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
+  });
+
+  it("a live holder present while a separate head stalls prevents early bypass by any waiter", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const root = scratch();
+    const canonical = path.join(root, ".lock");
+    const options = { stalledHeadBypassLock: canonical };
+    const head = ticket(root, 10_000, options);
+    const follower = ticket(root, 10_000, options);
+    const waiter = ticket(root, 10_000, options);
+    expect(head.mayContend()).toBe(true);
+    expect(follower.mayContend()).toBe(false);
+    expect(waiter.mayContend()).toBe(false); // first sight while .lock is free
+    const initial = names(root);
+    fs.mkdirSync(canonical); // an older/legacy holder need not have a FIFO receipt
+    const owner = `live-holder\n${process.pid}\n${Date.now()}\n`;
+    fs.writeFileSync(path.join(canonical, "owner"), owner);
+    vi.advanceTimersByTime(1100);
+    expect(follower.mayContend()).toBe(false);
+    expect(waiter.mayContend()).toBe(false);
+    expect(names(root)).toEqual(initial);
+    expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
+    fs.renameSync(canonical, `${canonical}.released`);
+    expect(waiter.mayContend()).toBe(true); // the same stalled-head proof is eligible only once free
+    expect(waiter.queued).toBe(false);
+  });
+
+  it("canonical-guarded waiters keep FIFO order while the head heartbeats, even with .lock absent", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const root = scratch();
+    const options = { stalledHeadBypassLock: path.join(root, ".lock") };
+    const ordered = Array.from({ length: 4 }, () => ticket(root, 10_000, options));
+    for (let index = 0; index < ordered.length; index++) {
+      for (let elapsed = 0; elapsed < 1100; elapsed += 50) {
+        vi.advanceTimersByTime(50);
+        expect(ordered[index]!.mayContend()).toBe(true);
+        for (const waiter of ordered.slice(index + 1).reverse()) {
+          expect(waiter.mayContend()).toBe(false);
+          expect(waiter.queued).toBe(true);
+        }
+      }
+      ordered[index]!.close();
+    }
+    expect(names(root)).toEqual([]);
+  });
+
+  it("a refreshed head cancels early escape even when our predecessor stays stalled", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const root = scratch();
+    const options = { stalledHeadBypassLock: path.join(root, ".lock") };
+    const head = ticket(root, 10_000, options);
+    ticket(root, 10_000, options);
+    const waiter = ticket(root, 10_000, options);
+    expect(head.mayContend()).toBe(true);
+    expect(waiter.mayContend()).toBe(false);
+    vi.advanceTimersByTime(1100);
+    expect(head.mayContend()).toBe(true);
+    expect(waiter.mayContend()).toBe(false);
+    vi.advanceTimersByTime(1100);
+    expect(waiter.mayContend()).toBe(true); // only after that last heartbeat stalls too
   });
 
   it("short try budgets keep the unconditional 80% fallback", () => {

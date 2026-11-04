@@ -674,7 +674,8 @@ export class MeshLock {
   }
 
   // A dead/other-incarnation complete receipt recovers at once, an empty ownerless directory after the grace (atomic
-  // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. smarty-dev#9569: pid
+  // rmdir: a late owner fails it closed). Empty/corrupt owner files get the same grace, then a retained rename
+  // receipt; a recognizable live PID still fails closed. Nonempty unrecorded directories stay. smarty-dev#9569: pid
   // evidence only for OUR PID namespace (foreign/unprovable: `note`). smarty-dev#9501: `expected` = exact owner bytes
   // after the read; its namespace must come from the owner, never a mutable receipt.
   // `beforeRename` is synchronous, restartable retirement of that exact owner's dependent receipt, not another death
@@ -722,7 +723,24 @@ export class MeshLock {
       const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5 || fields.length === 6) &&
         !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
-      if (!validOwner) return false;
+      if (!validOwner) {
+        // A legacy writer can die between its exclusive owner open and write. Use the existing ownerless
+        // grace (default 30 s), measured from the newer directory ctime/mtime, not the incomplete record's
+        // timestamp. A backdated mtime must not make a freshly opened initializer immediately reclaimable.
+        // A recognizable live PID is still not death evidence, even in a malformed receipt.
+        if (validPid && processAlive(pid)) return false;
+        if (Date.now() - Math.max(stat.ctimeMs, stat.mtimeMs) <= this.#staleLockMs) return false;
+        const entries = fs.readdirSync(this.#lockPath);
+        if (entries.length !== 1 || entries[0] !== "owner") return false;
+        const current = fs.lstatSync(this.#lockPath);
+        if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
+          current.mtimeMs !== stat.mtimeMs || current.ctimeMs !== stat.ctimeMs || readOwner() !== owner) return false;
+        const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:empty-owner`).digest("hex")}`;
+        // Keep the complete directory, including the empty/torn owner. Its nonempty deterministic receipt
+        // fences a paused fellow recoverer: after the first rename, it cannot rename a successor over it.
+        fs.renameSync(this.#lockPath, fence);
+        return true;
+      }
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
       // pi-fabric#923: under protocol 3 a record without a namespace (v1/v2 holder) is UNPROVEN (its pid may be alive in
       // another namespace); no previous-boot inference (VM clones share a machine id): operator recovery only.

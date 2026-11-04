@@ -1,15 +1,18 @@
 // expected-skip: no NATS_BIN/PATH executable, or no A' link entry (src/mesh/bridge-nats-link.ts) in this checkout.
 // Keep reason: smarty-dev#15310 A' exactly-once across the hop on a real broker. Every fault is real and hits
-// the link only, through its TLS wire relay: a forced disconnect (outage), a lost PubAck (the broker stored the
-// command, the link cannot know), a lost broker +ACK (the link appended, the broker redelivers after the real
-// 30 s AckWait) across a link restart, and a link restart with a command in flight. Each ends with exactly one
-// consumption and the sender's ACK. Official assumptions: AckWait is a redelivery deadline and Nats-Msg-Id
+// the link only, through its TLS wire relay: a forced disconnect (outage; each send must have one target-side
+// delivery or persisted notRun expiry), a lost PubAck (the broker stored the command, the link cannot know), a
+// lost broker +ACK (the link appended, the broker redelivers after the real 30 s AckWait) across a link restart,
+// and a link restart with a command in flight. The latter fault cases end with one consumption and sender ACK.
+// Official assumptions: AckWait is a redelivery deadline and Nats-Msg-Id
 // dedupe is bounded by the stream window (https://docs.nats.io/nats-concepts/jetstream/consumers,
 // https://docs.nats.io/nats-concepts/jetstream/headers). Only the Pi UI/model boundary is a fixture.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { MeshEvent } from "../src/mesh/store.js";
-import { transportInboxStream } from "../src/transport/nats/subjects.js";
+import { bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
+import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
+import { hashToken, transportInboxStream } from "../src/transport/nats/subjects.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import {
   BRIDGE_MACHINE, createMixedHarness, E2E_WAIT_MS, linkTail, NATS_MAIN_MACHINE, natsLinkPresent, waitForValue,
@@ -29,26 +32,127 @@ const bodyOf = (event: Pick<WireEvent, "envelope">) => event.envelope.body as Re
 const dataOf = (event: MeshEvent) => (event.data ?? {}) as Record<string, unknown>;
 const mentions = (main: MixedMain, token: string) => main.delivered().filter((row) => row.text.includes(token));
 
+const CONTROL_SEEN_PREFIX = "topology/control-seen/";
+const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
+type ControlSeenRecord = {
+  format?: unknown;
+  hostId?: unknown;
+  commandId?: unknown;
+  targetId?: unknown;
+  acceptance?: { accepted?: unknown; messageId?: unknown; error?: unknown; notRun?: unknown };
+};
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const controlSeenStores = new Map<string, MeshStore>();
+const controlSeenKey = (hostId: string, commandId: string) => CONTROL_SEEN_PREFIX +
+  createHash("sha256").update(`${hostId}\0${commandId}`).digest("hex");
+const controlSeenStoreFor = (main: MixedMain): MeshStore => {
+  let store = controlSeenStores.get(main.id);
+  if (!store) {
+    store = new MeshStore(path.join(main.runtime.mesh.root, "control-seen", hashToken(main.id)),
+      main.runtime.mesh.maxEventBytes, main.runtime.mesh.maxReadEvents,
+      { lockProtocol: main.runtime.mesh.lockProtocol, stateBackend: "file" });
+    controlSeenStores.set(main.id, store);
+  }
+  return store;
+};
+const controlSeenRecordsFor = (main: MixedMain, commandId: string) =>
+  controlSeenStoreFor(main).listAll(CONTROL_SEEN_PREFIX, { fresh: true }).flatMap((entry) => {
+    if (!isRecord(entry.value) || entry.value.hostId !== main.id || entry.value.commandId !== commandId) return [];
+    return [{ key: entry.key, record: entry.value as ControlSeenRecord }];
+  });
+const waitForControlOutcome = (main: MixedMain, commandId: string) => waitForValue(() => {
+  const records = controlSeenRecordsFor(main, commandId);
+  return records.some(({ record }) => record.acceptance !== undefined) ? records : undefined;
+}, `persisted control outcome for ${main.id}/${commandId}`, E2E_WAIT_MS);
+const deliveriesForCommand = (main: MixedMain, token: string, commandId: string) =>
+  mentions(main, token).flatMap((row) => {
+    const items = Array.isArray(row.details.items) ? row.details.items : [row.details];
+    return items.flatMap((item) => isRecord(item) && item.deliveryId === commandId && typeof item.id === "string"
+      ? [{ messageId: item.id }] : []);
+  });
+const assertOutageTerminalOutcome = async (main: MixedMain, commandId: string, token: string): Promise<void> => {
+  const records = await waitForControlOutcome(main, commandId);
+  expect(records).toHaveLength(1);
+  const { key, record } = records[0]!;
+  expect(key).toBe(controlSeenKey(main.id, commandId));
+  expect(record).toMatchObject({ format: 1, hostId: main.id, commandId, targetId: main.id });
+
+  const deliveries = deliveriesForCommand(main, token, commandId);
+  const exactlyOneDelivery = deliveries.length === 1;
+  const expiredAcceptance = record.acceptance?.accepted === false &&
+    record.acceptance.error === CONTROL_COMMAND_EXPIRED && record.acceptance.notRun === true;
+  expect(deliveries.length > 0 && expiredAcceptance).toBe(false);
+  // XOR: the target's persisted acceptance and deliveryId-correlation must prove one terminal outcome.
+  expect(exactlyOneDelivery).not.toBe(expiredAcceptance);
+  if (exactlyOneDelivery) {
+    expect(record.acceptance).toMatchObject({ accepted: true, messageId: deliveries[0]!.messageId });
+  } else {
+    expect(record.acceptance).toMatchObject({ accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true });
+    expect(deliveries).toEqual([]);
+  }
+};
+const closeControlSeenStores = (): void => {
+  for (const store of controlSeenStores.values()) store.closeState();
+  controlSeenStores.clear();
+};
+
 describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link faults on a real broker", () => {
   let h: MixedHarness;
   beforeAll(async () => { h = await createMixedHarness({ binary: binary!, natsPeer: false }); }, E2E_WAIT_MS + 60_000);
-  afterAll(async () => { await h?.stop(); }, 60_000);
+  afterAll(async () => { try { closeControlSeenStores(); } finally { await h?.stop(); } }, 60_000);
 
   const settle = <T>(work: Promise<T>) => work.catch((error: unknown) => { throw new Error(`${String(error)}\n${linkTail(h)}`); });
-  /** Observe the outcome now (no unhandled rejection if an earlier assertion fails); assert it later. */
-  const outcome = <T>(work: Promise<T>) => settle(work).then((value) => ({ value }), (error: unknown) => ({ error: String(error) }));
+  /** Observe the raw outcome now (no unhandled rejection); outage sends may time out without proving non-delivery. */
+  type SendOutcome<T> = { value: T } | { error: unknown };
+  const outcome = <T>(work: Promise<T>): Promise<SendOutcome<T>> => work.then(
+    (value) => ({ value }), (error: unknown) => ({ error }),
+  );
+  const assertOutageOutcome = (result: SendOutcome<unknown>, targetId: string) => {
+    if ("value" in result) {
+      expect(result.value).toMatchObject({ acknowledged: true });
+      return;
+    }
+    const error = result.error;
+    if (!(error instanceof Error) || error.constructor !== Error || error.name !== "Error") {
+      throw new Error(`Unexpected outage-send error class: ${String(error)}\n${linkTail(h)}`);
+    }
+    const prefix = "Fabric mesh bridge to remote host ";
+    const suffix = ` is not responding for ${targetId}; the outcome is unknown and it may still be delivered, so a retry can deliver it twice.`;
+    const host = error.message.startsWith(prefix) && error.message.endsWith(suffix)
+      ? error.message.slice(prefix.length, error.message.length - suffix.length)
+      : "";
+    const ownerTimeout = `Timed out waiting for the remote Fabric owner to acknowledge ${targetId}; ` +
+      "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.";
+    if ((!host || /[;\r\n]/.test(host)) && error.message !== ownerTimeout) {
+      throw new Error(`Unexpected outage-send error message: ${error.message}\n${linkTail(h)}`);
+    }
+  };
   const natsCommandsFor = (mark: number, token: string) => h.wire.since(mark).filter((event) => event.phase === "deliver" &&
     event.hostId === h.natsMain.id && event.envelope.kind === "command" && bodyOf(event).message === token);
   const fileCommandsFor = (token: string) => h.fileEvents({ topic: CONTROL }).filter((event) => dataOf(event).message === token);
 
-  it("after a forced disconnect and verified reconnect of the link, each message is consumed exactly once both ways", async () => {
+  it("after a forced disconnect, outage sends have one terminal outcome and reconnect sends are delivered once", async () => {
     const f2n = `OUTAGE_F2N_${randomUUID()}`, n2f = `OUTAGE_N2F_${randomUUID()}`;
+    const f2nKey = `o-${randomUUID()}`, n2fKey = `o-${randomUUID()}`;
     const mark = h.wire.mark(), refusedBefore = h.faults.refused;
     h.faults.block();
-    // The link really tried to come back and was refused at least once.
-    await waitForValue(() => h.faults.refused > refusedBefore ? true : undefined, "link reconnect attempt refused", E2E_WAIT_MS);
+    // Keep both sends inside the outage; outcomes may be ACKed or the exact documented unknown timeout.
+    const toNatsDuringOutage = outcome(h.fileMain.invoke("agents.followUp", {
+      id: h.natsMain.id, message: f2n, idempotencyKey: f2nKey,
+    }));
+    const toFileDuringOutage = outcome(h.natsMain.invoke("agents.followUp", {
+      id: h.fileMain.id, message: n2f, idempotencyKey: n2fKey,
+    }));
+    await waitForValue(() => fileCommandsFor(f2n).length ? true : undefined,
+      "file command appended during the outage", E2E_WAIT_MS);
+    await h.wire.until(() => h.wire.since(mark).some((event) => event.phase === "send" && event.hostId === h.natsMain.id &&
+      bodyOf(event).message === n2f), "NATS command stored during the outage", E2E_WAIT_MS);
+    // Neither outage send may be consumed before the verified reconnect.
     expect(mentions(h.natsMain, f2n)).toEqual([]);
     expect(mentions(h.fileMain, n2f)).toEqual([]);
+    // The link really tried to come back and was refused at least once.
+    await waitForValue(() => h.faults.refused > refusedBefore ? true : undefined, "link reconnect attempt refused", E2E_WAIT_MS);
     const reconnectMark = h.linkLog.length;
     h.faults.unblock();
     // Wait for the bridge port's own verified-reconnect callback, not another connection's recovery.
@@ -60,13 +164,37 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link fau
     } catch (error) {
       throw new Error(`Route readiness after verified reconnect failed: ${String(error)}\n${linkTail(h)}`, { cause: error });
     }
-    const toNats = outcome(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: f2n, idempotencyKey: `o-${randomUUID()}` }));
-    const toFile = outcome(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: n2f, idempotencyKey: `o-${randomUUID()}` }));
-    expect(await toNats).toMatchObject({ value: { acknowledged: true } });
-    expect(await toFile).toMatchObject({ value: { acknowledged: true } });
-    expect(mentions(h.natsMain, f2n)).toHaveLength(1);
-    expect(mentions(h.fileMain, n2f)).toHaveLength(1);
-    expect(natsCommandsFor(mark, f2n)).toHaveLength(1);
+    assertOutageOutcome(await toNatsDuringOutage, h.natsMain.id);
+    assertOutageOutcome(await toFileDuringOutage, h.fileMain.id);
+
+    const f2nFileCommand = fileCommandsFor(f2n).find((event) => dataOf(event).targetId === h.natsMain.id);
+    expect(f2nFileCommand).toBeDefined();
+    expect(typeof dataOf(f2nFileCommand!).commandId).toBe("string");
+    const f2nCommandId = bridgeNatsMappedCommandId(h.linkName, "toNats", h.fileMain.id,
+      String(dataOf(f2nFileCommand!).commandId));
+    const n2fFileCommand = await waitForValue(() => fileCommandsFor(n2f).find((event) => dataOf(event).targetId === h.fileMain.id),
+      "NATS-to-file command appended to the target hub after reconnect", E2E_WAIT_MS);
+    expect(typeof dataOf(n2fFileCommand).commandId).toBe("string");
+    const n2fCommandId = String(dataOf(n2fFileCommand).commandId);
+    await assertOutageTerminalOutcome(h.natsMain, f2nCommandId, f2n);
+    await assertOutageTerminalOutcome(h.fileMain, n2fCommandId, n2f);
+
+    const postF2n = `POST_RECONNECT_F2N_${randomUUID()}`, postN2f = `POST_RECONNECT_N2F_${randomUUID()}`;
+    const postToNats = settle(h.fileMain.invoke("agents.followUp", {
+      id: h.natsMain.id, message: postF2n, idempotencyKey: `p-${randomUUID()}`,
+    }));
+    const postToFile = settle(h.natsMain.invoke("agents.followUp", {
+      id: h.fileMain.id, message: postN2f, idempotencyKey: `p-${randomUUID()}`,
+    }));
+    await expect(postToNats).resolves.toMatchObject({ acknowledged: true });
+    await expect(postToFile).resolves.toMatchObject({ acknowledged: true });
+    await waitForValue(() => mentions(h.natsMain, postF2n).length > 0 ? true : undefined,
+      "post-reconnect file-to-NATS command consumed", E2E_WAIT_MS);
+    await waitForValue(() => mentions(h.fileMain, postN2f).length > 0 ? true : undefined,
+      "post-reconnect NATS-to-file command consumed", E2E_WAIT_MS);
+    expect(mentions(h.natsMain, postF2n)).toHaveLength(1);
+    expect(mentions(h.fileMain, postN2f)).toHaveLength(1);
+    expect(natsCommandsFor(mark, postF2n)).toHaveLength(1);
   }, E2E_WAIT_MS * 4);
 
   it("a lost PubAck on the link's publish: the stored command is consumed once, and any resend is the same id", async () => {

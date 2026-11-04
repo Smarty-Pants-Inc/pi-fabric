@@ -11,7 +11,6 @@ import {
 } from "@nats-io/jetstream";
 import { NoRespondersError, RequestError, TimeoutError } from "@nats-io/transport-node";
 import type { MeshEvent } from "../../mesh/event-log.js";
-import { diagnostics } from "../../core/diagnostics.js";
 import type { NatsConnectionHandle } from "./connection.js";
 import { ensureFabricEventsStream, natsEventsStreamName, natsGithubStreamName } from "./provision.js";
 import { hashToken } from "./subjects.js";
@@ -376,19 +375,14 @@ const startGroup = async (
       const config = info.config;
       const boundedPolicyDrift = config.ack_wait !== expectedAckWait || config.max_ack_pending !== MAX_ACK_PENDING || (config.inactive_threshold ?? 0) !== 0;
       const retryPolicyDrift = config.max_deliver !== -1 || JSON.stringify(config.backoff) !== JSON.stringify(retryBackoff);
-      if (boundedPolicyDrift) {
-        // These settings are required to preserve the durable's lease and delivery bounds; do not
-        // start pulling if JetStream refuses to repair them.
+      if (boundedPolicyDrift || retryPolicyDrift) {
+        // Do not pull until the legacy retry budget is repaired too: delayed NAKs
+        // alone still exhaust a finite max_deliver during repeated readiness loss.
+        // The manager retries transient setup failures without resetting the cursor.
         await api.update(stream, durable, {
           ack_wait: expectedAckWait, max_ack_pending: MAX_ACK_PENDING, inactive_threshold: 0,
           max_deliver: -1, backoff: retryBackoff,
         });
-      } else if (retryPolicyDrift) {
-        // Delayed NAKs remain the safe fallback if retry-only metadata cannot be repaired.
-        try { await api.update(stream, durable, { max_deliver: -1, backoff: retryBackoff }); }
-        catch {
-          diagnostics.warn("src/transport/nats/events-consume.ts", "[pi-fabric] NATS actor event retry policy update deferred", { stream, durable });
-        }
       }
       if (subjects.length > 0) await api.update(stream, durable, filterConfig(subjects));
     }

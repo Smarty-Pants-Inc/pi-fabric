@@ -22,6 +22,7 @@ vi.mock("../src/storage/verified-remove.js", async (importOriginal) => {
 const { RESIDENT_RUN_RETENTION_MS, ResidentRequestRetention, sweepResidentRuns } = await import("../src/residency/retention.js");
 
 const DAY = 24 * 60 * 60 * 1_000;
+const POLICY_MS = DAY;
 const EXITED_PID = "2147483647";
 const roots: string[] = [];
 afterEach(() => {
@@ -61,7 +62,8 @@ const fixture = (now: number) => {
   };
   // Resident metadata exists but no saved result: deletion would lose the outcome.
   writeJson(path.join(dir, "agents", "missing-result.json"), { format: 1, id: "missing-result" });
-  const aged = now - 2 * DAY;
+  // Explicit age: this fixture tests selection, not the disabled default.
+  const aged = now - POLICY_MS - DAY;
   for (const [name, directory] of Object.entries(run)) age(directory, name === "young" ? now - 60_000 : aged);
   const snapshot = () => Object.fromEntries(Object.values(run).map(directory =>
     [directory, fs.readdirSync(directory).sort().map(name => [name, fs.readFileSync(path.join(directory, name), "utf8")])]));
@@ -69,8 +71,8 @@ const fixture = (now: number) => {
 };
 
 describe.skipIf(process.platform === "win32")("resident run age pruning (no real deletion)", () => {
-  it("RESIDENT_RUN_RETENTION_MS is exactly 24 hours", () => {
-    expect(RESIDENT_RUN_RETENTION_MS).toBe(86_400_000);
+  it("RESIDENT_RUN_RETENTION_MS disables deletion by default", () => {
+    expect(RESIDENT_RUN_RETENTION_MS).toBeUndefined();
   });
 
   it("sweepResidentRuns({dryRun:true}) selects only the aged unreferenced exited terminal run", () => {
@@ -78,20 +80,20 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
     const { runs, actorRoot, run, snapshot } = fixture(now);
     const before = snapshot();
     const rm = vi.spyOn(fs, "rmSync"), rename = vi.spyOn(fs, "renameSync");
-    expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], dryRun: true })).toEqual([run.old]);
+    expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], retentionMs: POLICY_MS, dryRun: true })).toEqual([run.old]);
     expect(recorded).toEqual([{ target: run.old, deleter: "sweepResidentRuns", dryRun: true }]);
     expect(rm).not.toHaveBeenCalled(); expect(rename).not.toHaveBeenCalled();
     expect(snapshot()).toEqual(before);
 
     // retainRuns is an explicit policy: no run is selected for deletion.
     recorded.length = 0;
-    expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], dryRun: true, retainRuns: true })).toEqual([]);
+    expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], retentionMs: POLICY_MS, dryRun: true, retainRuns: true })).toEqual([]);
     expect(recorded).toEqual([]);
-    // Age is the 24 h constant: just inside the window keeps the run.
-    expect(sweepResidentRuns(runs, fs.statSync(run.old).mtimeMs + RESIDENT_RUN_RETENTION_MS - 1_000, 10_000,
-      { actorRoots: [actorRoot], dryRun: true })).toEqual([]);
+    // Just inside the default retention window keeps the run.
+    expect(sweepResidentRuns(runs, fs.statSync(run.old).mtimeMs + POLICY_MS - 1_000, 10_000,
+      { actorRoots: [actorRoot], retentionMs: POLICY_MS, dryRun: true })).toEqual([]);
     // A caller retention veto (current reference) keeps the aged candidate too.
-    expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], dryRun: true, isRetained: id => id === "old" })).toEqual([]);
+    expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], retentionMs: POLICY_MS, dryRun: true, isRetained: id => id === "old" })).toEqual([]);
     expect(recorded).toEqual([]);
     expect(snapshot()).toEqual(before);
   });
@@ -101,7 +103,7 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
     const { dir, actorRoot, run, snapshot } = fixture(now);
     const before = snapshot();
     const rm = vi.spyOn(fs, "rmSync");
-    const collector = new ResidentRequestRetention(dir, [actorRoot], { retainRuns: false });
+    const collector = new ResidentRequestRetention(dir, [actorRoot], { retainRuns: false, residentRunMs: POLICY_MS });
     try {
       for (let slice = 0; slice < 50 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000);
     } finally { collector.close(); }
@@ -144,7 +146,7 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
         age(run.old, aged);
       };
       const custody = { run: (id: string) => change === "manager custody" && id === "old", reference: () => false };
-      const collector = new ResidentRequestRetention(dir, [actorRoot], { retainRuns: false }, recover, custody);
+      const collector = new ResidentRequestRetention(dir, [actorRoot], { retainRuns: false, residentRunMs: POLICY_MS }, recover, custody);
       try {
         for (let slice = 0; slice < 50 && collector.due(now); slice++) collector.sweep(now, new Set(change === "live set" ? ["old"] : []), 10_000);
       } finally { collector.close(); }

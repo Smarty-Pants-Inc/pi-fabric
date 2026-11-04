@@ -36,9 +36,9 @@ describe("terminal run compaction is disabled", () => {
     expect(fs.statSync(run).mtimeMs).toBe(directoryMtime);
     expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now })).toEqual([]);
     expect(snapshot(run)).toEqual(before);
-    // Actor archives are traces and remain kept even after the run TTL expires.
+    // Actor run archives remain complete even after an explicit retention age passes (#1800).
     expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now: 4 * HOUR + 7 * 24 * HOUR })).toEqual([]);
-    expect(fs.existsSync(run)).toBe(true);
+    expect(snapshot(run)).toEqual(before);
   });
 
   it.each([

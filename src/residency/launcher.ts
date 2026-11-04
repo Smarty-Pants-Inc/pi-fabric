@@ -186,16 +186,17 @@ async function captureWedgeEvidence(root: string, config: ResidentHostConfig, at
   return dir;
 }
 
-/** Keep the five newest wedge evidence directories. smarty-dev#7916: each is judged with its owned stat and only
- * that inode is removed (off Linux main's removal). Exported for tests. */
-export const pruneWedgeEvidence = (wedges: string): void => {
+/** Preserve wedge trace evidence unless a caller supplies a count policy. smarty-dev#7916: each is judged
+ * with its owned stat and only that inode is removed (off Linux main's removal). Exported for tests. */
+export const pruneWedgeEvidence = (wedges: string, maxItems?: number): void => {
+  if (maxItems === undefined) return;
   const judged = new Map<string, fs.Stats | undefined>();
   const keep = fs.readdirSync(wedges).filter(name => {
     if (name === "reports" || !fs.statSync(path.join(wedges, name)).isDirectory()) return false;
     judged.set(name, ownedStat(path.join(wedges, name)));
     return true;
   }).sort();
-  for (const old of keep.slice(0, Math.max(0, keep.length - 5))) {
+  for (const old of keep.slice(0, Math.max(0, keep.length - maxItems))) {
     const target = path.join(wedges, old), stat = judged.get(old);
     verifiedRemove(target, stat, { deleter: "wedgeEvidence", fallback: () => { fs.rmSync(target, { recursive: true, force: true }); return true; } });
   }
@@ -240,25 +241,27 @@ function stopAttempt(attempt: Attempt): Promise<void> {
   })();
 }
 
-/** Size cap of launcher.log and each child-*.log: one rotated generation (.1) is kept (smarty-dev#3252). */
+/** Legacy explicit byte cap; production appends do not install a raw-log size policy. */
 export const RESIDENT_LOG_MAX_BYTES = 8 * 1024 * 1024;
-/** Per-transaction child logs older than this are removed when a new child starts. */
-const RESIDENT_CHILD_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+/** No implicit expiry for per-transaction raw child logs. */
+export const RESIDENT_CHILD_LOG_RETENTION_MS: number | undefined = undefined;
 /** Append, rotating the file to `<file>.1` (replacing the previous generation) once it exceeds the cap. */
-export const appendResidentLog = (file: string, data: string | Buffer, maxBytes = RESIDENT_LOG_MAX_BYTES): void => {
-  try { if (fs.statSync(file).size >= maxBytes) fs.renameSync(file, `${file}.1`); }
+export const appendResidentLog = (file: string, data: string | Buffer, maxBytes?: number): void => {
+  // Replacing .1 would discard an earlier raw log. Production has no implicit size policy.
+  try { if (maxBytes !== undefined && fs.statSync(file).size >= maxBytes) fs.renameSync(file, `${file}.1`); }
   catch { /* absent, or rotation failed: append to the current file */ }
   fs.appendFileSync(file, data);
 };
 /** smarty-dev#7916: the judged lstat (owned) is the only inode removed; off Linux main's removal. Exported for tests. */
-export const pruneResidentChildLogs = (root: string, keep: string, now = Date.now()): void => {
+export const pruneResidentChildLogs = (root: string, keep: string, now = Date.now(), retentionMs: number | undefined = RESIDENT_CHILD_LOG_RETENTION_MS): void => {
+  if (retentionMs === undefined) return;
   try {
     for (const name of fs.readdirSync(root)) {
       if (!/^child-.+\.log(\.1)?$/.test(name)) continue;
       const file = path.join(root, name);
       if (file === keep || file === `${keep}.1`) continue;
       const stat = fs.lstatSync(file, { throwIfNoEntry: false }); // the judgment; verifiedRemove proves ownership
-      if (stat?.isFile() && now - stat.mtimeMs > RESIDENT_CHILD_LOG_RETENTION_MS) {
+      if (stat?.isFile() && now - stat.mtimeMs > retentionMs) {
         verifiedRemove(file, stat, { deleter: "residentChildLogs", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
       }
     }
@@ -556,7 +559,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
         PI_FABRIC_RESIDENT_LAUNCH_TOKEN: launchToken }),
     });
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
-    pruneResidentChildLogs(root, logFile);
+    pruneResidentChildLogs(root, logFile, Date.now(), launchConfig.retention?.residentChildLogMs);
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child), generation,
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.on("message", (value: unknown) => {

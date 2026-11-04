@@ -29,10 +29,10 @@ const sandbox = () => {
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   return { root, short, disk };
 };
-const manager = (retainRuns = false) => {
+const manager = (retainRuns = false, retention = DEFAULT_FABRIC_CONFIG.retention) => {
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 1, retainRuns, transport: "process", sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
-    sweepPath: path.resolve("dist/storage/sweep-main.js"),
+    sweepPath: path.resolve("dist/storage/sweep-main.js"), retention,
   });
   closers.push(() => agents.close());
   return agents;
@@ -93,8 +93,12 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     const move = retain.mock.results.map(row => row.value as { source: string; receipt: string } | undefined).find(move => move?.source === runDirectory)!;
     expect(move).toBeDefined();
     const receipt = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
-    // Only a custody container may remain; ordinary scratch roots were released.
-    expect(fs.readdirSync(disk).filter(name => name.startsWith("pi-fabric-") && !move.receipt.startsWith(path.join(disk, name) + path.sep))).toEqual([]);
+    // The raw run's custody container, full output and transcript-linked shell log all survive.
+    expect(fs.readdirSync(disk).filter(name => name.startsWith("pi-fabric-") &&
+      !move.receipt.startsWith(path.join(disk, name) + path.sep) && !output.artifactPath!.startsWith(path.join(disk, name) + path.sep) &&
+      !log.startsWith(path.join(disk, name) + path.sep))).toEqual([]);
+    expect(fs.readFileSync(output.artifactPath!, "utf8")).toHaveLength(2000);
+    expect(fs.readFileSync(log, "utf8")).toContain("shell data");
     expect(receipt).toMatchObject({ id: run.id, state: "moved", reason: expect.any(String), time: expect.any(Number) });
     expect(JSON.parse(fs.readFileSync(path.join(receipt.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source: runDirectory, destination: receipt.destination, id: run.id, state: "prepared" });
     if (process.platform !== "win32") expect(fs.statSync(receipt.container).mode & 0o777).toBe(0o700);
@@ -124,13 +128,13 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     const scratch = createScratch("output");
     fs.writeFileSync(path.join(scratch, "output.txt"), "abandoned");
     fs.writeFileSync(path.join(scratch, SCRATCH_OWNER_FILE), JSON.stringify({ app: "pi-fabric-scratch", version: 1, kind: "output", pid: 2147483647, createdAt: 1, orphanedAt: 1 }));
-    expect((await sweepScratch({ tempRoot: disk, now: 100_000, orphanGraceMs: 1000 })).removed).toEqual([scratch]);
+    expect((await sweepScratch({ tempRoot: disk, now: 100_000, orphanGraceMs: 1000, maxAgeMs: 1000 })).removed).toEqual([scratch]);
     expect(fs.readdirSync(short)).toEqual([]);
   });
 
   it("starts its detached sweep in the allocated disk root, even if the override later changes", async () => {
     const { disk, short } = sandbox();
-    const agents = manager();
+    const agents = manager(false, { ...DEFAULT_FABRIC_CONFIG.retention, orphanedTempRunMs: 1000, oneShotRunMs: 1000 });
     const dead = fs.mkdtempSync(path.join(disk, "pi-fabric-runs-"));
     fs.writeFileSync(path.join(dead, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
     ageRunRoot(dead, 1);
@@ -143,12 +147,18 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
 });
 
 describe("session scratch release", () => {
-  it("releases only its own closed roots; protects another session, active data and unknown files", async () => {
+  it("releases only its own closed derived roots; retains traces, another session, active data and unknown files", async () => {
     const { disk } = sandbox();
     const scope = new ScratchScope();
-    const own = scope.create("output");
-    fs.writeFileSync(path.join(own, "output.txt"), "own");
+    const own = scope.create("checkpoint");
+    fs.writeFileSync(path.join(own, "checkpoint"), "derived");
     closeScratch(own);
+    const shell = scope.create("shell");
+    fs.writeFileSync(path.join(shell, "output.log"), "transcript-linked shell trace");
+    closeScratch(shell);
+    const trace = scope.create("output");
+    fs.writeFileSync(path.join(trace, "output.txt"), "lossless full output");
+    closeScratch(trace);
     const active = scope.create("output");
     const unknown = scope.create("output");
     closeScratch(unknown);
@@ -158,7 +168,9 @@ describe("session scratch release", () => {
     await scope.close();
     await scope.close();
     expect(fs.existsSync(own)).toBe(false);
-    for (const directory of [active, unknown, other]) expect(fs.existsSync(directory)).toBe(true);
+    for (const directory of [shell, trace, active, unknown, other]) expect(fs.existsSync(directory)).toBe(true);
+    expect(fs.readFileSync(path.join(shell, "output.log"), "utf8")).toBe("transcript-linked shell trace");
+    expect(fs.readFileSync(path.join(trace, "output.txt"), "utf8")).toBe("lossless full output");
     expect(() => scope.create("output")).toThrow("closed");
     expect(fs.existsSync(disk)).toBe(true);
   });
@@ -182,7 +194,7 @@ describe("session scratch release", () => {
     const outputs = new OutputArtifactStore();
     const writing = outputs.write("pending data");
     await outputs.close();
-    expect(fs.existsSync(path.dirname(await writing))).toBe(false);
+    expect(fs.readFileSync(await writing, "utf8")).toBe("pending data");
     await expect(outputs.write("late")).rejects.toThrow("closed");
     const jobs = new FabricShellJobStore();
     const job = jobs.begin("bash", "live child");
@@ -195,7 +207,7 @@ describe("session scratch release", () => {
     expect(fs.existsSync(job.logPath!)).toBe(true);
   });
 
-  it("releases pruned shell logs as well as handles still present at shutdown", async () => {
+  it("keeps logs for pruned shell handles as well as handles still present at shutdown", async () => {
     sandbox();
     const jobs = new FabricShellJobStore();
     const paths: string[] = [];
@@ -207,7 +219,9 @@ describe("session scratch release", () => {
     }
     expect(jobs.list().length).toBeLessThan(paths.length);
     expect(paths.every(directory => fs.existsSync(directory))).toBe(true);
+    const before = paths.map(directory => fs.readFileSync(path.join(directory, "output.log")));
     await jobs.close();
-    expect(paths.some(directory => fs.existsSync(directory))).toBe(false);
+    expect(paths.every(directory => fs.existsSync(directory))).toBe(true);
+    expect(paths.map(directory => fs.readFileSync(path.join(directory, "output.log")))).toEqual(before);
   });
 });

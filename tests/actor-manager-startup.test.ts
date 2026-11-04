@@ -49,7 +49,8 @@ function fixture(count: number) {
   new ActorRegistryStore(actorRoot).write(records);
   const make = (options: ConstructorParameters<typeof ActorManager>[6] = {}) => {
     const value = new ActorManager("startup", identity, mesh, DEFAULT_FABRIC_CONFIG.mesh, manager, () => {}, {
-      actorRoot, persistent: true, rootId: identity.id, claimResidency: "session", reapDeadSessionPresence: false, ...options,
+      actorRoot, persistent: true, rootId: identity.id, claimResidency: "session", reapDeadSessionPresence: false,
+      retention: { ...DEFAULT_FABRIC_CONFIG.retention, actorRunArchiveMs: 7 * 86_400_000 }, ...options,
     }); managers.push(value); return value;
   };
   const runDir = (actor: number, run: number) => path.join(actorRoot, records[actor]!.id, "runs", `run-${actor}-${run}`);
@@ -64,7 +65,7 @@ async function eventually(predicate: () => boolean, timeoutMs = 10_000) {
 }
 
 describe("ActorManager bounded startup (#4250 item 4)", () => {
-  it("loads 200 real-shaped actors in one linear read and eventually sweeps 2,000 runs in bounded event-loop slices", async () => {
+  it("loads 200 real-shaped actors in one linear read and maintains bounded slices while retaining 2,000 raw runs", async () => {
     const f = fixture(200);
     const rawOwnership = vi.fn(() => true);
     const snapshot = vi.fn(() => new Map(f.records.map((record) => [record.id, true])));
@@ -75,10 +76,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     let actorsThisTurn = 0, totalActors = 0;
     const actorsPerTurn: number[] = [];
     const pruneRuns = ActorLogStore.prototype.pruneRuns;
-    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation((actor, now) => {
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, actor, now) {
       actorsThisTurn++;
       totalActors++;
-      return pruneRuns.call(ActorLogStore.prototype, actor, now);
+      return pruneRuns.call(this, actor, now);
     });
     await turn();
     let previous = performance.now(), longest = 0, active = true;
@@ -139,13 +140,13 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       return Reflect.apply(lstat, fs, [file, ...args]);
     }) as never);
     const pruneRuns = ActorLogStore.prototype.pruneRuns;
-    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation((actor, now) => {
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, actor, now) {
       actorsThisTurn++;
       totalActors++;
       // Controlled per-actor maintenance work, independent of host filesystem latency.
       const until = performance.now() + 2;
       while (performance.now() < until) { /* bounded maintenance slice */ }
-      return pruneRuns.call(ActorLogStore.prototype, actor, now);
+      return pruneRuns.call(this, actor, now);
     });
     await turn();
     let previous = performance.now(), longest = 0, active = true;
@@ -190,9 +191,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     let published = true;
     const pruned: string[] = [];
     const pruneRuns = ActorLogStore.prototype.pruneRuns;
-    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation((actor, now) => {
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, actor, now) {
       pruned.push(path.basename(path.dirname(actor.sessionFile)));
-      return pruneRuns.call(ActorLogStore.prototype, actor, now);
+      return pruneRuns.call(this, actor, now);
     });
     const manager = f.make({ canManageActor: id => ownership.get(id), snapshotActorOwnership: () => new Map(ownership),
       canConsumeMesh: () => published });
@@ -254,9 +255,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     const ownership = new Map(f.records.map((record) => [record.id, true]));
     const pruned: string[] = [];
     const pruneRuns = ActorLogStore.prototype.pruneRuns;
-    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation((actor, now) => {
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, actor, now) {
       pruned.push(path.basename(path.dirname(actor.sessionFile)));
-      return pruneRuns.call(ActorLogStore.prototype, actor, now);
+      return pruneRuns.call(this, actor, now);
     });
     const manager = f.make({ canManageActor: (id) => ownership.get(id), snapshotActorOwnership: () => new Map(ownership) });
     const status = path.join(f.runDir(0, 0), "status.json");
@@ -295,7 +296,7 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     const sessionFile = path.join(f.actorRoot, actor.id, "session.jsonl");
     const store = new ActorChildCompletionStore(sessionFile);
     const expired = "e".repeat(32), fresh = "f".repeat(32);
-    const old = new Date(Date.now() - DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs - 1000);
+    const old = new Date(Date.now() - 7 * 86_400_000 - 1000);
     fs.mkdirSync(store.directory, { recursive: true });
     for (const id of [expired, fresh]) {
       fs.writeFileSync(store.resultFile(id), JSON.stringify({ id, text: id }));
@@ -337,9 +338,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     const f = fixture(1); let published = false;
     const pruned: string[] = [];
     const pruneRuns = ActorLogStore.prototype.pruneRuns;
-    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation((actor, now) => {
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, actor, now) {
       pruned.push(path.basename(path.dirname(actor.sessionFile)));
-      return pruneRuns.call(ActorLogStore.prototype, actor, now);
+      return pruneRuns.call(this, actor, now);
     });
     const manager = f.make({ canConsumeMesh: () => published });
     await turn(); await turn();
@@ -360,9 +361,9 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     const firstBatch = f.records.slice(0, batchSize).map(record => record.id);
     const pruned: string[] = [];
     const pruneRuns = ActorLogStore.prototype.pruneRuns;
-    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation((actor, now) => {
+    vi.spyOn(ActorLogStore.prototype, "pruneRuns").mockImplementation(function (this: ActorLogStore, actor, now) {
       pruned.push(path.basename(path.dirname(actor.sessionFile)));
-      return pruneRuns.call(ActorLogStore.prototype, actor, now);
+      return pruneRuns.call(this, actor, now);
     });
     const manager = f.make({ canConsumeMesh: () => published });
     // A callback queued behind the first maintenance slice withdraws publication

@@ -459,18 +459,18 @@ describe("FabricSettingsComponent", () => {
   it("exposes temporal retention defaults", () => {
     const items = buildItems();
     const retention = items.find((item) => item.id === "retention");
-    expect(retention?.currentValue).toBe("6h · 1d · 7d");
+    expect(retention?.currentValue).toBe("never · never · never");
     const lines = retention!.submenu!("", () => {}).render(100).join("\n");
     expect(lines).toContain("Orphaned temp runs");
-    expect(lines).toContain("6h");
+    expect(lines).toContain("never");
     expect(lines).toContain("One-shot runs");
-    expect(lines).toContain("1d");
+    expect(lines).toContain("never");
     expect(lines).toContain("Actor run archives");
-    expect(lines).toContain("7d");
+    expect(lines).toContain("never");
     expect(lines).toContain("session.jsonl");
     expect(lines).toContain("Terminal event log age");
     expect(lines).toContain("Terminal event log tail");
-    expect(lines).toContain("256 KiB");
+    expect(lines).toContain("16384 KiB");
   });
 
   it("presents the Tool display row in the UI settings section", () => {

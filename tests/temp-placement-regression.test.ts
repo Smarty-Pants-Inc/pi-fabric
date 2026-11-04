@@ -13,7 +13,7 @@ import { ageRunRoot } from "./helpers/age-run-root.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
-const setup = () => {
+const setup = (retention = DEFAULT_FABRIC_CONFIG.retention) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-test-"));
   roots.push(root);
   const short = path.join(root, "short");
@@ -24,7 +24,7 @@ const setup = () => {
   vi.stubEnv("PI_FABRIC_TMPDIR", disk);
   for (const key of ["PI_FABRIC_RUN_ROOT", "PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
-  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 1, retainRuns: false }, { sweepPath: path.resolve("dist/storage/sweep-main.js") });
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 1, retainRuns: false }, { sweepPath: path.resolve("dist/storage/sweep-main.js"), retention });
   const jobs = new FabricShellJobStore();
   closers.push(() => agents.close(), () => jobs.close());
   return { root, short, disk, agents, jobs };
@@ -47,19 +47,20 @@ it.skipIf(process.platform === "win32")("places every bulky file-root kind in PI
   expect(fs.readdirSync(short)).toEqual([]);
 });
 
-it.skipIf(process.platform === "win32")("removes finished session shell roots on close, without shortening live-session retention", async () => {
+it.skipIf(process.platform === "win32")("keeps finished session shell logs through close without an explicit policy", async () => {
   const { jobs } = setup();
   const job = jobs.begin("bash", "shutdown");
   job.spill();
   const log = await job.persistLog();
   await job.finish(0);
-  expect(fs.existsSync(log)).toBe(true);
+  const before = fs.readFileSync(log);
   await jobs.close();
-  expect(fs.existsSync(path.dirname(log))).toBe(false);
+  expect(fs.existsSync(path.dirname(log))).toBe(true);
+  expect(fs.readFileSync(log)).toEqual(before);
 });
 
-it.skipIf(process.platform === "win32")("reclaims an abandoned disk-root owner through the manager's existing sweep", async () => {
-  const { disk, agents } = setup();
+it.skipIf(process.platform === "win32")("explicit policy reclaims an abandoned disk-root owner through the manager's existing sweep", async () => {
+  const { disk, agents } = setup({ ...DEFAULT_FABRIC_CONFIG.retention, orphanedTempRunMs: 0, oneShotRunMs: 0 });
   const abandoned = fs.mkdtempSync(path.join(disk, "pi-fabric-runs-"));
   fs.writeFileSync(path.join(abandoned, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
   expect(fs.readdirSync(abandoned)).toEqual([".fabric-owner.json"]); // Only the empty owner marker is eligible for removal.

@@ -31,7 +31,8 @@ import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-
 import { FOLLOW_UP_LIMITS, type FabricMainAgentDeliveryRequest, type FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidencyClient } from "../src/residency/client.js";
-import { ResidentHost, RESIDENT_RUN_RETENTION_MS } from "../src/residency/host.js";
+import { ResidentHost } from "../src/residency/host.js";
+const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1000; // Explicit fixture policy.
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
 import { projectOf } from "../src/topology/project-identity.js";
@@ -267,7 +268,7 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
       fullCodeMode: true,
       agents: { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000 },
       mesh: meshConfig,
-      retention: DEFAULT_FABRIC_CONFIG.retention,
+      retention: { ...DEFAULT_FABRIC_CONFIG.retention, residentRunMs: RESIDENT_RUN_RETENTION_MS },
       workerPath: fakeWorker,
       fabricExtensionPath: path.resolve("dist/index.js"),
       piBinary: "pi",

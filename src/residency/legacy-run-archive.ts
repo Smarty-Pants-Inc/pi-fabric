@@ -12,7 +12,7 @@ export interface LegacyRunArchivePolicy {
   legacyRunArchiveEnabled?: boolean;
   legacyRunArchiveAgeMs?: number;
 }
-const DEFAULT_AGE_MS = 48 * 60 * 60 * 1000;
+const DEFAULT_AGE_MS = Number.POSITIVE_INFINITY;
 const terminal = new Set(["completed", "failed", "stopped"]);
 const files = new Set([
   "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "reply.json",
@@ -190,7 +190,7 @@ export class ResidentLegacyRunArchive {
   readonly health = { checked: 0, archived: 0, skipped: 0, error: "" };
   constructor(readonly root: string, readonly policy: LegacyRunArchivePolicy, readonly options: ArchiveOptions) {}
 
-  #enabled(): boolean { return this.policy.legacyRunArchiveEnabled !== false; }
+  #enabled(): boolean { return this.policy.legacyRunArchiveEnabled !== false && this.policy.legacyRunArchiveAgeMs !== undefined; }
 
   /** Event-driven: root/runs entry events and bounded per-run status.json
    * events queue the named run; a cursor with remaining work continues with

@@ -74,7 +74,8 @@ const childLogs = () => {
   const root = tmp("pi-fabric-vr-logs-");
   const file = path.join(root, "child-old.log");
   fs.writeFileSync(file, "log");
-  fs.utimesSync(file, old, old);
+  const oldLog = new Date(Date.now() - 366 * DAY);
+  fs.utimesSync(file, oldLog, oldLog);
   return { root, file, keep: path.join(root, "child-current.log") };
 };
 const requests = () => {
@@ -121,29 +122,35 @@ describe.skipIf(process.platform !== "linux")("secondary deleters remove only th
   describe("pruneWedgeEvidence", () => {
     it("removes the unswapped oldest directory beyond five", () => {
       const { dir, oldest } = wedges();
-      pruneWedgeEvidence(dir);
+      pruneWedgeEvidence(dir, 5);
       expect(fs.existsSync(oldest)).toBe(false);
       expect(fs.readdirSync(dir)).toHaveLength(5);
     });
     it.each(SWAPS)("deletes nothing after a %s swap", (swap) => {
       const { dir, oldest } = wedges();
       const probe = arm(oldest, swap, true);
-      pruneWedgeEvidence(dir);
+      pruneWedgeEvidence(dir, 5);
       probe.expectNothingDeleted();
       expect(fs.readdirSync(dir).filter(name => !name.startsWith(".retention-graveyard-"))).toHaveLength(6);
     });
   });
 
   describe("pruneResidentChildLogs", () => {
-    it("removes an unswapped log older than seven days", () => {
+    it("keeps a 30-day-old log with the default age", () => {
       const { root, file, keep } = childLogs();
+      fs.utimesSync(file, old, old);
       pruneResidentChildLogs(root, keep);
+      expect(fs.readFileSync(file, "utf8")).toBe("log");
+    });
+    it("removes an unswapped old log under an explicit short policy", () => {
+      const { root, file, keep } = childLogs();
+      pruneResidentChildLogs(root, keep, Date.now(), 7 * 86_400_000);
       expect(fs.existsSync(file)).toBe(false);
     });
     it.each(SWAPS)("deletes nothing after a %s swap", (swap) => {
       const { root, file, keep } = childLogs();
       const probe = arm(file, swap);
-      pruneResidentChildLogs(root, keep);
+      pruneResidentChildLogs(root, keep, Date.now(), 7 * 86_400_000);
       probe.expectNothingDeleted();
     });
   });

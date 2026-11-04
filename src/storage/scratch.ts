@@ -3,6 +3,8 @@ import { fabricDataRoot } from "./temp-root.js";
 import path from "node:path";
 
 export const SCRATCH_OWNER_FILE = ".fabric-scratch.json";
+// Full output and transcript-linked shell logs are traces: no age, orphan, pressure or
+// scope-release eviction without an explicit caller policy. Reader checkpoints remain derived state.
 export const SCRATCH_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 export const SCRATCH_RECENT_MS = 60 * 60 * 1_000;
 export const SCRATCH_ORPHAN_GRACE_MS = 6 * 60 * 60 * 1_000;
@@ -89,7 +91,7 @@ export interface ScratchSweepOptions {
   orphanGraceMs?: number;
   maxBytes?: number;
   maxItems?: number;
-  /** Session release: only these allocated, closed roots of this process, regardless of age. */
+  /** Session release: allocated, closed derived roots. Full output and shell logs still require maxAgeMs. */
   released?: ReadonlySet<string>;
 }
 export interface ScratchSweepResult {
@@ -127,6 +129,8 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       const owner = readOwner(directory);
       if (!owner) continue;
       if (options.released && (owner.pid !== process.pid || owner.closedAt === undefined)) continue;
+      // Normal session/store disposal is not a trace-deletion policy either.
+      if ((owner.kind === "output" || owner.kind === "shell") && options.maxAgeMs === undefined) continue;
       let bytes = 0;
       const files = new Map<string, fs.Stats>();
       let safe = true;

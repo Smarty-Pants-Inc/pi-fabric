@@ -598,14 +598,15 @@ export const removeEmptyRunRoot = (root: string): boolean => {
   } catch { return false; }
 };
 const pruneClosedRunRoot = (
-  root: string, owner: RunRootOwner, orphanMs: number, oneShotMs: number, now: number, expired: () => boolean,
+  root: string, owner: RunRootOwner, orphanMs: number | undefined, oneShotMs: number | undefined, now: number, expired: () => boolean,
   eventsRetention: TerminalRunEventsRetention,
   archive: (directory: string, record: RunRecordSummary | undefined, inventory: ReturnType<typeof tempTreeSnapshot>) => boolean,
   dryRun: boolean,
 ): string[] => {
   const removed: string[] = [];
   // Every run started after its root, so no run of a root younger than the shortest retention is due.
-  if (now - owner.startedAt < Math.min(orphanMs, oneShotMs, eventsRetention.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000)) return removed;
+  const ages = [orphanMs, oneShotMs, eventsRetention.terminalRunEventsAgeMs].filter((age): age is number => age !== undefined);
+  if (ages.length === 0 || now - owner.startedAt < Math.min(...ages)) return removed;
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
@@ -617,7 +618,7 @@ const pruneClosedRunRoot = (
     const terminal = !!record?.status && TERMINAL_STATUSES.has(record.status);
     const reference = terminal ? recordAgeReference(record!, ownedStat(directory)?.mtimeMs ?? now) : owner.closedAt!;
     const retention = terminal && !record?.actorId ? oneShotMs : orphanMs;
-    if (now - reference < retention) {
+    if (retention === undefined || now - reference < retention) {
       // Temp-root custody preserves every raw trace, including young event logs.
       continue;
     }
@@ -779,8 +780,8 @@ export interface TempRunSweepRequest extends TerminalRunEventsRetention {
   /** Preview custody candidates/bytes only; no markers, recovery, compaction or archives. */
   dryRun?: boolean;
   currentRoot?: string;
-  orphanedTempRunRetentionMs: number;
-  oneShotRunRetentionMs: number;
+  orphanedTempRunRetentionMs?: number | undefined;
+  oneShotRunRetentionMs?: number | undefined;
 }
 export const sweepTempRunRoots = (options: TempRunSweepRequest & {
   now?: number;
@@ -839,7 +840,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       const temporary = recordedShortTmpdir(directory, path.basename(directory), record?.temporaryDirectory ?? null);
       const scratch = temporary && ownedShortTmpdir(temporary) ? tempTreeSnapshot(temporary, expired) : undefined;
       if (temporary && ownedShortTmpdir(temporary) && !scratch) return false;
-      if (!closed && scratch && now - scratch.latest < options.orphanedTempRunRetentionMs) return false;
+      if (!closed && scratch && (options.orphanedTempRunRetentionMs === undefined || now - scratch.latest < options.orphanedTempRunRetentionMs)) return false;
       if (!inventory.unchanged() || scratch && !scratch.unchanged() || !ownerUnchanged()) return false;
       if (options.dryRun) {
         result.candidates!.push({ path: directory, bytes: inventory.bytes });
@@ -992,7 +993,7 @@ export const actorRunReferencedNow = (actorRoots: readonly string[], runId: stri
 };
 
 export interface TerminalRunEventsRetention {
-  terminalRunEventsAgeMs?: number;
+  terminalRunEventsAgeMs?: number | undefined;
   terminalRunEventsMaxBytes?: number;
 }
 
@@ -1072,7 +1073,7 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
 export const pruneActorRunArchives = (options: {
   runsDirectory: string;
   latestRunId?: string;
-  retentionMs: number;
+  retentionMs?: number | undefined;
   terminalRunEventsAgeMs?: number;
   terminalRunEventsMaxBytes?: number;
   now?: number;

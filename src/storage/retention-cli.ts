@@ -532,7 +532,7 @@ const sweep = async (meshRoot: string, options: {
           isRetained: () => veto(), measure: treeBytes,
           onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }),
           onCompact: change => changes.push(change),
-          ...(options.residentRunRetentionMs !== undefined ? { retentionMs: options.residentRunRetentionMs } : {}),
+          retentionMs: options.residentRunRetentionMs ?? options.runRetentionMs,
         }));
       } else compactRuns(path.join(root, "runs"), veto);
     });

@@ -116,7 +116,8 @@ const FIXTURES: Record<string, () => Fixture> = {
     const target = createScratch("output", tempRoot);
     write(path.join(target, "output.txt"), "x");
     closeScratch(target);
-    return { target, act: () => sweepScratch({ tempRoot, now: Date.now() + 2 * DAY }) };
+    // This matrix exercises deletion races, not the full-output never-delete default.
+    return { target, act: () => sweepScratch({ tempRoot, maxAgeMs: DAY, now: Date.now() + 2 * DAY }) };
   },
   claimMeshRetentionSweep: () => {
     const meshRoot = tmp("fabric-vr-claim-");
@@ -173,7 +174,7 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     expect(shape(target)).toEqual(before);
   });
 
-  it("mesh --runs-older-than pass: a dry run plans the expired run; apply rejects before the helper's seam (smarty-dev#10678)", async () => {
+  it("mesh --runs-older-than pass: actor archives stay out of the plan; apply rejects before the helper's seam (smarty-dev#10678)", async () => {
     const { root, target } = meshPass();
     const before = shape(target);
     const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });

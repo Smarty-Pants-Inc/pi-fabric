@@ -408,14 +408,14 @@ describe("Agent prompt retention (#11663)", () => {
       expect(fs.existsSync(runRoot)).toBe(false);
       const sweepOptions = {
         tempRoot,
-        orphanedTempRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
-        oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs,
+        orphanedTempRunRetentionMs: 6 * 3_600_000,
+        oneShotRunRetentionMs: 86_400_000,
       };
       expect(retentionStorage.sweepTempRunRoots({ ...sweepOptions,
-        now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs - 1,
+        now: result.finishedAt! + 86_400_000 - 1,
       }).removedRuns).toEqual([]);
       const swept = retentionStorage.sweepTempRunRoots({ ...sweepOptions,
-        now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs + 1,
+        now: result.finishedAt! + 86_400_000 + 1,
       });
       expect(swept).toEqual({ removedRuns: [], removedRoots: [] });
       expect(rawInventory(held)).toEqual(heldBeforeSweep);
@@ -436,8 +436,8 @@ describe("Agent prompt retention (#11663)", () => {
     const removals: string[] = [];
     const remove = vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation(target => { removals.push(target); return { removed: true, bytes: 0 }; });
     try {
-      const options = { tempRoot: path.dirname(runRoot), orphanedTempRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
-        oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs };
+      const options = { tempRoot: path.dirname(runRoot), orphanedTempRunRetentionMs: 6 * 3_600_000,
+        oneShotRunRetentionMs: 86_400_000 };
       expect(retentionStorage.sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs - 1 }).removedRuns).toEqual([]);
       expect(removals).toEqual([]);
       expect(custodyMoves.filter(move => move.source === run)).toEqual([]);

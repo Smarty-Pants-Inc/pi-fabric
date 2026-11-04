@@ -367,7 +367,7 @@ fs.writeFileSync(args.get('--status-file'), JSON.stringify({
     vi.unstubAllEnvs();
     const heldRunBeforeSweep = inventory(heldRun!), heldTmpBeforeSweep = inventory(heldTmp!);
     expect(fs.existsSync(path.dirname(run))).toBe(false); // Only the empty owner root goes.
-    for (const now of [result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs - 1, Date.now() + 365 * 86_400_000]) {
+    for (const now of [result.finishedAt! + 86_400_000 - 1, Date.now() + 365 * 86_400_000]) {
       expect(sweepTempRunRoots({ tempRoot: parent, now, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs }))
         .toEqual({ removedRuns: [], removedRoots: [] });
       expect(inventory(heldRun!)).toEqual(heldRunBeforeSweep);

@@ -442,16 +442,20 @@ export const clampCompactionRatioThreshold = (value: number): number =>
   );
 
 export interface FabricRetentionConfig {
-  orphanedTempRunMs: number;
-  oneShotRunMs: number;
-  actorRunArchiveMs: number;
-  /** Compact safe terminal run event logs after this age; latest actor runs are exempt. */
-  terminalRunEventsAgeMs: number;
-  /** Total retained events.jsonl bytes, including the truncation marker. */
+  /** Unset ages disable trace deletion. Explicit ages retain their existing bounds. */
+  orphanedTempRunMs?: number;
+  oneShotRunMs?: number;
+  actorRunArchiveMs?: number;
+  residentRunMs?: number;
+  residentChildLogMs?: number;
+  perCallLedgerDays?: number;
+  /** Legacy compatibility field; terminal raw event logs are never tail-rewritten. */
+  terminalRunEventsAgeMs?: number;
+  /** Legacy compatibility byte bound; does not authorize terminal raw-log compaction. */
   terminalRunEventsMaxBytes: number;
   /** Move eligible identity-less legacy runs into runs-retired/; never delete their bytes. */
   legacyRunArchiveEnabled?: boolean;
-  /** Minimum terminal finishedAt age before legacy retirement (default 48 hours). */
+  /** Minimum terminal finishedAt age before legacy retirement; unset disables retirement. */
   legacyRunArchiveAgeMs?: number;
 }
 
@@ -1141,13 +1145,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     repairOrphans: true,
   },
   retention: {
-    orphanedTempRunMs: 6 * 60 * 60 * 1_000,
-    oneShotRunMs: 24 * 60 * 60 * 1_000,
-    actorRunArchiveMs: 7 * 24 * 60 * 60 * 1_000,
-    terminalRunEventsAgeMs: 6 * 60 * 60 * 1_000,
-    terminalRunEventsMaxBytes: 256 * 1024,
+
+    terminalRunEventsMaxBytes: 16 * 1024 * 1024,
     legacyRunArchiveEnabled: true,
-    legacyRunArchiveAgeMs: 48 * 60 * 60 * 1_000,
   },
   actors: {
     maxSessionBytes: 20 * 1024 * 1024,
@@ -2094,33 +2094,13 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     },
     retention: {
       legacyRunArchiveEnabled: booleanValue(retention.legacyRunArchiveEnabled, DEFAULT_FABRIC_CONFIG.retention.legacyRunArchiveEnabled ?? true),
-      legacyRunArchiveAgeMs: boundedInteger(retention.legacyRunArchiveAgeMs,
-        DEFAULT_FABRIC_CONFIG.retention.legacyRunArchiveAgeMs ?? 48 * 60 * 60 * 1_000,
-        60 * 60 * 1_000, 365 * 24 * 60 * 60 * 1_000),
-      orphanedTempRunMs: boundedInteger(
-        retention.orphanedTempRunMs,
-        DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
-        60 * 60 * 1_000,
-        365 * 24 * 60 * 60 * 1_000,
-      ),
-      oneShotRunMs: boundedInteger(
-        retention.oneShotRunMs,
-        DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs,
-        60 * 60 * 1_000,
-        365 * 24 * 60 * 60 * 1_000,
-      ),
-      actorRunArchiveMs: boundedInteger(
-        retention.actorRunArchiveMs,
-        DEFAULT_FABRIC_CONFIG.retention.actorRunArchiveMs,
-        60 * 60 * 1_000,
-        365 * 24 * 60 * 60 * 1_000,
-      ),
-      terminalRunEventsAgeMs: boundedInteger(
-        retention.terminalRunEventsAgeMs,
-        DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsAgeMs,
-        60 * 60 * 1_000,
-        365 * 24 * 60 * 60 * 1_000,
-      ),
+      ...Object.fromEntries([
+        "legacyRunArchiveAgeMs", "orphanedTempRunMs", "oneShotRunMs", "actorRunArchiveMs",
+        "terminalRunEventsAgeMs", "residentRunMs", "residentChildLogMs",
+      ].flatMap(key => typeof retention[key] === "number" && Number.isFinite(retention[key])
+        ? [[key, boundedInteger(retention[key], 3_600_000, 3_600_000, 31_536_000_000)]] : [])),
+      ...(typeof retention.perCallLedgerDays === "number" && Number.isFinite(retention.perCallLedgerDays)
+        ? { perCallLedgerDays: boundedInteger(retention.perCallLedgerDays, 1, 1, 365) } : {}),
       terminalRunEventsMaxBytes: boundedInteger(
         retention.terminalRunEventsMaxBytes,
         DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsMaxBytes,

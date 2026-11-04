@@ -58,6 +58,8 @@ const owner = () => {
     { ...DEFAULT_FABRIC_CONFIG.mesh, enabled: true }, agents, () => {}, {
       actorRoot, persistent: true, canConsumeMesh: () => true, reapDeadSessionPresence: false,
       meshRetentionSweepPath: script, retentionSweepMs: 20, closeGraceMs: 0,
+      // Lock guards require an enabled sweep; the unset archive policy starts none.
+      retention: { ...DEFAULT_FABRIC_CONFIG.retention, actorRunArchiveMs: DAY },
     });
   cleanups.push(async () => {
     await manager.close();

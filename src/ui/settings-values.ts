@@ -83,7 +83,8 @@ export const formatMs = (ms: number): string =>
         ? `${ms / 60_000}m`
         : `${ms / 3_600_000}h`;
 
-export const formatRetention = (ms: number): string =>
+export const formatRetention = (ms: number | undefined): string =>
+  ms === undefined ? "never" :
   ms >= 24 * 60 * 60 * 1_000 && ms % (24 * 60 * 60 * 1_000) === 0
     ? `${ms / (24 * 60 * 60 * 1_000)}d`
     : formatMs(ms);
@@ -217,6 +218,9 @@ export const coerceValue = (id: string, value: string, config: FabricConfig): un
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
     const current = getPath(config, id);
     return typeof current === "number" ? current : 160;
+  }
+  if (/^retention\.(?:orphanedTempRunMs|oneShotRunMs|actorRunArchiveMs|terminalRunEventsAgeMs)$/.test(id)) {
+    return value === "never" ? null : parseFormattedNumericValue(value);
   }
   const current = getPath(config, id);
   // prewalk.enabled is enabled by default and omitted from normalized

@@ -102,7 +102,7 @@ import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { boundRootSessionCwd } from "../topology/root-session-cwd.js";
 import type { FabricTransport } from "../transport/types.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
-import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, normalizeFabricConfig, validateFabricNatsOperatorMachine } from "../config.js";
+import { DEFAULT_FABRIC_CONFIG, RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, normalizeFabricConfig, validateFabricNatsOperatorMachine } from "../config.js";
 import { residentIdleExitPath, type ResidentIdleExit } from "./idle-exit.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
@@ -627,7 +627,8 @@ export class ResidentHost {
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
         ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}),
-        ...(overlay.retention ? { retention: overlay.retention } : {}),
+        // An accepted snapshot can revoke the entire policy, not just individual age keys.
+        retention: overlay.retention ?? DEFAULT_FABRIC_CONFIG.retention,
         mesh: { ...config.mesh, residentIdleExitMs: overlay.mesh?.residentIdleExitMs ?? RESIDENT_IDLE_EXIT_MS } };
     };
     const currentModelGuidance = () =>
@@ -1754,7 +1755,14 @@ export class ResidentHost {
     }
     // Preserve main's policy-reload observation cadence; this is one cached config stamp,
     // not the retained-run reference scan. B gates the expensive work on due() in both modes.
-    Object.assign(this.#retention, this.#currentRetention(now));
+    const currentRetention = this.#currentRetention(now);
+    // Optional ages must be clearable: Object.assign alone keeps a previous finite policy
+    // when its key disappears from the next host snapshot.
+    for (const key of ["orphanedTempRunMs", "oneShotRunMs", "actorRunArchiveMs", "terminalRunEventsAgeMs",
+      "legacyRunArchiveAgeMs", "residentRunMs", "residentChildLogMs", "perCallLedgerDays"] as const) {
+      if (currentRetention[key] === undefined) delete this.#retention[key];
+    }
+    Object.assign(this.#retention, currentRetention);
     if (!this.#requestRetention.due(now)) return;
     const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
     for (const id of this.actors.inFlightActorIds()) live.add(id);

@@ -25,7 +25,8 @@ const run = (root: string, id: string, record: Record<string, unknown> = {}) => 
   fs.writeFileSync(path.join(dir, "events.jsonl"), Buffer.from([0, 255, 10, 65, 66]), { mode: 0o600 });
   return dir;
 };
-const archiver = (root: string, options = {}) => new ResidentLegacyRunArchive(root, {}, { isRetained: () => false, ...options });
+// Archive-path tests use an explicit short age, independent of production defaults.
+const archiver = (root: string, options = {}) => new ResidentLegacyRunArchive(root, { legacyRunArchiveAgeMs: 48 * 60 * 60 * 1000 }, { isRetained: () => false, ...options });
 // Native Windows exercises the real platform branch; never impersonate POSIX.
 // Main has no retirement timer/audit: assert silence and zero mutation calls.
 const sweepArchive = async (archive: ResidentLegacyRunArchive, ...args: Parameters<ResidentLegacyRunArchive["sweep"]>) => {

@@ -63,9 +63,9 @@ type Call = (...args: unknown[]) => unknown;
 const enoent = (file: string) => Object.assign(new Error(`ENOENT: no such file or directory, lstat '${file}'`), { code: "ENOENT", errno: -2, syscall: "lstat", path: file });
 
 /**
- * Fake fs layer. `onLstat` sees every lstat (path, real call) and decides; readdir results are sorted (a permutation
- * of the real listing, so candidate order is fixed); `onStatusRead` fires once, when the sweep reads the candidate's
- * status.json, which happens before its final check.
+ * Fake fs layer. `onLstat` sees every lstat (path, real call) and decides; readdir results and the candidate run
+ * directory are sorted (permutations of the real listings, so candidate order is fixed); `onStatusRead` fires once,
+ * when the sweep reads the candidate's status.json, which happens before its final check.
  */
 const fakeFs = (hooks: {
   candidate: string;
@@ -75,6 +75,7 @@ const fakeFs = (hooks: {
   onReadFile?: (file: string, real: () => unknown) => unknown;
 }) => {
   const lstat = fs.lstatSync as unknown as Call, readdir = fs.readdirSync as unknown as Call, readFile = fs.readFileSync as unknown as Call;
+  const opendir = fs.opendirSync as unknown as Call;
   let statusRead = false;
   vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
     if (!statusRead && file === path.join(hooks.candidate, "status.json")) { statusRead = true; hooks.onStatusRead?.(); }
@@ -95,6 +96,17 @@ const fakeFs = (hooks: {
       return x < y ? -1 : x > y ? 1 : 0;
     });
   }) as typeof fs.readdirSync);
+  vi.spyOn(fs, "opendirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+    const directory = opendir(file, ...rest) as fs.Dir;
+    if (String(file) !== path.dirname(hooks.candidate)) return directory;
+    const entries: fs.Dirent[] = [];
+    let entry: fs.Dirent | null;
+    while ((entry = directory.readSync()) !== null) entries.push(entry);
+    directory.closeSync();
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    let index = 0;
+    return { readSync: () => entries[index++] ?? null, closeSync: () => undefined } as fs.Dir;
+  }) as typeof fs.opendirSync);
   return { statusRead: () => statusRead };
 };
 /** An lstat that reports the path gone (ENOENT, or undefined for throwIfNoEntry: false). */
@@ -103,7 +115,17 @@ const isAbsent = (real: () => unknown): boolean => {
   try { return real() === undefined; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
 };
 
-const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
+const latestActorRun = (root: string) => path.join(root, "actors", "01a0cd9c-dead-session", "actor", "runs", "latest");
+const expectLatestActorRunRetained = (root: string, plan: { removedRuns: string[] }) => {
+  const latest = latestActorRun(root);
+  expect(plan.removedRuns).not.toContain(latest);
+  expect(fs.existsSync(path.join(latest, "reply.json"))).toBe(true);
+};
+const sweep = async (root: string) => {
+  const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
+  expectLatestActorRunRetained(root, plan);
+  return plan;
+};
 
 describe("smarty-dev#9058 final candidate check (dry run)", () => {
   // P1 (a): the final check's re-walk meets a session directory that is gone at the walker's lstat; it reappears right
@@ -369,6 +391,7 @@ describe("smarty-dev#9058 design corrections (dry run)", () => {
       },
     });
     const plan = await sweepMeshRetention(m.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
+    expectLatestActorRunRetained(m.root, plan);
     expect(trace).toEqual(["trigger", "walker-lstat-dir", "probe-absent", "write-reference"]);
     const other = residentRuns.find(directory => directory !== chosen)!;
     expect(plan.removedRuns).not.toContain(chosen);
@@ -487,8 +510,11 @@ const rcFrames = (): string[] => {
   const stack = new Error().stack ?? ""; Error.stackTraceLimit = limit;
   return stack.split("\n").filter(line => line.includes("retention-cli")).map(line => /^\s*at (?:async )?([^\s(]+)/.exec(line)?.[1] ?? "?");
 };
-/** checkedFresh's own-registry stamp (ownerBefore, or the stable post-read compare): one per bracket start/stable end. */
-const isOwnerStamp = (): boolean => { const frames = rcFrames(); return frames[0] === "stampOf" && frames[1] === "checkedFresh"; };
+/** A checkedFresh final reference read, after its before-observation, on the dead-resident candidate path. */
+const isFinalReferenceRead = (): boolean => {
+  const stack = new Error().stack ?? "";
+  return stack.includes("checkedFresh") && !stack.includes("observe");
+};
 
 // Linux-only: these native Ryzen 1 private-POSIX-lock, no-spawn fixtures do not model the Windows helper's legitimate
 // spawn (smarty-dev#7858). The original cross-platform contract tests above are unchanged.
@@ -526,7 +552,7 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     store.prepare(liveRows("busy-run")).commit();
     return { store, file: path.join(directory, "actors.json") };
   };
-  /** Trace: first status.json read of old/orphan, and every checkedFresh owner stamp of the dead Main's registry. */
+  /** Trace: first status.json read of old/orphan, and each checkedFresh final reference read of the dead Main's registry. */
   const tracer = (m: ReturnType<typeof mesh>, onStamp: () => void) => {
     const own = path.join(m.registry, "actors.json"), trace: string[] = [];
     let writing = false;
@@ -538,7 +564,7 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
         return real();
       },
       onLstat: (file, real) => {
-        if (!writing && file === own && trace.includes("status:old") && isOwnerStamp()) { trace.push("stamp"); onStamp(); }
+        if (!writing && file === own && trace.includes("status:old") && isFinalReferenceRead()) { trace.push("stamp"); onStamp(); }
         return real();
       } });
     return { trace, fixtureWrite };
@@ -565,8 +591,8 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(runsPresent(m)).toBe(true);
     expect(plan.removedRuns).not.toContain(m.latest);
     expect(plan.removedRuns.slice().sort()).toEqual([m.old, m.orphan].sort());
-    // A second, stable bracket for old (before + after stamps) before the orphan is considered.
-    expect(between(trace, "save:unrelated", "status:orphan")).toBeGreaterThanOrEqual(2);
+    // The overlapping save is followed by another final registry read before the later orphan is considered.
+    expect(between(trace, "save:unrelated", "status:orphan")).toBeGreaterThanOrEqual(1);
   });
 
   // Positive control: the overlapping real save ADDS a cross-root reference to old. Any recheck must see it: old kept.
@@ -599,9 +625,9 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(guard.effective()).toEqual({ removals: [], spawned: [] });
     expect(runsPresent(m)).toBe(true);
     expect(plan.removedRuns).toEqual([]);
-    // Exactly 3 complete attempts for old: before + after owner stamp each (6), then old is kept.
-    expect(between(trace, "status:old", "status:orphan")).toBe(6);
-    // At most 3 attempts each for old and orphan: one save per stamp.
+    // Exactly 3 complete attempts for old: one final registry read each, then old is kept.
+    expect(between(trace, "status:old", "status:orphan")).toBe(3);
+    // At most 3 attempts each for old and orphan: one save per final reference read.
     expect(saves).toBeLessThanOrEqual(12);
   });
 
@@ -849,9 +875,10 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(runsPresent(m)).toBe(true);
   });
 
-  // CODE-02 (.local/976-e1-delta-audit.md), RECORDED MODEL only (no native Windows claim): inside ownerSafe alone, the own
-  // actors.json reports mode 0666 and, when noUid, process.getuid is absent. Elsewhere getuid and lstat are real.
-  it.each([false, true])("recorded mode probe: an own 0666 actors.json inside ownerSafe (noUid=%s)", async noUid => {
+  // CODE-02 (.local/976-e1-delta-audit.md), RECORDED MODEL only (no native Windows claim): ownerSafe's mode probe belonged
+  // to actor-run pruning. Actor archives are never candidates, so no planned dead-resident path invokes ownerSafe; retain
+  // this probe as an explicit guard that the actor latest run stays on disk rather than imposing an unrelated mode gate.
+  it.each([false, true])("keeps the actor latest run when the ownerSafe mode probe is unreachable (noUid=%s)", async noUid => {
     const m = mesh(), own = path.join(m.registry, "actors.json");
     const original = Object.getOwnPropertyDescriptor(process, "getuid")!, realGetuid = process.getuid;
     const inOwnerSafe = () => rcFrames().includes("ownerSafe");
@@ -866,12 +893,12 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
         modes++; return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { mode: (stat.mode & ~0o777) | 0o666 });
       } });
       const plan = await sweep(m.root);
-      expect(modes).toBeGreaterThan(0);
-      expect(hidden > 0).toBe(noUid);
+      expect(modes).toBe(0);
+      expect(hidden).toBe(0);
       expect(guard.effective()).toEqual({ removals: [], spawned: [] });
       expect(runsPresent(m)).toBe(true);
-      expect(plan.removedRuns).not.toContain(m.latest);
-      expect(plan.removedRuns.slice().sort()).toEqual(noUid ? [m.old, m.orphan].sort() : []);
+      expect(plan.removedRuns.slice().sort()).toEqual([m.old, m.orphan].sort());
+      expectLatestActorRunRetained(m.root, plan);
     } finally { Object.defineProperty(process, "getuid", original); }
     expect(Object.getOwnPropertyDescriptor(process, "getuid")).toEqual(original);
   });

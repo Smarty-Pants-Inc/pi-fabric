@@ -18,7 +18,7 @@ const run = (directory: string, finishedAt: number) => {
   write(path.join(directory, "reply.json"), '{"text":"done"}');
   return directory;
 };
-/** A dead session registry with two expired candidates (old, then orphan) and an entry actors/s of the given kind. */
+/** A dead session registry with two expired resident candidates and an entry actors/s of the given kind. */
 const mesh = (kind: "file" | "directory") => {
   const root = tmp("fabric-9160-");
   const registry = path.join(root, "actors", "01a0cd9c-dead-session");
@@ -27,7 +27,7 @@ const mesh = (kind: "file" | "directory") => {
     id: "actor", rootId: "session:01a0cd9c-dead-session", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest",
   }] }));
   write(path.join(actor, "session.jsonl"), "live");
-  run(path.join(actor, "runs", "latest"), NOW - 9 * DAY);
+  const actorRun = run(path.join(actor, "runs", "latest"), NOW - 9 * DAY);
   const host = path.join(root, "residency", "host");
   write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
   write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:01a0cd9c-dead-session", residencyRoot: host, meshRoot: root }));
@@ -37,7 +37,7 @@ const mesh = (kind: "file" | "directory") => {
   fs.utimesSync(orphan, (NOW - 10 * DAY) / 1_000, (NOW - 10 * DAY) / 1_000);
   const entry = path.join(root, "actors", "s");
   if (kind === "file") fs.writeFileSync(entry, "not a registry"); else fs.mkdirSync(entry);
-  return { root, old, orphan, entry, away: path.join(tmp("fabric-9160-away-"), "s") };
+  return { root, old, orphan, actorRun, entry, away: path.join(tmp("fabric-9160-away-"), "s") };
 };
 const onStatusRead = (changes: Record<string, () => void>) => {
   const original = fs.readFileSync;
@@ -56,17 +56,22 @@ const toRegistry = (entry: string, away: string, runId: string) => {
 };
 const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
 const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
+const assertActorRunRetained = (m: ReturnType<typeof mesh>, plan: { removedRuns: string[] }) => {
+  expect(plan.removedRuns).not.toContain(m.actorRun);
+  expect(fs.existsSync(m.actorRun)).toBe(true);
+};
 
 describe("sweep fences each direct actors/ entry's type and identity (#9160)", () => {
   it("file becomes a same-named registry referencing the candidate: kept, and the stop is sticky after a restore", async () => {
     const m = mesh("file");
     const moved = path.join(path.dirname(m.away), "s-dir");
     const injected = onStatusRead({
-      [m.old]: () => toRegistry(m.entry, m.away, "old"),
-      [m.orphan]: () => { fs.renameSync(m.entry, moved); fs.renameSync(m.away, m.entry); },
+      [m.orphan]: () => toRegistry(m.entry, m.away, "orphan"),
+      [m.old]: () => { fs.renameSync(m.entry, moved); fs.renameSync(m.away, m.entry); },
     });
     const plan = await sweep(m.root);
     expect(injected()).toBe(2);
+    assertActorRunRetained(m, plan);
     expect(fs.lstatSync(m.entry).isFile()).toBe(true);
     expect(plan.removedRuns).not.toContain(m.old);
     expect(plan.removedRuns).not.toContain(m.orphan);
@@ -79,9 +84,10 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
     ["a file replaced by a directory without a registry", "file", (e: string, a: string) => { fs.renameSync(e, a); fs.mkdirSync(e); }],
   ] as const)("stops on %s", async (_name, kind, change) => {
     const m = mesh(kind);
-    const injected = onStatusRead({ [m.old]: () => change(m.entry, m.away) });
+    const injected = onStatusRead({ [m.orphan]: () => change(m.entry, m.away) });
     const plan = await sweep(m.root);
     expect(injected()).toBe(1);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).not.toContain(m.old);
     expect(plan.removedRuns).not.toContain(m.orphan);
     expect(plan.skipped).toContainEqual(stopped(m.root));
@@ -90,6 +96,7 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
   it.each(["file", "directory"] as const)("plans eligible runs when an unchanged %s entry stays", async kind => {
     const m = mesh(kind);
     const plan = await sweep(m.root);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).toEqual(expect.arrayContaining([m.old, m.orphan]));
     expect(plan.skipped).not.toContainEqual(stopped(m.root));
   });
@@ -102,6 +109,7 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
     });
     const plan = await sweep(m.root);
     expect(injected()).toBe(2);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).toEqual(expect.arrayContaining([m.old, m.orphan]));
     expect(plan.skipped).not.toContainEqual(stopped(m.root));
   });
@@ -117,7 +125,7 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
         if (new Error().stack?.includes("discover")) walked = true;
         else if (walked) {
           swapped = true;
-          write(path.join(m.away, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "old" }] }));
+          write(path.join(m.away, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "orphan" }] }));
           fs.renameSync(m.entry, path.join(path.dirname(m.away), "s-file"));
           fs.symlinkSync(m.away, m.entry);
         }
@@ -126,7 +134,9 @@ describe("sweep fences each direct actors/ entry's type and identity (#9160)", (
     }) as typeof fs.readdirSync);
     const plan = await sweep(m.root);
     expect(swapped).toBe(true);
+    assertActorRunRetained(m, plan);
     expect(plan.removedRuns).not.toContain(m.old);
+    expect(plan.removedRuns).not.toContain(m.orphan);
     expect(plan.skipped).toContainEqual(stopped(m.root));
   });
 });

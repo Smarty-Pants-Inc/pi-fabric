@@ -2979,11 +2979,15 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(presence(forged.id)?.lastRunId).toBe(lastRunIdsBefore.forged);
       expect(presence(forged.id)).not.toHaveProperty("model");
       expect(presence(forged.id)).not.toHaveProperty("thinking");
-      // No new run: no run directory, no lastRunId, and the verified view was not persisted as a run pin.
+      // Deferred owner verification now persists the admitted live binding (#18491), not a run.
+      // No new run directory or lastRunId is created, and the refused forged selector stays unknown.
       expect(runs()).toEqual(runsBefore);
       expect(row(bound.id).lastRunId).toBeUndefined();
       expect(row(forged.id).lastRunId).toBeUndefined();
-      expect(row(bound.id).resolvedBinding).toBeUndefined();
+      expect(row(bound.id).resolvedBinding).toEqual({ modelSource: "explicit", model: "provider/visible",
+        modelReason: "review pair", thinking: "high" });
+      expect(row(bound.id).projectDefaults).toEqual({ model: "provider/visible", modelReason: "review pair", thinking: "high" });
+      expect(row(forged.id).resolvedBinding).toBeUndefined();
     } finally {
       await client.close();
       await state.participants.close();

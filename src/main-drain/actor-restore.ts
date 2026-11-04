@@ -5,7 +5,7 @@ import type { MainDrainBindingRequest } from "./binding.js";
 import { readOwned, writeOnce } from "../seat-drain/run.js";
 
 /** Reuse the ordinary create path; identity/authority is re-minted only by this owning Main. */
-const CREATE_KEYS = ["name", "instructions", "events", "eventsStartAt", "topics", "delivery", "responseMode", "triggerTurn",
+const CREATE_KEYS = ["name", "scope", "instructions", "events", "eventsStartAt", "topics", "delivery", "responseMode", "triggerTurn",
   "coalesce", "coalesceKey", "dedupeKey", "activation", "activationFilter", "deadLetterReplayMaxAgeMs", "batchWindowMs",
   "batchMax", "batchMaxBytes", "residency", "runner", "kernel", "pythonRuntime", "model", "modelReason", "thinking",
   "modelPolicyOriginalModel", "routeClass", "protected", "tools", "transport", "timeoutMs", "nice", "bashTimeoutSeconds",

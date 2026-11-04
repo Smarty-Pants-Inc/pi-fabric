@@ -373,7 +373,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(restored.listOwned(true)[0]).toMatchObject(defaults);
   });
 
-  it.each([false, true])("round 2 keeps reader overlays out of legacy shared views with project defaults=%s", async hasDefaults => {
+  it.each([false, true])("round 2 keeps unadmitted reader overlays private and publishes admitted bindings with project defaults=%s", async hasDefaults => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "legacy-reader", instructions: "Observe.",
       ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
@@ -384,6 +384,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     delete registry.actors[0].projectDefaults;
     delete registry.actors[0].resolvedBinding;
     fs.writeFileSync(file, JSON.stringify(registry));
+    let admitted: { modelSource: "explicit"; model: string; thinking: "high" } | undefined;
     for (const sessionId of ["reader-a", "reader-b"]) {
       const bindings = new ActorBindingStore(sessionId, path.join(state.root, "actors"));
       await bindings.setModel(actor.id, `provider/${sessionId}`);
@@ -395,23 +396,22 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       actorManagers.push(reader);
       const before = fs.readFileSync(file, "utf8");
       expect(reader.status(actor.id)).toMatchObject({ model: `provider/${sessionId}`, thinking: "high" });
-      // A foreign root cannot see the owner's overlay, so even a legacy row's persisted
-      // model/thinking stays unknown here (pi-fabric#843): never this reader's overlay.
+      // A passive reader never advertises its private overlay. It sees either unknown
+      // legacy metadata or the binding explicitly admitted by the preceding owner (#18491).
       const shared = reader.listOwned(true)[0]!;
-      expect(shared.model).toBeUndefined();
-      expect(shared.thinking).toBeUndefined();
+      expect(shared.model).toBe(admitted?.model);
+      expect(shared.thinking).toBe(admitted?.thinking);
       expect(shared.binding).toBeUndefined();
       const member = actorParticipantRecord(shared, `session:${sessionId}`, "host", `session:${sessionId}`, `session:${sessionId}`);
-      expect(member.model).toBeUndefined();
-      expect(member.thinking).toBeUndefined();
+      expect(member.model).toBe(admitted?.model);
+      expect(member.thinking).toBe(admitted?.thinking);
       expect(fs.readFileSync(file, "utf8")).toBe(before);
-      // A binding-only presence publication also must not stamp the overlay
-      // into either shared presence or the registry.
+      // This manager owns the actor: an explicit setter admits and saves its idle live
+      // binding, without changing the downgrade-compatible project-default fields.
       await reader.setModel(actor.id, `provider/${sessionId}-new`);
-      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("model");
-      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("thinking");
-      // A restored binding is a derived view: never saved, so never an overlay in the row.
-      expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+      admitted = { modelSource: "explicit", model: `provider/${sessionId}-new`, thinking: "high" };
+      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).toMatchObject({ model: admitted.model, thinking: admitted.thinking });
+      expect(row(state.root, actor.id).resolvedBinding).toEqual(admitted);
       expect(row(state.root, actor.id).model).toBe(hasDefaults ? "provider/project" : undefined);
       expect(row(state.root, actor.id).thinking).toBe(hasDefaults ? "medium" : undefined);
       await reader.close();
@@ -547,8 +547,12 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(presenceOf(state, actor.id)).toMatchObject({ status: "idle", model: "cliproxyapi/gpt-6-luna", modelReason: "review pair", thinking: "high" });
     expect(restarted.listOwned(true)[0]).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
     expect(resolver).toHaveBeenCalledWith("cliproxyapi/gpt-6-luna", false);
-    // Verified and advertised, never persisted as if a run had admitted it.
-    expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+    // Deferred verification republishes through the owner's live-binding writer (#18491).
+    // Synchronous restoration remains a derived view until an explicit publication.
+    if (_kind === "async") expect(row(state.root, actor.id).resolvedBinding).toEqual({ modelSource: "explicit",
+      model: "cliproxyapi/gpt-6-luna", modelReason: "review pair", thinking: "high" });
+    else expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+    expect(row(state.root, actor.id).lastRunId).toBeUndefined();
     expect(state.agents.list()).toHaveLength(0);
   }, 20_000);
 
@@ -600,22 +604,27 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(state.agents.list()).toHaveLength(0);
   }, 20_000);
 
-  it("withdraws a restored binding once an owner override diverges, and restores it when cleared (pi-fabric#843)", async () => {
+  it("publishes an admitted owner override and its clear without a run (pi-fabric#843, #18491)", async () => {
     const state = setup(true);
     const actor = await legacyRow(state, { model: "provider/project", thinking: "medium" });
     const restarted = restartWith(state);
     await waitFor(() => presenceOf(state, actor.id)?.model === "provider/project", 10_000);
     await restarted.setModel(actor.id, "provider/override");
-    expect(presenceOf(state, actor.id)).not.toHaveProperty("model");
-    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+    expect(presenceOf(state, actor.id)).toMatchObject({ model: "provider/override", thinking: "medium" });
+    expect(restarted.listOwned(true)[0]).toMatchObject({ model: "provider/override", thinking: "medium" });
     await restarted.setModel(actor.id, undefined);
     expect(presenceOf(state, actor.id)).toMatchObject({ model: "provider/project", thinking: "medium" });
     await restarted.setThinking(actor.id, "low");
-    expect(presenceOf(state, actor.id)).not.toHaveProperty("thinking");
-    // A project-scope change also moves the effective binding away from the verified row.
+    expect(presenceOf(state, actor.id)).toMatchObject({ model: "provider/project", thinking: "low" });
+    // A project-default edit does not replace the last admitted live binding. The
+    // effective next-run view moves, while the shared view keeps its known binding.
     await restarted.setThinking(actor.id, undefined);
     await restarted.setModel(actor.id, "provider/next", "project");
-    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+    expect(restarted.listOwned(true)[0]).toMatchObject({ model: "provider/project", thinking: "medium" });
+    expect(restarted.status(actor.id)).toMatchObject({ model: "provider/next", thinking: "medium" });
+    expect(row(state.root, actor.id).resolvedBinding).toEqual({ modelSource: "explicit", model: "provider/project", thinking: "medium" });
+    expect(row(state.root, actor.id).projectDefaults).toEqual({ model: "provider/next", thinking: "medium" });
+    expect(row(state.root, actor.id).lastRunId).toBeUndefined();
     expect(state.agents.list()).toHaveLength(0);
   }, 20_000);
 
@@ -629,7 +638,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     });
     expect(row(state.root, actor.id).model).toBeUndefined();
     expect(row(state.root, actor.id).thinking).toBeUndefined();
-    expect(row(state.root, actor.id).projectDefaults).toBeUndefined();
+    expect(row(state.root, actor.id).projectDefaults).toEqual({});
     expect(state.actors.status(actor.id).projectDefaults?.model).toBeUndefined();
     expect(state.actors.resolveBinding(actor.id)).toEqual({});
     await state.actors.stop(actor.id);

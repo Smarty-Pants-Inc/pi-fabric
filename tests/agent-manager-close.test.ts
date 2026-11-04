@@ -485,6 +485,76 @@ describe("AgentManager close storage", () => {
     } finally { launch.mockRestore(); }
   });
 
+  // Data-safety regression (#18535): exercise both archive-commit paths with
+  // real whole-root custody, including retainRuns:true (the old bypass ignored it).
+  it.each([
+    ["settlement", true], ["settlement", false], ["shutdown", true], ["shutdown", false],
+  ] as const)("retains queued files byte-identically after %s archive commit (retainRuns:%s)", async (phase, retainRuns) => {
+    let directory = "";
+    let queuedId = "";
+    let queuedResult: Buffer | undefined;
+    const settled = vi.fn((result) => {
+      if (result.id === queuedId) queuedResult = fs.readFileSync(path.join(directory, "queued-result.json"));
+    });
+    const stoppedAtClose = vi.fn((results) => {
+      if (phase === "shutdown" && results.some((result: { id: string }) => result.id === queuedId)) {
+        // Controlled exit-proof transition: a prelaunch veto blocks settlement
+        // custody, then clears before the independent shutdown archive commits.
+        expect(fs.existsSync(path.join(directory, "status.json"))).toBe(false);
+        expect(custodyMoves.some(move => move.source === directory)).toBe(false);
+        fs.unlinkSync(path.join(directory, "unresolved-worker.json"));
+      }
+    });
+    const { manager, root } = setup(retainRuns, { onSettled: settled, onStoppedAtClose: stoppedAtClose });
+    // In-process worker boundary: storage and manager admission/stop stay real;
+    // no native process/scope is needed to hold the one admission permit.
+    let alive = true;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async () => ({
+      kind: "process", sessionId: "2147483647", isAlive: async () => alive,
+      stop: async () => { alive = false; },
+    }));
+    await manager.spawn({ task: "HANG", extensions: false });
+    launch.mockClear();
+    const queued = await manager.spawn({ task: "queued history π", extensions: false });
+    queuedId = queued.id;
+    directory = path.join(root, queued.id);
+    expect(queued.status).toBe("queued");
+    fs.mkdirSync(path.join(directory, "tmp", "empty"), { recursive: true, mode: 0o700 });
+    const opaque = Buffer.from([0, 255, 13, 10, 128]);
+    fs.writeFileSync(path.join(directory, "tmp", "opaque.bin"), opaque, { mode: 0o600 });
+    fs.writeFileSync(path.join(directory, "events.jsonl"), 'raw π\n{"torn":', { mode: 0o600 });
+    if (phase === "shutdown") fs.writeFileSync(path.join(directory, "unresolved-worker.json"), "prelaunch custody pending");
+    const inode = fs.statSync(directory).ino;
+    const rename = fs.renameSync.bind(fs);
+    let before: unknown[] | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(source) === directory) before = closeInventory(directory);
+      rename(source, destination);
+    });
+    const remove = vi.spyOn(fs, "rmSync"); // observer only: no deletion is suppressed
+    if (phase === "settlement") await manager.stop(queued.id);
+    await manager.close();
+    await expect(manager.wait(queued.id)).resolves.toMatchObject({ status: "stopped", task: "queued history π" });
+    expect(launch).not.toHaveBeenCalled();
+    expect(settled.mock.calls.some(([result]) => result.id === queued.id)).toBe(true);
+    expect(stoppedAtClose.mock.calls.some(([results]) => results.some((result: { id: string }) => result.id === queued.id))).toBe(phase === "shutdown");
+    expect(queuedResult).toBeDefined();
+    const held = heldRoot(directory);
+    expect(before).toBeDefined();
+    expect(closeInventory(held)).toEqual(before); // every byte, inode, mode, and empty directory
+    expect(fs.statSync(held).ino).toBe(inode);
+    expect(fs.readFileSync(path.join(held, "queued-result.json"))).toEqual(queuedResult);
+    expect(fs.readFileSync(path.join(held, "tmp", "opaque.bin"))).toEqual(opaque);
+    expect(fs.readFileSync(path.join(held, "events.jsonl"), "utf8")).toBe('raw π\n{"torn":');
+    expect(fs.existsSync(path.join(held, "archive-pending.json"))).toBe(false);
+    expect(fs.existsSync(path.join(held, "status.json"))).toBe(phase === "settlement");
+    const within = (target: string) => target === directory || target.startsWith(directory + path.sep) || target === held || target.startsWith(held + path.sep);
+    expect(remove.mock.calls.filter(([target, options]) => options?.recursive && within(String(target)))).toEqual([]);
+    expect(remove.mock.calls.filter(([target]) => String(target) === path.join(directory, "queued-result.json"))).toEqual([]);
+    const move = custodyMoves.find(move => move.source === directory)!;
+    closeProofs.push({ source: directory, before: before!, destination: held, receipt: move.receipt });
+  });
+
   it.runIf(hostedDelete)("waits for a pending spawn to observe close before deleting the root", async () => {
     let resume!: () => void;
     const gate = new Promise<void>((resolve) => { resume = resolve; });

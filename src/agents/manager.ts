@@ -4094,17 +4094,15 @@ export class AgentManager {
         delete queued.routeSaveFailure;
         if (queued.routeOutcome || this.#onSettled) this.#commitArchive(path.join(this.#runRoot, queued.info.id), queued.terminal);
         // Recordless prelaunch sources are not worker runs. Persist their safe
-        // archived state before best-effort deletion, so a Windows sharing error
+        // archived state before best-effort retention, so a Windows sharing error
         // cannot make this committed source uncollectible on a later sweep.
         const directory = path.join(this.#runRoot, queued.info.id);
         if ((!fs.existsSync(path.join(directory, "status.json")) ||
             (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeRemovalVeto(directory)) {
           writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
-          try {
-            fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
-            fs.rmSync(directory, { recursive: true, force: true });
-          } catch { /* Its committed terminal state is collectible later. */ }
+          // Custody moves synchronously; a refusal keeps the committed source collectible later.
+          void this.#removeRunTree(directory, queued.info.id).catch(() => undefined);
         }
         queued.outcomeSaved = true;
         return true;
@@ -6151,7 +6149,7 @@ export class AgentManager {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
             if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
-                !fs.existsSync(path.join(directory, "status.json")) && !runTreeRemovalVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeRemovalVeto(directory)) await this.#removeRunTree(directory, result.id);
           }
           break;
         }

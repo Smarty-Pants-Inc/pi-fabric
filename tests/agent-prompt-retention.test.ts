@@ -51,7 +51,7 @@ const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, expl
   return { root, tempRoot, manager };
 };
 
-// Queued rollback bypasses removeTree. Keep this narrow fence registered through
+// Detect any regression to queued rollback bypassing whole-root custody. Keep this narrow fence registered through
 // afterEach's manager.close even when an assertion fails; atomic temp-file cleanup
 // still passes through, and fixture cleanup runs only after mocks are restored.
 const recordQueuedRollback = (directory: string): void => {
@@ -417,7 +417,7 @@ describe("Agent prompt retention at manager close (#11663)", () => {
   });
 
   // A live worker closes with checked ESRCH and a retained pair. Never-admitted
-  // queued work has no task artifact: record its direct rollback, never invent one.
+  // queued work has no task artifact, but its whole run history must also survive.
   it("retains the stopped active prompt while closing queued admission without a launch", async () => {
     const { root, manager } = fixture({ maxConcurrent: 1 });
     const prompt = "HANG_WITH_PROGRESS\nactive close brief π\n";
@@ -450,7 +450,7 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       expectWholeRun(directory, files, inode);
       expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(prompt);
       expect(savedStatus(taskPath)).toMatchObject({ status: "stopped", promptSha256: hash(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
-      expect(queuedRollbackIntents).toEqual([path.join(queuedDirectory, "queued-result.json"), queuedDirectory]);
+      expect(queuedRollbackIntents).toEqual([]);
       expect(removalIntents).not.toContain(queuedDirectory);
       const heldQueued = heldRoot(queuedDirectory);
       expect(fs.existsSync(path.join(heldQueued, "task.txt"))).toBe(false);

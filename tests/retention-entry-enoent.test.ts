@@ -9,8 +9,39 @@ import { sweepMeshRetention } from "../src/storage/retention-cli.js";
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const roots: string[] = [];
+let shuffleSeedLogged = false;
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); };
+const shuffleResidentRuns = (runsRoot: string, seedText: string) => {
+  if (!shuffleSeedLogged) {
+    process.stderr.write(`[retention-entry-enoent] opendirSync shuffle seed=${seedText}\n`);
+    shuffleSeedLogged = true;
+  }
+  const opendir = fs.opendirSync;
+  vi.spyOn(fs, "opendirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+    const directory = Reflect.apply(opendir, fs, [target, ...rest]) as fs.Dir;
+    if (String(target) !== runsRoot) return directory;
+    const entries: fs.Dirent[] = [];
+    let entry: fs.Dirent | null;
+    while ((entry = directory.readSync()) !== null) entries.push(entry);
+    directory.closeSync();
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+
+    let state = Number(seedText) >>> 0;
+    const random = () => {
+      state = (state + 0x6D2B79F5) >>> 0;
+      let value = Math.imul(state ^ (state >>> 15), 1 | state);
+      value ^= value + Math.imul(value ^ (value >>> 7), 61 | value);
+      return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+    };
+    for (let i = entries.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [entries[i], entries[j]] = [entries[j]!, entries[i]!];
+    }
+    let index = 0;
+    return { readSync: () => entries[index++] ?? null, closeSync: () => undefined } as unknown as fs.Dir;
+  }) as typeof fs.opendirSync);
+};
 const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
 const run = (directory: string, finishedAt: number) => {
   write(path.join(directory, "status.json"), JSON.stringify({ transport: "process", sessionId: "2147483647", status: "completed", finishedAt }));
@@ -32,10 +63,17 @@ const mesh = () => {
   const host = path.join(root, "residency", "host");
   write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
   write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:01a0cd9c-dead-session", residencyRoot: host, meshRoot: root }));
-  const old = run(path.join(host, "runs", "old"), NOW - 8 * DAY);
-  fs.utimesSync(old, (NOW - 8 * DAY) / 1_000, (NOW - 8 * DAY) / 1_000);
-  const orphan = run(path.join(host, "runs", "orphan"), NOW - 10 * DAY);
-  fs.utimesSync(orphan, (NOW - 10 * DAY) / 1_000, (NOW - 10 * DAY) / 1_000);
+  const createResidentCandidate = (name: "old" | "orphan", age: number) => {
+    const candidate = run(path.join(host, "runs", name), NOW - age);
+    fs.utimesSync(candidate, (NOW - age) / 1_000, (NOW - age) / 1_000);
+    return candidate;
+  };
+  const candidates = process.env.PI_FABRIC_RETENTION_RUN_ORDER === "reverse"
+    ? { orphan: createResidentCandidate("orphan", 10 * DAY), old: createResidentCandidate("old", 8 * DAY) }
+    : { old: createResidentCandidate("old", 8 * DAY), orphan: createResidentCandidate("orphan", 10 * DAY) };
+  const old = candidates.old, orphan = candidates.orphan;
+  const shuffleSeed = process.env.PI_FABRIC_RETENTION_OPENDIR_SHUFFLE_SEED;
+  if (shuffleSeed !== undefined) shuffleResidentRuns(path.join(host, "runs"), shuffleSeed);
   write(path.join(actors, "other", "actors.json"), JSON.stringify({ actors: [] }));
   const entry = path.join(actors, "s");
   fs.writeFileSync(entry, "not a registry");
@@ -111,7 +149,7 @@ const uncertain = (root: string) => ({ path: path.join(root, "actors"), reason: 
 const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
 const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
 
-describe("ENOENT-aware actors/ entry listing (#10635)", () => {
+describe.skipIf(process.platform !== "linux")("ENOENT-aware actors/ entry listing (#10635)", () => {
   it.each([1, 2])("plans eligible runs when actors/s is removed between readdir and lstat (listing %i)", async n => {
     const m = mesh();
     const listings = onListing(m.actors, { [n]: { after: () => fs.rmSync(m.entry) } });
@@ -223,4 +261,16 @@ describe("ENOENT-aware actors/ entry listing (#10635)", () => {
     expect(plan.removedRuns).toEqual(expect.arrayContaining([m.old, m.orphan]));
     expect(plan.skipped).not.toContainEqual(stopped(m.root));
   });
+});
+
+it.skipIf(process.platform === "linux")("preserves resident candidates and the actor latest reply on non-Linux platforms", async () => {
+  const m = mesh();
+  const latestReply = path.join(m.actors, "01a0cd9c-dead-session", "actor", "runs", "latest", "reply.json");
+  const plan = await sweep(m.root);
+  expect(plan.removedRuns).toEqual([]);
+  for (const directory of [m.old, m.orphan]) {
+    expect(fs.statSync(directory).isDirectory()).toBe(true);
+    expect(fs.readFileSync(path.join(directory, "reply.json"), "utf8")).toBe('{"text":"done"}');
+  }
+  expect(fs.readFileSync(latestReply, "utf8")).toBe('{"text":"done"}');
 });

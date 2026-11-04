@@ -63,6 +63,54 @@ const addDeadResidentRun = (host: string, id: string) => {
   fs.utimesSync(candidate, (NOW - 2 * DAY) / 1000, (NOW - 2 * DAY) / 1000);
   return candidate;
 };
+const addDeadResidentCandidates = (host: string, rejectedId: string, controlId: string) => {
+  const candidates = [{ kind: "rejected", id: rejectedId }, { kind: "control", id: controlId }];
+  if (process.env.PI_FABRIC_RETENTION_RUN_ORDER === "reverse") candidates.reverse();
+  const paths = new Map(candidates.map(({ kind, id }) => [kind, addDeadResidentRun(host, id)]));
+  return { rejected: paths.get("rejected")!, control: paths.get("control")! };
+};
+let opendirShuffleSeedLogged = false;
+const shuffleResidentRunsDirectory = (runsRoot: string) => {
+  const seedText = process.env.PI_FABRIC_RETENTION_OPENDIR_SHUFFLE_SEED;
+  if (seedText === undefined) return;
+  const seed = Number(seedText);
+  if (!Number.isSafeInteger(seed) || seed < 0 || seed > 0xffff_ffff) {
+    throw new Error(`PI_FABRIC_RETENTION_OPENDIR_SHUFFLE_SEED must be a uint32; received ${JSON.stringify(seedText)}`);
+  }
+  // The fixed seed is logged once per test process so shuffled-order runs are reproducible from their output.
+  if (!opendirShuffleSeedLogged) {
+    process.stderr.write(`[mesh-retention-sweep] opendir shuffle seed=${seedText}\n`);
+    opendirShuffleSeedLogged = true;
+  }
+  const original = fs.opendirSync;
+  vi.spyOn(fs, "opendirSync").mockImplementation(((directory: fs.PathLike, ...args: unknown[]) => {
+    const opened = Reflect.apply(original, fs, [directory, ...args]) as fs.Dir;
+    if (directory !== runsRoot) return opened;
+    const entries: fs.Dirent[] = [];
+    let entry: fs.Dirent | null;
+    while ((entry = opened.readSync()) !== null) entries.push(entry);
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    let state = seed >>> 0;
+    const random = () => {
+      let value = (state += 0x6d2b79f5);
+      value = Math.imul(value ^ (value >>> 15), value | 1);
+      value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+      return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+    };
+    for (let index = entries.length - 1; index > 0; index--) {
+      const swap = Math.floor(random() * (index + 1));
+      [entries[index], entries[swap]] = [entries[swap]!, entries[index]!];
+    }
+    let index = 0;
+    return new Proxy(opened, {
+      get(target, property) {
+        if (property === "readSync") return () => entries[index++] ?? null;
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }) as typeof fs.opendirSync);
+};
 const residentTreeHash = (root: string): string => {
   const hash = createHash("sha256");
   const visit = (directory: string, prefix = "") => {
@@ -102,10 +150,10 @@ describe("mesh-wide age-based run retention", () => {
     expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toHaveLength(3);
   });
 
-  it("keeps an expired dead-resident run with an unknown root identity out of the plan", async () => {
+  it.skipIf(process.platform !== "linux")("keeps an expired dead-resident run with an unknown root identity out of the plan", async () => {
     const { mesh, host } = deadResidentRoot(deadRootMesh());
-    const rejected = addDeadResidentRun(host, "unknown-root-identity");
-    const valid = addDeadResidentRun(host, "eligible-control");
+    const { rejected, control: valid } = addDeadResidentCandidates(host, "unknown-root-identity", "eligible-control");
+    shuffleResidentRunsDirectory(path.join(host, "runs"));
     write(path.join(rejected, "status.json"), JSON.stringify({
       transport: "process", status: "completed", finishedAt: NOW - 2 * DAY,
     }));
@@ -119,10 +167,10 @@ describe("mesh-wide age-based run retention", () => {
     expect(residentTreeHash(rejected)).toBe(hash);
   });
 
-  it("keeps an expired dead-resident run with running status out of the plan", async () => {
+  it.skipIf(process.platform !== "linux")("keeps an expired dead-resident run with running status out of the plan", async () => {
     const { mesh, host } = deadResidentRoot(deadRootMesh());
-    const rejected = addDeadResidentRun(host, "running-status");
-    const valid = addDeadResidentRun(host, "eligible-control");
+    const { rejected, control: valid } = addDeadResidentCandidates(host, "running-status", "eligible-control");
+    shuffleResidentRunsDirectory(path.join(host, "runs"));
     // Match the eligible record's age and exited worker identity; running status is the only changed fence.
     const status = JSON.parse(fs.readFileSync(path.join(valid, "status.json"), "utf8")) as Record<string, unknown>;
     status.status = "running";
@@ -137,10 +185,10 @@ describe("mesh-wide age-based run retention", () => {
     expect(residentTreeHash(rejected)).toBe(hash);
   });
 
-  it("keeps an expired dead-resident run with an unfamiliar entry out of the plan", async () => {
+  it.skipIf(process.platform !== "linux")("keeps an expired dead-resident run with an unfamiliar entry out of the plan", async () => {
     const { mesh, host } = deadResidentRoot(deadRootMesh());
-    const rejected = addDeadResidentRun(host, "unfamiliar-entry");
-    const valid = addDeadResidentRun(host, "eligible-control");
+    const { rejected, control: valid } = addDeadResidentCandidates(host, "unfamiliar-entry", "eligible-control");
+    shuffleResidentRunsDirectory(path.join(host, "runs"));
     write(path.join(rejected, "surprise.bin"), "x".repeat(1000));
     fs.utimesSync(rejected, (NOW - 2 * DAY) / 1_000, (NOW - 2 * DAY) / 1_000);
     const hash = residentTreeHash(rejected);
@@ -192,6 +240,19 @@ describe("mesh-wide age-based run retention", () => {
       expect(fs.existsSync(kept)).toBe(true);
     }
     expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toHaveLength(3);
+  });
+
+  it.skipIf(process.platform === "linux")("keeps actor and resident runs intact when the non-Linux dry-run cannot prove candidates safe", async () => {
+    const { mesh, resident } = deadResidentMesh();
+    const actorRuns = [mesh.old, mesh.latest, mesh.young, mesh.inflight, mesh.orphan];
+    const plan = await sweepMeshRetention(mesh.root, {
+      now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY,
+    });
+    expect(plan.removedRuns).toEqual([]);
+    for (const kept of [...actorRuns, resident]) {
+      expect(fs.existsSync(kept)).toBe(true);
+      expect(fs.readFileSync(path.join(kept, "reply.json"), "utf8")).toBe('{"text":"done"}');
+    }
   });
 
   // pi-fabric#645 review round 1: the final pre-delete check re-reads every registry's in-flight runs.

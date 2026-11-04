@@ -31,7 +31,8 @@ const pidAlive = (name: string): boolean => {
  * head is woken when .lock is released. The holder keeps its receipt until it releases, so the
  * receipt order is the admission order. An ordinary waiter falls back to the plain contest after
  * 80% of its budget only when the head has stopped making progress (its receipt heartbeat is
- * older than the stall bound), so live queued waiters do not barge the head. Old releases ignore
+ * older than the stall bound), or early while the configured canonical .lock is absent. Live
+ * progressing queued waiters are not barged. Old releases ignore
  * this queue and still barge. The caller's acquisition deadline is never extended, and a live
  * lock is never removed.
  */
@@ -70,8 +71,9 @@ export class MeshLockTicket {
    * A `.lock` holder keeps its receipt through its critical section, so a long hold would look stalled.
    * `stalledHeadBypassLock` (smarty-dev#9805): the canonical `.lock` directory path. Only the waiter directly behind
    * the head may reap its receipt early, once its own observation of the head's name and mtime is older than the stall
-   * bound and that path is absent. Reaping makes the follower the new FIFO head; a resumed head sees its missing ticket
-   * and falls back to the plain contest, while mkdir/rename stays the only exclusion fence. */
+   * bound and that path is absent. Any waiter may also use the existing stalled-head plain-contest escape early while
+   * that path is absent, so a parked follower cannot block ready waiters. Reaping makes the follower the new FIFO head;
+   * a resumed head sees its missing ticket and falls back to the plain contest. mkdir/rename stays the exclusion fence. */
   constructor(root: string, token: string, budgetMs: number,
     options: { passStalledHead?: boolean; stalledHeadBypassLock?: string } = {}) {
     this.#directory = meshLockQueueDirectory(root);
@@ -105,8 +107,8 @@ export class MeshLockTicket {
 
   /** True when this waiter may probe .lock: it is the head, or admission is closed/fell back.
    * Non-heads stat only their predecessor's receipt (never .lock/owner) and list the queue only
-   * when that receipt goes, or once past the fallback point (with `passStalledHead`, at most once
-   * per heartbeat interval at any time) to judge the head's progress. */
+   * when that receipt goes, or once past the fallback point (with `passStalledHead` or an absent configured canonical
+   * lock, at most once per heartbeat interval at any time) to judge the head's progress. */
   mayContend(): boolean {
     if (this.#closed) return true;
     // Short (try) budgets keep the previous unconditional 80% fallback, head included.
@@ -178,7 +180,8 @@ export class MeshLockTicket {
     return false;
   }
 
-  /** Past 80% of an ordinary budget (with `passStalledHead`, at any time), join the plain contest only if the head is
+  /** Past 80% of an ordinary budget (with `passStalledHead` or an absent configured canonical lock, at any time),
+   * join the plain contest only if the head is
    * stalled: neither its heartbeat nor our first sight of it as head is within the stall bound. The second term
    * keeps a head that has only just taken over from being judged by its old creation time. Returns undefined when the
    * canonical-lock follower reaped its stalled head and the caller must rescan. */
@@ -188,7 +191,8 @@ export class MeshLockTicket {
     if (now < this.#fallbackAt) {
       // smarty-dev#10516: a stalled head otherwise holds every waiter to 80% of its budget, and most then time out in
       // the last 20%. One queue listing per heartbeat interval at most, not one per poll.
-      if (!this.#passStalledHead || now - this.#headCheckedAt < HEARTBEAT_MS) return false;
+      if ((!this.#passStalledHead && (this.#bypassLock === undefined || !this.#canonicalLockAbsent())) ||
+        now - this.#headCheckedAt < HEARTBEAT_MS) return false;
       this.#headCheckedAt = now;
     }
     const head = fs.readdirSync(this.#directory).filter(name => TICKET.test(name)).sort()[0];
@@ -201,6 +205,8 @@ export class MeshLockTicket {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
     }
+    // Recheck at early admission too: a holder may have appeared while we judged the head's heartbeat.
+    if (now < this.#fallbackAt && !this.#canonicalLockAbsent()) return false;
     this.close();
     return true;
   }

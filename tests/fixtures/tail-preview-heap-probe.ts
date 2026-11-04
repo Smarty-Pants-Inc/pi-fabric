@@ -135,23 +135,21 @@ await sample("classifier-reason-and-evidence", async index => {
 }, false, 8 * 1024 * 1024);
 await sample("compaction-alarm-fields", async index => {
   const handlers = new Map<string, (event: unknown, context: ExtensionContext) => unknown>();
-  let retry: { onError?: (error: Error) => void } | undefined;
   let data: Record<string, unknown> | undefined;
-  const context = { hasUI: false, isIdle: () => true, sessionManager: { getSessionId: () => "probe" },
-    getContextUsage: () => undefined, compact: (options: typeof retry) => { retry = options; } } as unknown as ExtensionContext;
+  const context = { hasUI: false, isIdle: () => false, sessionManager: { getSessionId: () => "probe" },
+    getContextUsage: () => undefined, compact: () => assert.fail("Fabric must not retry native compaction") } as unknown as ExtensionContext;
   registerCompactionRecovery({ on: (name: string, fn: (event: unknown, ctx: ExtensionContext) => unknown) => handlers.set(name, fn) } as unknown as ExtensionAPI,
-    { enabled: () => true, alarm: async value => { data = value; } });
+    { enabled: () => true, alarm: async value => { data = value; },
+      retryEnded: () => assert.fail("A failure alarm must not signal recovery") });
   await handlers.get("session_compact_failed")!({ reason: "threshold", errorMessage: large(index) }, context);
-  // This is the existing event-driven deferred retry, not a new polling loop.
-  await new Promise(resolve => setTimeout(resolve, 1));
-  assert.ok(retry?.onError);
-  retry.onError(new Error(large(index)));
-  await handlers.get("session_shutdown")!({}, context); // release the intentionally full incident
-  return data!;
+  await handlers.get("session_shutdown")!({}, context);
+  return { data: data!, expected: String.fromCharCode(97 + index % 26) };
 }, value => {
-  assert.equal((value.error as string).length, 4000);
-  assert.equal((value.firstError as string).length, 4000);
-  assert.equal(value.attempts, 2);
+  assert.equal((value.data.error as string).length, 4000);
+  assert.equal(value.data.error, value.expected.repeat(4000));
+  assert.equal(value.data.fabricAttempts, 0);
+  assert.equal(value.data.firstError, undefined);
+  assert.equal(value.data.attempts, undefined);
 });
 console.log(JSON.stringify({ size: SIZE, count: COUNT, limit: LIMIT, controlMin: CONTROL_MIN, samples }));
 for (const sample of samples) {

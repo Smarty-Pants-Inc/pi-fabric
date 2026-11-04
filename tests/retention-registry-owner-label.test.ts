@@ -48,21 +48,24 @@ const fixture = () => {
     id: "actor", status: "idle", lastRunId: "latest", sessionFile: path.join(actor, "session.jsonl"),
   }] }));
   write(path.join(actor, "session.jsonl"), "live");
-  const runs = ["old", "latest"].map(id => {
-    const run = path.join(actor, "runs", id);
-    write(path.join(run, "status.json"), JSON.stringify({
-      transport: "process", sessionId: "2147483647", status: "completed", finishedAt: NOW - 9 * DAY,
-    }));
-    write(path.join(run, "events.jsonl"), '{"sequence":1}\n');
-    write(path.join(run, "reply.json"), '{"text":"done"}');
-    return run;
-  });
+  const host = path.join(root, "residency", "host");
+  write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
+  write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:owner-label", residencyRoot: host, meshRoot: root }));
+  const old = path.join(host, "runs", "old");
+  write(path.join(old, "status.json"), JSON.stringify({ transport: "process", sessionId: "2147483647", status: "completed", finishedAt: NOW - 9 * DAY }));
+  write(path.join(old, "events.jsonl"), '{"sequence":1}\n');
+  write(path.join(old, "reply.json"), '{"text":"done"}');
+  fs.utimesSync(old, (NOW - 9 * DAY) / 1_000, (NOW - 9 * DAY) / 1_000);
+  const latest = path.join(actor, "runs", "latest");
+  write(path.join(latest, "status.json"), JSON.stringify({ transport: "process", sessionId: "2147483647", status: "completed", finishedAt: NOW - 9 * DAY }));
+  write(path.join(latest, "events.jsonl"), '{"sequence":1}\n');
+  write(path.join(latest, "reply.json"), '{"text":"done"}');
   const lock = path.join(actors, "actors.json.lock");
-  return { root, actors, lock, owner: path.join(lock, "owner"), old: runs[0]!, latest: runs[1]! };
+  return { root, actors, lock, owner: path.join(lock, "owner"), old, latest };
 };
 type Fixture = ReturnType<typeof fixture>;
 const owner = (m: Fixture, record: string) => write(m.owner, record);
-const sweep = (m: Fixture) => sweepMeshRetention(m.root, { dryRun: true, now: NOW, runRetentionMs: 7 * DAY });
+const sweep = (m: Fixture) => sweepMeshRetention(m.root, { dryRun: true, now: NOW, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
 const unchanged = (m: Fixture) => {
   for (const run of [m.old, m.latest]) expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"done"}');
 };

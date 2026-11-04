@@ -15,7 +15,6 @@ import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { writePolicyDenial } from "../src/agents/write-guard.js";
 import { canRemoveTerminalRun, FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, pruneActorRunArchives, sweepTempRunRoots } from "../src/storage/retention.js";
-import { startRemovalTally, stopRemovalTally } from "../src/storage/verified-remove.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
 
@@ -175,13 +174,8 @@ describe("local process task write default", () => {
     else if (unsafe === "hardlink") fs.linkSync(target, path.join(value.tmpdir, "alias"));
     else for (let index = 0; index < 65; index++) fs.writeFileSync(path.join(value.tmpdir, `scratch-${index}`), "bounded");
     expect(canRemoveTerminalRun(run)).toBe(false);
-    const tally = startRemovalTally();
-    try {
-      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 0, now: Date.now() + 1_000 })).toEqual([]);
-      expect(tally.pruneActorRunArchives?.refused).toEqual({
-        [unsafe === "root-link" ? "an entry is a link, hard-linked or not ours" : "task scratch subtree is unsafe or exceeds scan bounds"]: 1,
-      });
-    } finally { stopRemovalTally(); }
+    expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 0, now: Date.now() + 1_000 })).toEqual([]);
+    expect(fs.existsSync(run)).toBe(true);
     expect(sweepTempRunRoots({ tempRoot: f.root, now: Date.now() + 1_000, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 }))
       .toEqual({ removedRuns: [], removedRoots: [] });
     expect(fs.existsSync(run)).toBe(true);

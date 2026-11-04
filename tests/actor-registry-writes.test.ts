@@ -40,6 +40,29 @@ function setup(records: Record<string, unknown>[] = [], actorQueueLimit = DEFAUL
 }
 
 describe("actor registry lazy/status writes (#3752, #4383)", () => {
+  it("#18491: registry rows and actor listings retain resolved model overrides separately from project defaults", async () => {
+    const f = setup();
+    const actor = await f.manager.create({ name: "binding-snapshot", instructions: "Review.", model: "test/project", thinking: "low" });
+    await f.manager.setModel(actor.id, "test/live-override", "session", undefined, "Saved explicit binding #18491");
+    await f.manager.setThinking(actor.id, "high", "session");
+    const resolvedBinding = { model: "test/live-override", thinking: "high", modelReason: "Saved explicit binding #18491" };
+    const saved = f.store.records().find(row => row.id === actor.id)!;
+    expect(saved.resolvedBinding).toMatchObject(resolvedBinding);
+    expect(saved.projectDefaults).toEqual({ model: "test/project", thinking: "low" });
+    // Legacy top-level fields remain downgrade-compatible defaults, now explicitly labelled too.
+    expect(saved.model).toBe("test/project");
+    for (const listing of [f.manager.list(), f.manager.listOwned(), f.manager.listOwned(true)]) {
+      expect(listing.find(row => row.id === actor.id)).toMatchObject({ ...resolvedBinding, resolvedBinding,
+        projectDefaults: { model: "test/project", thinking: "low" } });
+    }
+    const created = await f.manager.create({ name: "creation-override", instructions: "Review.", model: "test/creation", thinking: "high",
+      modelReason: "Creation override #18491" });
+    expect(f.store.records().find(row => row.id === created.id)?.resolvedBinding)
+      .toMatchObject({ model: "test/creation", thinking: "high", modelReason: "Creation override #18491" });
+    expect(f.manager.listOwned(true).find(row => row.id === created.id))
+      .toMatchObject({ model: "test/creation", thinking: "high", modelReason: "Creation override #18491" });
+  });
+
   it("restarts over external instructions/history and saves hydrated owned rows on Windows", async () => {
     const f = setup();
     const instructions = "Review. ".repeat(2_500);

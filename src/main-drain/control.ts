@@ -1,12 +1,14 @@
-import fs from "node:fs";
-import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, procStartTime, provePodCaller, proveHostBinding, sameOperation,
+import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, procWorkerExited, provePodCaller, proveHostBinding, sameOperation,
   type MainDrainBinding, type MainDrainBindingRequest } from "./binding.js";
 import { assertMainInboxOpen, closeMainInbox, mainInboxDrainGate, reopenMainInbox } from "./gate.js";
 import { fenceNativeInput, nativeFenceHeld, observeNativeInput, releaseNativeInput, type NativeInputObservation } from "./native-port.js";
 import { drainSlot, peekDrainSlot } from "./slot.js";
 import type { MainDrainActorRow, MainDrainIngressProbe, MainDrainOp, MainDrainReply } from "./protocol.js";
+import type { FabricActorRequest } from "../actors/types.js";
+import type { FabricThinking } from "../thinking.js";
+import { actorLiveBinding, actorRestoreRequest, assertCutoverRestore, readDrainActors, sameActorConfiguration, sameActorSpec,
+  saveDrainActor, type DrainActorSpec } from "./actor-restore.js";
 
 /** What the drain control needs from the live Main runtime. Getters: a reload replaces each one. */
 export interface MainDrainHost {
@@ -36,7 +38,11 @@ export interface MainDrainActors {
   listOwned(): ReadonlyArray<{ id: string; name: string; status: string; rootId?: string; residency?: string }>;
   drainQuiescence(id: string): string[];
   drainWorker(id: string): { runId: string; pid: number; startTime: string | undefined } | null | undefined;
-  stop(id: string, beforeCommit: undefined, wait: boolean, path: "actors.stop", options: { explicit: true }): Promise<unknown>;
+  stop(id: string, beforeCommit: ((id: string) => void) | undefined, wait: boolean, path: "actors.stop", options: { explicit: true }): Promise<unknown>;
+  drainSpec?(id: string): Record<string, unknown>;
+  create?(request: FabricActorRequest): Promise<{ id: string }>;
+  setModel?(id: string, model: string | undefined, scope: "session", beforeCommit: undefined, modelReason?: string): Promise<unknown>;
+  setThinking?(id: string, thinking: FabricThinking | undefined, scope: "session"): Promise<unknown>;
 }
 export interface MainDrainAgents {
   list(): ReadonlyArray<{ id: string; status: string }>;
@@ -109,9 +115,11 @@ export const probeIngress = (rootId: string, native: NativeInputObservation, mai
  * - stop-actors (bound; r2 N2): the LAST act. With the fence held and all else 0, and only if EVERY
  *   session actor is quiesced, owner-stop them all (wait=true; B3), recording each one's public spec.
  * - undo (same run, operationId AND generation, r2 N6 ii; = release): release the fence through the
- *   kept handle, reopen the gate, clear the record. The reply's probes are the canary. Only a LOST
- *   handle means restart required. Actors this operation stopped are not recreated here (stage 1): the
- *   undo reports actorsRestored:false, which the seam folds into admissionRestored.
+ *   kept handle, reopen the gate, recreate saved actors through the ordinary owner create path, then
+ *   clear the binding only after exact spec/live-binding readback. The reply's probes are the canary.
+ * - restore-actors: after activation, the new Main performs the same recreation from the RUN's saved
+ *   rows without lifting a fence. Kubernetes drain pattern: cordon, evict within the quiescence budget,
+ *   wait for termination with grace, uncordon on failure. Durable actors are the disruption budget.
  * - exit (pod binding, §1.13): when fully drained, accept a clean Main exit.
  * - status, probe: observe only. Durable actors are reported, never stopped.
  */
@@ -122,8 +130,9 @@ export class MainDrainControl {
   /** Authorize, then run one op. Returns a refusal code instead of throwing. */
   async handle(op: MainDrainOp, request: MainDrainBindingRequest | null, peer: MainDrainPeer | undefined, uid: number): Promise<MainDrainReply | string> {
     const { rootId } = this.host;
-    if (op === "drain" || op === "stop-actors" || op === "undo" || op === "exit") {
+    if (op === "drain" || op === "stop-actors" || op === "undo" || op === "restore-actors" || op === "exit") {
       if (!request) return "BINDING_REQUIRED";
+      if ((op === "restore-actors") !== (request.phase === "drain-restore")) return "PHASE_MISMATCH";
       // An accepted exit is final: no undo can reopen admission in the shutdown grace, which would admit
       // input that the shutdown then cuts off after the exit reply already claimed the fence held.
       if (peekDrainSlot(rootId)?.exitingAt !== undefined) return "EXITING";
@@ -149,14 +158,21 @@ export class MainDrainControl {
         // Only the SAME operation, holding the SAME lock, may act on a standing record: another operation's fence is UNKNOWN.
         const existing: MainDrainBinding | undefined = currentBinding(rootId);
         if (existing && !sameOperation(existing, request, kind, lock)) return "DRAIN_BOUND_ELSEWHERE";
-        if (op !== "undo" && !existing) return "NOT_BOUND";
+        if (op !== "undo" && op !== "restore-actors" && !existing) return "NOT_BOUND";
+        if (op === "restore-actors" && (kind !== "host" || existing || mainInboxDrainGate(rootId) || nativeFenceHeld(rootId) ||
+          observeNativeInput(this.host.pi, this.host.context(), rootId).piInputsFenced !== false)) return "RESTORE_REQUIRES_NEW_MAIN";
       }
     }
     let undo: MainDrainReply["undo"] = null;
     let stopRefused: string | null = null;
     if (op === "drain") await this.#drain();
-    if (op === "stop-actors") stopRefused = await this.#stopActors();
-    if (op === "undo") undo = this.#undo();
+    if (op === "stop-actors") stopRefused = await this.#stopActors(request!);
+    if (op === "undo") undo = await this.#undo(request!);
+    if (op === "restore-actors") {
+      try { assertCutoverRestore(request!, rootId); } catch { return "RESTORE_NOT_AUTHORIZED"; }
+      const actorsRestored = await this.#restoreActors(request!);
+      undo = { fenceReleased: false, inboxReopened: mainInboxDrainGate(rootId) === undefined, restartRequired: false, actorsRestored };
+    }
     const reply = this.#reply(op, undo);
     reply.stopRefused = stopRefused;
     if (op === "exit") {
@@ -179,6 +195,7 @@ export class MainDrainControl {
   /** The first bind: record the drain's own children (r2 N1) and start a fresh ledger (N8). */
   #begin(): void {
     const slot = drainSlot(this.host.rootId);
+    slot.stopped = []; slot.stopAttempted = []; slot.restored = [];
     slot.children = { runIds: new Set((this.#agentRuns() ?? []).map(run => run.id)), actorIds: new Set(this.#liveSessionActorIds()) };
   }
 
@@ -198,8 +215,9 @@ export class MainDrainControl {
       native.fenceApi && native.drained === true && native.idle === true;
   }
 
-  async #stopActors(): Promise<string | null> {
+  async #stopActors(request: MainDrainBindingRequest): Promise<string | null> {
     const { rootId } = this.host;
+    if (peekDrainSlot(rootId)?.pendingStop) return "ACTOR_STOP_PENDING";
     const native = observeNativeInput(this.host.pi, this.host.context(), rootId);
     if (!native.inputsFenced) return "NOT_FENCED";
     if (!this.#allElseDrained()) return "NOT_DRAINED";
@@ -211,21 +229,39 @@ export class MainDrainControl {
     // All or none: one actor that is not quiesced stops nothing (r2 N2, N9).
     if (live.some(actor => actor.quiescence === null || actor.quiescence.length > 0)) return "ACTORS_NOT_QUIESCED";
     const slot = drainSlot(rootId);
-    const specs = new Map(actors.listOwned().map(actor => [actor.id, actor as unknown as Record<string, unknown>]));
+    // Never stop something we cannot recreate. Save ALL complete rows + resolved live pins before the first effect.
+    if (live.length && (!actors.create || !actors.drainSpec)) return "ACTORS_UNRESTORABLE";
+    const specs = new Map<string, Record<string, unknown>>();
+    try {
+      for (const actor of live) {
+        const spec = actors.drainSpec!(actor.id);
+        actorRestoreRequest(spec);
+        const binding = actorLiveBinding(spec);
+        if (spec.rootId !== rootId || ((binding.model !== spec.model || binding.modelReason !== spec.modelReason) && !actors.setModel) ||
+          (binding.thinking !== spec.thinking && !actors.setThinking)) return "ACTORS_UNRESTORABLE";
+        saveDrainActor(request, rootId, { id: actor.id, spec, stoppedAt: Date.now() });
+        specs.set(actor.id, spec);
+      }
+    } catch { return "ACTORS_UNRESTORABLE"; }
     for (const actor of live) {
       // Re-check the predicate at the moment of the stop: a quiesced actor has nothing to drop.
       let reasons: string[];
       try { reasons = actors.drainQuiescence(actor.id); } catch { return "ACTORS_UNKNOWN"; }
       if (reasons.length) return "ACTORS_NOT_QUIESCED";
       // Attempted first (an undo must find it active again, stopped or not); stopped only once proven (#1607 P1).
-      const entry = { id: actor.id, spec: structuredClone(specs.get(actor.id) ?? { id: actor.id }), stoppedAt: Date.now() };
+      const entry = { id: actor.id, spec: structuredClone(specs.get(actor.id)!), stoppedAt: Date.now() };
       if (!(slot.stopAttempted ??= []).some(known => known.id === actor.id)) slot.stopAttempted.push(entry);
       slot.children?.actorIds.delete(actor.id);
       const wait = this.host.stopWaitMs ?? STOP_WAIT_MS;
       const deadline = Date.now() + wait;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      const pending = actors.stop(actor.id, () => {
+        if (actors.drainQuiescence(actor.id).length) throw new Error("ACTORS_NOT_QUIESCED");
+      }, true, "actors.stop", { explicit: true });
+      slot.pendingStop = pending;
+      void pending.finally(() => { if (slot.pendingStop === pending) delete slot.pendingStop; }).catch(() => undefined);
       const outcome = await Promise.race([
-        actors.stop(actor.id, undefined, true, "actors.stop", { explicit: true }).then(() => "stopped" as const, () => "failed" as const),
+        pending.then(() => "stopped" as const, () => "failed" as const),
         new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), wait); }),
       ]);
       if (timer) clearTimeout(timer);
@@ -250,8 +286,7 @@ export class MainDrainControl {
       try { worker = this.host.actors()?.drainWorker(id); } catch { worker = undefined; }
       if (worker === null) return true;
       if (worker !== undefined && worker.startTime !== undefined) {
-        const now = procStartTime(worker.pid, procRoot);
-        if (now !== undefined ? now !== worker.startTime : !fs.existsSync(path.join(procRoot, String(worker.pid)))) return true;
+        if (procWorkerExited(worker.pid, worker.startTime, procRoot) === true) return true;
       }
       if (Date.now() >= deadline) return false;
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -273,23 +308,67 @@ export class MainDrainControl {
     if (this.#allElseDrained()) await fenceNativeInput(this.host.pi, this.host.context(), rootId);
   }
 
-  #undo(): NonNullable<MainDrainReply["undo"]> {
+  async #undo(request: MainDrainBindingRequest): Promise<NonNullable<MainDrainReply["undo"]>> {
     const { rootId } = this.host;
     const held = nativeFenceHeld(rootId);
     releaseNativeInput(rootId);
     const inboxReopened = reopenMainInbox(rootId) || mainInboxDrainGate(rootId) === undefined;
-    clearBinding(rootId);
     // The process-global handle survives a reload, and Pi's original release() still reopens its fence.
     // Only a LOST handle (Pi still fenced, nothing held here) needs a restart.
     const native = observeNativeInput(this.host.pi, this.host.context(), rootId);
     // A fence-capable host must READ open (a missing context or unreadable state is unknown, never open).
     const restartRequired = native.capability && !(native.fenceApi && native.piInputsFenced === false);
-    // Stage 1 does not recreate a stopped actor: every one this operation stopped must be active again.
-    const owned = this.#owned();
-    const slot = peekDrainSlot(rootId);
-    const stopped = [...(slot?.stopAttempted ?? []), ...(slot?.stopped ?? [])];
-    const actorsRestored = owned !== undefined && stopped.every(entry => owned.some(actor => actor.id === entry.id && actor.status !== "stopped"));
+    const actorsRestored = await this.#restoreActors(request);
+    if (actorsRestored) clearBinding(rootId);
     return { fenceReleased: held && !restartRequired, inboxReopened, restartRequired, actorsRestored };
+  }
+
+  /** Re-create, never revive an explicitly stopped actor or copy its authority around the owner path. */
+  async #restoreActors(request: MainDrainBindingRequest): Promise<boolean> {
+    const slot = drainSlot(this.host.rootId);
+    // A timed-out stop may still commit. Never report an actor restored ahead of that late stop.
+    if (slot.pendingStop) return false;
+    let saved: DrainActorSpec[];
+    try {
+      saved = [...new Map([...readDrainActors(request, this.host.rootId), ...(slot.stopAttempted ?? []),
+        ...(slot.stopped ?? [])].map(entry => [entry.id, entry])).values()];
+    } catch { return false; }
+    if (!saved.length) return true;
+    const actors = this.host.actors();
+    if (!actors) return false;
+    let restored = true;
+    for (const entry of saved) {
+      try {
+        const rows = actors.listOwned().filter(row => row.rootId === this.host.rootId);
+        let active = rows.find(row => row.id === entry.id && row.status !== "stopped") ??
+          rows.find(row => row.name === entry.spec.name && row.status !== "stopped");
+        if (!actors.drainSpec || !actors.create) throw new Error("ACTORS_UNRESTORABLE");
+        if (active && !sameActorConfiguration(entry.spec, actors.drainSpec(active.id))) throw new Error("ACTOR_SPEC_CONFLICT");
+        if (!active) {
+          const original = rows.find(row => row.id === entry.id);
+          if (!original || original.status !== "stopped" || (request.phase !== "drain-restore" &&
+            !(await this.#workerGone(entry.id, Date.now())))) throw new Error("ACTOR_STOP_UNPROVEN");
+          const created = await actors.create(actorRestoreRequest(entry.spec));
+          active = actors.listOwned().find(row => row.id === created.id && row.rootId === this.host.rootId && row.status !== "stopped");
+          if (!active) throw new Error("ACTOR_CREATE_UNPROVEN");
+        }
+        const binding = actorLiveBinding(entry.spec);
+        const current = actorLiveBinding(actors.drainSpec(active.id));
+        if (binding.model !== current.model || binding.modelReason !== current.modelReason) {
+          if (!actors.setModel) throw new Error("ACTOR_BINDING_UNRESTORABLE");
+          await actors.setModel(active.id, binding.model, "session", undefined, binding.modelReason);
+        }
+        if (binding.thinking !== current.thinking) {
+          if (!actors.setThinking) throw new Error("ACTOR_BINDING_UNRESTORABLE");
+          await actors.setThinking(active.id, binding.thinking, "session");
+        }
+        if (!sameActorSpec(entry.spec, actors.drainSpec(active.id))) throw new Error("ACTOR_RESTORE_MISMATCH");
+        const result = { id: entry.id, restoredId: active.id };
+        slot.restored ??= [];
+        if (!slot.restored.some(row => row.id === entry.id)) slot.restored.push(result);
+      } catch { restored = false; }
+    }
+    return restored;
   }
 
   #mainSnapshot(): ReturnType<MainDrainMain["drainSnapshot"]> | undefined {
@@ -321,7 +400,8 @@ export class MainDrainControl {
           worker = record === null ? null : record === undefined ? "unknown" : { runId: record.runId, pid: record.pid, startTime: record.startTime ?? null };
         } catch { worker = "unknown"; }
         const disposition = kind === "durable" ? "durable-blocks-drain" : kind === "unknown" ? "unknown-residency"
-          : actor.status === "stopped" ? "stopped-for-good" : quiescence === null ? "unknown-quiescence"
+          : actor.status === "stopped" ? peekDrainSlot(this.host.rootId)?.stopAttempted?.some(row => row.id === actor.id)
+            ? "stopped-awaiting-restore" : "stopped-for-good" : quiescence === null ? "unknown-quiescence"
             : quiescence.length ? `waiting:${quiescence.join(",")}` : "quiesced";
         return { id: actor.id, name: actor.name, status: actor.status, residency: kind, quiescence, worker, disposition };
       });
@@ -375,7 +455,7 @@ export class MainDrainControl {
       admitted: [...(peekDrainSlot(rootId)?.admitted ?? [])], ledger: [...(peekDrainSlot(rootId)?.ledger ?? [])],
       ledgerOverflow: peekDrainSlot(rootId)?.ledgerOverflow ?? 0,
       stopped: [...(peekDrainSlot(rootId)?.stopped ?? [])], stopAttempted: [...(peekDrainSlot(rootId)?.stopAttempted ?? [])], stopRefused: null,
-      undo, exiting: false, exitRefused: [],
+      restored: [...(peekDrainSlot(rootId)?.restored ?? [])], undo, exiting: false, exitRefused: [],
     };
   }
 

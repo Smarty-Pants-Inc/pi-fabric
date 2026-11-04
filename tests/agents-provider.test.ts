@@ -5311,7 +5311,7 @@ describe("AgentsProvider retained run authorization", () => {
 });
 
 describe("AgentsProvider shared actor definitions", () => {
-  it.each([false, true])("round 2 members keeps a legacy binding unknown under a diverging overlay with project defaults=%s (#7682, #8487)", async hasDefaults => {
+  it.each([false, true])("round 2 members publishes the owner's admitted idle binding with project defaults=%s (#7682, #8487, #18491)", async hasDefaults => {
     const state = setup();
     const actor = await state.actors.create({ name: "legacy-member", instructions: "Observe.",
       ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
@@ -5339,11 +5339,13 @@ describe("AgentsProvider shared actor definitions", () => {
       const members = await provider.invoke("members", { kinds: ["actor"] }, context) as FabricParticipantInfo[];
       expect(members).toHaveLength(1);
       expect(members[0]?.id).toBe(actor.id);
-      // The owner's overlay now differs from the row's persisted model/thinking, so a run
-      // would not pin them: unknown (pi-fabric#843), and never the overlay itself.
-      expect(members[0]?.model).toBeUndefined();
-      expect(members[0]?.thinking).toBeUndefined();
-      expect(reader.status(actor.id)).toMatchObject({ model: "provider/reader-overlay", thinking: "high" });
+      // The owning manager's setters admit and persist the idle live binding (#18491).
+      // Shared members report that binding, while the project-default layer stays unchanged.
+      expect(members[0]).toMatchObject({ model: "provider/reader-overlay", thinking: "high" });
+      expect(reader.status(actor.id)).toMatchObject({ model: "provider/reader-overlay", thinking: "high",
+        resolvedBinding: { model: "provider/reader-overlay", thinking: "high" },
+        projectDefaults: { scope: "project", ...(hasDefaults ? { model: "provider/project", thinking: "medium" } : {}) } });
+      expect(state.agents.list()).toHaveLength(0);
     } finally { await directory.close(); }
   });
 

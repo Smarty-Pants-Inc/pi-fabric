@@ -186,7 +186,7 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
     seat.actors.stop = async () => { throw new Error("synthetic stop failure"); };
     fs.mkdirSync(path.join(seat.meshRoot, "actors", SID), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(seat.meshRoot, "actors", SID, "actors.json"), JSON.stringify({ format: 1,
-      actors: [{ id, name: "stuck", rootId: ROOT, status: "idle" }] }), { mode: 0o600 });
+      actors: [{ id, name: "stuck", instructions: "Exercise the ordinary stop refusal.", rootId: ROOT, status: "idle" }] }), { mode: 0o600 });
     const result = await cli(seat, exitArgs(seat));
     expect(result.line).toMatchObject({ op: "exit", drained: false, exiting: false, stopRefused: "ACTOR_STOP_FAILED" });
     expect(result.code).toBe(1);

@@ -179,6 +179,39 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
     expect((await inProcess(target, "drain")).receipt).toMatchObject({ result: "pass", observed: { childrenTerminal: true } });
   });
 
+  it("#18489: zombie actor and terminal-agent workers (state Z) cannot keep children live", async () => {
+    const target = await seat(), id = "c".repeat(32), pid = 999_999_999;
+    const procRoot = path.join(target.base, "proc");
+    fs.mkdirSync(path.join(procRoot, String(pid)), { recursive: true });
+    fs.mkdirSync(path.join(procRoot, String(process.pid)), { recursive: true });
+    fs.writeFileSync(path.join(procRoot, String(process.pid), "stat"), fs.readFileSync(`/proc/${process.pid}/stat`));
+    fs.writeFileSync(path.join(procRoot, String(pid), "stat"), `${pid} (zombie (tool)) Z ${Array(18).fill("0").join(" ")} 12345 0\n`);
+    target.writeActors([actorRow(id, "stopped", { stopReason: "explicit" })]);
+    target.actors.listOwned = () => [{ id, name: "zombie", status: "stopped", rootId: ROOT }];
+    target.actors.drainQuiescence = () => ["status-stopped"];
+    target.actors.drainWorker = () => ({ runId: "old-run", pid, startTime: "12345" });
+    target.host.agents = () => ({ list: () => [{ id: "old-run", status: "completed" }], workerIdentity: () => ({ pid, startTime: "12345" }) });
+    const result = await inProcess(target, "drain", {}, { procRoot });
+    expect(result.receipt).toMatchObject({ result: "pass", observed: { childrenTerminal: true } });
+    expect(outcome(target).measured.workers).toEqual([
+      { id, pid, exited: true }, { id: "old-run", pid, exited: true },
+    ]);
+  });
+
+  it("#18489: an in-flight native tool call is waited out until turn end / idle before fencing", async () => {
+    const target = await seat();
+    target.native.state.busy = true; target.native.state.idle = false;
+    let waits = 0;
+    const result = await inProcess(target, "drain", {}, { deadlineMs: 8_000, sleep: async () => {
+      if (waits === 0) expect(target.native.state.fenced).toBe(false);
+      waits++;
+      target.native.state.busy = false; target.native.state.idle = true;
+    } });
+    expect(waits).toBeGreaterThan(0);
+    expect(result.receipt).toMatchObject({ result: "pass" });
+    expect(outcome(target).passes[0].reasons.some((reason: string) => reason.startsWith("admitted:"))).toBe(true);
+  });
+
   it("a stopped actor whose recorded worker still runs (pid + start time) is NOT terminal", async () => {
     const target = await seat();
     const id = "c".repeat(32);
@@ -214,7 +247,7 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
       actors: [expect.objectContaining({ id, registryRow: expect.objectContaining({ id, instructions: "stay quiet" }) })] })]);
     expect(result.receipt).toMatchObject({ result: "pass", observed: { childrenTerminal: true } });
     // The full registry row (instructions included) is captured from the file BEFORE the stop, for recreation.
-    expect(outcome(target).stoppedActors).toEqual([expect.objectContaining({ id, spec: expect.objectContaining({ id, name: "quiet" }),
+    expect(outcome(target).stoppedActors).toEqual([expect.objectContaining({ id, spec: expect.objectContaining({ id, name: `actor-${id.slice(0, 4)}` }),
       registryRow: expect.objectContaining({ id, instructions: "stay quiet", status: "idle" }) })]);
   });
 
@@ -288,7 +321,7 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
     // The Main's own memory of the stop is gone too (a reload of the slot is not assumed).
     drainSlot(ROOT).stopped = []; drainSlot(ROOT).stopAttempted = [];
     const undo = await inProcess(target, "drain-undo", undoInputs(1, null));
-    expect(undo.receipt).toMatchObject({ result: "refused", observed: { inputsFenced: false, admissionRestored: false } });
+    expect(undo.receipt).toMatchObject({ result: "pass", observed: { inputsFenced: false, admissionRestored: true } });
     expect(outcome(target, "fabric-v2-drain-undo-1-intent.json").measured.stopIntents).toEqual([id]);
   });
 
@@ -483,6 +516,8 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     second.writeActors([actorRow(actor, "idle")]);
     const drained = await inProcess(second, "drain", {}, { deadlineMs: 8_000 });
     expect(drained.receipt?.result).toBe("pass");
+    // Force the ordinary create path to fail after a valid pre-stop restoration check.
+    second.actors.create = async () => { throw new Error("synthetic recreation failure"); };
     const undone = await inProcess(second, "drain-undo", undoInputs(1, storeReceipt(second, "drain", drained.stdout)));
     expect(undone.receipt?.observed).toMatchObject({ inputsFenced: false, admissionRestored: false });
     expect(await inProcess(second, "drain-undo", undoInputs(2, storeReceipt(second, "drain", drained.stdout)))).toMatchObject({ code: 2,

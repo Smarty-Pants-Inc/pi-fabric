@@ -54,7 +54,7 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
   const renewals: number[] = [];
   let renewalDelay = 0;
   const renewalPlan: Array<{ delay: number; fail?: boolean }> = [];
-  const fault = { down: false, presenceDelay: 0, sampleSourceTime: false,
+  const fault = { down: false, presenceDelay: 0, holdPresenceReady: false, sampleSourceTime: false,
     presenceWrites: [] as number[], uncertainWrites: 0, unavailableReads: 0, failedRenewals: 0 };
   const transport: FabricTransport = { ...base,
     onVerifiedReconnect(listener) {
@@ -64,7 +64,13 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
     },
     kv(bucket) {
       if (bucket === "presence") return {
-        ttlMs: presenceKv.ttlMs, delete: presenceKv.delete.bind(presenceKv), watch: presenceKv.watch.bind(presenceKv),
+        ttlMs: presenceKv.ttlMs, delete: presenceKv.delete.bind(presenceKv),
+        async *watch<V>(prefix: string, signal: AbortSignal) {
+          for await (const event of presenceKv.watch<V>(prefix, signal)) {
+            if (event.type === "ready" && fault.holdPresenceReady) continue;
+            yield event;
+          }
+        },
         async get(key, signal) {
           if (fault.down) {
             fault.unavailableReads++;
@@ -482,6 +488,9 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     clock();
     const f = await nats("unready-independent-renewals", () => 1);
     const before = f.presence().revision;
+    // Keep replacement snapshots unavailable too: the carrier now restarts a
+    // silent watch itself instead of requiring an external resnapshot forever.
+    f.fault.holdPresenceReady = true;
     f.world.presence.gap();
     await vi.advanceTimersByTimeAsync(0);
     f.reconnect();
@@ -492,6 +501,7 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     }
     expect(f.renewals.length).toBeGreaterThanOrEqual(4);
     expect(f.presence().revision).toBe(before);
+    f.fault.holdPresenceReady = false;
     f.world.presence.resnapshot();
     await vi.advanceTimersByTimeAsync(0);
     expect(f.directory.canConsumeMesh()).toBe(true);

@@ -36,7 +36,7 @@ const DEADLINE_MS = 600_000;
 const UNDO_BUDGET_MS = 60_000;
 const POLL_MS = 1_000;
 const MAX_REQUEST = 64 * 1024;
-const PHASES = new Set(["drain", "drain-undo", "drain-recheck", "resume-drain"]);
+const PHASES = new Set(["drain", "drain-undo", "drain-restore", "drain-recheck", "resume-drain"]);
 const INTENT = "fabric-v2-drain-intent.json";
 /** Stop-intent files per drain: one per new set of actors to stop (a retried request reuses the last one). */
 const MAX_STOP_CALLS = 20;
@@ -146,6 +146,7 @@ export const main = async (argv: string[], io: SeamIo, deps: SeamDeps = {}): Pro
       return await drain(context);
     }
     if (phase === "drain-undo") return await drainUndo(context);
+    if (phase === "drain-restore") return await drainRestore(context);
     if (Object.keys(request.inputs).join(",") !== "operationId") throw new SeamGap("inputs-invalid");
     return recheck(context);
   } catch (error) {
@@ -184,7 +185,7 @@ const verifyServer = (context: Context) => async (client: net.Socket): Promise<s
   return undefined;
 };
 
-const call = async (context: Context, op: "drain" | "stop-actors" | "undo" | "probe", bound: MainDrainBindingRequest | null, timeoutMs: number):
+const call = async (context: Context, op: "drain" | "stop-actors" | "undo" | "restore-actors" | "probe", bound: MainDrainBindingRequest | null, timeoutMs: number):
   Promise<{ reply?: MainDrainReply; error?: string; written?: boolean }> => {
   try {
     const socket = mainDrainSocket(context.meshRoot, context.request.sessionId, context.uid);
@@ -240,19 +241,27 @@ const undoAndProbe = async (context: Context, generation: string | undefined, ph
     if (!undone) {
       const result = await call(context, "undo", binding(context, phase, generation!), until - context.now());
       if (result.error?.startsWith("MAIN_DRAIN_REFUSED")) throw new BindingGap(`undo-refused:${result.error.slice(19).toLowerCase()}`);
-      if (result.error) attempts.push(`undo:${result.error}`); else { undo = result.reply; undone = true; }
+      if (result.error) attempts.push(`undo:${result.error}`); else {
+        undo = result.reply;
+        undone = true;
+      }
     }
     if (undone) {
       const result = await call(context, "probe", null, until - context.now());
-      if (result.error) attempts.push(`probe:${result.error}`); else { probe = result.reply; break; }
+      if (result.error) attempts.push(`probe:${result.error}`); else {
+        probe = result.reply;
+        if (undo?.undo?.actorsRestored !== false) break;
+        undone = false; // retry a settled late stop / transient recreation failure within the same undo budget
+      }
     }
     await context.sleep(Math.min(POLL_MS, Math.max(0, until - context.now())));
   }
   const seen = canary(probe);
-  const restartRequired = !undone || undo?.undo?.restartRequired === true || seen.inputsFenced;
+  const restartRequired = (generation !== undefined && undo === undefined) || undo?.undo?.restartRequired === true || seen.inputsFenced;
   const stopped = new Set([...stoppedIds, ...(undo?.stopped ?? []).map(entry => entry.id)]);
+  const restoredIds = new Map((probe?.restored ?? []).map(row => [row.id, row.restoredId]));
   const actorsRestored = undo?.undo?.actorsRestored !== false && [...stopped].every(id =>
-    probe?.actors.owned.some(actor => actor.id === id && actor.status !== "stopped") === true);
+    probe?.actors.owned.some(actor => (actor.id === id || actor.id === restoredIds.get(id)) && actor.status !== "stopped") === true);
   return { undo, probe, attempts: attempts.slice(-20), ...seen, restartRequired, actorsRestored,
     admissionRestored: seen.inboxOpen && !restartRequired && actorsRestored };
 };
@@ -616,6 +625,26 @@ const drainUndo = async (context: Context): Promise<number> => {
   evidence(context, names.outcome, { schema: "fabric-v2-drain-undo-outcome-v2", attempt, result: passed ? "pass" : "refused",
     intentSha256: undoIntentSha256, observed, receipt: text, main, ...detail });
   context.io.stdout(text);
+  return 0;
+};
+
+/** Explicit post-activation owned step: same saved rows and owner create path as undo, never lift a v1 fence. */
+const drainRestore = async (context: Context): Promise<number> => {
+  if (Object.keys(context.request.inputs).join(",") !== "operationId") throw new SeamGap("inputs-invalid");
+  const intent = readIntent(context);
+  if (!intent || drainOutcome(context)?.result !== "pass") throw new SeamGap("drain-not-passed");
+  verifyFenceReceipt(context);
+  let attempt = 1;
+  while (attempt <= 999 && present(path.join(context.runDir, `fabric-v2-drain-restore-${attempt}-outcome.json`))) attempt++;
+  if (attempt > 999) throw new SeamGap("restore-attempt-limit");
+  const name = `fabric-v2-drain-restore-${attempt}-outcome.json`;
+  // The control operation reconciles already-created exact matches, so a crashed client can retry safely.
+  const result = await call(context, "restore-actors", binding(context, "drain-restore", intent.generation), UNDO_BUDGET_MS);
+  const actorsRestored = result.reply?.undo?.actorsRestored === true;
+  const observed = { sessionId: context.request.sessionId, actorsRestored };
+  evidence(context, name, { schema: "fabric-v2-drain-restore-outcome-v1", attempt,
+    result: actorsRestored ? "pass" : "refused", observed, reply: result.reply ?? null, error: result.error ?? null });
+  context.io.stdout(receipt(context.request, actorsRestored ? "pass" : "refused", observed));
   return 0;
 };
 

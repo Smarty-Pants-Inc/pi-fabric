@@ -29,7 +29,7 @@ export const MAIN_DRAIN_MAX_SOCKET_PATH = 107;
  * undo: the same (run, operationId, generation) releases the fence and reopens the gates (B1, N6 ii).
  * exit: a pod binding only; a fully drained raw-Pod Main exits cleanly.
  */
-export const MAIN_DRAIN_OPS = ["status", "probe", "drain", "stop-actors", "undo", "exit"] as const;
+export const MAIN_DRAIN_OPS = ["status", "probe", "drain", "stop-actors", "undo", "restore-actors", "exit"] as const;
 export type MainDrainOp = typeof MAIN_DRAIN_OPS[number];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -50,7 +50,7 @@ export const parseMainDrainRequest = (line: string): MainDrainRequest | undefine
     typeof request.sessionId !== "string" || !UUID.test(request.sessionId) ||
     !(MAIN_DRAIN_OPS as readonly unknown[]).includes(request.op)) return undefined;
   const op = request.op as MainDrainOp;
-  const mutating = op === "drain" || op === "stop-actors" || op === "undo" || op === "exit";
+  const mutating = op === "drain" || op === "stop-actors" || op === "undo" || op === "restore-actors" || op === "exit";
   const binding = request.binding === null ? null : parseBindingRequest(request.binding);
   if (binding === undefined || mutating !== (binding !== null)) return undefined;
   return { v: 1, op, sessionId: request.sessionId, binding };
@@ -111,8 +111,10 @@ export interface MainDrainReply {
   /** Every actor this operation sent a stop for (recorded before the stop), whether or not it was proven stopped. */
   stopAttempted: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
   stopRefused: string | null;
-  /** undo only. restartRequired: the fence could not be lifted through this process's handle; actorsRestored:
-   * every actor this operation stopped is active again (stage 1 cannot recreate: false when any was stopped). */
+  /** Original-to-recreated identity mapping, only after exact spec + live-binding readback. */
+  restored: Array<{ id: string; restoredId: string }>;
+  /** undo / restore-actors. restartRequired: the fence could not be lifted; actorsRestored:
+   * every actor this operation stopped is active again with its saved configuration and resolved binding. */
   undo: { fenceReleased: boolean; inboxReopened: boolean; restartRequired: boolean; actorsRestored: boolean } | null;
   /** exit only: the Main accepted a clean exit and shuts down right after this reply. */
   exiting: boolean;

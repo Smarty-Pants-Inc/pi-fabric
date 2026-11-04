@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import piFabric from "../src/index.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { FabricState } from "../src/fabric-state.js";
-import { MeshBackgroundQueue } from "../src/core/atomic-write.js";
+import { MeshBackgroundQueue } from "../src/core/mesh-background-queue.js";
 import { diagnostics } from "../src/core/diagnostics.js";
 
 type Handler = (event: unknown, context: ExtensionContext) => unknown;

@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
-import { childProcessEnvironment, meshJournalAlarmLine, writeJsonAtomic } from "../core/atomic-write.js";
+import { childProcessEnvironment, meshBackgroundGiveupMs, meshJournalAlarmLine, writeJsonAtomic } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
-import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
+import { observeResidentOwner, captureDescendants, stopObservedDescendants, stopOwnedSessionDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildExit, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { assertResidentWakeConfig, canonicalResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch } from "./wake-index.js";
@@ -66,17 +66,23 @@ interface Attempt {
   logFile: string;
   firstLeaseAt?: number;
   watchdogGivenUp?: boolean;
-  watchdogDeferred?: { checks: number; nextCheckAt: number };
+  watchdogDeferred?: { checks: number; nextCheckAt: number; giveupAt: number };
   native: ResidentChildLifetime;
   stop?: Promise<void>;
   seenOwner: boolean;
   claimedOwner: boolean;
   ownerToken?: string;
+  /** Actual old owner, sampled only while bound to this native child's birth. */
+  ownerSnapshot?: ResidentHostOwner;
+  ownerLossCustodyWritten?: boolean;
+  ownerLossDeferredReported?: boolean;
+  ownerLossCleanupComplete?: boolean;
   /** The generation (owner token) this launcher chose for the child before spawning it (smarty-dev#7950). */
   generation: string;
   /** Whether this attempt is an attributable startup failure; decided once, at exit. */
   sharedExit?: boolean;
   closingInput: boolean;
+  closingInputGiveupAt?: number;
   processes: Map<number, OwnedProcess>;
   stderr: string;
 }
@@ -498,6 +504,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     try { initial = residentLaunchSpec(config, entry, launcher.runtime); }
     catch (error) { trace("handover-capability-deferred", { reason: error instanceof Error ? error.message : String(error) }); }
   }
+  const rootIdentity = fs.statSync(root);
   let current: Attempt | undefined;
   let stopping = false;
   const stop = (): void => {
@@ -515,6 +522,15 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     // is already known; a receipt from another generation must never silence an exit.
     return idleExit?.pid === attempt.child.pid && idleExit?.token === (attempt.ownerToken ?? attempt.generation)
       ? undefined : "exit-0-unreceipted";
+  };
+  const captureOwner = (attempt: Attempt, owner: ResidentHostOwner): void => {
+    const pid = attempt.child.pid;
+    const birth = pid ? attempt.processes.get(pid)?.processStartTime : undefined;
+    if (current !== attempt || attempt.native.exited || stopping || !pid || owner.pid !== pid || !birth ||
+        typeof owner.token !== "string" || !owner.token || owner.processStartTime !== birth ||
+        processStartTime(pid) !== birth || !residentProcessAlive(pid, birth)) return;
+    attempt.claimedOwner = true; attempt.seenOwner = true; attempt.ownerToken = owner.token;
+    attempt.ownerSnapshot = structuredClone(owner);
   };
   const start = (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Attempt => {
     const launchConfig = spec?.config ?? config;
@@ -565,7 +581,13 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       const owner = readOwner();
       const maintenance = readWakeJson<{ token?: string }>(path.join(root, "maintenance-ready.json"));
       if (owner && owner.pid === child.pid && owner.token === receipt.token && owner.readyAt > 0 && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
-          owner.maintenanceReady === 1 && maintenance?.token === owner.token) residentChildReady(root, launchConfig);
+          owner.maintenanceReady === 1 && maintenance?.token === owner.token) {
+        // This receiver is registered BEFORE waitResidentChange's startup receiver.
+        // Capture the real owner synchronously, before its promise can forward ready
+        // to Main and permit a successor to replace owner.json before the first poll.
+        captureOwner(attempt, owner);
+        residentChildReady(root, launchConfig);
+      }
     });
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, attempt.generation, error); });
     if (process.connected && process.send) {
@@ -573,8 +595,12 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       void waitResidentChange(root, () => {
         const owner = readOwner();
         const receipt = readWakeJson<{ token?: string }>(path.join(root, "maintenance-ready.json"));
-        return !!owner && owner.pid === child.pid && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
+        const accepted = !!owner && owner.pid === child.pid && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
           (owner.maintenanceReady !== 1 || receipt?.token === owner.token);
+        // The file/deadline fallback can accept before native IPC arrives too.
+        // Pin the owner at acceptance, never by a later .then reread after release.
+        if (accepted) captureOwner(attempt, owner!);
+        return accepted;
       }, 90_000, "Resident host startup pending", child).then(() => {
         const owner = readOwner();
         if (process.connected && process.send) process.send({ event: "resident-ready", root, token: owner?.token ?? launcher.token }, () => {});
@@ -631,8 +657,15 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
-    if (owner && owner.pid === attempt.child.pid && observation.observedOwner) attempt.ownerToken = owner.token;
-    if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }
+    if (owner && owner.pid === attempt.child.pid && observation.observedOwner) {
+      attempt.ownerToken = owner.token;
+      captureOwner(attempt, owner);
+    }
+    if (observation.closeInput && !attempt.closingInput) {
+      attempt.closingInput = true;
+      attempt.closingInputGiveupAt = performance.now() + watchdogGiveupMs;
+      attempt.child.stdin?.end();
+    }
   };
   const assertFenceFree = async (inode: fs.Stats): Promise<void> => {
     const lock = path.join(root, "host.lock");
@@ -664,6 +697,93 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   ensureResidentGenerations(root);
   let attempt = start(initial);
   let nextWatchdogAt = 0;
+  const watchdogGiveupMs = meshBackgroundGiveupMs();
+  const deferWatchdog = (candidate: Attempt): void => {
+    candidate.watchdogDeferred ??= { checks: 0, nextCheckAt: 0, giveupAt: performance.now() + watchdogGiveupMs };
+    if (!candidate.closingInput) residentUnhosted(root, "custody");
+  };
+  const ownerLossDiagnostic = (candidate: Attempt, event: Record<string, unknown>): void => {
+    // The root may already belong to a live successor. Never trace to its shared log/error/owner.
+    recordResidentGenerationError(root, { format: 1, generation: candidate.generation, writer: "launcher",
+      error: JSON.stringify(event), occurredAt: Date.now(), pid: process.pid });
+    try { process.stderr.write(`${JSON.stringify(event)}\n`); } catch { /* best effort */ }
+  };
+  const ownerLossDeferred = (candidate: Attempt, error: unknown): void => {
+    if (candidate.ownerLossDeferredReported) return;
+    candidate.ownerLossDeferredReported = true;
+    try { ownerLossDiagnostic(candidate, { event: "watchdog-deferred", reason: String(error),
+      pid: candidate.child.pid, proofCheck: candidate.watchdogDeferred!.checks,
+      custody: candidate.ownerLossCustodyWritten ? "retained" : "unwritten" }); }
+    catch { /* Diagnostic failure cannot release supervision or start a retry log storm. */ }
+  };
+  const retryOwnerLossCleanup = async (candidate: Attempt): Promise<boolean> => {
+    const deferred = candidate.watchdogDeferred!;
+    if (performance.now() < deferred.nextCheckAt) return false;
+    deferred.checks++;
+    deferred.nextCheckAt = performance.now() + numberSetting(options.proofRetryMs, 1_000, 1);
+    let fd: number | undefined;
+    try {
+      fd = await lockFile(path.join(root, "handover.lock"), 0, true);
+      const validate = (): void => {
+        const stat = fs.statSync(root);
+        const currentConfig = readConfig(configPath);
+        const owner = candidate.ownerSnapshot;
+        const pid = candidate.child.pid;
+        const birth = pid ? candidate.processes.get(pid)?.processStartTime : undefined;
+        if (stat.dev !== rootIdentity.dev || stat.ino !== rootIdentity.ino || currentConfig.rootId !== config.rootId ||
+            currentConfig.residencyRoot !== root) throw new Error("Owner-loss custody root identity changed or unavailable");
+        if (!pid || !birth || !owner || owner.pid !== pid || owner.token !== candidate.ownerToken || owner.processStartTime !== birth) {
+          throw new Error("Owner-loss old owner/native birth is unproven; supervision retained");
+        }
+        const currentBirth = processStartTime(pid);
+        if (currentBirth !== undefined && currentBirth !== birth) throw new Error("Owner-loss native PID was reused; supervision retained");
+        if (!candidate.native.exited) {
+          if (currentBirth !== birth || !residentProcessAlive(pid, birth)) throw new Error("Owner-loss native birth is unavailable");
+        } else {
+          // A joined native exit is not PID reuse. Retry only under already-retained,
+          // exact OLD custody; unreadable live identity and any new birth still refuse.
+          if (residentProcessAlive(pid) || !candidate.ownerLossCustodyWritten ||
+              JSON.stringify(readHandoverJson(watchdogCustodyPath(root))) !== JSON.stringify({ format: 1, launcher, owner })) {
+            throw new Error("Owner-loss native exit/old custody cannot be revalidated");
+          }
+        }
+      };
+      validate();
+      if (!candidate.ownerLossCustodyWritten) {
+        // Existing immutable fence, attributed to OLD's real owner snapshot, never a successor token.
+        writeHandoverImmutable(watchdogCustodyPath(root), { format: 1, launcher, owner: candidate.ownerSnapshot });
+        candidate.ownerLossCustodyWritten = true;
+        validate(); // Storage/lock acquisition must not create a stale signal authority.
+      }
+    } catch (error) {
+      ownerLossDeferred(candidate, error);
+      return false;
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
+    try {
+      if (!candidate.ownerLossCleanupComplete) {
+        // The helper must synchronously anchor OLD's SID/birth BEFORE native stop can remove its leader.
+        // It excludes the direct child. Join native receipt/observed cleanup even if session cleanup fails.
+        const descendants = stopOwnedSessionDescendants(candidate, candidate.child.pid);
+        const results = await Promise.allSettled([stopAttempt(candidate), descendants]);
+        const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+        if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
+        // A transient zombie can delay the necessary SID-empty check after successful
+        // cleanup/native join. Retry that proof only: never re-anchor or re-signal.
+        candidate.ownerLossCleanupComplete = true;
+      }
+      const session = checkResidentSessionExit(candidate.child.pid);
+      if (!session.known || !session.empty) throw new Error(`Owner-loss session exit remains unproven: ${session.reason}`);
+      const event = { event: "launcher-exit", reason: "resident-owner-giveup", pid: candidate.child.pid,
+        generation: candidate.generation, nativeExit: await candidate.native.exit, giveupMs: watchdogGiveupMs,
+        custody: "retained", proofChecks: deferred.checks };
+      ownerLossDiagnostic(candidate, event);
+      process.exitCode = 1;
+      return true;
+    } catch (error) {
+      ownerLossDeferred(candidate, error);
+      return false;
+    }
+  };
   const evidenceError = (stage: string, error: unknown): void => {
     trace("watchdog-evidence-error", { stage, reason: String(error).slice(0, 500) });
   };
@@ -766,16 +886,12 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       captureDescendants(candidate);
       const stopped = await terminateWedgedChild(candidate, options.termMs ?? 30_000, options.killWaitMs ?? 5_000, revalidate);
       if (!stopped && !candidate.native.exited) return;
-      candidate.watchdogDeferred = { checks: 0, nextCheckAt: 0 };
-      residentUnhosted(root, "custody");
+      deferWatchdog(candidate);
       retryExitProof(candidate);
     } catch (error) {
       trace("watchdog-deferred", { pid: candidate.child.pid, reason: String(error).slice(0, 500) });
       // A native exit still does not release custody of an uncertain attempt.
-      if (candidate.native.exited) {
-        candidate.watchdogDeferred ??= { checks: 0, nextCheckAt: 0 };
-        residentUnhosted(root, "custody");
-      }
+      if (candidate.native.exited) deferWatchdog(candidate);
     } finally { if (recoveryFd !== undefined) fs.closeSync(recoveryFd); }
   };
   try {
@@ -785,11 +901,42 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       let inode: fs.Stats | undefined;
       while ((!attempt.native.exited || attempt.watchdogDeferred) && !stopping) {
         if (attempt.watchdogDeferred) {
+          if (attempt.closingInput) {
+            // Unknown membership/failed cleanup is a real outstanding custody obligation,
+            // not a reason to exit after the budget and leave an old-session worker alive.
+            if (await retryOwnerLossCleanup(attempt)) return;
+            await delay(50);
+            continue;
+          }
           retryExitProof(attempt);
+          if (performance.now() >= attempt.watchdogDeferred.giveupAt) {
+            // The unchanged stale owner lease already authorized watchdog custody.
+            // Parent/Main exit alone never enters this path: healthy durable work
+            // keeps renewing and may outlive its originating Main. Complete exit
+            // remains unproven, so retain the durable no-replacement fence, not an
+            // otherwise idle launcher process polling it forever.
+            await stopAttempt(attempt);
+            const nativeExit = await attempt.native.exit;
+            trace("launcher-exit", { reason: "resident-watchdog-giveup", pid: attempt.child.pid,
+              generation: attempt.generation, nativeExit, custody: "retained", giveupMs: watchdogGiveupMs,
+              proofChecks: attempt.watchdogDeferred.checks });
+            process.exitCode = 1;
+            return;
+          }
           await delay(50);
           continue;
         }
         observe(attempt);
+        if (attempt.closingInputGiveupAt !== undefined && performance.now() >= attempt.closingInputGiveupAt) {
+          // owner.json already told this attempt to close: its claimed owner
+          // disappeared or another live owner won. Bound a child ignoring EOF,
+          // including watchdog-disabled/NATS children, never Main/PPID loss.
+          // Use the existing unresolved-custody path, not a direct-child-only exit.
+          // Even known-empty SID cleanup cannot authorize replacement: immutable
+          // old-attempt custody remains until an explicit complete installer drain.
+          deferWatchdog(attempt);
+          continue;
+        }
         const sleepingOwner = readOwner();
         if (!plan && sleepingOwner?.pid === attempt.child.pid && residentOwnerSleeping(root)) {
           // This launcher spawned the closing owner. Its native exit notification, not

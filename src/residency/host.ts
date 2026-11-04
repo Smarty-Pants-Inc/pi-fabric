@@ -94,7 +94,8 @@ import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycl
 import { meshStateBackendFromMarker } from "../mesh/backend-fence.js";
 import { MeshStore, meshOutageAlarmSink, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue } from "../core/mesh-background-queue.js";
+import { MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
@@ -351,7 +352,8 @@ export class ResidentHost {
   #routeOwner?: ShadowRouteOwner;
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll")
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
-  readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
+  readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   #started = false;
   #ready = false;
   #idleSince: number | undefined;

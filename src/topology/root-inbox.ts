@@ -4,7 +4,7 @@ import { readNativeRecoveryCustody, nativeRecoveryCarrierCustody } from "../core
 import type { NativeRecoveryBinding, NativeRecoveryCustodyReader, NativeRecoveryCustodyResult,
   NativeRecoveryParkIntent, NativeRecoverySessionRef } from "../core/session-receipts.js";
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
-import { MeshBackgroundQueue } from "../core/atomic-write.js";
+import { MeshBackgroundQueue } from "../core/mesh-background-queue.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
   INBOX_HORIZON_MS, ROOT_ID_PREFIX, ROOT_INBOX_ACTION_KINDS, compareRootInboxEvents, crossIdentityReceipts, deliveryIdentity,

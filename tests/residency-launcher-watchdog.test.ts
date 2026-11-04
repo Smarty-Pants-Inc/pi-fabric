@@ -12,7 +12,7 @@ import * as residentWake from "../src/residency/wake.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 
 const mocks = vi.hoisted(() => ({ spawn: vi.fn(), alive: new Set<number>(), births: new Map<number, string>(),
-  sessionEmpty: true, lockHook: undefined as (() => void) | undefined }));
+  sessionEmpty: true, sessionUnknown: false, sessionStop: vi.fn(async () => {}), lockHook: undefined as (() => void) | undefined }));
 vi.mock("cross-spawn", () => ({ default: mocks.spawn }));
 vi.mock("../src/residency/process-identity.js", () => ({
   processStartTime: (pid: number) => mocks.births.get(pid) ?? "fixture-birth", residentProcessAlive: (pid: number) => mocks.alive.has(pid),
@@ -24,7 +24,9 @@ vi.mock("../src/residency/file-lock.js", () => ({ lockFile: async (file: string)
 } }));
 vi.mock("../src/residency/launcher-owner.js", async importOriginal => ({
   ...await importOriginal<typeof import("../src/residency/launcher-owner.js")>(),
-  checkResidentSessionExit: () => ({ empty: mocks.sessionEmpty, reason: mocks.sessionEmpty ? "owned session exited" : "owned session still has members", members: mocks.sessionEmpty ? [] : [900_999] }),
+  stopOwnedSessionDescendants: mocks.sessionStop,
+  checkResidentSessionExit: () => mocks.sessionUnknown ? { empty: false, known: false, reason: "session membership unreadable", members: [] } :
+    ({ empty: mocks.sessionEmpty, known: true, reason: mocks.sessionEmpty ? "owned session exited" : "owned session still has members", members: mocks.sessionEmpty ? [] : [900_999] }),
 }));
 import { supervise } from "../src/residency/launcher.js";
 
@@ -83,7 +85,7 @@ class FakeChild extends EventEmitter {
 }
 
 const ROOT_SESSION = "session:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = false, noLease = false, actorCount = 1, rootId = ROOT_SESSION, startImmediately = true) => {
+const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = false, noLease = false, actorCount = 1, rootId = ROOT_SESSION, startImmediately = true, nativeStartup = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-wedge-unit-"));
   const config = { cwd: root, piBinary: path.join(root, "fixture.mjs"), residencyRoot: root,
     rootId, sessionId: "fixture-session", meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
@@ -98,6 +100,8 @@ const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = fa
   const children: FakeChild[] = [];
   mocks.spawn.mockImplementation((_command, _args, options) => {
     const child = new FakeChild(config, children.length, alwaysStall, noLease, options.env.PI_FABRIC_RESIDENT_GENERATION);
+    // Only startup-forwarding tests opt into the native ChildProcess null exit fields.
+    if (nativeStartup) Object.assign(child, { exitCode: null, signalCode: null });
     children.push(child); return child as unknown as ChildProcess;
   });
   const controller = new AbortController();
@@ -117,11 +121,12 @@ const originalExitCode = process.exitCode;
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.useRealTimers(); process.exitCode = originalExitCode;
   mocks.spawn.mockReset(); mocks.alive.clear(); mocks.births.clear(); mocks.lockHook = undefined; mocks.sessionEmpty = true;
+  mocks.sessionUnknown = false; mocks.sessionStop.mockReset(); mocks.sessionStop.mockResolvedValue(undefined);
 });
 
 const clock = () => {
   // MeshStore's real setImmediate durability barrier must still finish when an exiting supervisor awaits it.
-  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+  vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
 };
 const ALARM_TOPIC = "fabric.alarm.resident-unhosted";
@@ -540,6 +545,306 @@ describe("launcher watchdog Windows contract", () => {
 });
 // These signal, incarnation and session-evidence contracts require POSIX.
 describe.skipIf(process.platform === "win32")("launcher live-child lease watchdog", () => {
+  it("exits after the custody give-up budget with a native child receipt, retaining the no-replacement fence", async () => {
+    alarmClock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "1000");
+    const f = fixture({}, true);
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      expect(f.events().filter(row => row.event === "watchdog-giving-up")).toHaveLength(1);
+      expect(returned).toBe(false); // Proof exhaustion alone cannot shorten the give-up budget.
+      const custody = fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8");
+      vi.setSystemTime(Date.now() - 86_400_000); // A backwards wall-clock jump cannot extend custody.
+      await vi.advanceTimersByTimeAsync(1000); await settleAlarms(); await f.done;
+      expect(returned).toBe(true); expect(process.exitCode).toBe(1);
+      expect(f.events().filter(row => row.event === "launcher-exit")).toEqual([expect.objectContaining({
+        reason: "resident-watchdog-giveup", pid: f.children[0]!.pid, custody: "retained", giveupMs: 1000,
+        proofChecks: 3, nativeExit: { code: null, signal: "SIGKILL" },
+      })]);
+      expect(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")).toBe(custody);
+      await supervise(path.join(f.root, "config.json"));
+      expect(f.children).toHaveLength(1); // Exiting the launcher never authorizes a successor.
+    } finally { await f.close(); }
+  });
+
+  it("does not apply the give-up deadline to a healthy renewing durable owner", async () => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "1");
+    const f = fixture();
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(returned).toBe(false); expect(f.children[0]!.signals).toEqual([]);
+      expect(f.children[0]!.stdin.end).not.toHaveBeenCalled(); expect(mocks.sessionStop).not.toHaveBeenCalled();
+      expect(f.events().some(row => row.event === "launcher-exit")).toBe(false);
+      expect(fs.existsSync(path.join(f.root, "watchdog-custody.json"))).toBe(false);
+    } finally { await f.close(); }
+  });
+
+  // Keep: the real native owner-loss catch raced Main's ready/exit before the FIRST 50ms poll.
+  // IPC is only a notification: custody must come from the owner file plus recorded native birth.
+  it.each(["valid", "predicate", "predicate-unrecorded-birth", "root", "token", "owner-birth", "native-birth", "unrecorded-birth", "unclaimed"] as const)(
+    "attributes readiness before the FIRST poll and immediate successor replacement (%s)", async mode => {
+      clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+      vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const connected = Object.getOwnPropertyDescriptor(process, "connected");
+      const send = Object.getOwnPropertyDescriptor(process, "send");
+      Object.defineProperty(process, "connected", { configurable: true, value: true });
+      let replaceOwner = () => {};
+      const forward = vi.fn(() => { replaceOwner(); return true; });
+      Object.defineProperty(process, "send", { configurable: true, value: forward });
+      let acceptPredicate!: () => void;
+      if (mode.startsWith("predicate")) vi.spyOn(residentWake, "waitResidentChange").mockImplementation((_root, ready) =>
+        new Promise<void>(resolve => { acceptPredicate = () => { expect(ready()).toBe(true); resolve(); }; }));
+      const f = fixture({ enabled: false }, false, false, 1, ROOT_SESSION, true, true);
+      let returned = false; void f.done.then(() => { returned = true; });
+      try {
+        const child = f.children[0]!;
+        // Missing spawn-time birth cannot be repaired from readiness IPC or a later PID read.
+        if (mode.endsWith("unrecorded-birth")) mocks.births.set(child.pid, "");
+        await vi.advanceTimersByTimeAsync(1); // Spawn fired; FIRST owner poll is still at 50ms.
+        mocks.births.set(child.pid, "fixture-birth");
+        const ownerFile = path.join(f.root, "owner.json");
+        const oldOwner = { ...JSON.parse(fs.readFileSync(ownerFile, "utf8")), readyAt: Date.now(), maintenanceReady: 1 };
+        if (mode === "owner-birth") oldOwner.processStartTime = "wrong-owner-birth";
+        if (mode === "native-birth") mocks.births.set(child.pid, "reused-native-birth");
+        if (mode === "unclaimed") { oldOwner.pid = 12346; mocks.alive.add(oldOwner.pid); }
+        fs.writeFileSync(ownerFile, JSON.stringify(oldOwner));
+        fs.writeFileSync(path.join(f.root, "maintenance-ready.json"), JSON.stringify({ token: oldOwner.token }));
+        const successor = { pid: 12345, token: "successor-token", processStartTime: "successor-birth" };
+        mocks.alive.add(successor.pid); mocks.births.set(successor.pid, successor.processStartTime);
+        replaceOwner = () => { fs.writeFileSync(ownerFile, JSON.stringify(successor)); };
+        child.kill = (signal: string) => {
+          child.signals.push(signal); clearInterval(child.timer); mocks.alive.delete(child.pid);
+          child.emit("exit", null, signal); return true;
+        };
+        if (mode.startsWith("predicate")) acceptPredicate(); // Accept real production predicate, with NO IPC message.
+        else child.emit("message", { event: "resident-ready", root: mode === "root" ? `${f.root}-wrong` : f.root,
+          token: mode === "token" ? "wrong-token" : oldOwner.token });
+        await Promise.resolve(); // Existing startup .then forwards to Main, which immediately replaces owner.
+        if (mode === "root") expect(forward).not.toHaveBeenCalled();
+        else expect(forward).toHaveBeenCalledWith(expect.objectContaining({ event: "resident-ready" }), expect.any(Function));
+        replaceOwner(); // Also replace when malformed-root readiness did not forward.
+        fs.writeFileSync(path.join(f.root, "error.json"), "successor diagnostic");
+        const shared = () => ["owner.json", "error.json", "launcher.log"].map(name => fs.readFileSync(path.join(f.root, name), "utf8"));
+        const before = shared();
+        await vi.advanceTimersByTimeAsync(500);
+        if (mode === "valid" || mode === "predicate") {
+          await f.done;
+          expect(returned).toBe(true); expect(child.signals).toEqual(["SIGTERM"]);
+          expect(mocks.sessionStop).toHaveBeenCalledOnce();
+          expect(JSON.parse(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")).owner).toEqual(oldOwner);
+          expect(process.exitCode).toBe(1);
+        } else {
+          expect(returned).toBe(false); expect(child.signals).toEqual([]);
+          expect(mocks.sessionStop).not.toHaveBeenCalled();
+          expect(fs.existsSync(path.join(f.root, "watchdog-custody.json"))).toBe(false);
+        }
+        expect(shared()).toEqual(before); expect(mocks.alive.has(successor.pid)).toBe(true);
+        expect(f.children).toHaveLength(1);
+      } finally {
+        try { await f.close(); } finally {
+          if (connected) Object.defineProperty(process, "connected", connected); else Reflect.deleteProperty(process, "connected");
+          if (send) Object.defineProperty(process, "send", send); else Reflect.deleteProperty(process, "send");
+        }
+      }
+    });
+
+  it("bounds a claimed owner disappearing while its watchdog-disabled child ignores EOF, using a monotonic deadline", async () => {
+    alarmClock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "1000");
+    const diagnostics = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const f = fixture({ enabled: false });
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      const child = f.children[0]!;
+      child.kill = (signal: string) => {
+        child.signals.push(signal); clearInterval(child.timer); mocks.alive.delete(child.pid);
+        child.emit("exit", null, signal); return true;
+      };
+      fs.unlinkSync(path.join(f.root, "owner.json"));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(child.stdin.end).toHaveBeenCalledOnce(); expect(child.signals).toEqual([]);
+      vi.setSystemTime(Date.now() + 86_400_000); // Wall time must not terminate the child early either.
+      await vi.advanceTimersByTimeAsync(100);
+      expect(child.signals).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1000); await settleAlarms(); await f.done;
+      expect(child.signals).toEqual(["SIGTERM"]); expect(process.exitCode).toBe(1);
+      const failure = JSON.parse(fs.readFileSync(path.join(f.root, "generations", `${child.token}.error.json`), "utf8"));
+      expect(JSON.parse(failure.error)).toMatchObject({ event: "launcher-exit", reason: "resident-owner-giveup",
+        nativeExit: { code: null, signal: "SIGTERM" }, giveupMs: 1000 });
+      expect(diagnostics.mock.calls.filter(([line]) => String(line).includes('"reason":"resident-owner-giveup"'))).toHaveLength(1);
+      expect(f.events().some(row => row.event === "launcher-exit")).toBe(false); // Never a late shared-root trace.
+      expect(f.children).toHaveLength(1);
+      expect(mocks.sessionStop).toHaveBeenCalledOnce();
+      const custody = JSON.parse(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8"));
+      expect(custody.owner).toMatchObject({ pid: child.pid, token: child.token, processStartTime: "fixture-birth" });
+    } finally { await f.close(); }
+  });
+
+  // Keep: F1's native double-fork catch needs deterministic failure/unknown-identity coverage
+  // that cannot cheaply be forced through the real /proc/native process boundary.
+  it.each(["cleanup-failure", "unknown-membership"])("retains old custody and live supervision on owner-loss %s without touching the successor", async mode => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    if (mode === "cleanup-failure") mocks.sessionStop.mockRejectedValue(new Error("old SID birth is unreadable"));
+    else mocks.sessionUnknown = true;
+    const f = fixture({ enabled: false });
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      const child = f.children[0]!;
+      const oldOwner = JSON.parse(fs.readFileSync(path.join(f.root, "owner.json"), "utf8"));
+      child.kill = (signal: string) => {
+        child.signals.push(signal); clearInterval(child.timer); mocks.alive.delete(child.pid);
+        child.emit("exit", null, signal); return true;
+      };
+      const successor = { hostId: "successor-host", token: "successor-token", pid: 12345, processStartTime: "successor-birth" };
+      mocks.alive.add(successor.pid); mocks.births.set(successor.pid, successor.processStartTime);
+      fs.writeFileSync(path.join(f.root, "owner.json"), JSON.stringify(successor));
+      fs.writeFileSync(path.join(f.root, "error.json"), "successor diagnostic");
+      const shared = () => ["owner.json", "error.json", "launcher.log"].map(name => fs.readFileSync(path.join(f.root, name), "utf8"));
+      const before = shared();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(returned).toBe(false); expect(child.signals).toEqual(["SIGTERM"]);
+      if (mode === "cleanup-failure") expect(mocks.sessionStop.mock.calls.length).toBeGreaterThan(1);
+      else expect(mocks.sessionStop).toHaveBeenCalledOnce(); // Successful cleanup waits only on the SID proof.
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")).owner).toEqual(oldOwner);
+      expect(shared()).toEqual(before); expect(mocks.alive.has(successor.pid)).toBe(true);
+      const privateError = JSON.parse(fs.readFileSync(path.join(f.root, "generations", `${child.token}.error.json`), "utf8"));
+      expect(JSON.parse(privateError.error)).toMatchObject({ event: "watchdog-deferred", custody: "retained" });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(returned).toBe(false); expect(shared()).toEqual(before); expect(f.children).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it("retries only the SID-empty proof after fulfilled cleanup/native join when a transient zombie remains", async () => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100"); mocks.sessionEmpty = false;
+    const diagnostics = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const f = fixture({ enabled: false });
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(50); const child = f.children[0]!;
+      child.kill = (signal: string) => {
+        child.signals.push(signal); clearInterval(child.timer); mocks.alive.delete(child.pid);
+        child.emit("exit", null, signal); return true;
+      };
+      fs.unlinkSync(path.join(f.root, "owner.json"));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(returned).toBe(false); expect(mocks.sessionStop).toHaveBeenCalledOnce();
+      const custody = fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8");
+      mocks.sessionEmpty = true;
+      await vi.advanceTimersByTimeAsync(100); await f.done;
+      expect(returned).toBe(true); expect(mocks.sessionStop).toHaveBeenCalledOnce();
+      expect(child.signals).toEqual(["SIGTERM"]);
+      expect(diagnostics.mock.calls.filter(([line]) => String(line).includes('"event":"launcher-exit"'))).toHaveLength(1);
+      expect(diagnostics.mock.calls.filter(([line]) => String(line).includes('"event":"watchdog-deferred"'))).toHaveLength(1);
+      expect(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")).toBe(custody);
+    } finally { await f.close(); }
+  });
+
+  it.each(["retry", "pid-reuse"])("retries failed session cleanup after native exit, but refuses a reused old PID (%s)", async mode => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+    const diagnostics = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    mocks.sessionStop.mockRejectedValueOnce(new Error("first old-session cleanup failed"));
+    const f = fixture({ enabled: false });
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(50); const child = f.children[0]!;
+      child.kill = (signal: string) => {
+        child.signals.push(signal); clearInterval(child.timer); mocks.alive.delete(child.pid);
+        child.emit("exit", null, signal); return true;
+      };
+      fs.unlinkSync(path.join(f.root, "owner.json"));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(child.signals).toEqual(["SIGTERM"]); expect(mocks.sessionStop).toHaveBeenCalledOnce();
+      expect(returned).toBe(false);
+      const custody = fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8");
+      if (mode === "pid-reuse") { mocks.births.set(child.pid, "successor-native-birth"); mocks.alive.add(child.pid); }
+      await vi.advanceTimersByTimeAsync(300);
+      if (mode === "retry") {
+        await f.done;
+        expect(returned).toBe(true); expect(mocks.sessionStop).toHaveBeenCalledTimes(2);
+        expect(diagnostics.mock.calls.filter(([line]) => String(line).includes('"reason":"resident-owner-giveup"'))).toHaveLength(1);
+      } else {
+        expect(returned).toBe(false); expect(mocks.sessionStop).toHaveBeenCalledOnce();
+        expect(child.signals).toEqual(["SIGTERM"]); // No signal to the reused incarnation.
+        expect(diagnostics.mock.calls.filter(([line]) => String(line).includes('"event":"launcher-exit"'))).toHaveLength(0);
+      }
+      expect(diagnostics.mock.calls.filter(([line]) => String(line).includes('"event":"watchdog-deferred"'))).toHaveLength(1);
+      expect(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")).toBe(custody);
+      expect(f.children).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it("joins native child exit before reporting rejected session cleanup, and never reports a clean launcher exit", async () => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+    const diagnostics = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    mocks.sessionStop.mockRejectedValue(new Error("injected session cleanup failure"));
+    const f = fixture({ enabled: false });
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(50); const child = f.children[0]!;
+      child.kill = (signal: string) => {
+        child.signals.push(signal);
+        setTimeout(() => child.exit(0), 200);
+        return true;
+      };
+      fs.unlinkSync(path.join(f.root, "owner.json"));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(child.signals).toEqual(["SIGTERM"]); expect(mocks.sessionStop).toHaveBeenCalledOnce();
+      expect(diagnostics).not.toHaveBeenCalled(); expect(returned).toBe(false);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(diagnostics.mock.calls.some(([line]) => String(line).includes("injected session cleanup failure"))).toBe(true);
+      expect(diagnostics.mock.calls.some(([line]) => String(line).includes('"event":"launcher-exit"'))).toBe(false);
+      expect(returned).toBe(false); expect(f.children).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it("stops only the old attempt, leaves successor bytes untouched, and retains immutable old-owner custody even with an empty SID", async () => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const f = fixture({ enabled: false });
+    try {
+      await vi.advanceTimersByTimeAsync(50); const child = f.children[0]!;
+      const oldOwner = JSON.parse(fs.readFileSync(path.join(f.root, "owner.json"), "utf8"));
+      const order: string[] = [];
+      mocks.sessionStop.mockImplementation(async () => { order.push("old-session"); });
+      child.kill = (signal: string) => {
+        order.push("native-stop"); child.signals.push(signal); clearInterval(child.timer); mocks.alive.delete(child.pid);
+        child.emit("exit", null, signal); return true;
+      };
+      mocks.alive.add(12345);
+      fs.writeFileSync(path.join(f.root, "owner.json"), JSON.stringify({ hostId: "successor-host", pid: 12345, token: "successor-token" }));
+      fs.writeFileSync(path.join(f.root, "error.json"), "successor diagnostic");
+      const shared = () => ["owner.json", "error.json", "launcher.log"].map(name => fs.readFileSync(path.join(f.root, name), "utf8"));
+      const before = shared();
+      await vi.advanceTimersByTimeAsync(300); await f.done;
+      expect(order).toEqual(["old-session", "native-stop"]); expect(child.signals).toEqual(["SIGTERM"]);
+      expect(shared()).toEqual(before); expect(mocks.alive.has(12345)).toBe(true);
+      const custody = fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8");
+      expect(JSON.parse(custody).owner).toEqual(oldOwner); expect(process.exitCode).toBe(1);
+      await supervise(path.join(f.root, "config.json"));
+      expect(f.children).toHaveLength(1); expect(fs.readFileSync(path.join(f.root, "watchdog-custody.json"), "utf8")).toBe(custody);
+    } finally { await f.close(); }
+  });
+
+  it.each(["birth", "root"])("revalidates %s under the handover lock before publishing old-owner custody or signaling", async changed => {
+    clock(); vi.stubEnv("PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS", "100");
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const f = fixture({ enabled: false });
+    let returned = false; void f.done.then(() => { returned = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(50); const child = f.children[0]!;
+      fs.unlinkSync(path.join(f.root, "owner.json"));
+      mocks.lockHook = () => {
+        if (changed === "birth") mocks.births.set(child.pid, "reused-native-pid");
+        else fs.writeFileSync(path.join(f.root, "config.json"), JSON.stringify({ ...f.config, rootId: "different-root" }));
+      };
+      await vi.advanceTimersByTimeAsync(500);
+      expect(returned).toBe(false); expect(child.signals).toEqual([]); expect(mocks.sessionStop).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(f.root, "watchdog-custody.json"))).toBe(false);
+    } finally { mocks.lockHook = undefined; await f.close(); }
+  });
+
   it("F1 captures evidence and stops the wedged child but never authorizes replacement from an empty session or sampled descendants", async () => {
     clock(); const f = fixture({}, true);
     try {

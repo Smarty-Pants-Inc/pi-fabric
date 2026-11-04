@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshBackgroundQueue } from "../src/core/atomic-write.js";
+import { MeshBackgroundQueue } from "../src/core/mesh-background-queue.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane, type FabricControlHandler, type FabricControlResult } from "../src/topology/control-plane.js";
 import type { ParticipantRoute, ParticipantView } from "../src/topology/participant-view.js";

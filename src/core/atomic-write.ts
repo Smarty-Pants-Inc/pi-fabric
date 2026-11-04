@@ -857,6 +857,15 @@ export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   return undefined;
 };
 
+export const DEFAULT_MESH_BACKGROUND_GIVEUP_MS = 600_000;
+
+/** `PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS`: positive milliseconds; blank or invalid uses 10 min. */
+export const meshBackgroundGiveupMs = (): number => {
+  const raw = process.env.PI_FABRIC_MESH_BACKGROUND_GIVEUP_MS;
+  const value = Number(raw);
+  return raw?.trim() && Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MESH_BACKGROUND_GIVEUP_MS;
+};
+
 export const DEFAULT_MESH_RETRY_WARNING_WINDOW_MS = 60_000;
 
 /** `PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS`: positive milliseconds; blank or invalid uses 60 s. */
@@ -1089,6 +1098,15 @@ export class MeshBackgroundRetry {
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
   #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; this.#failureDelay = 0; }
+  /** A queue abandoned an unconfirmed write: alarm even before the usual outage window, never report recovery.
+   * Clear only its retry cadence so later jobs can make progress. */
+  giveUp(): void {
+    this.#resetBackoff();
+    if (this.#outageSince === undefined || this.#outageRaised) return;
+    this.#outageRaised = true;
+    this.#raise({ label: this.label, state: "outage", sinceMs: this.#outageSinceWall,
+      durationMs: Math.round(performance.now() - this.#outageSince), reason: "mesh background retry budget exhausted" });
+  }
   /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). `final`: the path's work is
    * done (a one-shot write such as one actor's presence), so its outage ends now, with no further writes to wait for. */
   success(final = false): void {
@@ -1193,82 +1211,5 @@ export class MeshBackgroundRetry {
     } catch (error) {
       return this.failure(error) ? "retry" : "failed";
     } finally { this.#running = false; }
-  }
-}
-
-/** One-shot notifications have no natural next tick. An owned serial queue retains them;
- * only a typed acquisition timeout retries (no write occurred). Idle costs no timer.
- * Awaiting enqueue waits for the first attempt, never an indefinitely locked mesh.
- */
-export class MeshBackgroundQueue {
-  readonly #retry: MeshBackgroundRetry;
-  readonly #pending: Array<{ operation: () => unknown | Promise<unknown>; attempted: () => void }> = [];
-  #timer: NodeJS.Timeout | undefined;
-  #draining: Promise<void> | undefined;
-  #closed = false;
-  #failed = false;
-  constructor(label: string, minMs = 100, maxMs = 5_000) { this.#retry = new MeshBackgroundRetry(label, minMs, maxMs); }
-
-  enqueue(operation: () => unknown | Promise<unknown>): Promise<void> {
-    if (this.#closed) return Promise.resolve();
-    // Bounded best-effort notifications. Durable protocol cursors are not stored here.
-    if (this.#pending.length >= 1_000) {
-      this.#failed = true;
-      diagnostics.warn("src/core/atomic-write.ts", "[pi-fabric] background mesh notification queue full; dropping newest notification");
-      return Promise.resolve();
-    }
-    const admission = new Promise<void>(resolve => this.#pending.push({ operation, attempted: resolve }));
-    // A hook behind an already queued/outage write must not wait for mesh recovery.
-    // The queue still owns its retry; close also settles every outstanding admission.
-    if (this.#pending.length > 1 || this.#retry.waitMs > 0) this.#pending[this.#pending.length - 1]!.attempted();
-    this.#schedule();
-    return admission;
-  }
-
-  retry(operation: () => unknown | Promise<unknown>, error: unknown): Promise<void> {
-    this.#retry.failure(error);
-    return this.enqueue(operation);
-  }
-
-  #schedule(): void {
-    if (this.#closed || this.#draining || this.#timer || !this.#pending.length) return;
-    if (this.#retry.waitMs > 0) {
-      this.#timer = setTimeout(() => { this.#timer = undefined; this.#schedule(); }, this.#retry.waitMs);
-      this.#timer.unref();
-      return;
-    }
-    // Assign before the microtask starts, so a burst has exactly one drain.
-    this.#draining = Promise.resolve(); // fence reentrant admission before first operation
-    const work = this.#drain();
-    this.#draining = work;
-    void work.finally(() => { this.#draining = undefined; this.#schedule(); }).catch(error => {
-      this.#retry.failure(error); // an owned boundary, not a global bug-hiding handler
-    });
-  }
-
-  async #drain(): Promise<void> {
-    while (!this.#closed && this.#pending.length) {
-      const item = this.#pending[0]!;
-      const result = await this.#retry.run(item.operation);
-      item.attempted();
-      if (result === "retry" || result === "skipped") return;
-      if (result === "failed") this.#failed = true;
-      this.#pending.shift(); // permanent failures are visible but do not poison later notices
-    }
-  }
-
-  /** Admission only waits for a first attempt; release needs a confirmed empty queue. */
-  async checkpointForRelease(): Promise<void> {
-    await this.#draining;
-    if (this.#pending.length || this.#failed) throw new Error("Background mesh release has unconfirmed publication obligations");
-  }
-
-  async close(): Promise<void> {
-    this.#closed = true;
-    this.#retry.close();
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
-    await this.#draining;
-    for (const item of this.#pending.splice(0)) item.attempted();
   }
 }

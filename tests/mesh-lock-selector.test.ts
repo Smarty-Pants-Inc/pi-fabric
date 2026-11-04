@@ -28,15 +28,18 @@ describe("startup mesh lock selector", () => {
     const rename = vi.spyOn(fs, "renameSync");
     const remove = vi.spyOn(fs, "rmSync");
     const write = vi.spyOn(fs, "writeFileSync");
+    const link = vi.spyOn(fs, "linkSync");
     let token = "";
     await mesh.exclusive(() => {
       const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
       expect(owner).toMatch(new RegExp(`^[^\\n]+\\n${process.pid}\\n[0-9]+\\n$`));
       expect(mkdir).toHaveBeenCalledWith(lock, { mode: 0o700 });
       token = owner.split("\n")[0]!;
-      expect(write).toHaveBeenCalledWith(path.join(lock, "owner"), owner, {
+      const temporaryOwner = path.join(lock, `.owner.${token}.tmp`);
+      expect(write).toHaveBeenCalledWith(temporaryOwner, owner, {
         encoding: "utf8", flag: "wx", mode: 0o600,
       });
+      expect(link).toHaveBeenCalledWith(temporaryOwner, path.join(lock, "owner"));
     });
     expect(mesh.lockProtocol).toBe(1);
     if (process.platform === "linux") {

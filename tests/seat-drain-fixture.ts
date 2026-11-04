@@ -128,6 +128,24 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
   const native = fakeNative(options.fenceApi ?? true);
   const fabric = { held: 0, handed: 0, halted: false };
   const actors = fakeActors([]);
+  const registry = path.join(meshRoot, "actors", SID, "actors.json");
+  const readActors = (): Array<Record<string, unknown>> => JSON.parse(fs.readFileSync(registry, "utf8")).actors;
+  const writeActors = (rows: Array<Record<string, unknown>>, scope = SID): void => {
+    const directory = path.join(meshRoot, "actors", scope);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(directory, "actors.json"), JSON.stringify({ format: 1, actors: rows.map(row => ({
+      instructions: "Synthetic actor.", events: [], topics: [], residency: "session", createdAt: 1, ...row,
+    })) }), { mode: 0o600 });
+  };
+  actors.drainSpec = id => readActors().find(row => row.id === id)!;
+  actors.create = async request => {
+    const id = randomBytes(16).toString("hex");
+    const before = actors.listOwned;
+    const row = { ...request, id, rootId: ROOT, status: "idle", createdAt: 1 };
+    writeActors([...readActors().filter(old => old.name !== request.name), row]);
+    actors.listOwned = () => [...before().filter(old => old.name !== request.name), row];
+    return { id };
+  };
   const agents: Array<{ id: string; status: string }> = [];
   const completionsPending = { count: 0 };
   const host: MainDrainHost = {
@@ -160,11 +178,7 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
         id: item.id, from: { id: "session:00000000-0000-4000-8000-0000000000aa", kind: "main", name: "peer" }, message: "synthetic",
         sentAt: 1_000 + index, ...(item.handed ? { handed: true } : {}) })) }), { mode: 0o600 });
     },
-    writeActors: (rows, scope = SID) => {
-      const directory = path.join(meshRoot, "actors", scope);
-      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(directory, "actors.json"), JSON.stringify({ format: 1, actors: rows }), { mode: 0o600 });
-    },
+    writeActors,
     /** A real exclusive flock held by THIS process's open file description (a child takes it on the shared OFD). */
     lockFd: () => {
       if (heldLock !== undefined) return heldLock;

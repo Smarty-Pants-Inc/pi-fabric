@@ -18,7 +18,7 @@ import { drainSlot, peekDrainSlot, pruneDrainSlot, type MainDrainSlotBinding } f
  * environment is a Kubernetes container (KUBERNETES_SERVICE_HOST), and binds to the pod UID that the
  * seam re-reads from the API before and after.
  */
-export type MainDrainPhase = "drain" | "drain-undo" | "resume-drain";
+export type MainDrainPhase = "drain" | "drain-undo" | "drain-restore" | "resume-drain";
 export interface MainDrainBindingRequest {
   runDir: string | null;
   run: string;
@@ -37,7 +37,7 @@ const HEX32 = /^[0-9a-f]{32}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const POD_UID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_RUN_BYTES = 1024 * 1024;
-const PHASES = new Set<MainDrainPhase>(["drain", "drain-undo", "resume-drain"]);
+const PHASES = new Set<MainDrainPhase>(["drain", "drain-undo", "drain-restore", "resume-drain"]);
 
 /** Exact keys and shapes; anything else is refused. */
 export const parseBindingRequest = (value: unknown): MainDrainBindingRequest | undefined => {
@@ -120,6 +120,18 @@ export const procStartTime = (pid: number, procRoot = "/proc"): string | undefin
     const start = fields[19];
     return start && /^[0-9]+$/.test(start) ? start : undefined;
   } catch { return undefined; }
+};
+
+/** A zombie cannot execute or hold an in-flight tool call. Unreadable /proc remains unknown. */
+export const procWorkerExited = (pid: number, startTime: string, procRoot = "/proc"): boolean | null => {
+  try {
+    const stat = fs.readFileSync(path.join(procRoot, String(pid), "stat"), "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    if (!fields[19] || !/^[0-9]+$/.test(fields[19])) return null;
+    return fields[19] !== startTime || fields[0] === "Z";
+  } catch {
+    return fs.existsSync(path.join(procRoot, String(pid))) ? null : true;
+  }
 };
 
 export interface HostBindingProof {

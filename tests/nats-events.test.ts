@@ -106,8 +106,8 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     new JetStreamApiError({ code: status, err_code: code, description });
   const statusError = (code: number) => Object.assign(new JetStreamError("private status detail"), { name: "JetStreamStatusError", code });
   const wrapper = (cause?: unknown) => Object.assign(new Error("private request detail", { cause }), { name: "JetStreamNotEnabled" });
-  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false, oldRetryPolicy = false, pending = 0, hold = false, deliver, openMessages, monitorConsume = false }: {
-    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean; oldRetryPolicy?: boolean; pending?: number; hold?: boolean; deliver?: JsMsg; openMessages?: Promise<void>; monitorConsume?: boolean;
+  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false, oldRetryPolicy = false, retryPolicyOnly = false, pending = 0, hold = false, deliver, openMessages, monitorConsume = false }: {
+    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean; oldRetryPolicy?: boolean; retryPolicyOnly?: boolean; pending?: number; hold?: boolean; deliver?: JsMsg; openMessages?: Promise<void>; monitorConsume?: boolean;
   } = {}) => {
     const target = resources(kind);
     const calls: Array<{ step: SetupStep | "close" | "delete"; stream: string; durable: string }> = [];
@@ -132,7 +132,7 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
         ack_wait: oldRetryPolicy && durable === target.durable ? 30_000_000_000 : 1_000_000_000,
         max_ack_pending: oldRetryPolicy && durable === target.durable ? 1 : 128,
         inactive_threshold: oldRetryPolicy && durable === target.durable ? 604_800_000_000_000 : 0,
-        ...(oldRetryPolicy && durable === target.durable ? { max_deliver: 5 } : {
+        ...((oldRetryPolicy || retryPolicyOnly) && durable === target.durable ? { max_deliver: 5 } : {
           max_deliver: -1,
           backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
         }) },
@@ -209,6 +209,7 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
       monitorActive: () => monitorInterval !== undefined,
       stopMonitor: () => { if (monitorInterval !== undefined) clearInterval(monitorInterval); monitorInterval = undefined; },
       setFailure(step: SetupStep, cause: unknown) { failureStep = step; failureCause = cause; },
+      clearFailure() { failureStep = undefined; failureCause = undefined; },
     };
   };
   const start = (connection: Parameters<typeof startNatsActorEventsConsumer>[0]) =>
@@ -309,6 +310,22 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
       expect(fake.calls.some(call => call.step === "delete")).toBe(false);
       expect(fake.calls.filter(call => call.stream === resources("ev").stream).map(call => call.step))
         .toEqual(["info", "update", "update", "get", "consume"]);
+    } finally { await consumer.close(false); }
+  });
+
+  it("does not pull if a retry-only legacy policy repair fails, and repairs it on the next setup", async () => {
+    const fake = fakeJs({ retryPolicyOnly: true, pending: 3 });
+    const cause = new TimeoutError();
+    fake.setFailure("update", cause);
+    await expectFailure(start(fake.connection), cause, "ev", "TIMEOUT", true);
+    expect(fake.calls.some(call => call.step === "consume")).toBe(false);
+    // A new setup attempt uses the same durable and leaves its pending cursor intact.
+    fake.clearFailure();
+    const consumer = await start(fake.connection);
+    try {
+      expect(fake.updates[1]).toMatchObject({ max_deliver: -1,
+        backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000] });
+      expect(fake.calls.some(call => call.step === "delete")).toBe(false);
     } finally { await consumer.close(false); }
   });
 

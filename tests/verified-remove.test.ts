@@ -114,7 +114,7 @@ const FIXTURES: Record<string, () => Fixture> = {
   },
 };
 // The public mesh pass is not in FIXTURES: its apply rejects at the boundary until smarty-dev#10678 (pi-fabric#1014 SEC
-// P2-1), so no helper seam can fire through it. The deleter it calls (pruneActorRunArchives) keeps the swap matrix above.
+// P2-1), so no helper seam can fire through it. Actor-run archives are keep-all; the swap matrix above remains covered by the planned session-backup move.
 const meshPass = () => {
   const root = tmp("fabric-vr-mesh-");
   const registry = path.join(root, "actors", "project");

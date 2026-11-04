@@ -12,7 +12,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { appendResidentLog } from "../src/residency/launcher.js";
 
-// smarty-dev#3252: age-based removal of terminal runs mesh-wide, independent of the owner.
+// smarty-dev#3252: mesh-wide maintenance keeps actor run archives; only resident runs and session backups are retention candidates.
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const roots: string[] = [];
@@ -60,7 +60,8 @@ describe("mesh-wide age-based run retention", () => {
     const mesh = deadRootMesh();
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(plan.skipped).toEqual([]);
-    expect(plan.removedRuns.sort()).toEqual([mesh.old, mesh.orphan].sort());
+    expect(plan.removedRuns).toEqual([]);
+    for (const kept of [mesh.old, mesh.orphan]) expect(fs.existsSync(path.join(kept, "reply.json"))).toBe(true);
     expect(plan.changes.map(change => change.path).filter(file => file.endsWith(".bak")).sort()).toEqual(
       ["20260920T150000000Z", "20260921T150000000Z"].map(stamp => path.join(mesh.actor, `session.jsonl.${stamp}.bak`)));
     for (const kept of [mesh.old, mesh.orphan, mesh.latest, mesh.young, mesh.inflight]) expect(fs.existsSync(path.join(kept, "reply.json"))).toBe(true);
@@ -74,10 +75,9 @@ describe("mesh-wide age-based run retention", () => {
     write(path.join(mesh.old, "status.json"), JSON.stringify({ status: "completed", finishedAt: NOW - 8 * DAY }));
     write(path.join(mesh.orphan, "surprise.bin"), "x".repeat(1000));
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-    const item = plan.summary.deleters.pruneActorRunArchives!;
-    expect(item.refused).toMatchObject({ "worker exit is unconfirmed: unknown root identity": 1, "unknown entry surprise.bin": 1, "status is running": 1 });
-    expect(item.refusedBytes["unknown entry surprise.bin"]).toBeGreaterThan(1000);
-    expect(summaryLines(true, plan.summary).join("\n")).toMatch(/refused 1 \(0\.000 GiB\): unknown entry surprise\.bin/);
+    expect(plan.removedRuns).toEqual([]);
+    expect(fs.existsSync(path.join(mesh.old, "reply.json"))).toBe(true);
+    expect(fs.existsSync(path.join(mesh.orphan, "reply.json"))).toBe(true);
   });
 
   // smarty-dev#9058 item 1: an offline removal (`fabric-actors remove --main-stopped`) moves the whole actor directory
@@ -86,8 +86,8 @@ describe("mesh-wide age-based run retention", () => {
     const mesh = deadRootMesh();
     write(path.join(mesh.registry, "offline-removal-actor.json"), JSON.stringify({ format: 1, kind: "offline-removal", id: "actor" }));
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-    expect(applied.removedRuns).not.toContain(mesh.old);
-    expect(applied.removedRuns).toContain(mesh.orphan); // another actor's home is unaffected
+    expect(applied.removedRuns).toEqual([]);
+    expect(fs.existsSync(path.join(mesh.orphan, "reply.json"))).toBe(true);
   });
 
   it("without runRetentionMs removes nothing (compaction-only contract unchanged)", async () => {
@@ -105,8 +105,8 @@ describe("mesh-wide age-based run retention", () => {
     const other = path.join(mesh.root, "actors", "01a118ab-live-session");
     write(path.join(other, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "old" }] }));
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-    expect(applied.removedRuns).toEqual([mesh.orphan]);
-    for (const kept of [mesh.old, mesh.latest, mesh.young, mesh.inflight]) expect(fs.existsSync(kept)).toBe(true);
+    expect(applied.removedRuns).toEqual([]);
+    for (const kept of [mesh.old, mesh.orphan, mesh.latest, mesh.young, mesh.inflight]) expect(fs.existsSync(kept)).toBe(true);
     expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toHaveLength(3);
   });
 

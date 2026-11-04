@@ -33,10 +33,15 @@ const mesh = () => {
     id: "actor", rootId: "session:01a0cd9c-dead-session", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest",
   }]));
   write(path.join(actor, "session.jsonl"), "live");
-  const old = run(path.join(actor, "runs", "old"), { status: "completed", finishedAt: NOW - 8 * DAY });
+  const host = path.join(root, "residency", "host");
+  write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
+  write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:01a0cd9c-dead-session", residencyRoot: host, meshRoot: root }));
+  const old = run(path.join(host, "runs", "old"), { status: "completed", finishedAt: NOW - 8 * DAY });
+  fs.utimesSync(old, (NOW - 8 * DAY) / 1_000, (NOW - 8 * DAY) / 1_000);
   const latest = run(path.join(actor, "runs", "latest"), { status: "completed", finishedAt: NOW - 9 * DAY });
-  // Processed after `old` (listings are sorted below): the next, independent candidate.
-  const orphan = run(path.join(registry, "removed-actor", "runs", "orphan"), { status: "failed", finishedAt: NOW - 10 * DAY });
+  // A second dead-resident candidate keeps the final-check fences exercised after actor archives become keep-all.
+  const orphan = run(path.join(host, "runs", "orphan"), { status: "failed", finishedAt: NOW - 10 * DAY });
+  fs.utimesSync(orphan, (NOW - 10 * DAY) / 1_000, (NOW - 10 * DAY) / 1_000);
   return { root, actors, registry, actor, old, latest, orphan };
 };
 
@@ -98,7 +103,7 @@ const isAbsent = (real: () => unknown): boolean => {
   try { return real() === undefined; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
 };
 
-const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
 
 describe("smarty-dev#9058 final candidate check (dry run)", () => {
   // P1 (a): the final check's re-walk meets a session directory that is gone at the walker's lstat; it reappears right

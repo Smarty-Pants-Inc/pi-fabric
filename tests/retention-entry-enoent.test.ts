@@ -29,8 +29,13 @@ const mesh = () => {
   }] }));
   write(path.join(actor, "session.jsonl"), "live");
   run(path.join(actor, "runs", "latest"), NOW - 9 * DAY);
-  const old = run(path.join(actor, "runs", "old"), NOW - 8 * DAY);
-  const orphan = run(path.join(registry, "removed-actor", "runs", "orphan"), NOW - 10 * DAY);
+  const host = path.join(root, "residency", "host");
+  write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
+  write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:01a0cd9c-dead-session", residencyRoot: host, meshRoot: root }));
+  const old = run(path.join(host, "runs", "old"), NOW - 8 * DAY);
+  fs.utimesSync(old, (NOW - 8 * DAY) / 1_000, (NOW - 8 * DAY) / 1_000);
+  const orphan = run(path.join(host, "runs", "orphan"), NOW - 10 * DAY);
+  fs.utimesSync(orphan, (NOW - 10 * DAY) / 1_000, (NOW - 10 * DAY) / 1_000);
   write(path.join(actors, "other", "actors.json"), JSON.stringify({ actors: [] }));
   const entry = path.join(actors, "s");
   fs.writeFileSync(entry, "not a registry");
@@ -103,7 +108,7 @@ const withIno = (file: string, ino: number): fs.Stats => {
   return Object.assign(Object.create(Object.getPrototypeOf(real)), real, { ino });
 };
 const uncertain = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots are uncertain/) });
-const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
 const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
 
 describe("ENOENT-aware actors/ entry listing (#10635)", () => {

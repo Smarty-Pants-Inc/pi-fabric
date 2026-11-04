@@ -28,8 +28,13 @@ const mesh = (kind: "file" | "directory") => {
   }] }));
   write(path.join(actor, "session.jsonl"), "live");
   run(path.join(actor, "runs", "latest"), NOW - 9 * DAY);
-  const old = run(path.join(actor, "runs", "old"), NOW - 8 * DAY);
-  const orphan = run(path.join(registry, "removed-actor", "runs", "orphan"), NOW - 10 * DAY);
+  const host = path.join(root, "residency", "host");
+  write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
+  write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:01a0cd9c-dead-session", residencyRoot: host, meshRoot: root }));
+  const old = run(path.join(host, "runs", "old"), NOW - 8 * DAY);
+  fs.utimesSync(old, (NOW - 8 * DAY) / 1_000, (NOW - 8 * DAY) / 1_000);
+  const orphan = run(path.join(host, "runs", "orphan"), NOW - 10 * DAY);
+  fs.utimesSync(orphan, (NOW - 10 * DAY) / 1_000, (NOW - 10 * DAY) / 1_000);
   const entry = path.join(root, "actors", "s");
   if (kind === "file") fs.writeFileSync(entry, "not a registry"); else fs.mkdirSync(entry);
   return { root, old, orphan, entry, away: path.join(tmp("fabric-9160-away-"), "s") };
@@ -49,7 +54,7 @@ const toRegistry = (entry: string, away: string, runId: string) => {
   fs.renameSync(entry, away);
   write(path.join(entry, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: runId }] }));
 };
-const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
 const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
 
 describe("sweep fences each direct actors/ entry's type and identity (#9160)", () => {

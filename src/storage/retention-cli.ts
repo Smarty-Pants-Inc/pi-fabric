@@ -114,10 +114,10 @@ const lockWaiter = (fd: number): boolean => {
   } catch { return true; } // unknown: treat as contended
 };
 
-/** Offline compaction; with `runRetentionMs`, also age-based run removal (smarty-dev#3252). Existing host flocks must
- * exist and be claimable, diagnostic holders must be proven dead, and actor roots
- * must belong to those fenced resident roots. Live/legacy/unknown custody is skipped.
- * Dry-run never creates locks, markers or files (flock on an existing inode only). */
+/** Offline compaction; actor run archives are retained regardless of `runRetentionMs` (R-keep-all-traces).
+ * `residentRunRetentionMs` applies only to runs under proven-dead resident roots. Existing host flocks must exist and
+ * be claimable, diagnostic holders must be proven dead, and resident roots must be fenced. Live/legacy/unknown
+ * custody is skipped. Dry-run never creates locks, markers or files (flock on an existing inode only). */
 /** The deleters --apply reaches; every one removes through verifiedRemove (smarty-dev#7916). A deleter added to this
  * sweep without it must stay dry-run, with the message below. */
 export const MESH_RETENTION_APPLY_DISABLED = "retention --apply is disabled for this deleter until smarty-dev#7916 (verified-inode deletion); run --dry-run";
@@ -148,7 +148,7 @@ let registryParses: ReadonlyMap<string, number> = new Map();
 let registryRewalks = 0;
 export const sweepMeshRetention = async (meshRoot: string, options: {
   dryRun?: boolean; now?: number;
-  /** Remove terminal actor runs older than this, mesh-wide (the actor archive TTL). Unset: compaction only. */
+  /** Deprecated compatibility option; actor run archives are never removed (R-keep-all-traces). */
   runRetentionMs?: number;
   /** Removal age of a proven-dead resident root's runs (default: the live host's 24 h). */
   residentRunRetentionMs?: number;

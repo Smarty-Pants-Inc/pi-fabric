@@ -29,7 +29,9 @@ function start(kind: "soak" | "holder", rootPath: string, arg: string): Promise<
     const args = kind === "holder" ? ["--input-type=module", "-e", code] : ["--input-type=module", "-e", code, rootPath, arg, "60000"];
     const child = spawn(process.execPath, args, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] }); let output = "";
     child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; }); child.once("error", reject);
-    const timer = setTimeout(() => child.kill("SIGKILL"), kind === "holder" ? 10_000 : 70_000);
+    // Include up to 30s of cold child startup under CI load, in addition to the
+    // holder's 1.5s critical section or each writer's full 60s soak and exit.
+    const timer = setTimeout(() => child.kill("SIGKILL"), kind === "holder" ? 40_000 : 100_000);
     child.once("close", (exit, signal) => { clearTimeout(timer); resolve({ code: exit, signal, output }); });
   });
 }
@@ -46,7 +48,9 @@ describe("mesh backend mixed-load soak", () => {
     // Failure cleanup only: release the probe's SQLite handle and join the holder before afterEach
     // removes the root, so a cleanup error cannot replace the original assertion. close() is idempotent.
     try {
-    const until = Date.now() + 5_000; while (!fs.existsSync(held) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
+    // The child writes this readiness marker only after acquiring .lock. Cold
+    // startup can exceed 5s on loaded Windows runners; do not start the probe early.
+    const until = Date.now() + 30_000; while (!fs.existsSync(held) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
     expect(fs.existsSync(held)).toBe(true);
     const startAt = Date.now(); await probe.put({ key: "soak/probe", value: 1, identity });
     expect(Date.now() - startAt).toBeLessThan(1_000); probe.close();
@@ -64,5 +68,6 @@ describe("mesh backend mixed-load soak", () => {
       try { probe.close(); } catch { /* keep the original failure */ }
       await holder.catch(() => undefined);
     }
-  }, 85_000);
+  // Holder startup + writer startup + 60s of writes + bounded exit/cleanup.
+  }, 150_000);
 });

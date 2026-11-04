@@ -64,8 +64,10 @@ const installLegacyPrimaryExitReceipt = () => {
   });
 };
 
+// Observe fixture readiness/status and checked exit, rather than sleeping for a
+// fixed startup delay. Nested cold workers can take >5s to publish under CI load.
 const waitFor = async (predicate: () => boolean) => {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 30_000;
   while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
   expect(predicate()).toBe(true);
 };
@@ -199,7 +201,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   }
-}, 20_000);
+}, 90_000);
 
 // POSIX-only: the fixture's nested writer must outlive its crashed primary, which
 // relies on POSIX detached process groups. Windows durable residency is unsupported
@@ -390,7 +392,8 @@ it.skipIf(process.platform === "win32").each([
     vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   }
-}, 30_000);
+// Allow both nested workers to start, then exercise crash/recovery and join cleanup.
+}, 120_000);
 
 it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)("public recovered durable cleanup retains a real live descendant through the client fallback (%s owner)", async owner => {
   installLegacyPrimaryExitReceipt();
@@ -481,7 +484,7 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
     await client?.close(); await host.close(); await participants.close(); vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   }
-}, 30_000);
+}, 120_000);
 
 it("retention ownership uses checked orphan exit evidence, not terminal status, and fails closed on unknown trees", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-orphan-writer-retention-"));

@@ -54,6 +54,8 @@ describe("unset trace deletion policies", () => {
     "$policy: two-year-old $kind temporary raw tree", ({ explicit, kind }) => {
       const tempRoot = temporary(), root = path.join(tempRoot, "pi-fabric-runs-old");
       const directory = run(path.join(root, "terminal"), kind === "closed actor");
+      const original = new Map(fs.readdirSync(directory).map(name => [name, fs.readFileSync(path.join(directory, name))]));
+      const originalStat = fs.statSync(directory);
       write(path.join(root, ".fabric-owner.json"), { pid: 2147483647, startedAt: OLD - DAY, heartbeatAt: OLD,
         ...(kind === "orphan" ? { orphanedAt: OLD } : { closedAt: OLD, childrenStopped: true }) });
       age(path.join(root, ".fabric-owner.json")); age(root);
@@ -61,9 +63,37 @@ describe("unset trace deletion policies", () => {
       const result = sweepTempRunRoots({ tempRoot, now: NOW,
         orphanedTempRunRetentionMs: explicit ? DAY : retention.orphanedTempRunMs,
         oneShotRunRetentionMs: explicit ? DAY : retention.oneShotRunMs });
-      // Match #1800's Linux-only orphan collection expectations; Windows retains this fixture.
-      if (explicit && (kind !== "orphan" || process.platform === "linux")) expect(fs.existsSync(directory)).toBe(false);
-      else { expect(result).toEqual({ removedRoots: [], removedRuns: [] }); kept(directory); }
+      let retained = directory;
+      // #1800 moves eligible raw trees into receipted custody, never deletes their contents.
+      // Match its Linux-only orphan collection expectations; Windows retains this fixture in place.
+      if (explicit && (kind !== "orphan" || process.platform === "linux")) {
+        expect(result).toEqual({ removedRoots: [root], removedRuns: kind === "orphan" ? [] : [directory] });
+        expect(fs.existsSync(directory)).toBe(false);
+        const archive = `${root}.trace-archive`, containers = fs.readdirSync(archive);
+        expect(containers).toHaveLength(1);
+        retained = path.join(archive, containers[0]!, "tree");
+        const receipt = JSON.parse(fs.readFileSync(path.join(archive, containers[0]!, "custody.json"), "utf8"));
+        expect(receipt).toMatchObject({ state: "moved", source: directory, destination: retained, id: "terminal" });
+        expect(fs.statSync(retained)).toMatchObject({ dev: originalStat.dev, ino: originalStat.ino });
+      } else expect(result).toEqual({ removedRoots: [], removedRuns: [] });
+      expect(fs.readdirSync(retained).sort()).toEqual([...original.keys()].sort());
+      for (const [name, bytes] of original) expect(fs.readFileSync(path.join(retained, name))).toEqual(bytes);
+      kept(retained);
+    });
+
+  it.skipIf(process.platform !== "linux").each(["inside grace", "expired"])(
+    "explicit short policy: metadata-only orphan root (%s)", kind => {
+      const tempRoot = temporary(), root = path.join(tempRoot, "pi-fabric-runs-empty");
+      const lastActivity = kind === "expired" ? OLD : NOW - DAY / 2;
+      const marker = path.join(root, ".fabric-owner.json");
+      write(marker, { pid: 2147483647, startedAt: OLD - DAY, heartbeatAt: lastActivity, orphanedAt: lastActivity });
+      for (const file of [marker, root]) fs.utimesSync(file, lastActivity / 1000, lastActivity / 1000);
+      const ownerBefore = fs.readFileSync(marker, "utf8");
+      expect(sweepTempRunRoots({ tempRoot, now: NOW, orphanedTempRunRetentionMs: DAY, oneShotRunRetentionMs: DAY }))
+        .toEqual({ removedRoots: kind === "expired" ? [root] : [], removedRuns: [] });
+      if (kind === "expired") expect(fs.existsSync(root)).toBe(false);
+      else expect(fs.readFileSync(marker, "utf8")).toBe(ownerBefore);
+      expect(fs.existsSync(`${root}.trace-archive`)).toBe(false);
     });
 
   it.skipIf(process.platform !== "linux").each(["dead", "live", "unknown", "dry-run", "unknown content"])(

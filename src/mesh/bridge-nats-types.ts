@@ -418,6 +418,10 @@ export const bridgeNatsTopicIdempotencyKey = (link: string, fileEventId: string)
 // L1 -> L2: the raw NATS port (L1 provides it; L2's NatsCarrierSide consumes it)
 // ---------------------------------------------------------------------------------------------
 
+/** Route failure classification only; these labels never grant authority. */
+export type BridgeNatsPresenceFailure = "no-route" | "identity-mismatch" | "incarnation-mismatch" |
+  "binding-mismatch" | "root-recheck" | "terminal" | "expired";
+
 /** One KV presence record resolved for an id: the route plus the identity from the KV record itself. */
 export interface BridgeNatsPortResolved {
   /** ParticipantRoute semantics (participant-view.ts): machine from the KV key, presence + lease liveness. */

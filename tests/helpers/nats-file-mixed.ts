@@ -19,6 +19,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { fauxProvider } from "@earendil-works/pi-ai";
@@ -33,7 +34,8 @@ import { hashToken } from "../../src/transport/nats/subjects.js";
 import type { BridgeNatsAllowEntryInput } from "../../src/mesh/bridge-nats-types.js";
 import type { FabricControlOperation } from "../../src/topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantRecord, FabricKvHostLease } from "../../src/topology/types.js";
-import type { FabricTransport, TransportEnvelope, TransportSent } from "../../src/transport/types.js";
+import type { FabricTransport, TransportEnvelope, TransportKvEvent, TransportSent } from "../../src/transport/types.js";
+import type { NatsPresenceReader } from "../../src/mesh/bridge-nats-presence.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, teardownWithin, type PathBHarness } from "./nats-cluster.js";
 import { NatsWireFaults } from "./nats-wire-faults.js";
 
@@ -324,6 +326,60 @@ export class NatsWire {
       test();
     });
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A watch-I/O barrier, not a presence/authorization fixture
+// ---------------------------------------------------------------------------------------------
+
+/** Install BEFORE this real reader starts. Only the selected root's lease observations are held;
+ * all other real KV events (including the link's own leases) continue normally. release() supplies
+ * the original broker events, never synthetic presence, a replacement route, or a renewed clock. */
+export function pauseMixedLeaseWatch(reader: NatsPresenceReader, id: string) {
+  const kv = reader.options.transport.kv("leases");
+  const watch = kv.watch.bind(kv);
+  const queue = new Readable({ objectMode: true, read() {} });
+  const pending: TransportKvEvent[] = [];
+  let paused = false, intercepted = 0;
+  const spy = vi.spyOn(kv, "watch").mockImplementation(async function*<V>(prefix: string, signal: AbortSignal) {
+    const abort = new AbortController();
+    const lifetime = AbortSignal.any([signal, abort.signal]);
+    const end = () => { if (!queue.destroyed && !queue.readableEnded) queue.push(null); };
+    lifetime.addEventListener("abort", end, { once: true });
+    const pumping = (async () => {
+      try {
+        for await (const event of watch(prefix, lifetime)) {
+          if (lifetime.aborted) break;
+          const key = event.type === "put" ? event.entry.key : event.type === "gone" ? event.key : undefined;
+          if (paused && key === `${NATS_MAIN_MACHINE}.h.${hashToken(id)}`) {
+            pending.push(event);
+            intercepted++;
+          } else if (!queue.destroyed) queue.push(event);
+        }
+        end();
+      } catch (error) { if (!lifetime.aborted && !queue.destroyed) queue.destroy(error as Error); }
+    })();
+    try {
+      for await (const event of queue as AsyncIterable<TransportKvEvent<V>>) {
+        if (lifetime.aborted) break;
+        yield event;
+      }
+    } finally {
+      abort.abort();
+      lifetime.removeEventListener("abort", end);
+      queue.destroy();
+      await pumping;
+    }
+  });
+  return {
+    pause() { paused = true; },
+    release() {
+      paused = false;
+      for (const event of pending.splice(0)) if (!queue.destroyed) queue.push(event);
+    },
+    intercepted: () => intercepted,
+    restore: () => spy.mockRestore(),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

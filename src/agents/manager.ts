@@ -6314,7 +6314,7 @@ export class AgentManager {
           (managed.actorId && managed.nativeReleasePending) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
-      return typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;
+      return this.#retention.oneShotRunMs !== undefined && typeof finishedAt === "number" && now - finishedAt >= this.#retention.oneShotRunMs;
     });
     for (const managed of expired) {
       if (!this.#canCollect(managed)) continue;

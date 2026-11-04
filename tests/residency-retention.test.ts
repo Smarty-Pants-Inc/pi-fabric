@@ -211,7 +211,7 @@ describe("resident terminal event retention", () => {
     expect(fs.existsSync(path.join(old, "status.json"))).toBe(true);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
     fs.utimesSync(old, day / 1000, day / 1000);
-    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot] })).toEqual([old]);
+    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot], retentionMs: day })).toEqual([old]);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
   });
 

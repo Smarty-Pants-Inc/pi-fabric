@@ -44,7 +44,7 @@ const fixture = (scratchEntries: number) => {
   return { residencyRoot, run, temporary, now };
 };
 const sweep = (residencyRoot: string, now: number): void => {
-  const collector = new ResidentRequestRetention(residencyRoot, [], { retainRuns: false });
+  const collector = new ResidentRequestRetention(residencyRoot, [], { retainRuns: false, residentRunMs: DAY });
   try { collector.sweep(now, new Set(), 10_000); } finally { collector.close(); }
 };
 

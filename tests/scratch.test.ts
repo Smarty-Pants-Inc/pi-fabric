@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { closeScratch, createScratch, SCRATCH_OWNER_FILE, sweepScratch } from "../src/storage/scratch.js";
+import { closeScratch, createScratch, SCRATCH_OWNER_FILE, sweepScratch as sweepWithDefaults } from "../src/storage/scratch.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
 
 const HOUR = 3_600_000;
+// Exercise expiry/pressure/recheck paths with an explicit short policy.
+const sweepScratch = (options: Parameters<typeof sweepWithDefaults>[0]) =>
+  sweepWithDefaults({ maxAgeMs: 24 * HOUR, recentMs: HOUR, orphanGraceMs: 6 * HOUR, ...options });
 // pi-fabric#1014: on Linux the verified helper removes (only with getuid proof); off Linux scratch keeps main's path
 // removal after its rechecks (tests/scratch-platform-retention.test.ts). Planning and dry runs are unchanged everywhere.
 // This suite performs real deletions of its own fixtures: hosted CI only, not run on agent hosts.

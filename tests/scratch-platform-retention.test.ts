@@ -3,7 +3,7 @@ import { hostedOnly } from "../scripts/hosted-only.mjs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SCRATCH_OWNER_FILE, sweepScratch } from "../src/storage/scratch.js";
+import { SCRATCH_OWNER_FILE, sweepScratch as sweepWithDefaults } from "../src/storage/scratch.js";
 import { platformRemovalSkips, startRemovalTally, stopRemovalTally, verifiedRemove } from "../src/storage/verified-remove.js";
 import { spawnSync } from "node:child_process";
 import { build } from "esbuild";
@@ -15,6 +15,9 @@ import { build } from "esbuild";
 // execute it, so no product deletion runs here. A forced process.platform is not native Darwin or Windows evidence:
 // it proves which removal sweepScratch dispatches, with which target and options, and what it reports.
 const HOUR = 3_600_000;
+// Exercise candidate/recheck paths with an explicit short policy, not production defaults.
+const sweepScratch = (options: Parameters<typeof sweepWithDefaults>[0]) =>
+  sweepWithDefaults({ maxAgeMs: 24 * HOUR, recentMs: HOUR, orphanGraceMs: 6 * HOUR, ...options });
 // The fixture's own concurrent replacement moves its directory aside with the real rename, not the recorder.
 const realRename = fs.renameSync;
 const roots: string[] = [];

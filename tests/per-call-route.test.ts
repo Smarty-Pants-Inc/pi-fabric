@@ -132,20 +132,20 @@ describe("per-call shadow ledger", () => {
     expect(readLedger(ledger)[0]).toMatchObject({ previousCallModel: "cliproxyapi/gpt-6-luna", sameAsPrevious: false });
   });
 
-  it("rotates daily and keeps seven days", () => {
+  it("rotates daily with an explicit seven-day retention policy", () => {
     const ledger = path.join(dir, "per-call-routing.jsonl");
     const now = new Date("2026-10-07T12:00:00Z");
     fs.writeFileSync(ledger, "{}\n");
     fs.utimesSync(ledger, new Date("2026-10-06T23:00:00Z"), new Date("2026-10-06T23:00:00Z"));
     for (const day of ["2026-09-29", "2026-09-30", "2026-10-01", "2026-10-05"]) fs.writeFileSync(path.join(dir, `per-call-routing.${day}.jsonl`), "{}\n");
     fs.writeFileSync(path.join(dir, "unrelated.2026-01-01.jsonl"), "");
-    expect(rotatePerCallLedger(ledger, now)).toBe(true);
+    expect(rotatePerCallLedger(ledger, now, 7)).toBe(true);
     expect(fs.readdirSync(dir).sort()).toEqual(["per-call-routing.2026-10-01.jsonl", "per-call-routing.2026-10-05.jsonl",
       "per-call-routing.2026-10-06.jsonl", "unrelated.2026-01-01.jsonl"]);
     fs.writeFileSync(ledger, "{}\n");
     // Pin the same-day mtime to `now`: the wall clock is not 2026-10-07 on every runner.
     fs.utimesSync(ledger, now, now);
-    expect(rotatePerCallLedger(ledger, now)).toBe(false);
+    expect(rotatePerCallLedger(ledger, now, 7)).toBe(false);
     expect(fs.existsSync(ledger)).toBe(true);
   });
 });

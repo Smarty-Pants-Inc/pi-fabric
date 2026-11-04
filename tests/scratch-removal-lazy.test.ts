@@ -35,13 +35,13 @@ describe.skipIf(process.platform !== "linux")("scratch verified remover loads at
       fs.writeFileSync(path.join(directory, "output.txt"), "keep bytes");
       return directory;
     });
-    const now = 100 * 3_600_000;
-    expect((await scratch.sweepScratch({ tempRoot: root, now, dryRun: true })).eligible.sort()).toEqual([...fixtures].sort());
+    const now = 100 * 3_600_000, maxAgeMs = 24 * 3_600_000;
+    expect((await scratch.sweepScratch({ tempRoot: root, now, maxAgeMs, dryRun: true })).eligible.sort()).toEqual([...fixtures].sort());
     expect(loads).not.toHaveBeenCalled();
     const unlinks: string[] = [], rmdirs: string[] = [];
     vi.spyOn(fs, "unlinkSync").mockImplementation(file => { unlinks.push(String(file)); });
     vi.spyOn(fs, "rmdirSync").mockImplementation(file => { rmdirs.push(String(file)); });
-    const result = await scratch.sweepScratch({ tempRoot: root, now });
+    const result = await scratch.sweepScratch({ tempRoot: root, now, maxAgeMs });
     expect(result.removed.sort()).toEqual([...fixtures].sort());
     expect(loads).toHaveBeenCalledTimes(1);
     expect(unlinks.map(file => path.basename(file)).sort()).toEqual([
@@ -73,7 +73,7 @@ describe.skipIf(process.platform !== "linux")("scratch verified remover loads at
     vi.spyOn(fs, "rmdirSync").mockImplementation(file => { ops.push(`rmdir ${String(file)}`); });
     vi.spyOn(fs, "rmSync").mockImplementation(file => { ops.push(`rm ${String(file)}`); });
     vi.spyOn(fs, "renameSync").mockImplementation(file => { ops.push(`rename ${String(file)}`); });
-    const result = await scratch.sweepScratch({ tempRoot: root, now: 100 * 3_600_000 });
+    const result = await scratch.sweepScratch({ tempRoot: root, now: 100 * 3_600_000, maxAgeMs: 24 * 3_600_000 });
     expect(loads).toHaveBeenCalledTimes(1);
     expect(fs.lstatSync(directory).mtimeMs).toBe(rootMtime);
     expect(result).toMatchObject({ eligible: [directory], removed: [] });

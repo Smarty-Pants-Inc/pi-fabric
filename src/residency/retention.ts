@@ -10,7 +10,8 @@ import { verifiedRemove } from "../storage/verified-remove.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
 
-export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+/** No deletion age without an explicit policy. */
+export const RESIDENT_RUN_RETENTION_MS: number | undefined = undefined;
 
 /** Called under the host fence: by the mesh-wide sweep (storage/retention-cli.ts) for a resident root whose
  * host is proven dead and flock-fenced. Every existing run is then untracked. The reference snapshot
@@ -33,7 +34,7 @@ export const sweepResidentRuns = (
     onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): string[] => {
   const removed: string[] = [];
-  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
+  if (options.retentionMs === undefined || !ownedStat(runsRoot)?.isDirectory()) return removed;
   const started = performance.now();
   const expired = () => performance.now() - started >= budgetMs;
   const actorRoots = options.actorRoots ?? [];
@@ -57,7 +58,7 @@ export const sweepResidentRuns = (
       const run = path.join(runsRoot, entry.name);
       const stat = ownedStat(run);
       if (!stat?.isDirectory()) continue;
-      if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
+      if (!options.retainRuns && now - stat.mtimeMs > options.retentionMs &&
           !runTreeExitVeto(run, 0, expired, true, options.acceptPidReuse === true) &&
           canRemoveTerminalRun(run, expired, options.acceptPidReuse === true) &&
           hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
@@ -155,7 +156,7 @@ export class ResidentRequestRetention {
   constructor(
     readonly root: string,
     readonly actorRoots: readonly string[] = [],
-    readonly retention: TerminalRunEventsRetention & { retainRuns?: boolean } = {},
+    readonly retention: TerminalRunEventsRetention & { retainRuns?: boolean; residentRunMs?: number } = {},
     readonly recoverRunArchives?: (directory: string, expired?: () => boolean) => void,
     readonly custody?: { run: (id: string) => boolean; reference: (id: string) => boolean },
   ) {}
@@ -255,7 +256,7 @@ export class ResidentRequestRetention {
           // Same exit/result fences as the former startup sweep, now streaming
           // after the lease is up. A terminal marker alone is never exit evidence.
           const stat = ownedStat(file);
-          if (this.retention.retainRuns === false && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
+          if (this.retention.retainRuns === false && this.retention.residentRunMs !== undefined && stat && now - stat.mtimeMs > this.retention.residentRunMs &&
               !runTreeExitVeto(file, 0, unitExpired, true) && canRemoveTerminalRun(file, unitExpired) &&
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
@@ -363,7 +364,7 @@ export class ResidentRequestRetention {
           // Same exit/result fences as the former startup sweep, now streaming
           // after the lease is up. A terminal marker alone is never exit evidence.
           const stat = ownedStat(file);
-          if (this.retention.retainRuns === false && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
+          if (this.retention.retainRuns === false && this.retention.residentRunMs !== undefined && stat && now - stat.mtimeMs > this.retention.residentRunMs &&
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {

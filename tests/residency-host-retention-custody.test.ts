@@ -87,7 +87,8 @@ describe("ResidentHost legacy retention custody wiring", () => {
       sessionActorRoot: path.join(root, "session-actors"), residencyRoot: path.join(root, "resident"),
       fullCodeMode: false,
       agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns, sessionExport: false },
-      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh }, retention: { ...DEFAULT_FABRIC_CONFIG.retention },
+      // Exercise the explicit-policy collector; unset ages intentionally keep traces.
+      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh }, retention: { ...DEFAULT_FABRIC_CONFIG.retention, residentRunMs: DAY },
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("src/index.ts"),
       piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     };

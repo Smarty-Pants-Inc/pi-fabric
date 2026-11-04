@@ -1045,7 +1045,13 @@ describe("resident retention config reload", () => {
       reloaded: { terminalRunEventsAgeMs: 6 * 60 * 60 * 1000 } },
     { change: "byte cap", initial: { terminalRunEventsMaxBytes: 512 * 1024 },
       reloaded: { terminalRunEventsMaxBytes: 128 * 1024 } },
-  ].flatMap(policy => [0, 6].map(recoveryMs => ({ ...policy, recoveryMs }))))("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change, recovery=$recoveryMs ms)", async ({ initial, reloaded, recoveryMs }) => {
+    { change: "clear explicit resident age", initial: { residentRunMs: 31_536_000_000 },
+      reloaded: {} },
+    { change: "clear explicit event age", initial: { terminalRunEventsAgeMs: 86_400_000 },
+      reloaded: {} },
+    { change: "clear entire retention policy", initial: { residentRunMs: 86_400_000, terminalRunEventsAgeMs: 86_400_000 },
+      reloaded: {} },
+  ].flatMap(policy => [0, 6].map(recoveryMs => ({ ...policy, recoveryMs }))))("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change, recovery=$recoveryMs ms)", async ({ change, initial, reloaded, recoveryMs }) => {
     // Set the legacy settings before construction, then prove a real client
     // reload reaches the existing collector. Neither policy may shorten logs.
     const { root, config, host } = fixture(initial);
@@ -1080,6 +1086,10 @@ describe("resident retention config reload", () => {
       // The real reload creates a new client; ensureHost publishes desired config and reuses the owner.
       // Each case changes one compatibility setting; the collector must see it.
       const next = { ...config, retention: { ...config.retention, ...reloaded } };
+      if (change === "clear explicit resident age") delete next.retention.residentRunMs;
+      if (change === "clear explicit event age") delete next.retention.terminalRunEventsAgeMs;
+      if (change === "clear entire retention policy") delete (next as Partial<ResidentHostConfig>).retention;
+      const expectedRetention = next.retention ?? DEFAULT_FABRIC_CONFIG.retention;
       client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
         mainAgent: { local: false } as FabricMainAgentTarget });
       expect((await client.ensureHost()).pid).toBe(process.pid);
@@ -1102,18 +1112,18 @@ describe("resident retention config reload", () => {
         policies.push({ ...this.retention });
         return nativeSweep.call(this, now + 60_001, ...args);
       });
-      await vi.waitFor(() => expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns }));
+      await vi.waitFor(() => expect(policies).toContainEqual({ ...expectedRetention, retainRuns: config.agents.retainRuns }));
       expect(sweep).toHaveBeenCalled();
       expect(sweep.mock.calls.every(call => call[2] === 5)).toBe(true);
-      expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns });
+      expect(policies).toContainEqual({ ...expectedRetention, retainRuns: config.agents.retainRuns });
       due.mockRestore(); sweep.mockRestore();
       expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(log);
       expect(config.retention).toEqual(initialRetention);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep"}');
       expect(fs.readFileSync(ownerPath, "utf8")).toBe(owner);
-      expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsAgeMs).toBe(6 * 60 * 60 * 1000);
-      expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsMaxBytes).toBe(256 * 1024);
+      expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsAgeMs).toBeUndefined();
+      expect(DEFAULT_FABRIC_CONFIG.retention.terminalRunEventsMaxBytes).toBe(16 * 1024 * 1024);
     } finally {
       vi.restoreAllMocks(); await client?.close(); await host.close();
       fs.rmSync(root, { recursive: true, force: true });
@@ -1263,7 +1273,7 @@ describe("resident tracked result preservation", () => {
 
 describe("resident orphan retention", () => {
   it("F1 retains a public task's only completion until a valid saved terminal result authorizes collection", async () => {
-    const { root, config, host } = fixture();
+    const { root, config, host } = fixture({ residentRunMs: RESIDENT_RUN_RETENTION_MS });
     const id = "a".repeat(32);
     const runs = path.join(config.residencyRoot, "runs");
     const run = path.join(runs, id);
@@ -1299,7 +1309,7 @@ describe("resident orphan retention", () => {
         JSON.stringify({ ...result, usage: { ...result.usage, output: "invalid" } }),
       ]) {
         fs.writeFileSync(resultPath, malformed);
-        expect(sweepResidentRuns(runs), malformed).toEqual([]);
+        expect(sweepResidentRuns(runs, Date.now(), 100, { retentionMs: RESIDENT_RUN_RETENTION_MS }), malformed).toEqual([]);
         expect(fs.existsSync(run), malformed).toBe(true);
         expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toEqual(result);
       }
@@ -1313,13 +1323,13 @@ describe("resident orphan retention", () => {
         JSON.stringify({ ...parsedMetadata, runDirectory: path.join(runs, "unrelated") }),
       ]) {
         fs.writeFileSync(metadataPath, malformed);
-        expect(sweepResidentRuns(runs), malformed).toEqual([]);
+        expect(sweepResidentRuns(runs, Date.now(), 100, { retentionMs: RESIDENT_RUN_RETENTION_MS }), malformed).toEqual([]);
         expect(fs.existsSync(run), malformed).toBe(true);
         expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toEqual(result);
       }
       fs.writeFileSync(metadataPath, metadata);
       // Counterexample: this SAME public task becomes collectable once its authoritative copy exists.
-      expect(sweepResidentRuns(runs)).toEqual([run]);
+      expect(sweepResidentRuns(runs, Date.now(), 100, { retentionMs: RESIDENT_RUN_RETENTION_MS })).toEqual([run]);
       expect(fs.existsSync(run)).toBe(false);
       expect(JSON.parse(fs.readFileSync(resultPath, "utf8"))).toEqual(result);
       expect(fs.existsSync(metadataPath)).toBe(true);
@@ -1327,7 +1337,7 @@ describe("resident orphan retention", () => {
   });
 
   it("F6 sweeps old terminal untracked runs after lease publication, preserving recent/live/unknown/unresolved runs", async () => {
-    const { root, config, host } = fixture();
+    const { root, config, host } = fixture({ residentRunMs: RESIDENT_RUN_RETENTION_MS });
     const runs = path.join(config.residencyRoot, "runs");
     const now = Date.now();
     const make = (name: string, status: Record<string, unknown>, age = RESIDENT_RUN_RETENTION_MS + 60_000) => {
@@ -1373,8 +1383,8 @@ describe("resident orphan retention", () => {
       expect(fs.existsSync(actor)).toBe(false);
       for (const run of [recent, live, unknown, recordlessIdentity, external, malformed, deadWithoutBirth, unresolved]) expect(fs.existsSync(run), run).toBe(true);
       // Inject the clock: a preserved terminal survivor becomes eligible on a later host start.
-      expect(sweepResidentRuns(runs, now + RESIDENT_RUN_RETENTION_MS + 60_000)).toEqual([recent]);
-      expect(sweepResidentRuns(runs, now + 10 * RESIDENT_RUN_RETENTION_MS, 0)).toEqual([]);
+      expect(sweepResidentRuns(runs, now + RESIDENT_RUN_RETENTION_MS + 60_000, 100, { retentionMs: RESIDENT_RUN_RETENTION_MS })).toEqual([recent]);
+      expect(sweepResidentRuns(runs, now + 10 * RESIDENT_RUN_RETENTION_MS, 0, { retentionMs: RESIDENT_RUN_RETENTION_MS })).toEqual([]);
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

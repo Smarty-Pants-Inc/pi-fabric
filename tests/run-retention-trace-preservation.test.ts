@@ -47,7 +47,7 @@ describe("raw terminal run trace preservation", () => {
       const assertRetained = () => expect(fs.readFileSync(path.join(retained, trace))).toEqual(bytes);
       const ageRuns = () => { for (const run of [retained, control]) fs.utimesSync(run, aged / 1000, aged / 1000); };
       ageRuns();
-      const collector = new ResidentRequestRetention(root, [], { retainRuns: false });
+      const collector = new ResidentRequestRetention(root, [], { retainRuns: false, residentRunMs: HOUR });
       try { for (let slice = 0; slice < 20 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000); }
       finally { collector.close(); }
       expect(fs.existsSync(control), "resident sweep must actually collect the unfenced control").toBe(false);
@@ -57,7 +57,7 @@ describe("raw terminal run trace preservation", () => {
       fs.mkdirSync(control);
       fs.copyFileSync(path.join(retained, "status.json"), path.join(control, "status.json"));
       ageRuns();
-      expect(sweepResidentRuns(runs, now, 10_000, { retainRuns: false })).toEqual([control]);
+      expect(sweepResidentRuns(runs, now, 10_000, { retainRuns: false, retentionMs: HOUR })).toEqual([control]);
       assertRetained();
       fs.mkdirSync(control);
       fs.copyFileSync(path.join(retained, "status.json"), path.join(control, "status.json"));
@@ -90,13 +90,13 @@ describe("raw terminal run trace preservation", () => {
     };
     const assertRetained = () => expect(fs.readFileSync(path.join(retained, "nested", "child", trace))).toEqual(bytes);
     build(retained, true); build(control, false);
-    const collector = new ResidentRequestRetention(root, [], { retainRuns: false });
+    const collector = new ResidentRequestRetention(root, [], { retainRuns: false, residentRunMs: HOUR });
     try { for (let slice = 0; slice < 20 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000); }
     finally { collector.close(); }
     expect(fs.existsSync(control), "resident sweep must actually collect the unfenced nested control").toBe(false);
     assertRetained();
     build(control, false);
-    expect(sweepResidentRuns(runs, now, 10_000, { retainRuns: false })).toEqual([control]);
+    expect(sweepResidentRuns(runs, now, 10_000, { retainRuns: false, retentionMs: HOUR })).toEqual([control]);
     assertRetained();
     build(control, false);
     expect(pruneActorRunArchives({ runsDirectory: runs, retentionMs: HOUR, now })).toEqual([]);

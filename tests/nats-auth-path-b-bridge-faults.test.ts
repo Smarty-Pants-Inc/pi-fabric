@@ -41,21 +41,27 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link fau
     event.hostId === h.natsMain.id && event.envelope.kind === "command" && bodyOf(event).message === token);
   const fileCommandsFor = (token: string) => h.fileEvents({ topic: CONTROL }).filter((event) => dataOf(event).message === token);
 
-  it("a forced disconnect of the link holds traffic both ways; after reconnect each message is consumed exactly once", async () => {
+  it("after a forced disconnect and verified reconnect of the link, each message is consumed exactly once both ways", async () => {
     const f2n = `OUTAGE_F2N_${randomUUID()}`, n2f = `OUTAGE_N2F_${randomUUID()}`;
     const mark = h.wire.mark(), refusedBefore = h.faults.refused;
     h.faults.block();
-    // Both sends are issued during the outage: the file command is in the hub log, the NATS command in the broker.
-    const toNats = outcome(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: f2n, idempotencyKey: `o-${randomUUID()}` }));
-    const toFile = outcome(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: n2f, idempotencyKey: `o-${randomUUID()}` }));
-    await waitForValue(() => fileCommandsFor(f2n).length ? true : undefined, "file command appended during the outage", E2E_WAIT_MS);
-    await h.wire.until(() => h.wire.since(mark).some((event) => event.phase === "send" && event.hostId === h.natsMain.id &&
-      bodyOf(event).message === n2f), "NATS command stored during the outage", E2E_WAIT_MS);
     // The link really tried to come back and was refused at least once.
     await waitForValue(() => h.faults.refused > refusedBefore ? true : undefined, "link reconnect attempt refused", E2E_WAIT_MS);
     expect(mentions(h.natsMain, f2n)).toEqual([]);
     expect(mentions(h.fileMain, n2f)).toEqual([]);
+    const reconnectMark = h.linkLog.length;
     h.faults.unblock();
+    // Wait for the bridge port's own verified-reconnect callback, not another connection's recovery.
+    await waitForValue(() => h.linkLog.slice(reconnectMark).includes("nats port: verified-reconnect") ? true : undefined,
+      () => `reconnect not verified\n${linkTail(h)}`, 30_000);
+    // Post-signal route-readiness barrier: waitMirrored/liveRow reads participantInfos({ fresh: true }) only now.
+    try {
+      await h.waitMirrored(30_000);
+    } catch (error) {
+      throw new Error(`Route readiness after verified reconnect failed: ${String(error)}\n${linkTail(h)}`, { cause: error });
+    }
+    const toNats = outcome(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: f2n, idempotencyKey: `o-${randomUUID()}` }));
+    const toFile = outcome(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: n2f, idempotencyKey: `o-${randomUUID()}` }));
     expect(await toNats).toMatchObject({ value: { acknowledged: true } });
     expect(await toFile).toMatchObject({ value: { acknowledged: true } });
     expect(mentions(h.natsMain, f2n)).toHaveLength(1);

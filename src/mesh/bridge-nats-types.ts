@@ -457,8 +457,8 @@ export interface BridgeNatsPort {
   readonly machine: string;
   /** Current KV presence: NATS roots and actors, in MeshBridge's shape (records under the bridge machine excluded). */
   presence(): Promise<BridgePresence>;
-  /** Presence change hints; failure is fatal for the link. Returns the unsubscribe. */
-  watchPresence(changed: () => void, failed: (error: Error) => void): () => void;
+  /** Presence hints (no reason), or a verified transport reconnect; failure is fatal for the link. */
+  watchPresence(changed: (reason?: "verified-reconnect") => void, failed: (error: Error) => void): () => void;
   /** ParticipantView semantics: the one record answering to the id, or undefined when absent or on two machines. */
   resolve(id: string): BridgeNatsPortResolved | undefined;
   /** Every KV record for the id on every machine, live or not, for bridge-nats-identity.ts. */

@@ -540,23 +540,33 @@ export class MeshLock {
             const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
               code: "FABRIC_MESH_LOCK_OWNERSHIP_LOST",
             });
+            const temporaryOwner = path.join(this.#lockPath, `.owner.${token}.tmp`);
             try {
               const directory = fs.lstatSync(this.#lockPath);
-              fs.writeFileSync(ownerPath, ownerRecord, {
-                encoding: "utf8", flag: "wx", mode: 0o600,
-              });
-              // The exclusive create may itself have paused with an open descriptor to a
-              // recovered directory. Prove publication still belongs to the canonical lock
-              // before entering the critical section; never clean a successor on failure.
+              // Complete the bytes under a private name first. link() publishes the complete
+              // legacy wire record atomically and fails rather than replacing an old writer's owner.
+              fs.writeFileSync(temporaryOwner, ownerRecord, { encoding: "utf8", flag: "wx", mode: 0o600 });
+              fs.linkSync(temporaryOwner, ownerPath);
+              // A resumed initializer whose directory was fenced cannot claim its replacement.
               const current = fs.lstatSync(this.#lockPath);
               if (!current.isDirectory() || current.dev !== directory.dev || current.ino !== directory.ino ||
                 fs.readFileSync(ownerPath, "utf8") !== ownerRecord) throw ownershipLost();
             } catch (error) {
-              // A resumed initializer may have published into an empty replacement before
-              // rejecting its directory identity. Remove only that attempt's exact receipt.
+              // Remove only our receipt; never clean a successor on failure.
               releaseOwned();
               if (errorCode(error) === "EEXIST" || errorCode(error) === "ENOENT") throw ownershipLost();
               throw error;
+            } finally {
+              try {
+                fs.unlinkSync(temporaryOwner);
+              } catch (error) {
+                if (errorCode(error) !== "ENOENT") {
+                  // A failed temp cleanup must not leave a published owner for an operation that
+                  // never entered its critical section. Detach/release our canonical lock first.
+                  if (canonicalRelease && !canonicalRelease.released) releaseOwned();
+                  throw error;
+                }
+              }
             }
           } else {
             // Never expose an ownerless canonical directory: a stalled initializer must not
@@ -673,8 +683,9 @@ export class MeshLock {
     }
   }
 
-  // A dead/other-incarnation complete receipt recovers at once, an empty ownerless directory after the grace (atomic
-  // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. smarty-dev#9569: pid
+  // A dead/other-incarnation complete receipt recovers at once; ownerless directories and malformed owner files
+  // recover only after the stale grace (atomic rmdir/rename fences). Nonempty unrecorded directories stay.
+  // smarty-dev#9569: pid
   // evidence only for OUR PID namespace (foreign/unprovable: `note`). smarty-dev#9501: `expected` = exact owner bytes
   // after the read; its namespace must come from the owner, never a mutable receipt.
   // `beforeRename` is synchronous, restartable retirement of that exact owner's dependent receipt, not another death
@@ -698,6 +709,85 @@ export class MeshLock {
         const current = fs.lstatSync(this.#lockPath);
         if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino ||
           current.mtimeMs !== stat.mtimeMs || readOwner() !== undefined) return false;
+        const entries = fs.readdirSync(this.#lockPath);
+        if (entries.length > 0) {
+          // Atomic protocol-1 publishers may die after creating their private receipt but before
+          // linking `owner`. Retire only a directory made entirely of aged private receipts;
+          // young entries protect a writer between create/write/link, and a complete PID line
+          // protects a writer still alive even after the grace period. Snapshot every entry so
+          // concurrent publication/recovery cannot turn this into a broader directory cleanup.
+          if (!entries.every(name => /^\.owner\..+\.tmp$/.test(name))) return false;
+          const receipts = entries.map(name => {
+            const file = path.join(this.#lockPath, name);
+            const receiptStat = fs.lstatSync(file);
+            if (!receiptStat.isFile() || Date.now() - receiptStat.mtimeMs <= this.#staleLockMs) return undefined;
+            const bytes = fs.readFileSync(file, "utf8");
+            const pid = Number(bytes.split("\n")[1]);
+            if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) return undefined;
+            return { name, dev: receiptStat.dev, ino: receiptStat.ino, mtimeMs: receiptStat.mtimeMs, bytes };
+          });
+          if (receipts.some(receipt => receipt === undefined)) return false;
+          const unchangedReceipts = (): boolean => {
+            const latest = fs.lstatSync(this.#lockPath);
+            if (!latest.isDirectory() || latest.dev !== stat.dev || latest.ino !== stat.ino ||
+              latest.mtimeMs !== stat.mtimeMs || readOwner() !== undefined ||
+              JSON.stringify(fs.readdirSync(this.#lockPath).sort()) !== JSON.stringify([...entries].sort())) return false;
+            return receipts.every(receipt => {
+              const saved = receipt!;
+              const file = path.join(this.#lockPath, saved.name);
+              const latestReceipt = fs.lstatSync(file);
+              return latestReceipt.isFile() && latestReceipt.dev === saved.dev && latestReceipt.ino === saved.ino &&
+                latestReceipt.mtimeMs === saved.mtimeMs && fs.readFileSync(file, "utf8") === saved.bytes;
+            });
+          };
+          if (!unchangedReceipts()) return false;
+          const fingerprint = receipts.map(receipt => {
+            const saved = receipt!;
+            return `${saved.name}:${saved.dev}:${saved.ino}:${saved.mtimeMs}:${saved.bytes}`;
+          }).join("\0");
+          // Retire the exact stale receipts before the final native operation. A publisher's
+          // link(temp, owner) and this unlink race atomically: if link wins, rmdir below sees
+          // owner and fails; if unlink wins, that publisher's link fails because its source is
+          // gone. Any later publisher must create a receipt or owner in this directory, which
+          // makes the same atomic rmdir fail. Never rename a receipt directory: a publisher can
+          // appear after any snapshot.
+          for (const receipt of receipts) {
+            const saved = receipt!;
+            const file = path.join(this.#lockPath, saved.name);
+            try {
+              const current = fs.lstatSync(file);
+              if (!current.isFile() || current.dev !== saved.dev || current.ino !== saved.ino ||
+                current.mtimeMs !== saved.mtimeMs || fs.readFileSync(file, "utf8") !== saved.bytes) return false;
+              fs.unlinkSync(file);
+            } catch (error) {
+              if (errorCode(error) === "ENOENT") continue; // another recoverer already retired it
+              throw error;
+            }
+          }
+          let latest: fs.Stats;
+          try { latest = fs.lstatSync(this.#lockPath); }
+          catch (error) { if (errorCode(error) === "ENOENT") return true; throw error; }
+          if (!latest.isDirectory() || latest.dev !== stat.dev || latest.ino !== stat.ino || readOwner() !== undefined) return false;
+          let latestEntries: string[];
+          try { latestEntries = fs.readdirSync(this.#lockPath); }
+          catch (error) { if (errorCode(error) === "ENOENT") return true; throw error; }
+          if (latestEntries.length !== 0) return false;
+          // Unlike rename, native rmdir is an atomic nonempty check. If a live publisher raced
+          // the last observation, its owner/receipt makes this fail closed; no live directory
+          // is ever detached from the canonical name.
+          try { fs.rmdirSync(this.#lockPath); }
+          catch (error) {
+            if (["ENOTEMPTY", "EEXIST", "EPERM", "EACCES", "EBUSY"].includes(errorCode(error) ?? "")) return false;
+            if (errorCode(error) !== "ENOENT") throw error;
+          }
+          // Preserve the durable recovery receipt expected by concurrent/restarted recoverers.
+          // It is separate from the canonical directory and never contains a possible live owner.
+          const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${fingerprint}`).digest("hex")}`;
+          fs.mkdirSync(fence, { recursive: true, mode: 0o700 });
+          try { fs.writeFileSync(path.join(fence, ".recovery-fence"), "1\n", { flag: "wx", mode: 0o600 }); }
+          catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+          return true;
+        }
         // Native emptiness is the final fence, including against an initializer that
         // publishes and enters while this recoverer is paused at the removal syscall.
         // ponytail (smarty-dev#8907): atomic rmdir, not verifiedRemove. It removes only an EMPTY directory, so a
@@ -722,7 +812,25 @@ export class MeshLock {
       const validOwner = owner?.endsWith("\n") && (fields.length === 4 || fields.length === 5 || fields.length === 6) &&
         !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
-      if (!validOwner) return false;
+      if (!validOwner) {
+        // Old protocol-1 writers may have left an empty or partial owner before dying. Bound
+        // recovery by the owner's own mtime, then fence the exact directory/bytes just like a
+        // complete stale owner. A live slow initializer remains protected by this grace period.
+        let ownerStat: fs.Stats;
+        try { ownerStat = fs.lstatSync(ownerPath); } catch { return false; }
+        if (!ownerStat.isFile() || Date.now() - ownerStat.mtimeMs <= this.#staleLockMs) return false;
+        const unchangedTorn = (): boolean => {
+          const current = fs.lstatSync(this.#lockPath);
+          const currentOwner = fs.lstatSync(ownerPath);
+          return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino &&
+            currentOwner.isFile() && currentOwner.dev === ownerStat.dev && currentOwner.ino === ownerStat.ino &&
+            currentOwner.mtimeMs === ownerStat.mtimeMs && readOwner() === owner;
+        };
+        if (!unchangedTorn()) return false;
+        const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
+        fs.renameSync(this.#lockPath, fence);
+        return true;
+      }
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
       // pi-fabric#923: under protocol 3 a record without a namespace (v1/v2 holder) is UNPROVEN (its pid may be alive in
       // another namespace); no previous-boot inference (VM clones share a machine id): operator recovery only.

@@ -13,7 +13,12 @@ const calls: Call[] = [];
 let dryRun = true;
 let unpinned = false;
 let swapAt: ((target: string) => void) | undefined;
-const deletionPoint = (target: string): void => { const swap = swapAt; swapAt = undefined; swap?.(target); };
+// The release race is specifically at canonical `.lock` removal. Acquisition also unlinks its private
+// `.lock/.owner.*.tmp` receipt; that must not consume this race hook.
+const deletionPoint = (target: string): void => {
+  if (path.basename(target).startsWith(".owner.") && target.endsWith(".tmp")) return;
+  const swap = swapAt; swapAt = undefined; swap?.(target);
+};
 vi.mock("../src/storage/verified-remove.js", async (load) => {
   const actual = await load<typeof import("../src/storage/verified-remove.js")>();
   return { ...actual, verifiedRemove: (...[target, judged, options]: Parameters<typeof actual.verifiedRemove>) => {
@@ -252,7 +257,10 @@ linuxIt("mesh lock: an unpinned release whose .lock was replaced after the owner
   expect(operation).not.toHaveBeenCalled();
   expect(replacement).toBeGreaterThan(0);
   expect(holds(lock, replacement)).toBe(true);
-  expect(primitive.filter(call => call.target.startsWith(lock))).toEqual([]);
+  expect(primitive.filter(call => call.target === lock)).toEqual([]);
+  expect(primitive.filter(call => call.target.startsWith(`${lock}${path.sep}`))).toEqual([
+    { op: "unlink", target: expect.stringMatching(/\.lock\/\.owner\..+\.tmp$/) },
+  ]);
   expect(calls).toEqual([{ target: lock, ino: expect.any(Number), removed: false, reason: expect.stringMatching(/replaced since judgment/) }]);
 });
 

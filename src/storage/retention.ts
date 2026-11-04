@@ -192,6 +192,8 @@ const runTreeVeto = (
     // Keep the whole tree (including nested runs), not just its compacted reader view.
     // Resource/worktree cleanup remains independent of trace retention.
     if (preserveOriginal && fs.existsSync(path.join(directory, "events.jsonl.original"))) return "original run log is retained";
+    // Superseded attempt traces, like original logs, may be archived but never deleted.
+    if (preserveOriginal && fs.readdirSync(directory).some(name => /^(?:status\.json|lifecycle\.jsonl)\.attempt-\d+-(?:startup-retry|resume)(?:-\d+)?$/.test(name))) return "superseded attempt trace is retained";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
@@ -280,7 +282,8 @@ const runFiles = new Set([
 ]);
 const runFile = (name: string): boolean => runFiles.has(name) ||
   /^manager-restored-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/.test(name) ||
-  /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
+  /^oversized-event-prefix(-\d+)?\.txt$/.test(name) ||
+  /^(?:status\.json|lifecycle\.jsonl)\.attempt-\d+-(?:startup-retry|resume)(?:-\d+)?$/.test(name);
 const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
 /** Only paired, owned admission/final-receipt artifacts authorize collection.
  * A passed alarm deadline is not expiry of the payload: the sender may wait.

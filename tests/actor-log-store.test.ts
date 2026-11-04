@@ -165,7 +165,8 @@ describe("ActorLogStore", () => {
     expect(store.retainedRunIds(actor)).toEqual([]);
     const source = path.join(root, "source");
     fs.mkdirSync(path.join(source, "nested", "child"), { recursive: true });
-    const files = ["events.jsonl", "session.jsonl", "steer.jsonl", "lifecycle.jsonl", "route-session.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl", "nested/child/events.jsonl"];
+    const files = ["events.jsonl", "session.jsonl", "steer.jsonl", "lifecycle.jsonl", "route-session.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl",
+      "status.json.attempt-2-startup-retry", "lifecycle.jsonl.attempt-1-resume-1", "nested/child/events.jsonl"];
     const originals = new Map(files.map(file => [file, Buffer.from(`${file}: original trace 🙂\n`)]));
     for (const [file, bytes] of originals) fs.writeFileSync(path.join(source, file), bytes);
     fs.writeFileSync(path.join(source, "private.txt"), "not a trace\n");

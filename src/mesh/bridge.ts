@@ -3629,6 +3629,8 @@ export class MeshBridge {
   readonly #directionMirrorBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionWake: Partial<Record<Direction, (reason?: DirectionWakeReason) => void>> = {};
   readonly #directionWakeReason: Partial<Record<Direction, DirectionWakeReason>> = {};
+  /** Independent latch: presence/sync wakes cannot overwrite a reconnect during an in-flight pass. */
+  readonly #directionReconnectPending: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   /** The retained-boundary retry kind currently being consumed by a direction pass. */
   readonly #membershipAttempt: Partial<Record<Direction, "safety" | "grace">> = {};
   /** Next missed-notification delay; a real notification clears it, sync completion does not. */
@@ -4600,6 +4602,13 @@ export class MeshBridge {
       this.#directionPending[direction] = true;
     };
     while (running()) {
+      if (this.#directionReconnectPending[direction]) {
+        this.#directionReconnectPending[direction] = false;
+        finishBusy("resampling");
+        retryMs = LOCK_RETRY_MIN_MS;
+        walCapDelay = undefined;
+        this.#wakeRetainedMembership(direction);
+      }
       const wakeReason = this.#directionWakeReason[direction];
       delete this.#directionWakeReason[direction];
       // A notification can arrive during a pass, before the direction has a wait callback.
@@ -4732,6 +4741,8 @@ export class MeshBridge {
       }
       delete this.#membershipAttempt[direction];
       if (!running()) { reportRecoveredIngress(true); finishBusy("stopped"); return; }
+      // A reconnect received during this pass bypasses the retry it just armed, but never its fence.
+      if (this.#directionReconnectPending[direction]) continue;
       if (this.#directionPending[direction] && !this.#directionBackoff[direction]) continue;
       await new Promise<void>((resolve) => {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -5411,7 +5422,13 @@ export class MeshBridge {
         return;
       }
       this.#changesPending = true;
-      if (kind === "presence") {
+      if (kind === "verified-reconnect") {
+        for (const direction of ["toRemote", "toLocal"] as const) {
+          this.#directionReconnectPending[direction] = true;
+          this.#directionBackoff[direction] = false;
+        }
+      }
+      if (kind === "presence" || kind === "verified-reconnect") {
         this.#presenceVersion++;
         // A late mirror ACK already emits presence in RemoteBridgeSide. Do not leave it
         // waiting behind the degraded-mirror backoff (up to 30 s). WAL/lock backoff is intact.

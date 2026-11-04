@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export type BridgeChange = "events" | "presence" | "lease";
+export type BridgeChange = "events" | "presence" | "lease" | "verified-reconnect";
 
 /** Directory watches survive atomic file replacement. The root watch also discovers/rebinds
  * lease and participant directories: watching their old inode alone loses a mkdir/rename.

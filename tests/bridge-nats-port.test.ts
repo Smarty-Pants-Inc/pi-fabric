@@ -244,6 +244,38 @@ describe("NATS bridge port: link identity and presence", () => {
       `${LINK_ID}@${BRIDGE}`, `${FILE_ROOT}@${BRIDGE}`, `${NATS_ROOT}@v2-org`, `${NATS_ROOT}@v3-org`]);
   });
 
+  it("wakes on verified reconnect without a peer KV mutation and stops after unsubscribe", async () => {
+    const w = kvWorld();
+    const reconnectListeners = new Set<() => void>();
+    const transport = w.transport;
+    w.transport = (...args) => ({
+      ...transport(...args),
+      onVerifiedReconnect(listener) {
+        reconnectListeners.add(listener);
+        return () => { reconnectListeners.delete(listener); };
+      },
+    });
+    const { port: p } = port(w);
+    await p.start();
+    const changed = vi.fn();
+    const unsubscribe = p.watchPresence(changed, () => { throw new Error("unexpected failure"); });
+    expect((await p.presence()).hosts).toEqual([]);
+    expect(changed).not.toHaveBeenCalled();
+
+    const reconnect = (): void => { for (const listener of reconnectListeners) listener(); };
+    reconnect();
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(changed).toHaveBeenLastCalledWith("verified-reconnect");
+    reconnect();
+    expect(changed).toHaveBeenCalledTimes(2);
+    expect(changed).toHaveBeenLastCalledWith("verified-reconnect");
+
+    unsubscribe();
+    expect(reconnectListeners.size).toBe(0);
+    reconnect();
+    expect(changed).toHaveBeenCalledTimes(2);
+  });
+
   it("returns only admitted roots from other machines, and wakes only on another machine's change", async () => {
     const w = kvWorld();
     const other = "session:33333333-3333-4333-8333-333333333333";
@@ -251,13 +283,14 @@ describe("NATS bridge port: link identity and presence", () => {
     seedNative(w, V2, natsRoot(other), 1_000_000);
     const { port: p, clock } = port(w);
     await p.start();
-    const changes: number[] = [];
-    p.watchPresence(() => { changes.push(1); }, () => { throw new Error("unexpected failure"); });
+    const changes: Array<"verified-reconnect" | undefined> = [];
+    p.watchPresence(reason => { changes.push(reason); }, () => { throw new Error("unexpected failure"); });
     expect((await p.presence()).hosts.map(host => host.record.id)).toEqual([NATS_ROOT]);
     await p.mirror(mirrorSet(clock.wall), clock.wall);
     expect(changes).toEqual([]);
     seedNative(w, "v3-org", natsRoot("session:44444444-4444-4444-8444-444444444444"), clock.wall);
     await vi.waitFor(() => expect(changes.length).toBe(2));
+    expect(changes).toEqual([undefined, undefined]);
   });
 });
 

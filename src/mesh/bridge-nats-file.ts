@@ -380,8 +380,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): () => void {
     const listener = { changed, failed };
     this.#listeners.add(listener);
-    const unwatch = this.port.watchPresence(() => {
-      changed("presence");
+    const unwatch = this.port.watchPresence(reason => {
+      changed(reason ?? "presence");
       this.#fileRenewalPending = true;
       this.#renewFileMirror();
     }, failed);

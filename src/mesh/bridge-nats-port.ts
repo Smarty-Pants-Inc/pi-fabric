@@ -326,9 +326,14 @@ export class NatsBridgePort implements BridgeNatsPort {
   /** Live, unique, admitted canonical NATS roots on other machines (never this machine's own rows). */
   presence(): Promise<BridgePresence> { return this.kv.presence(); }
 
-  /** Another machine's presence or lease change. The KV watches retry on their own; `failed` is never called. */
-  watchPresence(changed: () => void, failed: (error: Error) => void): () => void {
-    return this.kv.subscribeChanges(() => { changed(); }, failed);
+  /** Peer KV changes or a verified reconnect. The KV watches retry on their own; `failed` is never called. */
+  watchPresence(changed: (reason?: "verified-reconnect") => void, failed: (error: Error) => void): () => void {
+    const unsubscribeChanges = this.kv.subscribeChanges(() => { changed(); }, failed);
+    const unsubscribeReconnect = this.#transport.onVerifiedReconnect?.(() => {
+      this.options.log?.("nats port: verified-reconnect");
+      changed("verified-reconnect");
+    });
+    return () => { unsubscribeChanges(); unsubscribeReconnect?.(); };
   }
 
   /**

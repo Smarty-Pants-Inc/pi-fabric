@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshIncarnationPendingError, MeshLockForeignHolderError, MeshLockTimeoutError,
   MeshSnapshotRetriesExhaustedError } from "../src/core/atomic-write.js";
 import { BridgeMirrorDeferredError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
+import type { BridgeChange } from "../src/mesh/change-notifier.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { MeshLock, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
@@ -54,7 +55,7 @@ const pending = () => withUntrustedDiagnostics(new MeshIncarnationPendingError()
 const queueExpired = () => withUntrustedDiagnostics(new MeshLockQueueExpiredError("fixture/.lock", 1, 1_000));
 const TOPIC = "fleet.work.busy-streak.1";
 
-const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Error | undefined>, log?: (message: string) => void, overRpc = false, ttl = 120_000) => {
+const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Error | undefined>, log?: (message: string) => void, overRpc = false, ttl = 120_000, inbound = overRpc) => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-bridge-busy-streak-"));
   const hub = new MeshStore(path.join(base, "hub"), 65_536, 100, { stateBackend: "file" });
   const far = new MeshStore(path.join(base, "far"), 65_536, 100, { stateBackend: "file" });
@@ -69,7 +70,11 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
   const local = new StoreBridgeSide(hub, "far", now), agent = new StoreBridgeSide(far, "hub", now);
   // As in membership-defer's scheduler fixture, withhold unrelated topology
   // notifications: retry timers must be sufficient; no fake read/publish results.
-  vi.spyOn(local, "subscribeChanges").mockImplementation(() => () => undefined);
+  let notifyChange: ((kind: BridgeChange) => void) | undefined;
+  vi.spyOn(local, "subscribeChanges").mockImplementation(changed => {
+    notifyChange = changed;
+    return () => { notifyChange = undefined; };
+  });
   vi.spyOn(agent, "subscribeChanges").mockImplementation(() => () => undefined);
   let remote: StoreBridgeSide | RemoteBridgeSide = agent;
   let closeTransport: (() => Promise<void>) | undefined;
@@ -81,7 +86,7 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
     closeTransport = async () => { rpc.close(); await served; };
     await rpc.hello(); // Negotiate tail so the refusal traverses the agent's real source page operation.
   }
-  const direction = overRpc ? "toLocal" : "toRemote";
+  const direction = inbound ? "toLocal" : "toRemote";
   const logs: Array<{ message: string; at: number }> = [];
   let didRecover!: () => void, didInitialRetry!: () => void;
   const recovered = new Promise<void>(done => { didRecover = done; });
@@ -97,9 +102,9 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
   let running: Promise<void> | undefined, failure: unknown;
   cleanups.push(async () => { await bridge.stop(); await running; await closeTransport?.(); hub.closeState(); far.closeState(); });
   await bridge.start();
-  const sent = await (overRpc ? far : hub).publish({ topic: TOPIC, kind: "ask", from: overRpc ? receiver : sender,
-    to: overRpc ? sender.id : receiver.id, text: "deliver once" });
-  const source = overRpc ? agent : local;
+  const sent = await (inbound ? far : hub).publish({ topic: TOPIC, kind: "ask", from: inbound ? receiver : sender,
+    to: inbound ? sender.id : receiver.id, text: "deliver once" });
+  const source = inbound ? agent : local;
   const attempts: number[] = [], tail = source.tail.bind(source);
   vi.spyOn(source, "tail").mockImplementation(async (...args) => {
     attempts.push(now() - epoch);
@@ -109,6 +114,7 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
   });
   return {
     bridge, hub, far, local, agent, remote, sent, attempts, recovered, logs,
+    verifiedReconnect: () => { expect(notifyChange).toBeDefined(); notifyChange!("verified-reconnect"); },
     launch: async () => {
       running = bridge.run().catch(error => { failure = error; });
       // Native recovery/subscription I/O can outlive a zero-time fake-timer flush. Wait for the
@@ -121,7 +127,7 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
     failure: () => failure,
     streak: () => logs.filter(({ message }) => message.includes(`(${direction})`) && message.includes("failed direction attempts")),
     cursor: () => (JSON.parse(fs.readFileSync(cursorPath, "utf8")) as Record<typeof direction, { after: number }>)[direction].after,
-    received: () => (overRpc ? hub : far).read({ topic: TOPIC, after: 0 }),
+    received: () => (inbound ? hub : far).read({ topic: TOPIC, after: 0 }),
   };
 };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -191,6 +197,60 @@ const sameFile = (fd: number, file: string) => {
 };
 
 describe("real MeshBridge direction busy streaks", () => {
+  // KEEP: recorded A' broker-outage failure after the adapter wake. Virtual time isolates
+  // verified reconnect from retry deadlines; real stores, direction loops and cursors remain.
+  describe.each([false, true])("verified reconnect (inbound=%s)", inbound => {
+    it.each([
+      { name: "contention", refuse: timeout, thirdAt: 600, minimum: 200, inFlight: false },
+      { name: "degraded mirror", refuse: () => new BridgeMirrorDeferredError(false, 0), thirdAt: 3_000, minimum: 1_000, inFlight: false },
+      { name: "contention during a pass", refuse: timeout, thirdAt: 600, minimum: 200, inFlight: true },
+      { name: "degraded mirror during a pass", refuse: () => new BridgeMirrorDeferredError(false, 0), thirdAt: 3_000, minimum: 1_000, inFlight: true },
+    ])("resets $name before the armed retry and starts a fresh streak", async ({ refuse, thirdAt, minimum, inFlight }) => {
+      const gate = deferred(), entered = deferred(), freshRetry = deferred();
+      let reconnected = false;
+      const direction = inbound ? "toLocal" : "toRemote";
+      const f = await fixture(async attempt => {
+        if (attempt === 3 && inFlight) { entered.resolve(); await gate.promise; }
+        return attempt <= 4 ? refuse() : undefined;
+      }, message => {
+        if (reconnected && message.includes(`(${direction}); retrying in`)) freshRetry.resolve();
+      }, false, 120_000, inbound);
+      cleanups.push(async () => { gate.resolve(); });
+      await f.launch();
+      await vi.advanceTimersByTimeAsync(thirdAt);
+      if (inFlight) await entered.promise;
+      expect(f.attempts).toHaveLength(3);
+      expect(f.received()).toEqual([]);
+      expect(f.cursor()).toBeLessThan(f.sent.sequence);
+
+      // No peer changes and no retry-timer advancement: only verified reconnect wakes us.
+      reconnected = true;
+      f.verifiedReconnect();
+      if (inFlight) {
+        await Promise.resolve();
+        expect(f.attempts).toHaveLength(3); // keep the in-flight fence until it settles
+        gate.resolve();
+      }
+      await freshRetry.promise;
+      expect(f.attempts).toEqual([0, minimum, thirdAt, thirdAt]);
+      const resampled = f.streak().find(({ message }) => message.startsWith(`bridge busy streak resampling (${direction})`));
+      expect(resampled?.message).toContain("; 3 failed direction attempts,");
+      const fresh = f.streak().at(-1)!;
+      expect(fresh.at).toBe(thirdAt);
+      expect(fresh.message).toContain(`retrying in ${minimum} ms; 1 failed direction attempts, elapsed 0 ms;`);
+      expect(f.received()).toEqual([]);
+      expect(f.cursor()).toBeLessThan(f.sent.sequence);
+
+      await vi.advanceTimersByTimeAsync(minimum - 1);
+      expect(f.attempts).toHaveLength(4);
+      await vi.advanceTimersByTimeAsync(1);
+      await f.recovered;
+      assertDelivered(f);
+      expect(f.streak().at(-1)!.message).toContain(`; 1 failed direction attempts, elapsed ${minimum} ms;`);
+      await f.bridge.stop();
+    });
+  });
+
   // KEEP: the recorded mixed-refusal failure path needs minutes of virtual time;
   // real stores, routing fences, durable delivery and cursor saves remain in use.
   it("re-samples on a lock-to-mirror failure change and bounds repeated degraded streaks without restarting", async () => {

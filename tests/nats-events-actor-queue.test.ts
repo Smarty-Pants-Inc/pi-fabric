@@ -63,7 +63,8 @@ const setupError = (durable: string, code = "timeout", retryable = true) => Obje
 
 // Failure-path integration: a fake transport drives the real manager's lifecycle,
 // not a second implementation of the setup scheduler. No actors launch inference.
-const setupManager = async (count: number, canManageActor: () => boolean = () => true) => {
+const setupManager = async (count: number, canManageActor: () => boolean = () => true,
+  options: ConstructorParameters<typeof ActorManager>[6] = {}) => {
   const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
@@ -80,7 +81,7 @@ const setupManager = async (count: number, canManageActor: () => boolean = () =>
     },
   };
   const actors = new ActorManager("nats-events-test", identity, mesh, meshConfig, agents, () => {}, {
-    actorRoot, persistent: true, canManageActor, canConsumeMesh: () => false,
+    actorRoot, persistent: true, canManageActor, canConsumeMesh: () => false, ...options,
   });
   close.push(async () => { await actors.close(); await agents.close(); });
   const created: Array<Awaited<ReturnType<ActorManager["create"]>>> = [];
@@ -93,6 +94,87 @@ const setupManager = async (count: number, canManageActor: () => boolean = () =>
 };
 
 describe("NATS actor event queue admission", () => {
+  it("backs off directory failures before consumer setup, alarms once, recovers, and cancels retries on close", async () => {
+    let blocked = false;
+    let reads = 0;
+    const directoryError = Object.assign(new Error("private directory detail"), { code: "FABRIC_DIRECTORY_NOT_READY" });
+    const { actors, created, mesh } = await setupManager(1, () => true, {
+      snapshotActorOwnership: () => {
+        reads++;
+        if (blocked) throw directoryError;
+        return new Map();
+      },
+    });
+    const warnings = vi.spyOn(diagnostics, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1 - Number.EPSILON);
+    try {
+      blocked = true;
+      const readsBefore = reads;
+      await mesh.publish({ topic: "test.wake", kind: "test", from: identity });
+      for (let index = 0; reads === readsBefore && index < 100; index++) await vi.advanceTimersByTimeAsync(10);
+      expect(reads).toBeGreaterThan(readsBefore);
+      const afterFirstFailure = reads;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(reads).toBe(afterFirstFailure);
+      expect(mocks.startConsumer).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(298_000);
+      expect(warnings).not.toHaveBeenCalled();
+      // The alarm is observed by the next bounded retry (at most 30s later).
+      await vi.advanceTimersByTimeAsync(30_000);
+      const alarms = () => warnings.mock.calls.filter(([, text]) => String(text).startsWith("fabric.alarm.mesh-outage "));
+      expect(alarms()).toHaveLength(1);
+      const alarm = JSON.parse(String(alarms()[0]![1]).slice("fabric.alarm.mesh-outage ".length));
+      expect(alarm).toMatchObject({ label: "NATS actor event setup", state: "outage", reason: "FABRIC_DIRECTORY_NOT_READY" });
+      expect(alarm.durationMs).toBeGreaterThanOrEqual(300_000);
+      expect(JSON.stringify(warnings.mock.calls)).not.toContain("private directory detail");
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(alarms()).toHaveLength(1);
+      expect(warnings).toHaveBeenCalledTimes(1);
+      blocked = false;
+      await vi.advanceTimersByTimeAsync(30_000);
+      vi.useRealTimers(); // Allow the first lazy NATS module import to finish.
+      await waitFor(() => mocks.startConsumer.mock.calls.length === 1);
+      expect(mocks.startConsumer).toHaveBeenCalledTimes(1);
+      expect(mocks.startConsumer.mock.calls[0]![1].actorId).toBe(created[0]!.id);
+      await actors.close();
+      const atClose = reads;
+      vi.useFakeTimers();
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(reads).toBe(atClose);
+    } finally { blocked = false; vi.useRealTimers(); }
+  });
+
+  it("retains the bounded directory alarm episode across per-actor setup retries", async () => {
+    let rejectFirst!: (error: Error) => void;
+    const directoryError = Object.assign(new Error("private directory detail"), { code: "FABRIC_DIRECTORY_NOT_READY" });
+    mocks.startConsumer.mockImplementation(async () => {
+      if (mocks.startConsumer.mock.calls.length === 1) await new Promise<never>((_, reject) => { rejectFirst = reject; });
+      throw directoryError;
+    });
+    const { actors, start } = await setupManager(1);
+    const warnings = vi.spyOn(diagnostics, "warn").mockImplementation(() => {});
+    await start();
+    await waitFor(() => !!rejectFirst);
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1 - Number.EPSILON);
+    rejectFirst(directoryError);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect(warnings).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(warnings).toHaveBeenCalledTimes(1);
+    expect(String(warnings.mock.calls[0]![1])).toContain('"reason":"FABRIC_DIRECTORY_NOT_READY"');
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(warnings).toHaveBeenCalledTimes(1);
+    expect(mocks.startConsumer.mock.calls.length).toBeLessThan(40);
+    await actors.close();
+    const attemptsAtClose = mocks.startConsumer.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(mocks.startConsumer).toHaveBeenCalledTimes(attemptsAtClose);
+    vi.useRealTimers();
+  });
+
   it("finishes 35 of 40 setups while five timeouts are pending, then retries only those five independently", async () => {
     const attempts = new Map<string, number>();
     const consumers = new Map<string, ReturnType<typeof fakeConsumer>>();

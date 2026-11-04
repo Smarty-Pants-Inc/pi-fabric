@@ -12,7 +12,7 @@ import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { coalescedMeshHistoryCaptured, mergeCoalescedMeshEvents, restoreCoalescedMeshEvents, type CoalescedMeshEvent } from "./coalesced-events.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
+import { emitMeshJournalAlarm, MESH_OUTAGE_ALARM_AFTER_MS, MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
 import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
 import { isMeshLockTimeout, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
@@ -109,6 +109,7 @@ interface NatsActorEventsSetupState {
   attempt: number;
   retryable: boolean;
   timer?: NodeJS.Timeout;
+  directoryStall?: { since: number; clock: number; alarmed: boolean };
 }
 
 export interface ActorModelRouteInput {
@@ -1070,6 +1071,7 @@ export class ActorManager {
   #natsEventsOpening: Promise<NatsActorEventsSession> | undefined;
   #natsEventsSyncPending: Promise<void> | undefined;
   #natsEventsSyncAgain = false;
+  #natsEventsSyncFailure: NatsActorEventsSetupState | undefined;
   readonly #natsEventSetupQueue = new Set<string>();
   readonly #natsEventSetups = new Map<string, Promise<void>>();
   readonly #natsEventSetupFailures = new Map<string, NatsActorEventsSetupState>();
@@ -1381,14 +1383,41 @@ export class ActorManager {
   }
 
   #scheduleNatsEventsSync(): void {
-    if (!this.#natsEventsEnabled() || !this.#persistent || this.#closing) return;
-    void this.#syncNatsEventConsumers().catch(error => {
-      const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
-      // The directory-ready gate suspends pulls and the consumer raises a bounded stall alarm.
-      // This expected condition is retried by the existing monitor; it is not a deferred setup warning.
-      if (code === "FABRIC_DIRECTORY_NOT_READY") return;
-      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event setup deferred: ${errorText(error)}`);
-    });
+    if (!this.#natsEventsEnabled() || !this.#persistent || this.#closing || this.#natsEventsSyncFailure?.timer) return;
+    // The sync boundary owns retries too: directory reads can fail before any
+    // consumer exists to gate pulls or report its bounded stall alarm.
+    void this.#syncNatsEventConsumers().catch(() => undefined);
+  }
+
+  #natsEventsDirectoryFailure(failure: NatsActorEventsSetupState, error: unknown, actorId?: string): boolean {
+    const directoryNotReady = typeof error === "object" && error !== null && "code" in error && error.code === "FABRIC_DIRECTORY_NOT_READY";
+    if (!directoryNotReady) {
+      delete failure.directoryStall;
+      return false;
+    }
+    const stall = failure.directoryStall ??= { since: Date.now(), clock: performance.now(), alarmed: false };
+    const durationMs = Math.round(performance.now() - stall.clock);
+    if (!this.#closing && !stall.alarmed && durationMs >= (this.#meshOutageAlarmMs ?? MESH_OUTAGE_ALARM_AFTER_MS)) {
+      stall.alarmed = true;
+      // This existing diagnostic/journal alarm remains visible even while the
+      // directory cannot authorize a mesh publication. Never log the raw error.
+      emitMeshJournalAlarm({ label: "NATS actor event setup", state: "outage", sinceMs: stall.since,
+        durationMs, reason: "FABRIC_DIRECTORY_NOT_READY", ...(actorId ? { actorId } : {}) });
+    }
+    return true;
+  }
+
+  #retryNatsEventSetup(failure: NatsActorEventsSetupState): void {
+    if (this.#closing || !failure.retryable || failure.timer) return;
+    // Reuse the per-actor setup backoff for failures before consumer setup too.
+    // Registry/monitor events are the normal driver; this is the bounded safety net.
+    const ceiling = Math.min(30_000, 1_000 * 2 ** Math.min(failure.attempt, 5));
+    const delay = 1_000 + Math.floor(Math.random() * (ceiling - 1_000 + 1));
+    failure.timer = setTimeout(() => {
+      delete failure.timer;
+      this.#scheduleNatsEventsSync();
+    }, delay);
+    failure.timer.unref();
   }
 
   async #natsEventsRuntime(): Promise<NatsActorEventsSession> {
@@ -1473,7 +1502,18 @@ export class ActorManager {
       for (const actor of candidates) this.#natsEventSetupQueue.add(actor.id);
       this.#startNatsEventSetups(session);
     })();
-    const pending = syncing.finally(() => {
+    const pending = syncing.then(() => {
+      if (this.#natsEventsSyncFailure?.timer) clearTimeout(this.#natsEventsSyncFailure.timer);
+      this.#natsEventsSyncFailure = undefined;
+    }, error => {
+      const failure = this.#natsEventsSyncFailure ??= { attempt: 0, retryable: true };
+      failure.attempt++;
+      if (!this.#natsEventsDirectoryFailure(failure, error)) {
+        diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event setup deferred: ${errorText(error)}`);
+      }
+      this.#retryNatsEventSetup(failure);
+      throw error;
+    }).finally(() => {
       if (this.#natsEventsSyncPending === pending) this.#natsEventsSyncPending = undefined;
       if (this.#natsEventsSyncAgain) {
         this.#natsEventsSyncAgain = false;
@@ -1499,7 +1539,6 @@ export class ActorManager {
     while (this.#natsEventSetups.size < 8 && this.#natsEventSetupQueue.size) {
       const actorId = this.#natsEventSetupQueue.values().next().value!;
       this.#natsEventSetupQueue.delete(actorId);
-      this.#refreshOwnership(actorId);
       if (!this.#natsEventSetupEligible(actorId)) continue;
       const task = this.#setupNatsActorConsumer(actorId, session).finally(() => {
         this.#natsEventSetups.delete(actorId);
@@ -1513,12 +1552,18 @@ export class ActorManager {
   async #setupNatsActorConsumer(actorId: string, session: NatsActorEventsSession): Promise<void> {
     const actor = this.#actors.get(actorId)!;
     const topics = [...actor.topics];
-    const failure: NatsActorEventsSetupState = {
-      attempt: (this.#natsEventSetupFailures.get(actorId)?.attempt ?? 0) + 1, retryable: true,
-    };
+    const failure = this.#natsEventSetupFailures.get(actorId) ?? { attempt: 0, retryable: true };
+    failure.attempt++;
     this.#natsEventSetupFailures.set(actorId, failure);
     let openedConsumer: Awaited<ReturnType<NatsActorEventsSession["startConsumer"]>> | undefined;
     try {
+      // Keep fresh authority reads inside the same retry boundary as transport
+      // setup, including setups started by another setup's completion callback.
+      this.#refreshOwnership(actorId);
+      if (!this.#canManageCached(actorId) || !this.#slotCurrent(actor)) {
+        this.#natsEventSetupFailures.delete(actorId);
+        return;
+      }
       const consumer = openedConsumer = await session.startConsumer(session.connection, {
         org: this.meshConfig.nats.org!, actorId, topics,
         ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
@@ -1563,20 +1608,12 @@ export class ActorManager {
         stream?: unknown; durable?: unknown; code?: unknown; retryable?: unknown;
       } | undefined : undefined;
       const safe = (value: unknown): string => typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value) ? value : "unknown";
-      const directoryNotReady = typeof error === "object" && error !== null && "code" in error && error.code === "FABRIC_DIRECTORY_NOT_READY";
+      const directoryNotReady = this.#natsEventsDirectoryFailure(failure, error, actorId);
       failure.retryable = setup?.retryable === true || directoryNotReady;
-      diagnostics.warn("src/actors/manager.ts", "[pi-fabric] NATS actor event setup failed", {
+      if (!directoryNotReady) diagnostics.warn("src/actors/manager.ts", "[pi-fabric] NATS actor event setup failed", {
         stream: safe(setup?.stream), durable: safe(setup?.durable), code: safe(setup?.code), attempt: failure.attempt,
       });
-      if (!this.#closing && failure.retryable && this.#natsEventSetupFailures.get(actorId) === failure) {
-        const ceiling = Math.min(30_000, 1_000 * 2 ** Math.min(failure.attempt, 5));
-        const delay = 1_000 + Math.floor(Math.random() * (ceiling - 1_000 + 1));
-        failure.timer = setTimeout(() => {
-          delete failure.timer;
-          this.#scheduleNatsEventsSync();
-        }, delay);
-        failure.timer.unref();
-      }
+      if (this.#natsEventSetupFailures.get(actorId) === failure) this.#retryNatsEventSetup(failure);
     }
   }
 
@@ -1596,6 +1633,8 @@ export class ActorManager {
   }
 
   async #closeNatsEvents(): Promise<void> {
+    if (this.#natsEventsSyncFailure?.timer) clearTimeout(this.#natsEventsSyncFailure.timer);
+    this.#natsEventsSyncFailure = undefined;
     this.#natsEventSetupQueue.clear();
     for (const failure of this.#natsEventSetupFailures.values()) {
       if (failure.timer) clearTimeout(failure.timer);

@@ -82,16 +82,15 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     write(file, JSON.stringify(registry));
     expect(fs.statSync(file).size).toBeGreaterThan(1024 * 1024);
     const before = snapshot(root);
-    // Use the still-operative whole-run expiry PREVIEW to prove lastRunId
-    // fencing. A compaction no-op alone cannot distinguish referenced runs.
+    // Mesh retention must keep actor run traces regardless of their age or reference status.
     const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true, runRetentionMs: 1000 });
     expect(snapshot(root)).toEqual(before);
     expect(plan.skipped).toEqual([]);
-    expect(plan.removedRuns).toEqual([path.join(actor, "runs", "archive")]);
-    expect(plan.changes.map(change => change.path).sort()).toEqual([
-      path.join(actor, "runs", "archive"),
+    expect(plan.removedRuns).toEqual([]);
+    expect(plan.changes.map(change => change.path)).toEqual([
       path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
-    ].sort());
+    ]);
+    expect(fs.existsSync(path.join(actor, "runs", "archive"))).toBe(true);
     fs.mkdirSync(`${file}.lock`);
     const locked = snapshot(root);
     expect((await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true })).skipped).toEqual([

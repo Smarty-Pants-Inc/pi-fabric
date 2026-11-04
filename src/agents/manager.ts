@@ -155,8 +155,10 @@ import { ownedStat, processAlive } from "../storage/scratch.js";
 import {
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
+  isSettledTerminalRun,
   hasUnresolvedWorker,
   runTreeExitVeto,
+  runTreeRemovalVeto,
   runTreeResourceVeto,
   markUnresolvedWorker,
   heartbeatRunRoot,
@@ -4072,7 +4074,7 @@ export class AgentManager {
         // cannot make this committed source uncollectible on a later sweep.
         const directory = path.join(this.#runRoot, queued.info.id);
         if ((!fs.existsSync(path.join(directory, "status.json")) ||
-            (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeExitVeto(directory)) {
+            (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeRemovalVeto(directory)) {
           writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
           try {
@@ -4884,7 +4886,7 @@ export class AgentManager {
         // establish exit; a terminal record with no PID is still uncertain.
         const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
           ? Number(record.sessionId) : undefined;
-        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) continue;
+        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && isSettledTerminalRun(run, expired)) continue;
         const actorId = record?.actorId;
         if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
         else refs.add("*");
@@ -5031,7 +5033,7 @@ export class AgentManager {
                   held: !(pid !== undefined && !processAlive(pid) &&
                     (yield* proof(() => boundedRunTree(run, expired))) &&
                     (yield* proof(() => !runTreeExitVeto(run, 0, expired, true))) &&
-                    (yield* proof(() => canRemoveTerminalRun(run, expired)))) };
+                    (yield* proof(() => isSettledTerminalRun(run, expired)))) };
                 this.#retentionSliceHint = undefined;
                 if (!incomplete) this.#retentionWatermark.set(entry.name, prepared);
                 index(entry.name, prepared.actorId);
@@ -5601,7 +5603,8 @@ export class AgentManager {
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
-      return { cleaned: cleaned || !fs.existsSync(runDirectory) };
+      // The queued handle was released even when its run files are retained.
+      return { cleaned: true };
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
@@ -5642,7 +5645,8 @@ export class AgentManager {
     this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
-    return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
+    // Successful cleanup releases custody; retained run files are not a failure.
+    return { cleaned: true };
   }
 
   readLog(id: string, opts: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
@@ -5975,13 +5979,13 @@ export class AgentManager {
         throw new Error("Agent release quiescence has an unconfirmed worker exit observation");
       }
     }
-    // Check preserved trees from previous hosts too. Reuse the conservative
-    // retention predicate without removing anything. Unknown external transport
-    // identities have no surviving handle, so are deliberately out of scope.
+    // Check preserved trees from previous hosts too. Prove settlement, not
+    // removability: retained originals are history, not live custody. Unknown
+    // external transport identities have no surviving handle, so are deliberately out of scope.
     const started = performance.now();
     const expired = () => performance.now() - started > 100;
     const inspect = (directory: string, tracked: boolean, depth = 0): void => {
-      if (expired() || depth > 32 || !canRemoveTerminalRun(directory, expired)) {
+      if (expired() || depth > 32 || !isSettledTerminalRun(directory, expired)) {
         throw new Error(`Agent release quiescence has an unresolved run tree: ${directory}`);
       }
       if (!tracked) {
@@ -6118,7 +6122,7 @@ export class AgentManager {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
             if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
-                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeRemovalVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
           }
           break;
         }

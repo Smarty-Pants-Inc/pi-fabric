@@ -5,11 +5,13 @@
 import { sweepTempRunRoots, type TempRunSweepRequest } from "./retention.js";
 
 const request = JSON.parse(process.argv[2] ?? "") as TempRunSweepRequest;
-sweepTempRunRoots({
+const result = sweepTempRunRoots({
   tempRoot: request.tempRoot,
+  ...(request.dryRun ? { dryRun: true } : {}),
   ...(request.currentRoot ? { currentRoot: request.currentRoot } : {}),
   orphanedTempRunRetentionMs: request.orphanedTempRunRetentionMs,
   oneShotRunRetentionMs: request.oneShotRunRetentionMs,
   ...(request.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: request.terminalRunEventsAgeMs } : {}),
   ...(request.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: request.terminalRunEventsMaxBytes } : {}),
 });
+if (request.dryRun) process.stdout.write(`${JSON.stringify(result)}\n`);

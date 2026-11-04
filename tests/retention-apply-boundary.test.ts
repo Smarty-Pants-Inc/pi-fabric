@@ -212,7 +212,8 @@ describe.skipIf(process.platform !== "linux")("sweepMeshRetention apply boundary
     vi.restoreAllMocks();
 
     expect(plan.dryRun).toBe(true);
-    expect(plan.removedRuns).toEqual([old]);
+    expect(plan.removedRuns).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true);
     expect(plan.changes.map(change => change.path)).toContain(backups[0]);
     expect(plan.changes.map(change => change.path)).not.toContain(backups[1]);
     expect(plan.removedRuns).not.toContain(latest);
@@ -220,7 +221,8 @@ describe.skipIf(process.platform !== "linux")("sweepMeshRetention apply boundary
     expect(Object.values(plan.summary.deleters).reduce((sum, item) => sum + item.removed, 0)).toBeGreaterThan(0);
     // The deleters ran, and every call was an explicit dry run.
     const deleterCalls = calls.filter(call => DELETERS.includes(call.name));
-    expect(deleterCalls.map(call => call.name)).toEqual(expect.arrayContaining(["pruneActorRunArchives", "pruneActorSessionBackups"]));
+    expect(deleterCalls.map(call => call.name)).not.toContain("pruneActorRunArchives");
+    expect(deleterCalls.map(call => call.name)).toContain("pruneActorSessionBackups");
     for (const call of deleterCalls) {
       const at = { pruneActorRunArchives: 0, pruneActorSessionBackups: 1, compactTerminalRunEvents: 1, sweepResidentRuns: 3, verifiedRemove: 2 }[call.name]!;
       expect(dryRunOf(call.args[at]), call.name).toBe(true);

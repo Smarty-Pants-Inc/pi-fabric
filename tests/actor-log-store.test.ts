@@ -20,7 +20,8 @@ const setup = () => {
 };
 
 describe("ActorLogStore", () => {
-  it("reads live message and retention limits instead of snapshotting configuration", () => {
+  // Keep: data safety; retention must preserve the original trace bytes on disk.
+  it("reads live message limits without allowing changed retention limits to delete archives", () => {
     const { root, actor } = setup();
     const mesh = { maxEventBytes: 8192 };
     const config = { eventContextChars: 1000 };
@@ -39,12 +40,17 @@ describe("ActorLogStore", () => {
     expect(Buffer.byteLength(JSON.stringify(history.at(-1)))).toBeLessThanOrEqual(504);
     const directory = path.join(root, "actor", "runs", "old");
     fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" }));
-    store.pruneRuns(actor, 1000);
-    expect(store.retainedRunIds(actor)).toEqual(["old"]);
-    retention.actorRunArchiveMs = 100;
-    store.pruneRuns(actor, 1000);
-    expect(store.retainedRunIds(actor)).toEqual([]);
+    const status = Buffer.from(JSON.stringify({ status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" }));
+    fs.writeFileSync(path.join(directory, "status.json"), status);
+    const events = Buffer.from('{"text":"original trace 🙂"}\n');
+    fs.writeFileSync(path.join(directory, "events.jsonl"), events);
+    for (const limit of [1000, 100]) {
+      retention.actorRunArchiveMs = limit;
+      store.pruneRuns(actor, 1000);
+      expect(store.retainedRunIds(actor)).toEqual(["old"]);
+      expect(fs.readFileSync(path.join(directory, "status.json"))).toEqual(status);
+      expect(fs.readFileSync(path.join(directory, "events.jsonl"))).toEqual(events);
+    }
   });
 
   it("preserves complete terminal event logs despite legacy retention settings, including lastRunId", () => {
@@ -78,15 +84,61 @@ describe("ActorLogStore", () => {
     expect(history.at(-1)?.id).toBe("101");
   });
 
-  it("prunes only expired terminal archives, protecting the latest and active runs", () => {
+  it("preserves expired terminal archives and every trace byte alongside latest, active and unknown runs", () => {
     const { root, actor, store } = setup();
-    for (const [id, status, finishedAt] of [["old", "completed", 1], ["latest", "completed", 1], ["active", "running", 1], ["recent", "failed", 950], ["unknown", undefined, 1]] as const) {
+    const originals = new Map<string, Buffer>();
+    for (const [id, status, finishedAt] of [["old", "completed", 1], ["failed", "failed", 1], ["stopped", "stopped", 1], ["timed-out", "timed_out", 1], ["latest", "completed", 1], ["active", "running", 1], ["recent", "failed", 950], ["unknown", undefined, 1]] as const) {
       const dir = path.join(root, "actor", "runs", id);
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ status, finishedAt, transport: "process", sessionId: "2147483647" }));
+      fs.mkdirSync(path.join(dir, "nested", "child"), { recursive: true });
+      const record = Buffer.from(JSON.stringify({ status, finishedAt, transport: "process", sessionId: "2147483647" }));
+      for (const prefix of ["", "nested/child/"]) {
+        originals.set(path.join(dir, `${prefix}status.json`), record);
+        for (const file of ["events.jsonl", "steer.jsonl", "relaunches.jsonl", "session.jsonl"]) {
+          originals.set(path.join(dir, prefix + file), Buffer.from(JSON.stringify({ text: `${id}/${prefix}${file}: original trace 🙂` }) + "\n"));
+        }
+      }
     }
+    for (const [file, bytes] of originals) fs.writeFileSync(file, bytes);
+    for (const now of [1000, 2000]) {
+      store.pruneRuns(actor, now);
+      expect(store.retainedRunIds(actor)).toEqual(["active", "failed", "latest", "old", "recent", "stopped", "timed-out", "unknown"]);
+      for (const [file, bytes] of originals) expect(fs.readFileSync(file)).toEqual(bytes);
+    }
+  });
+
+  it("preserves session and backup bytes while moving old backups into the existing archive", () => {
+    const { actor, store } = setup();
+    const directory = path.dirname(actor.sessionFile);
+    fs.mkdirSync(directory, { recursive: true });
+    const current = Buffer.from('{"text":"current session 🙂"}\n');
+    fs.writeFileSync(actor.sessionFile, current);
+    const backups = ["20200101T000000000Z", "20200102T000000000Z", "20200103T000000000Z"].map((stamp, index) => {
+      const file = `${actor.sessionFile}.${stamp}.bak`;
+      const bytes = Buffer.from(JSON.stringify({ text: `backup ${index} 🙂` }) + "\n");
+      fs.writeFileSync(file, bytes);
+      fs.utimesSync(file, index + 1, index + 1);
+      return { file, bytes };
+    });
+    const orphan = `${actor.sessionFile}.orphan.bak`;
+    fs.writeFileSync(orphan, "orphan recovery trace\n");
     store.pruneRuns(actor, 1000);
-    expect(store.retainedRunIds(actor)).toEqual(["active", "latest", "recent", "unknown"]);
+    const archive = path.join(directory, "session-archive");
+    const archived = fs.readdirSync(archive).filter(name => name !== "MANIFEST.jsonl").sort();
+    expect(archived).toHaveLength(2);
+    expect(archived.map(name => fs.readFileSync(path.join(archive, name)))).toEqual(backups.slice(0, 2).map(backup => backup.bytes));
+    for (const backup of backups.slice(0, 2)) expect(fs.existsSync(backup.file)).toBe(false);
+    const manifest = fs.readFileSync(path.join(archive, "MANIFEST.jsonl"));
+    const records = manifest.toString("utf8").trim().split("\n").map(line => JSON.parse(line));
+    for (const backup of backups.slice(0, 2)) {
+      expect(records).toContainEqual(expect.objectContaining({ from: backup.file, phase: "MOVED-TO", bytes: backup.bytes.length }));
+    }
+    store.pruneRuns(actor, 2000);
+    expect(fs.readFileSync(actor.sessionFile)).toEqual(current);
+    expect(fs.readFileSync(backups[2]!.file)).toEqual(backups[2]!.bytes);
+    expect(fs.readFileSync(orphan, "utf8")).toBe("orphan recovery trace\n");
+    expect(fs.readdirSync(archive).filter(name => name !== "MANIFEST.jsonl").sort()).toEqual(archived);
+    expect(fs.readFileSync(path.join(archive, "MANIFEST.jsonl"))).toEqual(manifest);
+    expect(archived.map(name => fs.readFileSync(path.join(archive, name)))).toEqual(backups.slice(0, 2).map(backup => backup.bytes));
   });
 
   it("archives matching dispatch receipts and rejects a receipt for another run", async () => {
@@ -113,13 +165,21 @@ describe("ActorLogStore", () => {
     expect(store.retainedRunIds(actor)).toEqual([]);
     const source = path.join(root, "source");
     fs.mkdirSync(path.join(source, "nested", "child"), { recursive: true });
-    for (const file of ["events.jsonl", "status.json", "task.txt", "relaunches.jsonl", "private.txt", "nested/child/events.jsonl"]) fs.writeFileSync(path.join(source, file), file);
+    const files = ["events.jsonl", "session.jsonl", "steer.jsonl", "lifecycle.jsonl", "route-session.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl", "nested/child/events.jsonl"];
+    const originals = new Map(files.map(file => [file, Buffer.from(`${file}: original trace 🙂\n`)]));
+    for (const [file, bytes] of originals) fs.writeFileSync(path.join(source, file), bytes);
+    fs.writeFileSync(path.join(source, "private.txt"), "not a trace\n");
     const dest = path.join(root, "actor", "runs", "latest");
     const result = { archived: true, receipt: { runId: "latest", directory: dest } };
     await expect(store.retainRun(actor, "latest", source)).resolves.toEqual(result);
     await expect(store.retainRun(actor, "latest", source)).resolves.toEqual(result);
-    expect(fs.readdirSync(dest).sort()).toEqual(["events.jsonl", "nested", "relaunches.jsonl", "status.json", "task.txt"]);
-    expect(fs.readFileSync(path.join(dest, "nested", "child", "events.jsonl"), "utf8")).toBe("nested/child/events.jsonl");
+    expect(fs.readdirSync(dest).sort()).toEqual([...files.filter(file => !file.includes("/")), "nested"].sort());
+    for (const [file, bytes] of originals) {
+      expect(fs.readFileSync(path.join(dest, file))).toEqual(bytes);
+      expect(fs.readFileSync(path.join(source, file))).toEqual(bytes);
+    }
+    expect(fs.existsSync(path.join(dest, "private.txt"))).toBe(false);
+    expect(fs.readFileSync(path.join(source, "private.txt"), "utf8")).toBe("not a trace\n");
     if (process.platform !== "win32") expect(fs.statSync(path.join(dest, "nested", "child")).mode & 0o777).toBe(0o700);
   });
 

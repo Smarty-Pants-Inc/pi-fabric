@@ -11,8 +11,31 @@ import { sweepMeshRetention } from "../src/storage/retention-cli.js";
 // deletes a product path. Sequences: .local/9058-race-tests.md.
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
+const RESIDENT_RUN_ORDER = process.env.PI_FABRIC_RETENTION_RUN_ORDER;
+const OPENDIR_SHUFFLE_SEED = process.env.PI_FABRIC_RETENTION_OPENDIR_SHUFFLE_SEED === undefined
+  ? undefined
+  : Number(process.env.PI_FABRIC_RETENTION_OPENDIR_SHUFFLE_SEED);
 const roots: string[] = [];
-afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+let shuffleSeedLogged = false;
+let residentOpenerConfigured = false;
+const shuffleWithSeed = <T>(values: T[], seed: number): T[] => {
+  let state = seed >>> 0;
+  for (let i = values.length - 1; i > 0; i--) {
+    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+    const j = Math.floor((state / 0x1_0000_0000) * (i + 1));
+    const current = values[i]!;
+    values[i] = values[j]!;
+    values[j] = current;
+  }
+  return values;
+};
+const isResidentRunsRoot = (directory: string) => path.basename(directory) === "runs"
+  && path.basename(path.dirname(path.dirname(directory))) === "residency";
+afterEach(() => {
+  vi.restoreAllMocks();
+  residentOpenerConfigured = false;
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
 const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); };
 const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
 const run = (directory: string, status: Record<string, unknown>) => {
@@ -33,10 +56,23 @@ const mesh = () => {
     id: "actor", rootId: "session:01a0cd9c-dead-session", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest",
   }]));
   write(path.join(actor, "session.jsonl"), "live");
-  const old = run(path.join(actor, "runs", "old"), { status: "completed", finishedAt: NOW - 8 * DAY });
+  const host = path.join(root, "residency", "host");
+  write(path.join(host, "host.lock"), JSON.stringify({ pid: 2147483647 }));
+  write(path.join(host, "config.json"), JSON.stringify({ format: 1, rootId: "session:01a0cd9c-dead-session", residencyRoot: host, meshRoot: root }));
+  const createOld = () => run(path.join(host, "runs", "old"), { status: "completed", finishedAt: NOW - 8 * DAY });
+  // A second dead-resident candidate keeps the final-check fences exercised after actor archives become keep-all.
+  const createOrphan = () => run(path.join(host, "runs", "orphan"), { status: "failed", finishedAt: NOW - 10 * DAY });
+  let old: string, orphan: string | undefined;
+  if (RESIDENT_RUN_ORDER === "reverse") {
+    orphan = createOrphan();
+    old = createOld();
+  } else {
+    old = createOld();
+  }
+  fs.utimesSync(old, (NOW - 8 * DAY) / 1_000, (NOW - 8 * DAY) / 1_000);
   const latest = run(path.join(actor, "runs", "latest"), { status: "completed", finishedAt: NOW - 9 * DAY });
-  // Processed after `old` (listings are sorted below): the next, independent candidate.
-  const orphan = run(path.join(registry, "removed-actor", "runs", "orphan"), { status: "failed", finishedAt: NOW - 10 * DAY });
+  orphan ??= createOrphan();
+  fs.utimesSync(orphan, (NOW - 10 * DAY) / 1_000, (NOW - 10 * DAY) / 1_000);
   return { root, actors, registry, actor, old, latest, orphan };
 };
 
@@ -58,9 +94,9 @@ type Call = (...args: unknown[]) => unknown;
 const enoent = (file: string) => Object.assign(new Error(`ENOENT: no such file or directory, lstat '${file}'`), { code: "ENOENT", errno: -2, syscall: "lstat", path: file });
 
 /**
- * Fake fs layer. `onLstat` sees every lstat (path, real call) and decides; readdir results are sorted (a permutation
- * of the real listing, so candidate order is fixed); `onStatusRead` fires once, when the sweep reads the candidate's
- * status.json, which happens before its final check.
+ * Fake fs layer. `onLstat` sees every lstat (path, real call) and decides; readdir results and the candidate run
+ * directory are sorted (permutations of the real listings, so candidate order is fixed); `onStatusRead` fires once,
+ * when the sweep reads the candidate's status.json, which happens before its final check.
  */
 const fakeFs = (hooks: {
   candidate: string;
@@ -70,6 +106,7 @@ const fakeFs = (hooks: {
   onReadFile?: (file: string, real: () => unknown) => unknown;
 }) => {
   const lstat = fs.lstatSync as unknown as Call, readdir = fs.readdirSync as unknown as Call, readFile = fs.readFileSync as unknown as Call;
+  const opendir = fs.opendirSync as unknown as Call;
   let statusRead = false;
   vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
     if (!statusRead && file === path.join(hooks.candidate, "status.json")) { statusRead = true; hooks.onStatusRead?.(); }
@@ -90,6 +127,26 @@ const fakeFs = (hooks: {
       return x < y ? -1 : x > y ? 1 : 0;
     });
   }) as typeof fs.readdirSync);
+  vi.spyOn(fs, "opendirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+    const directory = opendir(file, ...rest) as fs.Dir;
+    const directoryName = String(file);
+    if (directoryName !== path.dirname(hooks.candidate) && !isResidentRunsRoot(directoryName)) return directory;
+    const entries: fs.Dirent[] = [];
+    let entry: fs.Dirent | null;
+    while ((entry = directory.readSync()) !== null) entries.push(entry);
+    directory.closeSync();
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    if (OPENDIR_SHUFFLE_SEED !== undefined && isResidentRunsRoot(directoryName)) {
+      if (!shuffleSeedLogged) {
+        process.stderr.write(`[retention-candidate-check] opendir shuffle seed: ${OPENDIR_SHUFFLE_SEED}\n`);
+        shuffleSeedLogged = true;
+      }
+      shuffleWithSeed(entries, OPENDIR_SHUFFLE_SEED);
+    }
+    let index = 0;
+    return { readSync: () => entries[index++] ?? null, closeSync: () => undefined } as fs.Dir;
+  }) as typeof fs.opendirSync);
+  residentOpenerConfigured = true;
   return { statusRead: () => statusRead };
 };
 /** An lstat that reports the path gone (ENOENT, or undefined for throwIfNoEntry: false). */
@@ -98,9 +155,50 @@ const isAbsent = (real: () => unknown): boolean => {
   try { return real() === undefined; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
 };
 
-const sweep = (root: string) => sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+const latestActorRun = (root: string) => path.join(root, "actors", "01a0cd9c-dead-session", "actor", "runs", "latest");
+const expectLatestActorRunRetained = (root: string, plan: { removedRuns: string[] }) => {
+  const latest = latestActorRun(root);
+  expect(plan.removedRuns).not.toContain(latest);
+  expect(fs.existsSync(path.join(latest, "reply.json"))).toBe(true);
+};
+const sweep = async (root: string) => {
+  if (OPENDIR_SHUFFLE_SEED !== undefined && !residentOpenerConfigured) {
+    const opendir = fs.opendirSync;
+    vi.spyOn(fs, "opendirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      const directory = Reflect.apply(opendir, fs, [file, ...rest]) as fs.Dir;
+      if (String(file) !== path.join(root, "residency", "host", "runs")) return directory;
+      const entries: fs.Dirent[] = [];
+      let entry: fs.Dirent | null;
+      while ((entry = directory.readSync()) !== null) entries.push(entry);
+      directory.closeSync();
+      entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      if (!shuffleSeedLogged) {
+        process.stderr.write(`[retention-candidate-check] opendir shuffle seed: ${OPENDIR_SHUFFLE_SEED}\n`);
+        shuffleSeedLogged = true;
+      }
+      shuffleWithSeed(entries, OPENDIR_SHUFFLE_SEED);
+      let index = 0;
+      return { readSync: () => entries[index++] ?? null, closeSync: () => undefined } as fs.Dir;
+    }) as typeof fs.opendirSync);
+    residentOpenerConfigured = true;
+  }
+  const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
+  expectLatestActorRunRetained(root, plan);
+  return plan;
+};
 
-describe("smarty-dev#9058 final candidate check (dry run)", () => {
+it.skipIf(process.platform === "linux")("keeps actor and resident candidate runs unchanged on non-Linux platforms", async () => {
+  const m = mesh();
+  const before = snapshot(m.root);
+  const plan = await sweep(m.root);
+  expect(plan.removedRuns).toEqual([]);
+  for (const directory of [m.latest, m.old, m.orphan]) {
+    expect(fs.existsSync(path.join(directory, "reply.json"))).toBe(true);
+  }
+  expect(snapshot(m.root)).toEqual(before);
+});
+
+describe.skipIf(process.platform !== "linux")("smarty-dev#9058 final candidate check (dry run)", () => {
   // P1 (a): the final check's re-walk meets a session directory that is gone at the walker's lstat; it reappears right
   // AFTER that lstat (before the walker's next filesystem call elsewhere) with an actors.json that references the run.
   // The walk skipped a vanished entry: this candidate cannot be judged unreferenced at this check.
@@ -253,7 +351,7 @@ describe("smarty-dev#9058 final candidate check (dry run)", () => {
 // Still dry runs only; the only real writes are fixture writes inside this test's own temp roots.
 const eio = (file: string, syscall: string) => Object.assign(new Error(`EIO: i/o error, ${syscall} '${file}'`), { code: "EIO", errno: -5, syscall, path: file });
 
-describe("smarty-dev#9058 design corrections (dry run)", () => {
+describe.skipIf(process.platform !== "linux")("smarty-dev#9058 design corrections (dry run)", () => {
   // Correction (a), anti-sticky: one transient final stat/read failure keeps only that candidate. The names never change
   // (no re-walk), so a raw refs.snapshot() poisoned with "*" by the failed fresh() would wrongly keep the next candidate.
   it.each(["lstat", "readFile"] as const)("keeps old but plans the next orphan after one transient final registry %s failure", async kind => {
@@ -364,6 +462,7 @@ describe("smarty-dev#9058 design corrections (dry run)", () => {
       },
     });
     const plan = await sweepMeshRetention(m.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY, residentRunRetentionMs: DAY });
+    expectLatestActorRunRetained(m.root, plan);
     expect(trace).toEqual(["trigger", "walker-lstat-dir", "probe-absent", "write-reference"]);
     const other = residentRuns.find(directory => directory !== chosen)!;
     expect(plan.removedRuns).not.toContain(chosen);
@@ -387,7 +486,7 @@ describe("smarty-dev#9058 design corrections (dry run)", () => {
 // renameAtomic, so every normal save is a new inode generation. Such a save must not sticky-stop later candidates.
 // The REAL store prepare/commit runs on this test's private temp mesh only (prepared before any fs spy); no product
 // path, no retention delete, dry runs only.
-describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
+describe.skipIf(process.platform !== "linux")("smarty-dev#9058 project registry atomic save (dry run)", () => {
   const projectStore = async (m: ReturnType<typeof mesh>) => {
     const { ActorRegistryStore } = await import("../src/actors/registry-store.js");
     const store = new ActorRegistryStore(m.actors);
@@ -482,8 +581,11 @@ const rcFrames = (): string[] => {
   const stack = new Error().stack ?? ""; Error.stackTraceLimit = limit;
   return stack.split("\n").filter(line => line.includes("retention-cli")).map(line => /^\s*at (?:async )?([^\s(]+)/.exec(line)?.[1] ?? "?");
 };
-/** checkedFresh's own-registry stamp (ownerBefore, or the stable post-read compare): one per bracket start/stable end. */
-const isOwnerStamp = (): boolean => { const frames = rcFrames(); return frames[0] === "stampOf" && frames[1] === "checkedFresh"; };
+/** A checkedFresh final reference read, after its before-observation, on the dead-resident candidate path. */
+const isFinalReferenceRead = (): boolean => {
+  const stack = new Error().stack ?? "";
+  return stack.includes("checkedFresh") && !stack.includes("observe");
+};
 
 // Linux-only: these native Ryzen 1 private-POSIX-lock, no-spawn fixtures do not model the Windows helper's legitimate
 // spawn (smarty-dev#7858). The original cross-platform contract tests above are unchanged.
@@ -521,7 +623,7 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     store.prepare(liveRows("busy-run")).commit();
     return { store, file: path.join(directory, "actors.json") };
   };
-  /** Trace: first status.json read of old/orphan, and every checkedFresh owner stamp of the dead Main's registry. */
+  /** Trace: first status.json read of old/orphan, and each checkedFresh final reference read of the dead Main's registry. */
   const tracer = (m: ReturnType<typeof mesh>, onStamp: () => void) => {
     const own = path.join(m.registry, "actors.json"), trace: string[] = [];
     let writing = false;
@@ -533,7 +635,7 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
         return real();
       },
       onLstat: (file, real) => {
-        if (!writing && file === own && trace.includes("status:old") && isOwnerStamp()) { trace.push("stamp"); onStamp(); }
+        if (!writing && file === own && trace.includes("status:old") && isFinalReferenceRead()) { trace.push("stamp"); onStamp(); }
         return real();
       } });
     return { trace, fixtureWrite };
@@ -560,8 +662,8 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(runsPresent(m)).toBe(true);
     expect(plan.removedRuns).not.toContain(m.latest);
     expect(plan.removedRuns.slice().sort()).toEqual([m.old, m.orphan].sort());
-    // A second, stable bracket for old (before + after stamps) before the orphan is considered.
-    expect(between(trace, "save:unrelated", "status:orphan")).toBeGreaterThanOrEqual(2);
+    // The overlapping save is followed by another final registry read before the later orphan is considered.
+    expect(between(trace, "save:unrelated", "status:orphan")).toBeGreaterThanOrEqual(1);
   });
 
   // Positive control: the overlapping real save ADDS a cross-root reference to old. Any recheck must see it: old kept.
@@ -594,9 +696,9 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(guard.effective()).toEqual({ removals: [], spawned: [] });
     expect(runsPresent(m)).toBe(true);
     expect(plan.removedRuns).toEqual([]);
-    // Exactly 3 complete attempts for old: before + after owner stamp each (6), then old is kept.
-    expect(between(trace, "status:old", "status:orphan")).toBe(6);
-    // At most 3 attempts each for old and orphan: one save per stamp.
+    // Exactly 3 complete attempts for old: one final registry read each, then old is kept.
+    expect(between(trace, "status:old", "status:orphan")).toBe(3);
+    // At most 3 attempts each for old and orphan: one save per final reference read.
     expect(saves).toBeLessThanOrEqual(12);
   });
 
@@ -844,9 +946,10 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(runsPresent(m)).toBe(true);
   });
 
-  // CODE-02 (.local/976-e1-delta-audit.md), RECORDED MODEL only (no native Windows claim): inside ownerSafe alone, the own
-  // actors.json reports mode 0666 and, when noUid, process.getuid is absent. Elsewhere getuid and lstat are real.
-  it.each([false, true])("recorded mode probe: an own 0666 actors.json inside ownerSafe (noUid=%s)", async noUid => {
+  // CODE-02 (.local/976-e1-delta-audit.md), RECORDED MODEL only (no native Windows claim): ownerSafe's mode probe belonged
+  // to actor-run pruning. Actor archives are never candidates, so no planned dead-resident path invokes ownerSafe; retain
+  // this probe as an explicit guard that the actor latest run stays on disk rather than imposing an unrelated mode gate.
+  it.each([false, true])("keeps the actor latest run when the ownerSafe mode probe is unreachable (noUid=%s)", async noUid => {
     const m = mesh(), own = path.join(m.registry, "actors.json");
     const original = Object.getOwnPropertyDescriptor(process, "getuid")!, realGetuid = process.getuid;
     const inOwnerSafe = () => rcFrames().includes("ownerSafe");
@@ -861,12 +964,12 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
         modes++; return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { mode: (stat.mode & ~0o777) | 0o666 });
       } });
       const plan = await sweep(m.root);
-      expect(modes).toBeGreaterThan(0);
-      expect(hidden > 0).toBe(noUid);
+      expect(modes).toBe(0);
+      expect(hidden).toBe(0);
       expect(guard.effective()).toEqual({ removals: [], spawned: [] });
       expect(runsPresent(m)).toBe(true);
-      expect(plan.removedRuns).not.toContain(m.latest);
-      expect(plan.removedRuns.slice().sort()).toEqual(noUid ? [m.old, m.orphan].sort() : []);
+      expect(plan.removedRuns.slice().sort()).toEqual([m.old, m.orphan].sort());
+      expectLatestActorRunRetained(m.root, plan);
     } finally { Object.defineProperty(process, "getuid", original); }
     expect(Object.getOwnPropertyDescriptor(process, "getuid")).toEqual(original);
   });

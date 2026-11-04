@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+// test-affected edge: 'src/storage/retention-cli.ts' (built to dist/storage/retention-cli.js).
 
 // This is a real-bundle entry test. Fail before the first test if the checked-in
 // CLI no longer takes the hard dry-run / native-fence path audited for this case.

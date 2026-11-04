@@ -197,6 +197,11 @@ export class ActorDirectory extends ActorManager {
   }
   override drainQuiescence(id: string): string[] { return this.#isPrimary(id) ? super.drainQuiescence(id) : this.#secondary.drainQuiescence(id); }
   override drainWorker(id: string): ReturnType<ActorManager["drainWorker"]> { return this.#isPrimary(id) ? super.drainWorker(id) : this.#secondary.drainWorker(id); }
+  override drainSpec(id: string): ReturnType<ActorManager["drainSpec"]> {
+    const actor = this.status(id);
+    const spec = this.#isPrimary(actor.id) ? super.drainSpec(actor.id) : this.#secondary.drainSpec(actor.id);
+    return { ...spec, ...(actor.scope ? { scope: actor.scope } : {}) };
+  }
   override hasOwnedActors(): boolean { return super.hasOwnedActors() || this.#secondary.hasOwnedActors(); }
   override hasDurableActor(): boolean { return super.hasDurableActor() || this.#secondary.hasDurableActor(); }
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { SessionPendingInventory } from "../cli/session-pending.js";
-import { procStartTime } from "../main-drain/binding.js";
+import { procWorkerExited } from "../main-drain/binding.js";
 import { MAIN_DRAIN_INGRESS } from "../main-drain/control.js";
 import type { MainDrainReply } from "../main-drain/protocol.js";
 
@@ -195,9 +195,7 @@ export const evaluateDrain = (input: {
     if (!row) { children.push(`actor-not-owned:${actor.id}`); continue; }
     if (row.worker === null) continue;                  // never launched a worker: nothing to outlive
     if (row.worker === "unknown" || row.worker.startTime === null) { children.push(`worker-unverified:${actor.id}`); continue; }
-    const now = procStartTime(row.worker.pid, input.procRoot);
-    const exited = now === undefined ? (fs.existsSync(path.join(input.procRoot ?? "/proc", String(row.worker.pid))) ? null : true)
-      : now !== row.worker.startTime;
+    const exited = procWorkerExited(row.worker.pid, row.worker.startTime, input.procRoot);
     workers.push({ id: actor.id, pid: row.worker.pid, exited });
     if (exited !== true) children.push(`worker-alive:${actor.id}`);
   }
@@ -209,8 +207,7 @@ export const evaluateDrain = (input: {
   // A terminal run's local worker must be gone too (pid + start time from the launch record).
   for (const run of reply?.agents.workers ?? []) {
     if (run.startTime === null) { children.push(`agent-worker-unverified:${run.id}`); continue; }
-    const now = procStartTime(run.pid, input.procRoot);
-    const exited = now === undefined ? (fs.existsSync(path.join(input.procRoot ?? "/proc", String(run.pid))) ? null : true) : now !== run.startTime;
+    const exited = procWorkerExited(run.pid, run.startTime, input.procRoot);
     workers.push({ id: run.id, pid: run.pid, exited });
     if (exited !== true) children.push(`agent-worker-alive:${run.id}`);
   }

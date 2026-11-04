@@ -4,7 +4,7 @@ This is fabric-v2's `drain` seam for the D3 principal-seat move (smarty-dev#1531
 executable:
 
 ```text
-/proc/self/fd/N --run-dir RUN --phase drain|drain-undo|drain-recheck|resume-drain
+/proc/self/fd/N --run-dir RUN --phase drain|drain-undo|drain-recheck|drain-restore|resume-drain
 ```
 
 It reads one request on stdin and writes one receipt on stdout. The contract is DRAIN-PHASE-CONTRACT rev 4.
@@ -67,6 +67,8 @@ in `PATH` is never used.
 |---|---|
 | `fabric-v2-drain-intent.json` | before the first control call: `operationId`, the fence `generation`, the interpreter and seam hashes, the Main's owner record |
 | `fabric-v2-drain-stop-<n>-intent.json` | before stop request `n`: each actor about to be stopped, with its full registry row |
+| `fabric-v2-drain-actor-<id>.json` | the Main's own durable pre-stop spec and resolved live binding, tied to the run, operation and generation |
+| `fabric-v2-drain-restore-<n>-outcome.json` | each post-activation restoration attempt, including original-to-recreated ids |
 | `fabric-v2-drain-outcome.json` | at the end of `drain`, containing:<br>• the result and reason;<br>• `beginSent: false` when no drain request ever reached the Main;<br>• every sub-step (begin, fence, stop-actors, probes, undo);<br>• the measured inventory;<br>• the asserted Main replies;<br>• the dispositions;<br>• `stoppedActors` (proven or attempted) with each one's full registry row, and `stopIntended`;<br>• the admitted and ledger lists |
 | `fabric-v2-drain-undo-<n>-{intent,outcome}.json` | for each `drain-undo` attempt `n` |
 | `fabric-v2-drain-recheck-{intent,outcome}.json` | for `drain-recheck` |
@@ -92,62 +94,49 @@ Attempts are contiguous. Attempt `n + 1` is allowed only in two cases:
 `refused {inputsFenced: true, admissionRestored: false}` means restart required: the fence handle was lost, or v1
 is unreachable. Restart v1 (a new process starts unfenced), then run the next attempt.
 
-## Actors stopped by a drain (ruling A, 10-25): no automatic recreation
+## Reversible actor stops (#18489, #18490, #18491)
 
-The seam stops a session actor only as its last act. By then the fence is held, everything else is 0, and every
-actor is quiesced.
+The pattern is Kubernetes drain: cordon admission, evict within the disruption budget, wait for termination with
+a grace period, and uncordon on failure. A durable actor blocks before any stop. In-flight tool calls are waited
+out until native turn-end/idle within the existing 600-second deadline; a zombie worker (state `Z`) is terminal,
+not an executable child. Unknown worker identity still blocks.
 
-Before each stop request, the seam writes `fabric-v2-drain-stop-<n>-intent.json` with every actor it is about to
-stop and its full registry row. A crash after the request still leaves those rows. The Main counts an actor as
-stopped only after the stop resolved AND its worker is proven gone. A failed, slow or unproven stop ends the drain:
-it refuses and undoes. Every attempted actor, proven or not, must be active again for `admissionRestored: true`.
+Session actors, including an idle resident supervisor, are stopped only as the last act: fence held, everything
+else zero, every actor quiescent. Before the first stop, the Main saves each complete spec with its resolved live
+binding in `fabric-v2-drain-actor-<id>.json`. The seam also keeps its measured registry-row stop intents. Missing
+specs, unreadable evidence or an unavailable recreation path refuse without stopping an actor.
 
-If anything fails afterwards, or A rejects the pass, the seam does NOT recreate the actor. `drain-undo` then
-returns `admissionRestored: false`. The operator recreates the actor by hand from the full row saved in
-`fabric-v2-drain-outcome.json` → `stoppedActors[].registryRow`, or, when the outcome is missing, in
-`fabric-v2-drain-stop-<n>-intent.json` → `actors[].registryRow`:
+Undo releases the native fence, reopens admission and recreates stopped actors through the owning Main's ordinary
+create path. It preserves creation settings and project defaults, reapplies the saved live model, thinking and
+modelReason through session setters, and verifies the resulting spec. Supervisor authority is re-minted by that
+Main, not copied from a peer. Recreated actors have new ids and fresh sessions; `reply.restored` records the map.
+Already-live exact replacements are reused. A different same-name spec is a conflict, never a successful undo.
 
-1. Read the row: `name`, `instructions`, `events`, `topics`, `delivery`, `responseMode`, `triggerTurn`, `coalesce`,
-   `coalesceKey`, `dedupeKey`, `activation`, `activationFilter`, `residency`, `runner`, `model`, `thinking`, `tools`,
-   `transport` and `principalScope`.
-2. In the owning Main's own session, create the actor again. A stopped row with the same name does not block this:
+`actorsRestored: true` requires readback of every saved actor's configuration and live binding. A failed create,
+binding setter or readback leaves it false and retains the binding and saved rows. A timed-out stop that has not
+settled also keeps restoration false: a late stop must not kill an actor after undo claimed success. No queued
+work is dropped or force-archived: a last-moment quiescence check runs inside the existing stop primitive.
+Actors needing a protected slot's unreplayable admission claim are not stopped.
 
-   ```ts
-   return agents.create({
-     name: row.name,
-     instructions: row.instructions,
-     events: row.events,
-     topics: row.topics,
-     delivery: row.delivery,
-     responseMode: row.responseMode,
-     triggerTurn: row.triggerTurn,
-     coalesce: row.coalesce,
-     ...(row.coalesceKey ? { coalesceKey: row.coalesceKey } : {}),
-     ...(row.dedupeKey ? { dedupeKey: row.dedupeKey } : {}),
-     ...(row.activation ? { activation: row.activation } : {}),
-     ...(row.activationFilter ? { activationFilter: row.activationFilter } : {}),
-     residency: row.residency ?? "session",
-     ...(row.model ? { model: row.model } : {}),
-     ...(row.thinking ? { thinking: row.thinking } : {}),
-     ...(row.tools ? { tools: row.tools } : {}),
-   });
-   ```
+## Session actors after a successful cutover
 
-3. **Tier 1:** `protected`, `supervisorFor` and `principalScope` are identity and authority fields. Only the owner's
-   own session may re-mint them, through its normal creation path, never a copied value from another session.
-4. Read back: the new actor's name, `principalScope`, `topics` and `events` must match the row. Record the new id
-   next to the old one in the run's notes. The new actor has a new id and a fresh session.
+After A's activation step, run the pinned seam on the new Main's host, with the same sealed RUN, its saved actor
+files and the seat lock, using `--phase drain-restore`. The request has the normal envelope and only
+`inputs: { operationId }`. This is a separate owned step, not `drain-undo`: it never lifts the old Main's fence.
+The new Main must be reachable through the local owner socket; the RUN and source journal must resolve its mesh.
+The caller must arrange those local inputs when moving between hosts or into a Pod.
 
-## Session actors after a SUCCESSFUL drain
+Both the passing drain and the sealed fence owner's passing receipt must be present. A still-bound old Main
+refuses restoration. The new Main uses the same ordinary create/setter/readback path as undo, reading durable
+pre-stop rows without the old process's memory. The receipt reports
+`observed: { sessionId, actorsRestored }`; only `actorsRestored: true` passes. Each attempt writes a fresh outcome.
+Retries reconcile exact existing replacements and do not create duplicate supervisors. This additional phase
+must be invoked by the cutover caller after activation; it is not added to A's phase scheduler by this package.
 
-The seam stops a session actor explicitly, and an explicit stop never revives. So after a successful move, any
-session actor the seam stopped is GONE on v2. A seat with a session `supervisor` actor loses it this way.
-
-The operator recreates it from the RUN row, as described above, AFTER A's `activation` step. Then the operator
-reads back that the recreated actor's name, `principalScope` and `topics`/`events` match the row, and records the
-new id.
-
-If the org's own start procedure re-creates the supervisor itself, the operator's step is only that read-back.
+Registry rows retain downgrade-compatible top-level project defaults, explicitly labelled `projectDefaults`,
+and record the owner's live/last activation model, thinking and modelReason as `resolvedBinding`. Actor listings
+carry the same labelled binding. An in-flight activation keeps its launched pin; idle owner model/thinking
+changes update the registry before the setter acknowledges them.
 
 ## `resume-drain` (the raw Pod)
 

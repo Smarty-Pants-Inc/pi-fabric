@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
 import {
   MeshBatchConflictError,
   MeshStore,
@@ -1909,28 +1910,135 @@ describe("MeshStore lock recovery", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it.each([1, 2] as const)("fails closed on old torn/corrupt receipts (protocol %s), even with a dead-looking partial PID", async (lockProtocol) => {
-    vi.useFakeTimers({ now: 1_000_000 });
+  // Data-safety / recorded-catch regression: smarty-dev#18483, mkdir + wx open left a zero-byte owner.
+  it.each([1, 2] as const)("retains and recovers old empty/torn/corrupt receipts (protocol %s)", async (lockProtocol) => {
+    vi.useFakeTimers({ now: Date.now() });
     const store = createStore({ lockProtocol, lockTimeoutMs: 100, staleLockMs: 100 });
     const receipts = ["", "not-a-valid-owner", "writing\n999999999", "writing\n999999999\n",
-      "writing\n999999999\n100", "writing\n999999999\ninvalid-time\n", "writing\n999999999\n100\nextra\nextra\n"];
+      "writing\n999999999\n100", "writing\n999999999\ninvalid-time\n"];
     for (const owner of receipts) {
       const lock = holdLock(store, owner);
       const past = new Date(Date.now() - 60_000);
       fs.utimesSync(lock, past, past);
       const before = fs.lstatSync(lock);
+      vi.setSystemTime(Math.ceil(Math.max(before.ctimeMs, before.mtimeMs)) + 101);
       const operation = vi.fn();
       const pending = store.exclusive(operation).catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(100);
-      expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-      expect(operation).not.toHaveBeenCalled();
-      const after = fs.lstatSync(lock);
+      await pending;
+      expect(operation, JSON.stringify(owner)).toHaveBeenCalledOnce();
+      expect(fs.existsSync(lock)).toBe(false);
+      const receipt = `${lock}.dead.${createHash("sha256").update(`${before.dev}:${before.ino}:empty-owner`).digest("hex")}`;
+      const after = fs.lstatSync(receipt);
       expect([after.dev, after.ino, after.mtimeMs]).toEqual([before.dev, before.ino, before.mtimeMs]);
-      expect(fs.readdirSync(lock)).toEqual(["owner"]);
-      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
-      expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.dead."))).toBe(false);
-      fs.rmSync(lock, { recursive: true });
+      expect(fs.readdirSync(receipt)).toEqual(["owner"]);
+      expect(fs.readFileSync(path.join(receipt, "owner"), "utf8")).toBe(owner);
     }
+  });
+
+  it.each([1, 2] as const)("reclaims a zero-byte owner strictly after the directory grace (protocol %s)", async (lockProtocol) => {
+    vi.useFakeTimers({ now: Date.now() });
+    const store = createStore({ lockProtocol, lockTimeoutMs: 100, staleLockMs: 100 });
+    const lock = holdLock(store, "");
+    const created = new Date(Date.now());
+    fs.utimesSync(lock, created, created);
+    const directory = fs.lstatSync(lock);
+    vi.setSystemTime(Math.max(directory.ctimeMs, directory.mtimeMs));
+    const operation = vi.fn();
+    const pending = store.exclusive(operation).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe("");
+    await vi.advanceTimersByTimeAsync(1);
+    await store.exclusive(operation);
+    expect(operation).toHaveBeenCalledOnce();
+    expect(fs.existsSync(lock)).toBe(false);
+    const receipts = fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."));
+    expect(receipts).toHaveLength(1);
+    expect(fs.readFileSync(path.join(store.root, receipts[0]!, "owner"), "utf8")).toBe("");
+  });
+
+  it.each([1, 2] as const)("keeps an owner completed late inside the grace (protocol %s)", async (lockProtocol) => {
+    vi.useFakeTimers({ now: Date.now() });
+    const store = createStore({ lockProtocol, lockTimeoutMs: 300, staleLockMs: 100 });
+    const lock = holdLock(store, "");
+    const directory = fs.lstatSync(lock);
+    const live = `late-writer\n${process.pid}\n${Date.now()}\n`;
+    setTimeout(() => fs.writeFileSync(path.join(lock, "owner"), live), 90);
+    const operation = vi.fn();
+    const pending = store.exclusive(operation).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(live);
+    expect(fs.lstatSync(lock).ino).toBe(directory.ino);
+    expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.dead."))).toBe(false);
+  });
+
+  it.each(["successor", "completed-owner", "refreshed-directory"] as const)("refuses an empty-owner recovery after judgment changes: %s", async (change) => {
+    vi.useFakeTimers({ now: Date.now() });
+    const store = createStore({ staleLockMs: 100 });
+    const lock = holdLock(store, "");
+    const ownerPath = path.join(lock, "owner");
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, past, past);
+    vi.setSystemTime(Math.ceil(fs.lstatSync(lock).ctimeMs) + 101);
+    const successor = `successor\n${process.pid}\n${Date.now()}\n`;
+    const read = fs.readFileSync.bind(fs);
+    let swapped = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const bytes = (read as (...args: unknown[]) => unknown)(file, ...args);
+      if (!swapped && String(file) === ownerPath) {
+        swapped = true;
+        if (change === "successor") {
+          fs.renameSync(lock, `${lock}.fixture-original`);
+          fs.mkdirSync(lock);
+        }
+        if (change === "refreshed-directory") fs.utimesSync(lock, new Date(), new Date());
+        else fs.writeFileSync(ownerPath, successor);
+      }
+      return bytes;
+    }) as typeof fs.readFileSync);
+    const recovery = new MeshLock(store.root, { staleLockMs: 100 }, () => {});
+    expect(await recovery.clearStaleLock(ownerPath, Date.now() + 1_000)).toBe(false);
+    expect(swapped).toBe(true);
+    expect(read(ownerPath, "utf8")).toBe(change === "refreshed-directory" ? "" : successor);
+    expect(fs.readdirSync(store.root).some(name => name.startsWith(".lock.dead."))).toBe(false);
+  });
+
+  it("a paused empty-owner rename cannot move the successor over the first recoverer's kept receipt", async () => {
+    vi.useFakeTimers({ now: Date.now() });
+    const store = createStore({ staleLockMs: 100 });
+    const lock = holdLock(store, "");
+    const ownerPath = path.join(lock, "owner");
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, past, past);
+    const judged = fs.lstatSync(lock);
+    vi.setSystemTime(Math.ceil(judged.ctimeMs) + 101);
+    const receipt = `${lock}.dead.${createHash("sha256").update(`${judged.dev}:${judged.ino}:empty-owner`).digest("hex")}`;
+    const successor = `successor\n${process.pid}\n${Date.now()}\n`;
+    const rename = fs.renameSync.bind(fs);
+    let paused = false;
+    let successorInode = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (!paused && String(from) === lock && String(to) === receipt) {
+        paused = true;
+        // A fellow recoverer completes the same judgment while this one is paused at its syscall.
+        rename(lock, receipt);
+        fs.mkdirSync(lock);
+        fs.writeFileSync(ownerPath, successor);
+        successorInode = fs.lstatSync(lock).ino;
+      }
+      return rename(from, to); // native ENOTEMPTY/EEXIST against the retained nonempty receipt
+    });
+    const recovery = new MeshLock(store.root, { staleLockMs: 100 }, () => {});
+    expect(await recovery.clearStaleLock(ownerPath, Date.now() + 1_000)).toBe(false);
+    expect(paused).toBe(true);
+    expect(fs.readFileSync(ownerPath, "utf8")).toBe(successor);
+    expect(fs.lstatSync(lock).ino).toBe(successorInode);
+    expect(fs.readFileSync(path.join(receipt, "owner"), "utf8")).toBe("");
+    expect(fs.lstatSync(receipt).ino).toBe(judged.ino);
   });
 
   it.each([1, 2] as const)("recovers an empty ownerless lock strictly after its grace (protocol %s)", async (lockProtocol) => {

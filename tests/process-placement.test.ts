@@ -300,13 +300,57 @@ describe("host process task placement", () => {
     expect(result).toMatchObject({status:"completed",text:`REMOTE: ${task}`,exitCode:0});
     expect(JSON.parse(fs.readFileSync(path.join(f.results,h.id,"argv.json"),"utf8"))).toEqual(["--host","auto","--minutes","1","--cwd",f.root,"--model","test/model","--thinking","high","--",task]);
   });
-  it("ships a Git source cwd with --src rather than the target-only --cwd flag", async () => {
-    const f=fixture(); execFileSync("git",["init","--quiet",f.root]);
-    f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
-    const result=await f.manager.run({task:"source packet",transport:"process",model:"test/model",thinking:"high"});
-    expect(result).toMatchObject({status:"completed",text:"REMOTE: source packet"});
-    const argv=JSON.parse(fs.readFileSync(path.join(f.results,result.id,"argv.json"),"utf8"));
-    expect(argv).toEqual(["--host","auto","--minutes","1","--src",f.root,"--model","test/model","--thinking","high","--","source packet"]);
+  // Keep reason: real catch — non-shared Git cwd incorrectly pinned --src spawns to Main.
+  it.each((["spawn", "run"] as const).flatMap(method =>
+    ["shared", "non-shared", "caller-tmp"].map(location => ({ method, location })),
+  ))("ships a $location Git source cwd through $method with --src", async ({ method, location }) => {
+    const f = fixture();
+    const cwd = location === "caller-tmp" ? path.join(f.root, "caller-tmp", "source") : f.root;
+    fs.mkdirSync(cwd, { recursive: true });
+    execFileSync("git", ["init", "--quiet", cwd]);
+    if (location !== "shared") f.config.placement.sharedMounts = [];
+    f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
+    const request = { task: "source packet", cwd, transport: "process" as const, model: "test/model", thinking: "high" as const };
+    const result = method === "run" ? await f.manager.run(request) : await f.manager.wait((await f.manager.spawn(request)).id);
+    expect(result).toMatchObject({ status: "completed", text: "REMOTE: source packet" });
+    const argv = JSON.parse(fs.readFileSync(path.join(f.results, result.id, "argv.json"), "utf8"));
+    expect(argv).toEqual(["--host", "auto", "--minutes", "1", "--src", cwd, "--model", "test/model", "--thinking", "high", "--", "source packet"]);
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events.filter(event => event.type.startsWith("placement."))).toEqual([
+      expect.objectContaining({ type: "placement.remote" }),
+      expect.objectContaining({ type: "placement.result", status: "completed" }),
+    ]);
+  });
+  it("keeps a non-shared Git cwd local without --src", async () => {
+    const f = fixture(); execFileSync("git", ["init", "--quiet", f.root]);
+    f.config.placement.sharedMounts = [];
+    const result = await f.manager.run({ task: "target cwd only", transport: "process" });
+    expect(result).toMatchObject({ status: "completed", text: "LOCAL" });
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events.filter(event => event.type.startsWith("placement."))).toEqual([
+      expect.objectContaining({ type: "placement.local", reason: `caller-local cwd requires the local worker: ${f.root}` }),
+    ]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each([
+    { policy: "needs-local", reason: "reserved need: local pins to the Main host" },
+    { policy: "default-local", reason: "placement default is local" },
+    { policy: "unmet-need", reason: "unmet needs: github" },
+    { policy: "probe-failed", reason: "placement-probe-failed:" },
+  ])("preserves $policy for non-shared Git --src launches", async ({ policy, reason }) => {
+    const f = fixture(); execFileSync("git", ["init", "--quiet", f.root]);
+    f.config.placement.sharedMounts = [];
+    f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
+    if (policy === "default-local") f.config.placement.default = "local";
+    if (policy === "probe-failed") f.config.placement.command[0] = path.join(f.root, "missing");
+    const needs = policy === "needs-local" ? ["local"] : policy === "unmet-need" ? ["github"] : undefined;
+    const result = await f.manager.wait((await f.manager.spawn({ task: "stay local", transport: "process", ...(needs ? { needs } : {}) })).id);
+    expect(result).toMatchObject({ status: "completed", text: "LOCAL" });
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events.filter(event => event.type.startsWith("placement."))).toEqual([
+      expect.objectContaining({ type: "placement.local", reason: policy === "probe-failed" ? expect.stringContaining(reason) : reason }),
+    ]);
+    expect(fs.existsSync(f.results)).toBe(false);
   });
   it("resolves Ryzen 3 polling and cancellation through the configured forge alias", async () => {
     const f=fixture(true);
@@ -399,16 +443,19 @@ describe("host process task placement", () => {
     await expect(f.manager.spawn({task:"x",transport:"process"})).rejects.toThrow("ENOENT");
     expect(fs.existsSync(f.results)).toBe(false);
   });
-  it.each(["home","non-git"])("keeps an unshippable %s --src cwd local", async kind => {
+  it.each(["home","root","non-git"])("keeps an unshippable %s --src cwd local", async kind => {
     const f=fixture(); f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
-    if(kind==="home") vi.stubEnv("HOME",f.root);
-    const h=await f.manager.spawn({task:"x",transport:"process"});
+    f.config.placement.sharedMounts = [];
+    if(kind==="home") vi.spyOn(os, "homedir").mockReturnValue(f.root);
+    const cwd = kind === "root" ? path.parse(f.root).root : f.root;
+    const h=await f.manager.spawn({task:"x",cwd,transport:"process"});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     expect(fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8")).toContain('"reason":"cwd-not-shippable"');
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it.each([".local", "huge-cache"])("never invokes the launcher or ships an ignored %s source root", async directory => {
     const f = fixture(); execFileSync("git", ["init", "--quiet", f.root]);
+    f.config.placement.sharedMounts = [];
     fs.writeFileSync(path.join(f.root, ".gitignore"), `${directory}/\n`);
     const cwd = path.join(f.root, directory); fs.mkdirSync(cwd);
     const privateFile = path.join(cwd, "private-fixture.txt"); fs.writeFileSync(privateFile, "NONSECRET PRIVATE FIXTURE");

@@ -338,14 +338,16 @@ export class ProcessTransport implements AgentTransportAdapter {
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
-      if (!reason) {
+      const shipsSource = placement.command.some((entry, index) => entry === "--src" && placement.command[index + 1] === "{cwd}");
+      // Shipped sources need Git eligibility below, not an existing shared cwd on the target.
+      if (!reason && !shipsSource) {
         const { placementLocalPathReason } = await import("./placement.js");
         reason = placementLocalPathReason(request.cwd, placement);
       }
       // --src ships the Main's workspace, unlike --cwd which names a target-local
       // lane. Require the launcher's tracked/unignored manifest branch; home,
       // non-Git and ignored roots must never enter its recursive-copy branch.
-      if (!reason && placement.command.some((entry, index) => entry === "--src" && placement.command[index + 1] === "{cwd}")) {
+      if (!reason && shipsSource) {
         try {
           const cwd = fs.realpathSync(request.cwd);
           if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");

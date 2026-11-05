@@ -141,15 +141,17 @@ export type FleetPlacementSelection = { host: string } | { localReason: string }
  * for explicit --host. Missing/broken/slow picker safely selects the local worker.
  * An injected host-only picker opts a custom launcher into the same contract.
  */
-export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: string, signal?: AbortSignal, preflightDeadline?: number, environment: NodeJS.ProcessEnv = taskAgentEnvironment()): Promise<FleetPlacementSelection | undefined> => {
+export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: string, signal?: AbortSignal, environment: NodeJS.ProcessEnv = taskAgentEnvironment()): Promise<FleetPlacementSelection | undefined> => {
   try {
     const root = fleetRoot(config, cwd);
     if (!root && !config.pickerCommand) return undefined;
     const picker = config.pickerCommand ?? [path.join(root!, "bin/smarty-pick-host")];
-    const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     const slot = hostSlot(config.command);
     const requested = slot === undefined ? "auto" : config.command[slot + 1]!;
     if (requested !== "auto" && !hostName.test(requested)) throw new Error("Invalid --host option");
+    // Git/source checks must not spend the picker's budget, nor may a slow
+    // but eligible picker exhaust the subsequent read-only SSH checks.
+    const deadline = Date.now() + config.pickerTimeoutMs;
     const picked = await query(picker[0]!, [...picker.slice(1), "--list-room"], deadline, environment, signal);
     const hosts = picked.stdout.trim().split(/\r?\n/u).filter(Boolean);
     if (picked.code !== 0 || !hosts.length || hosts.some(host => !hostName.test(host)) || new Set(hosts).size !== hosts.length) throw new Error(`picker refused: ${picked.stderr.trim() || "no eligible host"}`);
@@ -172,13 +174,13 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
   try {
     const root = fleetRoot(config, request.cwd);
     if (!root && !config.pickerCommand) return undefined;
-    const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     if (!selectedHost) {
-      const selection = await selectFleetPlacement({ ...config, command }, request.cwd, request.signal, deadline, environment);
+      const selection = await selectFleetPlacement({ ...config, command }, request.cwd, request.signal, environment);
       if (!selection) throw new Error("No fleet placement selection");
       if ("localReason" in selection) throw new Error(selection.localReason);
       host = selection.host;
     }
+    const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     const alias = config.sshAliases?.[host];
     if (!alias || !Object.hasOwn(config.sshAliases!, host) || !hostName.test(alias)) throw new Error("host has no trusted placement sshAliases entry");
     const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");

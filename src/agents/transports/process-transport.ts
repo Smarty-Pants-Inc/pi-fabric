@@ -331,26 +331,28 @@ export class ProcessTransport implements AgentTransportAdapter {
     } else {
     const placement = this.#placement();
     if (placement) {
-      const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
+      const sourceDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
       const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
-      if (!reason) {
+      const shipsSource = placement.command.some((entry, index) => entry === "--src" && placement.command[index + 1] === "{cwd}");
+      // Shipped sources need Git eligibility below, not an existing shared cwd on the target.
+      if (!reason && !shipsSource) {
         const { placementLocalPathReason } = await import("./placement.js");
         reason = placementLocalPathReason(request.cwd, placement);
       }
       // --src ships the Main's workspace, unlike --cwd which names a target-local
       // lane. Require the launcher's tracked/unignored manifest branch; home,
       // non-Git and ignored roots must never enter its recursive-copy branch.
-      if (!reason && placement.command.some((entry, index) => entry === "--src" && placement.command[index + 1] === "{cwd}")) {
+      if (!reason && shipsSource) {
         try {
           const cwd = fs.realpathSync(request.cwd);
           if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");
           const git = await executeFile("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
-            timeoutMs: Math.max(1, Math.min(5_000, preflightDeadline - Date.now())), killSignal: "SIGKILL",
+            timeoutMs: Math.max(1, Math.min(5_000, sourceDeadline - Date.now())), killSignal: "SIGKILL",
           });
           if (git.stdout.trim() !== "true") throw new Error("not a Git work tree");
           // check-ignore -q exits 0 for ignored, 1 for definitely unignored,
@@ -358,7 +360,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           let unignored = false;
           try {
             await executeFile("git", ["-C", cwd, "check-ignore", "-q", "--", cwd], {
-              timeoutMs: Math.max(1, Math.min(5_000, preflightDeadline - Date.now())), killSignal: "SIGKILL",
+              timeoutMs: Math.max(1, Math.min(5_000, sourceDeadline - Date.now())), killSignal: "SIGKILL",
             });
           } catch (error) {
             const exit = error as { code?: unknown; signal?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown } | null;
@@ -370,9 +372,9 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
       if (!reason) {
         const { launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
-        const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline);
+        const selection = await selectFleetPlacement(placement, request.cwd, request.signal);
         if (selection && "localReason" in selection) reason = selection.localReason;
-        else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
+        else return launchPlacedTask(request, placement, undefined, selection?.host);
       }
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);

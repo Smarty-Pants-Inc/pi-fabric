@@ -15,7 +15,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?: number; executeRemote?: boolean } = {}) {
+function fixture(options: { candidates?: string[]; pickerExit?: number; pickerDelaySeconds?: number; sshExit?: number; executeRemote?: boolean } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-affinity-")); roots.push(base);
   // The test runner allocates outside /srv/scratch; caller TMPDIR is private, not the portable workspace.
   const callerTmp = path.join(base, "caller-tmp"); fs.mkdirSync(callerTmp);
@@ -37,7 +37,7 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
   const fleet = path.join(bin, "smarty-task-ryzen2");
   write(fleet, "#!/bin/sh\nprintf 'called\\n' >> \"$LAUNCH_CALLS\"\nprintf 'RYZEN2_TASK_ACCEPTED affinity on ryzen2\\n'\n"); fs.chmodSync(fleet, 0o700);
   const picker = path.join(base, "smarty-pick-host-fixture");
-  write(picker, `#!/bin/sh\nprintf 'called\\n' >> "$PICKER_CALLS"\nprintf '%s\\n' "$CANDIDATES"\nprintf 'eligible0=1 eligible1=1\\n' >&2\nexit "${options.pickerExit ?? 0}"\n`); fs.chmodSync(picker, 0o700);
+  write(picker, `#!/bin/sh\nprintf 'called\\n' >> "$PICKER_CALLS"\n${options.pickerDelaySeconds ? `sleep ${options.pickerDelaySeconds}\n` : ""}printf '%s\\n' "$CANDIDATES"\nprintf 'eligible0=1 eligible1=1\\n' >&2\nexit "${options.pickerExit ?? 0}"\n`); fs.chmodSync(picker, 0o700);
   const pathBin = path.join(base, "path"); fs.mkdirSync(pathBin);
   const python = path.join(pathBin, "python3");
   write(python, "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n"); fs.chmodSync(python, 0o700);
@@ -86,11 +86,66 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(result?.command.slice(result.command.indexOf("--host"), result.command.indexOf("--host") + 2)).toEqual(["--host", "intel1"]);
   });
 
+  // Recorded catch: #1830's shared 5 s preflight budget forced every loaded-fleet spawn LOCAL.
+  it.each([
+    { source: false, pickerTimeoutMs: undefined },
+    { source: true, pickerTimeoutMs: 10_000 },
+  ])("keeps a picker slower than 5 s remote with its own budget (source=$source)", async ({ source, pickerTimeoutMs }) => {
+    const f = fixture({ executeRemote: true, pickerDelaySeconds: 5.5 });
+    execFileSync("git", ["init", "--quiet", f.cwd]);
+    const local = localWorkerRequest(f);
+    const config = normalizeFabricConfig({ agents: { placement: {
+      ...f.config, commandTimeoutMs: 30_000, pickerTimeoutMs,
+      sharedMounts: source ? [] : [f.cwd],
+      command: f.config.command.map(entry => entry === "--cwd" && source ? "--src" : entry === f.cwd ? "{cwd}" : entry),
+    } } }).agents.placement!;
+    const result = path.join(f.base, "results", "affinity"); fs.mkdirSync(result, { recursive: true });
+    fs.writeFileSync(path.join(result, "rc"), "0"); fs.writeFileSync(path.join(result, "result.md"), "REMOTE");
+    const started = Date.now();
+    const handle = await new ProcessTransport(undefined, config).launch(local.request);
+    await handle.waitForClose?.();
+    expect(handle.sessionId).toBe("placement:affinity");
+    expect(Date.now() - started).toBeGreaterThan(5_000);
+    expect(await handle.isAlive()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(f.base, "run", "status.json"), "utf8")).text).toBe("REMOTE");
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.remote"');
+    expect(fs.existsSync(local.marker)).toBe(false);
+    for (const file of [f.pickerCalls, f.sshCalls, f.launchCalls]) expect(fs.readFileSync(file, "utf8")).toBe("called\n");
+  });
+
+  it("starts the read-only SSH budget after a standalone slow picker finishes", async () => {
+    const f = fixture({ pickerDelaySeconds: 5.5 });
+    const config = normalizeFabricConfig({ agents: { placement: {
+      ...f.config, commandTimeoutMs: 30_000, pickerTimeoutMs: 10_000,
+    } } }).agents.placement!;
+    const result = await preflightFleetPlacement(f.request(), config, config.command, "task", f.env);
+    expect(result?.host).toBe("ryzen2");
+    for (const file of [f.pickerCalls, f.sshCalls]) expect(fs.readFileSync(file, "utf8")).toBe("called\n");
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+  });
+
+  it("falls back to a real local worker with the deadline reason when the picker exceeds its own budget", async () => {
+    const f = fixture({ pickerDelaySeconds: 5.5 });
+    const local = localWorkerRequest(f);
+    const config = normalizeFabricConfig({ agents: { placement: {
+      ...f.config, commandTimeoutMs: 30_000, pickerTimeoutMs: 100,
+    } } }).agents.placement!;
+    const started = Date.now();
+    const handle = await new ProcessTransport(undefined, config).launch(local.request);
+    await handle.waitForClose?.();
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
+    const events = fs.readFileSync(local.events, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(events).toContainEqual(expect.objectContaining({ type: "placement.local", reason: "placement-picker-local: Preflight deadline expired" }));
+    expect(fs.readFileSync(f.pickerCalls, "utf8")).toBe("called\n");
+    for (const file of [f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
   it.each(["ineligible", "missing", "nonzero", "empty", "timeout"] as const)("runs a real local worker when picker admission is %s", async kind => {
     const f = fixture({ candidates: kind === "empty" ? [] : ["intel1", "ryzen2"], pickerExit: kind === "nonzero" ? 3 : 0 });
     const command = [...f.config.command];
     if (kind === "ineligible") command[command.indexOf("--host") + 1] = "qs32729";
-    const config = { ...f.config, command, ...(kind === "timeout" ? { commandTimeoutMs: 100 } : {}),
+    const config = { ...f.config, command, ...(kind === "timeout" ? { pickerTimeoutMs: 100 } : {}),
       ...(kind === "missing" ? { pickerCommand: [path.join(f.base, "absent-picker")] } : {}) };
     if (kind === "timeout") fs.writeFileSync(f.picker, "#!/bin/sh\nsleep 5\n");
     vi.stubEnv("CANDIDATES", f.env.CANDIDATES); vi.stubEnv("PATH", f.env.PATH); vi.stubEnv("SSH_CALLS", f.sshCalls); vi.stubEnv("PICKER_CALLS", f.pickerCalls);
@@ -142,7 +197,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     const picker = f.picker;
     fs.writeFileSync(picker, "#!/bin/sh\nsleep 5\n"); fs.chmodSync(picker, 0o700);
     const started = Date.now();
-    await expect(preflightFleetPlacement(f.request(), { ...f.config, commandTimeoutMs: 100 }, f.config.command, "task", f.env)).rejects.toThrow(/host=auto/);
+    await expect(preflightFleetPlacement(f.request(), { ...f.config, pickerTimeoutMs: 100 }, f.config.command, "task", f.env)).rejects.toThrow(/host=auto/);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(fs.existsSync(f.sshCalls)).toBe(false);
   });

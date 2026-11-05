@@ -104,8 +104,8 @@ const fixture = async () => {
   await side.mirror(direct);
   await new StoreBridgeSide(store, "other", () => NOW).mirror(relay);
   const changes: BridgeChange[] = [], failures: Error[] = [];
-  const subscribe = () => {
-    const unsubscribe = side.subscribeChanges(kind => changes.push(kind), error => failures.push(error));
+  const subscribe = (log?: (message: string) => void) => {
+    const unsubscribe = side.subscribeChanges(kind => changes.push(kind), error => failures.push(error), log);
     cleanup.push(unsubscribe);
     expect(observation.notify.has(root)).toBe(true);
     return unsubscribe;
@@ -321,6 +321,59 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       expect(f.changes).toEqual(["lease"]);
     }
     m.expectAttempts([false, false, false]);
+  });
+
+  it("retries a deferred capture to convergence and resets its backoff after success", async () => {
+    const f = await fixture();
+    const logs: string[] = [];
+    f.subscribe(line => logs.push(line));
+    const m = measure(f);
+    m.proofs.mockReturnValue(false);
+    vi.useFakeTimers();
+    try {
+      observation.notify.get(f.root)!("presence");
+      await vi.advanceTimersByTimeAsync(100); // notification scan; three failed proofs, then 100 ms retry
+      expect(m.proofs).toHaveBeenCalledTimes(3);
+      expect(vi.getTimerCount()).toBe(1);
+      await f.store.put({ key: key("participants", f.participant.id), identity: f.identity,
+        value: { ...f.participant, status: "running" } });
+      m.proofs.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(f.changes).toEqual(["presence"]);
+      expect(JSON.parse(frames().at(-1)!.content).native.participants[0].status).toBe("running");
+      expect(logs).toEqual([]);
+      // A fresh failure after success must again use the minimum 100 ms retry.
+      m.proofs.mockReturnValue(false);
+      observation.notify.get(f.root)!("presence");
+      await vi.advanceTimersByTimeAsync(100);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(m.proofs).toHaveBeenCalledTimes(7);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(m.proofs).toHaveBeenCalledTimes(10);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("counts deferred captures in one minute diagnostic windows and emits no line without deferrals", async () => {
+    const f = await fixture();
+    const logs: string[] = [];
+    f.subscribe(line => logs.push(line));
+    const m = measure(f);
+    vi.useFakeTimers();
+    try {
+      const notifyAndScan = async () => {
+        observation.notify.get(f.root)!("presence");
+        await vi.advanceTimersByTimeAsync(100);
+      };
+      await notifyAndScan(); // zero deferrals: the healthy capture is silent
+      expect(logs).toEqual([]);
+      m.proofs.mockReturnValue(false);
+      await notifyAndScan();
+      await vi.advanceTimersByTimeAsync(100); // retry is another deferred capture
+      expect(logs).toEqual([]);
+      vi.setSystemTime(Date.now() + 60_000);
+      await vi.advanceTimersByTimeAsync(200); // next retry closes the minute window
+      expect(logs).toEqual(["bridge far: capture deferred: 3 in last 60s (retry 400ms)"]);
+    } finally { vi.useRealTimers(); }
   });
 
   it.each(["hosts", "participants", "lease"] as const)("detects externally removed mirror %s and repairs real held authority", async removed => {

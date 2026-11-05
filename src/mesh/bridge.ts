@@ -439,7 +439,7 @@ export interface BridgeSide {
   /** Install before the first snapshot. Changes are latched during in-flight work.
    * Watch failure is fatal. undefined selects transitional legacy-remote polling only with
    * reported protocolVersion 1; local stores always require watches. Manual step() needs no subscription. */
-  subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
+  subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void, log?: (message: string) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
   /** Reported hello version, required before a remote may use the pre-capability polling path. */
   readonly protocolVersion?: number | undefined;
   /** An open, negotiated traffic lane remains usable despite a retained pending mirror. */
@@ -1080,7 +1080,7 @@ export class StoreBridgeSide implements BridgeSide {
       this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }));
   }
 
-  subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): () => void {
+  subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void, log?: (message: string) => void): () => void {
     let active = true;
     let queued = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1089,6 +1089,8 @@ export class StoreBridgeSide implements BridgeSide {
     let scanNext = false;
     let eventsNext = false;
     let retryMs = LOCK_RETRY_MIN_MS;
+    let deferredCaptures = 0;
+    let deferredLoggedAt = Date.now();
     let baseline: ReturnType<typeof snapshot> | undefined;
     // File snapshots are private, copy-on-write parses: reuse their read-only entries.
     // Other backends use detached prefix reads, reused only within one snapshot.
@@ -1152,6 +1154,13 @@ export class StoreBridgeSide implements BridgeSide {
         const value = snapshot();
         if (revision !== undefined && this.store.withStateWriteFence(() =>
           this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
+      }
+      deferredCaptures += 1;
+      const now = Date.now();
+      if (now - deferredLoggedAt >= 60_000) {
+        log?.(`bridge ${this.peer}: capture deferred: ${deferredCaptures} in last 60s (retry ${retryMs}ms)`);
+        deferredCaptures = 0;
+        deferredLoggedAt = now;
       }
       return undefined;
     };
@@ -5426,7 +5435,7 @@ export class MeshBridge {
           while (unsubscribers.length < sides.length && !this.#stopped) {
             const side = sides[unsubscribers.length]!;
             if (!side.subscribeChanges && unsubscribers.length === 0) throw new Error("The local bridge side requires filesystem change notifications");
-            const unsubscribe = await side.subscribeChanges?.(changed, failed);
+            const unsubscribe = await side.subscribeChanges?.(changed, failed, message => this.#log(message));
             if (!unsubscribe) {
               if (unsubscribers.length === 0) throw new Error("The local bridge side requires filesystem change notifications");
               if (side.protocolVersion !== LEGACY_BRIDGE_PROTOCOL_VERSION) {

@@ -88,6 +88,20 @@ describe("host process task placement", () => {
       expect(() => normalizeFabricConfig({agents:{placement:{...f.raw,...change}}})).toThrow();
     }
   });
+  it("defaults the picker budget to min(commandTimeoutMs, 20000) and accepts independent bounds", () => {
+    const f = fixture();
+    const normalize = (change: Record<string, unknown>) => normalizeFabricConfig({ agents: { placement: { ...f.raw, ...change } } }).agents.placement!;
+    expect(normalize({ commandTimeoutMs: undefined }).pickerTimeoutMs).toBe(20_000);
+    expect(normalize({ commandTimeoutMs: 8_000 }).pickerTimeoutMs).toBe(8_000);
+    expect(normalize({ commandTimeoutMs: 120_000 }).pickerTimeoutMs).toBe(20_000);
+    for (const pickerTimeoutMs of [100, 120_000]) {
+      expect(normalize({ commandTimeoutMs: 1_000, pickerTimeoutMs }).pickerTimeoutMs).toBe(pickerTimeoutMs);
+    }
+  });
+  it.each([99, 120_001, 100.5, -1, 0, NaN, Infinity, "20000", null, true, [], {}].map(pickerTimeoutMs => ({ pickerTimeoutMs })))("rejects invalid pickerTimeoutMs $pickerTimeoutMs", ({ pickerTimeoutMs }) => {
+    const f = fixture();
+    expect(() => normalizeFabricConfig({ agents: { placement: { ...f.raw, pickerTimeoutMs } } })).toThrow("Invalid agents.placement.pickerTimeoutMs");
+  });
   it.each(["local", "LOCAL", " local ", "local,compute", "compute LOCAL", "ＬＯＣＡＬ", "local\u0085compute"])("refuses reserved %s as a launcher capability with a typed error", capability => {
     const f = fixture();
     const invalid = () => normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: ["compute", capability] } } });

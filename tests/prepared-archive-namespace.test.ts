@@ -177,8 +177,8 @@ describe.skipIf(process.platform === "win32")("prepared archive prefix: independ
     const expected = reduced ? chain(f.leaf, common) : chain(f.leaf);
     const expectedLive = reduced ? [f.root] : chain(f.root);
     const held = measured.barriers.filter(b => b.held), files = held.filter(b => !b.directory && b.kind === "fsync");
-    expect(files).toHaveLength(6); expect(held.filter(b => b.kind === "fdatasync")).toHaveLength(1);
-    expect(files.filter(b => b.file.startsWith(path.join(f.leaf, "2.json.")))).toHaveLength(3);
+    expect(files).toHaveLength(5); expect(held.filter(b => b.kind === "fdatasync")).toHaveLength(1);
+    expect(files.filter(b => b.file.startsWith(path.join(f.leaf, "2.json.")))).toHaveLength(2);
     expect(files.filter(b => b.file.includes("event-receipts"))).toHaveLength(2);
     expect(files.filter(b => b.file === path.join(f.root, "events.jsonl"))).toHaveLength(1);
     expect(held.filter(b => b.directory && b.file === path.join(f.root, "event-receipts"))).toHaveLength(3);
@@ -187,42 +187,41 @@ describe.skipIf(process.platform === "win32")("prepared archive prefix: independ
     const intent = measured.events.findIndex(e => e.startsWith("rename:") && e.endsWith(".pending.json"));
     const appendAt = measured.events.indexOf(`append:${path.join(f.root, "events.jsonl")}`);
     const receipt = measured.events.findIndex(e => e.startsWith(`rename:${path.join(f.root, "event-receipts")}`) && !e.endsWith(".pending.json"));
-    expect(renames).toHaveLength(3);
+    expect(renames).toHaveLength(2);
     expect(renames[0]).toBeLessThan(intent); expect(intent).toBeLessThan(renames[1]!);
-    expect(renames[1]).toBeLessThan(appendAt); expect(appendAt).toBeLessThan(renames[2]!);
-    expect(renames[2]).toBeLessThan(receipt);
+    expect(renames[1]).toBeLessThan(appendAt); expect(appendAt).toBeLessThan(receipt);
     const dataAt = measured.events.findIndex(e => e.startsWith("fdatasync:"));
     expect(intent).toBeLessThan(dataAt); expect(dataAt).toBeLessThan(renames[1]!);
-    for (let p = 0; p < 3; p++) {
+    for (let p = 0; p < 2; p++) {
       const beforeRename = measured.events.slice(p ? renames[p - 1]! + 1 : 0, renames[p]);
       expect(beforeRename.filter(e => e.startsWith(`fsync:${path.join(f.leaf, "2.json.")}`))).toHaveLength(1);
     }
-    for (let phase = 0; phase < 3; phase++) for (const directory of expected) {
+    for (let phase = 0; phase < 2; phase++) for (const directory of expected) {
       expect(indexDirs(measured, phase)).toContain(directory); // Safety remains meaningful on baseline.
     }
     const offLock = measured.barriers.filter(b => b.directory && !b.held).map(b => b.file);
     expect(offLock).toEqual(chain(path.join(f.root, "event-receipts")));
-    const expectedHeld = 3 * expected.length + expectedLive.length + 3;
+    const expectedHeld = 2 * expected.length + expectedLive.length + 3;
     console.log("PREFIX_ACCOUNTING " + JSON.stringify({ layout, gate, host: process.platform, reduced, common, expectedIndex: expected,
       fullIndex: chain(f.leaf), expectedHeld, baselineFormula: 3 * chain(f.leaf).length + chain(f.root).length + 3,
-      actualHeld: held.filter(b => b.directory).length, actualIndex: [0, 1, 2].map(p => indexDirs(measured, p)),
+      actualHeld: held.filter(b => b.directory).length, actualIndex: [0, 1].map(p => indexDirs(measured, p)),
       live: liveDirs(measured), offLock, offLockCount: offLock.length, files: files.length,
       data: held.filter(b => b.kind === "fdatasync").length }));
     // Linux eligible: omit ONLY ancestors above common. Darwin/other denial:
-    // every old index chain at all three phases AND the complete live chain.
-    for (let phase = 0; phase < 3; phase++) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(expected));
+    // both durable index chains AND the complete live chain. The advisory third rewrite is gone.
+    for (let phase = 0; phase < 2; phase++) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(expected));
     expect(liveDirs(measured)).toEqual(expectedLive);
     expect(held.filter(b => b.directory)).toHaveLength(expectedHeld);
   });
 
-  it.each([0, 1, 2])("stable positive: all owed paths and live binding survive original phase %s", async phase => {
+  it.each([0, 1])("stable positive: all owed paths and live binding survive durable phase %s", async phase => {
     const f = await fixture(), measured = observe(f);
     await retryExactlyOnce(f, `stable-${phase}`);
     for (const directory of chain(f.leaf, commonDirectory(f.leaf, f.root))) expect(indexDirs(measured, phase)).toContain(directory);
     expect(liveDirs(measured)).toContain(f.root);
   });
 
-  it.each([0, 1, 2].flatMap(phase => ["archive", "ancestor"].map(move => ({ phase, move }))))(
+  it.each([0, 1].flatMap(phase => ["archive", "ancestor"].map(move => ({ phase, move }))))(
     "same-inode nonshared $move ABA at phase $phase still owes its parent; EIO refuses ACK", async ({ phase, move }) => {
       const f = await fixture(), target = move === "archive" ? f.archive : f.branch;
       const owed = path.dirname(target), before = fs.statSync(target);
@@ -255,7 +254,7 @@ describe.skipIf(process.platform === "win32")("prepared archive prefix: independ
     });
     const measured = observe(f); await f.side.publish(command("changed"), [sender.id]);
     expect(changed).toBe(true);
-    for (const phase of [0, 1, 2]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(chain(f.leaf)));
+    for (const phase of [0, 1]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(chain(f.leaf)));
     expect(liveDirs(measured)).toEqual(chain(f.root));
   });
 
@@ -263,13 +262,13 @@ describe.skipIf(process.platform === "win32")("prepared archive prefix: independ
     const f = await fixture("alias"), measured = observe(f);
     await f.side.publish(command("alias"), [sender.id]);
     const expected = [...new Set([...chain(path.join(f.physical, "sequence-index", "0")), ...chain(path.dirname(f.archive))])];
-    for (const phase of [0, 1, 2]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(expected));
+    for (const phase of [0, 1]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(expected));
   });
 
-  it("missing preparation batch keeps original full index/live fences", async () => {
+  it("prepared receipt batch keeps full durable index/live fences without single-publish prefix reuse", async () => {
     const f = await fixture(), measured = observe(f);
     await f.side.publishBatch([{ event: command("batch"), held: [sender.id] }]);
-    for (const phase of [0, 1, 2]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(chain(f.leaf)));
+    for (const phase of [0, 1]) expect(sorted(indexDirs(measured, phase))).toEqual(sorted(chain(f.leaf)));
     // Archive-coupled keyed confirmation under lock, then unconditional #finishBatch live confirmation.
     expect(liveDirs(measured)).toEqual([...chain(f.root), ...chain(f.root)]);
   });

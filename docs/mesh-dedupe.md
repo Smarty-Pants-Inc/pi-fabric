@@ -133,6 +133,14 @@ persistence remains subject to that existing platform limitation: if an intent
 reappears after a crash, the authoritative receipt settles it without re-appending.
 Unkeyed publication does not enter this receipt/intent path.
 
+Single publishes and batches with any keyed event prepare the complete
+`event-receipts` namespace **before acquiring the mesh lock**. A batch shares one
+preparation, but every intent install, receipt install, and intent unlink still
+pays a fresh leaf-directory fsync under its existing lock. The namespace identity
+is checked before and after that barrier; replacement or a changed ancestor uses
+the complete original barrier instead. A preparation I/O failure appends nothing.
+This does not extend single-publish archive/live shared-prefix reuse to batches.
+
 1. Read `event-receipts/<hash>.json`. A valid receipt is authoritative; confirm
    its file/namespace barriers, finish any pending-file cleanup, and return it.
 2. If `event-receipts/<hash>.pending.json` exists, repair the live tail and finish
@@ -170,7 +178,10 @@ Unkeyed publication does not enter this receipt/intent path.
    in that same append operation (the confirmation is advisory),
    before the event can go live. A rollback installs the explicit negative record.
    Append live, commit archive metadata, confirm the live file, durably write
-   the receipt, and only then unlink/sync the intent.
+   the receipt, and only then unlink/sync the intent. Ordinary commit does not
+   rewrite the advisory sidecar to `committed: true`: the durable exact address,
+   live-file confirmation, and durable receipt still supply the same evidence.
+   Explicit intent/reboot recovery may confirm or rebuild the sidecar.
 
 Archive lookup never scans a segment, index log, receipt directory, or day tree.
 It is one sequence-addressed sidecar read and one positioned event-line read.
@@ -213,8 +224,9 @@ archived bytes. Events beyond the live horizon remain invisible until promoted.
 A cursor already beyond the ambiguous old sequence cannot be rewound safely;
 this does not claim delivery of compacted or never-live bytes to a live-only tail.
 The deliberate preference is duplicate-free archive delivery over destructive loss,
-not replaying an old sequence at the tail. False markers are advisory confirmations
-left by writers that old recovery cannot update, not proof of non-publication.
+not replaying an old sequence at the tail. False markers are advisory: ordinary
+publishes now leave them false, and old recovery may leave them stale. Neither is
+proof of non-publication.
 
 ## Bounded receipt retention and expiry
 

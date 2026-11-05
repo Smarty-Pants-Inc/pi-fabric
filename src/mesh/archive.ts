@@ -54,7 +54,7 @@ export interface MeshArchivePending {
   digestAfter?: DigestCheckpoint;
   /** New writers index the append before it can go live. Old writers ignore this field. */
   indexed?: true;
-  /** Keyed publications also record their live commit in the sequence sidecar. */
+  /** Retained for older writers' advisory live confirmation of keyed publications. */
   dedupe?: true;
 }
 
@@ -382,11 +382,14 @@ export class MeshArchive {
   }
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
-  commit(pending: MeshArchivePending, sealClosedDays = true, syncIndexDirectory?: IndexDirectoryBarrier): void {
+  commit(pending: MeshArchivePending, sealClosedDays = true): void {
     // Advisory checkpoint of bytes begin() already synced: plain. A lost or stale one is a
     // valid prefix (rebuilt in slices); every truncation path saves its checkpoint durably.
     if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)), false);
-    if (pending.dedupe) this.confirmLive(pending.sequence, pending.id, syncIndexDirectory);
+    // Do not rewrite the advisory committed:true bit on the ordinary publish path (#18675).
+    // begin()'s durable exact address already fences intent recovery; publication is the live
+    // append, confirmed before its receipt. A false bit is never absence evidence (module
+    // header, lookupEntry and settleDedupeIntent). Explicit recovery keeps confirmLive().
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
     // ponytail (smarty-dev#8907, every PENDING.json/DIGEST-REPAIR.json removal below): these are fixed-name control

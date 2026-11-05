@@ -13,7 +13,7 @@ import type { LockTimingContext } from "./commit-stats.js";
 import { jsonClone } from "./state-file.js";
 import { RecoveryReader, type RecoveryHint, type RecoveryReadCost } from "./recovery-reader.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
-import { prepareKeyedPublishNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
+import { prepareKeyedPublishNamespace, prepareReceiptNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
@@ -185,7 +185,7 @@ interface AfterUnlock {
   /** Set with `finish` when `finish` is the live barrier followed by this receipt step: a batch
    * runs one barrier for all its events, then each receipt step in order (smarty-dev#6729). */
   receipt?: (() => Promise<void> | void) | undefined;
-  /** Keyed publish(): the receipt namespace prepared before `.lock` (fresh leaf barriers inside). */
+  /** Keyed publication: the receipt namespace prepared before `.lock` (fresh leaf barriers inside). */
   namespace?: ReceiptNamespace | undefined;
 }
 
@@ -500,7 +500,7 @@ export class EventLog {
       catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
       if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
           intent.reservedSequence !== event.sequence) return;
-      // Unprepared (batch, win32): exactly the previous writeFileAtomic + syncPathNamespace barriers.
+      // Unprepared (e.g. win32): exactly the previous writeFileAtomic + syncPathNamespace barriers.
       const syncDirectory = after.namespace && receiptDirectoryBarrier(after.namespace);
       writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true, ...(syncDirectory ? { syncDirectory } : {}) });
       this.#removeDedupeIntent(intentPath, syncDirectory);
@@ -965,7 +965,7 @@ export class EventLog {
         try { outbox?.committed(); } catch { /* durable row is retried by owner maintenance */ }
         // This distinct fence leaves the live event complete but the sidecar unconfirmed.
         if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
-        if (pending) archive!.commit(pending, true, publishNamespace?.syncIndexDirectory);
+        if (pending) archive!.commit(pending);
         return { event, line, bytes };
       };
       const { event, bytes } = input.fence ? input.fence(append) : append();
@@ -979,8 +979,8 @@ export class EventLog {
       } else if (receiptPath) {
         // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
         this.#confirmEventFile(this.#eventsPath, false, publishNamespace?.syncLiveNamespace);
-        // publish() only: the checked prepared-namespace leaf barrier (as for its intent);
-        // batch/unprepared keep writeFileAtomic's default chain + syncPathNamespace.
+        // Single and batch: the checked prepared-namespace leaf barrier (as for the intent);
+        // an unprepared/changed namespace keeps the complete default barriers.
         const syncDirectory = after?.namespace && receiptDirectoryBarrier(after.namespace);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true, ...(syncDirectory ? { syncDirectory } : {}) });
         if (intentPath) this.#removeDedupeIntent(intentPath, syncDirectory);
@@ -1046,6 +1046,11 @@ export class EventLog {
     if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
     inputs = inputs.map(input => this.#capturePublication(input));
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
+    // One checked preparation for the batch, BEFORE any acquisition. Every keyed intent,
+    // receipt and unlink still pays its own fresh leaf barrier and revalidates this key.
+    // Archive-index/live shared-prefix reuse remains single-publish-only.
+    const namespace = inputs.some(input => input.dedupeKey)
+      ? prepareReceiptNamespace(path.join(this.root, "event-receipts")) : undefined;
     for (;;) {
       // The after-release work of each event the hold committed, in commit order.
       const committed: AfterUnlock[] = [];
@@ -1053,7 +1058,7 @@ export class EventLog {
       try {
         const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number }; after: AfterUnlock }> = [];
         for (const input of inputs) {
-          const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = {};
+          const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = { namespace };
           try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
           catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
         }
@@ -1698,7 +1703,11 @@ export class EventLog {
   }
 
   /** Under .lock: reserve capacity before append, or expire receipts during compaction.
-   * One key consumes one slot even while both receipt and pending intent are present. */
+   * One key consumes one slot even while both receipt and pending intent are present.
+   * This listing is authoritative admission/retention state, not an advisory cache. An
+   * off-lock snapshot could miss another writer's new key or pending intent, admitting
+   * over capacity or evicting protected evidence. Legacy writers publish no generation
+   * fence for validating that snapshot, so keep the scan serialized with their writes. */
   #pruneDedupeReceipts(reserve = 0): number {
     const directory = path.join(this.root, "event-receipts");
     let names: string[];

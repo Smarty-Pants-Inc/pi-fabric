@@ -92,6 +92,7 @@ never a mesh publish: publishing would need the very lock that is contended. One
 ```json
 {"v":1,"at":<epoch ms>,"kind":"held"|"wait-timeout","store":"sqlite"|"mesh-lock","class":<MeshLockClass>,
  "heldMs":<n, for held>,"waitedMs":<n, for wait-timeout>,
+ "maxGapMs":<n, optional for SQLite wait-timeout>,"holderRead":<optional SQLite observation>,
  "holder":{"pid":<n|null>,"process":<string|null>,"op":<MeshLockClass|null>,"host":<string>},
  "waiter":{"pid":<n>,"process":<string>,"op":<MeshLockClass>}}
 ```
@@ -104,12 +105,20 @@ never a mesh publish: publishing would need the very lock that is contended. One
   `FABRIC_MESH_LOCK_TIMEOUT` (`FABRIC_MESH_STATE_BUSY` at the bridge). There is no `heldMs`.
   `holder` names the holder as far as the lock's own record shows it: for `.lock`, the pid in its
   owner record; for SQLite, which keeps no owner record, the process holding the WAL write-lock byte
-  (shm byte 120) in the kernel's lock table (Linux `/proc/locks`). Unreadable (another platform, a
-  release in between, no single holder) means `pid` and `process` are `null`. `holder.op` is always
-  `null` here: neither record carries the holder's class. Bounded tries (registry-fenced
-  `withTryLock` scopes, zero-wait callers, the single-attempt R20 fence) fail by design while the
-  lock is busy; they stay `tries` in the minute files and emit no event. Nor does a protocol-2
-  store that fails closed before its process incarnation is ready: it never tried `.lock`.
+  (shm byte 120) in the kernel's lock table (Linux `/proc/locks`). For ordinary positive-budget SQLite
+  writes, one final bounded native `BEGIN IMMEDIATE` is allowed after a late wake; SQLite still refuses
+  a live holder. `maxGapMs` records the largest measured gap between acquisition attempts, including
+  the terminal tail. `holderRead` is a one-shot, uncached `/proc/locks` observation at timeout:
+  `present` has one matching `pid`, `absent` means a successful read found no matching holder at that
+  sample, `ambiguous` carries multiple `pids`, and `unavailable` means the sample could not be established.
+  `sampledAtMs` is the observation time; it does not prove who held the lock throughout the wait.
+  `match` says whether device and inode matched exactly, inode only, or not at all; `reason` explains
+  an unavailable sample. Missing/ambiguous observations leave `holder.pid` and `holder.process` null.
+  SQLite observations include `unavailable` on non-Linux or when procfs could not be read; `.lock`
+  events do not have `holderRead`. `holder.op` is always `null` here: neither record carries the holder's class.
+  Bounded tries (registry-fenced `withTryLock` scopes, zero-wait callers, the single-attempt R20 fence)
+  remain strict while busy; they stay `tries` in the minute files and emit no event. Nor does a
+  protocol-2 store that fails closed before its process incarnation is ready: it never tried `.lock`.
 - SQLite `wait-timeout` events may additionally carry `holder.cgroup` and `holder.unit`. These are
   **current local procfs observations for the kernel-sampled PID**, not proof that the same process
   held the lock throughout the wait. Only `/proc/PID/cgroup` is read, at most 4097 bytes; a file over

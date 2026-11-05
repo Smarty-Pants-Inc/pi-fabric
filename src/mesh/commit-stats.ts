@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { WalWriterObservation } from "./wal-readers.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 
 interface CommitStats {
@@ -607,13 +608,17 @@ export interface LockEvent {
   holder: LockEventHolder;
   /** `wait-timeout` or `pre-lock`. */
   waiter?: LockEventWaiter;
+  /** SQLite wait-timeout only: largest measured gap between acquisition attempts, including the terminal tail. */
+  maxGapMs?: number;
+  /** SQLite wait-timeout only: one uncached /proc/locks observation at timeout. */
+  holderRead?: WalWriterObservation;
 }
 export interface LockEvents {
   /** A release after a hold longer than the caller's threshold (the caller compares). */
   held(root: string, store: LockEventStore, lockClass: MeshLockClass, heldMs: number): void;
-  /** A full-budget acquisition that gave up; `holderPid` from the lock's owner record, if readable. */
+  /** A full-budget acquisition that gave up; holder details are from its timeout observation. */
   waitTimeout(root: string, store: LockEventStore, lockClass: MeshLockClass, waitedMs: number,
-    holderPid: number | undefined): void;
+    holderPid: number | undefined, diagnostics?: { maxGapMs: number; holderRead: WalWriterObservation }): void;
   /** FIFO refusal before admission; separate from the real-contention event and minute counters. */
   queueExpired(root: string, store: LockEventStore, lockClass: MeshLockClass, waitedMs: number,
     waitersAhead: number | undefined): void;
@@ -734,7 +739,7 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
     sleep?: (ms: number) => void;
   } = {}): LockEvents | undefined => {
   const existing = eventsGlobals[eventsKey];
-  if (existing && (!existing.events || (existing.version >= 4 && typeof existing.events.queueExpired === "function"))) return existing.events;
+  if (existing && (!existing.events || (existing.version >= 5 && typeof existing.events.queueExpired === "function"))) return existing.events;
   if (!existing && lockStatsDisabled(setting)) {
     eventsGlobals[eventsKey] = { version: 1, events: undefined, dispose() {} };
     return undefined;
@@ -881,10 +886,11 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
       append(root, { v: 1, at: Date.now(), kind: "held", store, class: lockClass, heldMs: Math.round(heldMs),
         holder: { pid: process.pid, process: self(), op: lockClass, host } });
     },
-    waitTimeout(root, store, lockClass, waitedMs, holderPid) {
+    waitTimeout(root, store, lockClass, waitedMs, holderPid, diagnostics) {
       const pid = holderPid !== undefined && Number.isSafeInteger(holderPid) && holderPid > 0 ? holderPid : null;
       const name = pid === null ? null : pid === process.pid ? self() : lockEventProcessName(pid) ?? null;
       append(root, { v: 1, at: Date.now(), kind: "wait-timeout", store, class: lockClass, waitedMs: Math.round(waitedMs),
+        ...(diagnostics === undefined ? {} : { maxGapMs: diagnostics.maxGapMs, holderRead: diagnostics.holderRead }),
         holder: { pid, process: name, op: null, host, ...(store === "sqlite" && pid !== null ? lockEventCgroup(pid) : {}) },
         waiter: { pid: process.pid, process: self(), op: lockClass } });
     },
@@ -895,13 +901,13 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
     },
     get errors() { return errors; },
   };
-  // Newly captured v1-v3 recorders use this timeout implementation exactly once. Already-captured old
+  // Newly captured v1-v4 recorders use this timeout implementation exactly once. Already-captured old
   // methods remain valid; retain held, current queue writers, opt-in and accumulated append errors.
   const legacy = existing?.events;
   const shared: LockEvents = legacy ? { held: legacy.held, waitTimeout: events.waitTimeout,
     queueExpired: existing!.version >= 3 ? legacy.queueExpired : events.queueExpired,
     get errors() { return legacy.errors + events.errors; } } : events;
-  eventsGlobals[eventsKey] = { version: 4, events: shared, dispose: existing?.dispose ?? (() => {}) };
+  eventsGlobals[eventsKey] = { version: 5, events: shared, dispose: existing?.dispose ?? (() => {}) };
   return shared;
 };
 

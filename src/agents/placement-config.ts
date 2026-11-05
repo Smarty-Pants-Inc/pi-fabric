@@ -23,6 +23,8 @@ export interface AgentPlacementConfig {
   cancelCommand: string[];
   pollIntervalMs: number;
   commandTimeoutMs: number;
+  /** Independent picker query budget, starting only when the query is issued. */
+  pickerTimeoutMs: number;
 }
 
 const placeholders = new Set(["id", "cwd", "task", "minutes", "model", "thinking", "host", "sshAlias", "resultDir"]);
@@ -79,6 +81,7 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
   const usesAlias = [input.resultDirectory, ...(Array.isArray(input.resultCommand) ? input.resultCommand : []), ...(Array.isArray(input.cancelCommand) ? input.cancelCommand : [])]
     .some(entry => typeof entry === "string" && entry.includes("{sshAlias}"));
   if (usesAlias && !Object.keys(sshAliases ?? {}).length) throw new Error("agents.placement {sshAlias} requires sshAliases mapping");
+  const commandTimeoutMs = bound(input.commandTimeoutMs, 30_000, 100, 120_000, "commandTimeoutMs");
   return {
     command, default: input.default ?? "local", capabilities,
     ...(sharedMounts ? { sharedMounts } : {}),
@@ -88,7 +91,8 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
     ...(input.resultCommand !== undefined ? { resultCommand: argv(input.resultCommand, "resultCommand") } : {}),
     cancelCommand: argv(input.cancelCommand, "cancelCommand"),
     pollIntervalMs: bound(input.pollIntervalMs, 1_000, 10, 60_000, "pollIntervalMs"),
-    commandTimeoutMs: bound(input.commandTimeoutMs, 30_000, 100, 120_000, "commandTimeoutMs"),
+    commandTimeoutMs,
+    pickerTimeoutMs: bound(input.pickerTimeoutMs, Math.min(commandTimeoutMs, 20_000), 100, 120_000, "pickerTimeoutMs"),
   };
 };
 

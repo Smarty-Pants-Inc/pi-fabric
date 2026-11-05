@@ -357,6 +357,8 @@ type Instrumented = ReturnType<typeof instrument>;
 const runFirstIngress = async (f: Fixture, s: Instrumented, untilDecision = false) => {
   f.launch();
   await within(f.idle, "real empty toLocal page before SQLite contention");
+  // Let the subscription's startup capture fence finish before scripting publication refusals.
+  await new Promise<void>(resolve => setTimeout(resolve, 120));
   await new Promise<void>(resolve => setImmediate(resolve));
   s.holdSqlite();
   const sent = await f.far.publish({ topic: TOPIC, kind: "ask", from: f.sender, to: f.recipient.id,

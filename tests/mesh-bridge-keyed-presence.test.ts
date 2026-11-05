@@ -167,6 +167,7 @@ describe("real StoreBridgeSide keyed lease consumers", () => {
     const check = async (expected: BridgeChange[]) => {
       const before = f.listings();
       callbacks[0]!("presence");
+      await new Promise(resolve => setTimeout(resolve, 120)); // drain the bridge's 100 ms notification window
       await turn();
       expect(f.listings() - before, "one notification capture must not enumerate leases").toBe(0);
       observation.full = true;

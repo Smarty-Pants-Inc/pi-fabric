@@ -15,8 +15,8 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
-// A bounded observation window lets real fs.watch notifications reach the agent, not a mocked notifier.
-const settle = async () => { await new Promise(resolve => setTimeout(resolve, 30)); await turn(); };
+// Let the real fs.watch notification and the bridge's 100 ms coalescing window reach the agent.
+const settle = async () => { await new Promise(resolve => setTimeout(resolve, 120)); await turn(); };
 const key = (kind: string, id: string) => `topology/${kind}/${createHash("sha256").update(id).digest("hex")}`;
 const presence = (id: string, now: number): BridgePresence => {
   const identity: MeshIdentity = { id, name: "main", kind: "main", sessionId: id.slice(8) };

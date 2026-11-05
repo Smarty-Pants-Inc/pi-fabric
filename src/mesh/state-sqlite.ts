@@ -116,7 +116,7 @@ import { verifiedRemove } from "../storage/verified-remove.js";
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
-import { formatWalReaders, walReaderComm, walReaderPids, walWriterPid, type WalReader } from "./wal-readers.js";
+import { formatWalReaders, walReaderComm, walReaderPids, walWriterObservation, walWriterPid, type WalReader } from "./wal-readers.js";
 import { createLockEvents, lockHeldEventThreshold, type LockTimingContext, type MeshLockClass } from "./commit-stats.js";
 import { admitExistingStateRoot, assertGatedFlagDirectory, assertPrivatePath, assertPrivateStateRoot, createStateRoot, filesystemRefusal,
   MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
@@ -1865,6 +1865,7 @@ export class SqliteStateStore {
     let attempts = 0;
     let maxGap = 0;
     let last = started;
+    let finalProbeAttempted = false;
     let transient = 0;
     let yieldedMs = 0;
     let waiting = true;
@@ -1880,44 +1881,56 @@ export class SqliteStateStore {
         // smarty-dev#6100: a checkpoint flag pauses this writer for at most WRITER_YIELD_BUDGET_MS in total.
         if (iteration < deadline && yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) {
           this.#stats.checkpoints.writerYields += 1; yielding = true;
-        } else if (attempts === 0 || performance.now() < deadline) {
-          // A resumed retry must not BEGIN after its fixed budget; only the first attempt is exempt.
+        } else {
           const now = performance.now();
-          if (attempts > 0) maxGap = Math.max(maxGap, now - last);
-          last = now;
-          attempts += 1;
-          let begun = false;
-          sqliteHoldContext(this.#db, holdTag, started);
-          try {
-            this.#db.exec("BEGIN IMMEDIATE");
-            begun = true;
-          } catch (error) {
-            if (isTransient(error) && transient < TRANSIENT_RETRIES) { transient += 1; this.#stats.transientRetries += 1; }
-            else if (isBusy(error)) this.#stats.busyRetries += 1;
-            else throw error;
-          }
-          if (begun) {
-            const waitMs = performance.now() - started;
-            this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, waitMs);
-            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
-            this.#writesWaiting -= 1;
-            waiting = false;
-            return this.#run(body, lockClass, waitMs, timing);
+          const finalProbe = attempts > 0 && now >= deadline && !finalProbeAttempted &&
+            !scope?.active && budget > 0;
+          if (attempts === 0 || now < deadline || finalProbe) {
+            // A normally budgeted writer gets one final native probe after a late wake: SQLite itself
+            // still refuses a live holder. Bounded tries and zero-budget writes remain strict.
+            if (finalProbe) finalProbeAttempted = true;
+            if (attempts > 0) maxGap = Math.max(maxGap, now - last);
+            last = now;
+            attempts += 1;
+            let begun = false;
+            sqliteHoldContext(this.#db, holdTag, started);
+            try {
+              this.#db.exec("BEGIN IMMEDIATE");
+              begun = true;
+            } catch (error) {
+              if (isTransient(error) && transient < TRANSIENT_RETRIES) { transient += 1; this.#stats.transientRetries += 1; }
+              else if (isBusy(error)) this.#stats.busyRetries += 1;
+              else throw error;
+            }
+            if (begun) {
+              const waitMs = performance.now() - started;
+              this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, waitMs);
+              this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
+              this.#writesWaiting -= 1;
+              waiting = false;
+              return this.#run(body, lockClass, waitMs, timing);
+            }
           }
         }
         const now = performance.now();
         if (now >= deadline) {
           // A checkpoint yield can consume the last slice, but the writer still gets a real attempt.
           if (attempts === 0) continue;
+          // A normal attempt that crossed the deadline is followed by the one final native probe.
+          if (!scope?.active && budget > 0 && !finalProbeAttempted) continue;
+          // Account for a final scheduling/event-loop stall even when it delayed the waiter past its deadline.
+          maxGap = Math.max(maxGap, now - last);
           this.#stats.lockTimeouts += 1;
           this.#window.lockTimeouts += 1;
           this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, now - started);
-          this.#flushCheckpointWindow();
-          // smarty-dev#9290: a full-budget waiter names the writer from the kernel's lock table; a
-          // bounded try (a withTryLock scope or a zero budget) fails by design and emits nothing.
+          // A full-budget timeout gets one fresh kernel snapshot before other timeout bookkeeping.
           const tried = Boolean(scope?.active) || budget <= 0;
+          const holderRead = !tried && lockEvents ? walWriterObservation(this.file) : undefined;
+          this.#flushCheckpointWindow();
           lockStats?.failed(this.root, lockClass, now - started, tried, timing);
-          if (!tried) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
+          if (holderRead) lockEvents!.waitTimeout(this.root, "sqlite", lockClass, now - started,
+            holderRead.state === "present" ? holderRead.pid : undefined,
+            { maxGapMs: Math.round(maxGap), holderRead });
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));

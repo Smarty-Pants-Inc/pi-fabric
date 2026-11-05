@@ -145,37 +145,76 @@ export function walReaderPids(dbPath: string): WalReader[] {
   return found;
 }
 
+/** One observation of SQLite's WAL writer POSIX lock on state.db-shm byte 120. */
+export interface WalWriterObservation {
+  state: "present" | "absent" | "unavailable" | "ambiguous";
+  /** Epoch time immediately after the procfs snapshot was read (or the unavailable observation was made). */
+  sampledAtMs: number;
+  match: "device+inode" | "inode-only" | "none";
+  pid?: number;
+  pids?: number[];
+  reason?: string;
+}
+
+const writerObservationFromLocks = (st: { dev: bigint; ino: bigint }, locks: string, sampledAtMs: number): WalWriterObservation => {
+  const major = devMajor(st.dev);
+  const minor = devMinor(st.dev);
+  const exact = new Set<number>();
+  const inodeOnly = new Set<number>();
+  for (const line of locks.split("\n")) {
+    if (line.includes("->")) continue; // blocked waiter, not a holder
+    const m = /^\d+:\s+POSIX\s+\S+\s+WRITE\s+(-?\d+)\s+([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)\s+(\d+)\s+(\d+|EOF)\s*$/.exec(line.trim());
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || BigInt(m[4]!) !== st.ino) continue;
+    const start = Number(m[5]);
+    const end = m[6] === "EOF" ? Number.POSITIVE_INFINITY : Number(m[6]);
+    if (!(start <= WALINDEX_LOCK_OFFSET && WALINDEX_LOCK_OFFSET <= end)) continue;
+    (BigInt(`0x${m[2]}`) === major && BigInt(`0x${m[3]}`) === minor ? exact : inodeOnly).add(pid);
+  }
+  // As for readers: fall back to an inode-only match (btrfs subvolumes) when nothing matched both.
+  const hits = exact.size > 0 ? exact : inodeOnly;
+  const pids = [...hits].sort((a, b) => a - b);
+  const match = exact.size > 0 ? "device+inode" : inodeOnly.size > 0 ? "inode-only" : "none";
+  if (pids.length === 0) return { state: "absent", sampledAtMs, match: "none" };
+  if (pids.length === 1) return { state: "present", pid: pids[0]!, sampledAtMs, match };
+  return { state: "ambiguous", pids, sampledAtMs, match };
+};
+
+const unavailableWriterObservation = (reason: string): WalWriterObservation => ({
+  state: "unavailable", sampledAtMs: Date.now(), match: "none", reason,
+});
+
 /**
- * The process holding SQLite's WAL writer lock (POSIX WRITE lock on shm byte 120) on `dbPath`'s `-shm`
- * file, for a waiter that gave up on it (smarty-dev#9290). The kernel's lock table is the writer lock's only
- * owner record: SQLite keeps none. Read only on that rare path, never per transaction. Never throws;
- * undefined on non-Linux, without a `-shm` file, or when no single process holds the byte.
+ * Fresh, uncached read for the full-budget SQLite wait-timeout event. The existing reporter deliberately
+ * caches /proc/locks for up to ten seconds; that is useful for routine diagnostics but cannot establish
+ * holder presence at a timeout. This one-shot path bypasses only that snapshot cache.
+ */
+export function walWriterObservation(dbPath: string): WalWriterObservation {
+  if (process.platform !== "linux") return unavailableWriterObservation("unsupported-platform");
+  let st: { dev: bigint; ino: bigint };
+  try { st = fs.statSync(`${dbPath}-shm`, { bigint: true }); }
+  catch { return unavailableWriterObservation("shm-unavailable"); }
+  if (procLocksDiagnostics.disabled()) return unavailableWriterObservation("diagnostics-disabled");
+  let locks: string;
+  try { locks = fs.readFileSync("/proc/locks", "utf8"); }
+  catch { return unavailableWriterObservation("proc-locks-unavailable"); }
+  return writerObservationFromLocks(st, locks, Date.now());
+}
+
+/**
+ * Cached process holding the writer lock, used by non-timeout diagnostics. For timeout evidence use
+ * walWriterObservation(), which performs one fresh /proc/locks read.
  */
 export function walWriterPid(dbPath: string): number | undefined {
   if (process.platform !== "linux") return undefined;
   try {
     const st = fs.statSync(`${dbPath}-shm`, { bigint: true });
-    const major = devMajor(st.dev);
-    const minor = devMinor(st.dev);
     if (procLocksDiagnostics.disabled()) return undefined;
     const locks = procLocksDiagnostics.locks();
     if (locks === undefined) return undefined;
-    const exact = new Set<number>();
-    const inodeOnly = new Set<number>();
-    for (const line of locks.split("\n")) {
-      if (line.includes("->")) continue; // blocked waiter, not a holder
-      const m = /^\d+:\s+POSIX\s+\S+\s+WRITE\s+(-?\d+)\s+([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)\s+(\d+)\s+(\d+|EOF)\s*$/.exec(line.trim());
-      if (!m) continue;
-      const pid = Number(m[1]);
-      if (!Number.isSafeInteger(pid) || pid <= 0 || BigInt(m[4]!) !== st.ino) continue;
-      const start = Number(m[5]);
-      const end = m[6] === "EOF" ? Number.POSITIVE_INFINITY : Number(m[6]);
-      if (!(start <= WALINDEX_LOCK_OFFSET && WALINDEX_LOCK_OFFSET <= end)) continue;
-      (BigInt(`0x${m[2]}`) === major && BigInt(`0x${m[3]}`) === minor ? exact : inodeOnly).add(pid);
-    }
-    // As for readers: fall back to an inode-only match (btrfs subvolumes) when nothing matched both.
-    const hits = exact.size > 0 ? exact : inodeOnly;
-    return hits.size === 1 ? [...hits][0] : undefined;
+    const observation = writerObservationFromLocks(st, locks, Date.now());
+    return observation.state === "present" ? observation.pid : undefined;
   } catch { return undefined; }
 }
 

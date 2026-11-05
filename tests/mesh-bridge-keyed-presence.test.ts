@@ -156,6 +156,8 @@ describe("real StoreBridgeSide keyed lease consumers", () => {
 
   it("classifies real notification snapshots identically without listing after each renewal", async () => {
     const f = await fixture();
+    // Let notifications from fixture setup clear before measuring subscription's initial cost.
+    await new Promise(resolve => setTimeout(resolve, 120)); // drain the bridge's 100 ms notification window
     const oracle: BridgeChange[] = [], keyed: BridgeChange[] = [], failures: Error[] = [];
     const beforeBaseline = f.listings();
     closers.push(f.side.subscribeChanges(kind => keyed.push(kind), error => failures.push(error)));

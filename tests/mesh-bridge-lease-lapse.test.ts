@@ -103,7 +103,8 @@ describe("bounded own-root lease lapse", () => {
     expect(f.cursor().toLocal.after).toBe(before.after);
     expect(f.cursor().toLocal.offset).toBe(before.offset);
     expect(commands(f.hub)).toEqual([]);
-    expect(fs.readdirSync(path.join(f.hub.root, "event-receipts"))).toEqual([]);
+    const receipts = path.join(f.hub.root, "event-receipts");
+    expect(fs.existsSync(receipts) ? fs.readdirSync(receipts) : []).toEqual([]);
     expect(refusalLines(f.logs, sent.id)).toEqual([]);
     const retried = await f.send();
     expect(retried.id).toBe(sent.id); // real source receipt, not a freshly keyed happy path

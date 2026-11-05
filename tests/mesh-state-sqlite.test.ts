@@ -601,6 +601,56 @@ describe("SqliteStateStore", () => {
     expect(store.get("w/abort")).toBeUndefined();
   }, 60_000);
 
+  it("gives an ordinary positive-budget writer one final native attempt after a late wake", async () => {
+    const root = tempRoot("late-wake-free-lock");
+    const setup = await open(root);
+    setup.close();
+    let begins = 0;
+    let holder: ReturnType<typeof raw> | undefined = raw(root);
+    holder.exec("BEGIN IMMEDIATE");
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      holder?.exec("ROLLBACK");
+      holder?.close();
+      holder = undefined;
+    };
+    const store = await open(root, { lockTimeoutMs: 25, open: file => {
+      const connection = openNodeSqlite(file);
+      return {
+        exec: (sql: string) => {
+          if (sql === "BEGIN IMMEDIATE") {
+            begins += 1;
+            try { connection.exec(sql); }
+            catch (error) {
+              if (begins === 1) {
+                const until = performance.now() + 80;
+                while (performance.now() < until) { /* model a waiter descheduled beyond its budget */ }
+                release(); // the native lock is free before the late waiter resumes
+              }
+              throw error;
+            }
+            return;
+          }
+          connection.exec(sql);
+        },
+        prepare: (sql: string) => connection.prepare(sql),
+        close: () => connection.close(),
+        get isTransaction() { return connection.isTransaction; },
+      };
+    } });
+    try {
+      const started = performance.now();
+      const written = await store.put({ key: "deadline/late", value: 7, identity });
+      expect(performance.now() - started).toBeGreaterThanOrEqual(80);
+      expect(begins).toBe(2); // one failed BEGIN, one final native probe after release
+      expect(written.version).toBe(1);
+      expect(store.get("deadline/late")?.value).toBe(7);
+      expect(store.stats().writesWaiting).toBe(0);
+    } finally { release(); }
+  });
+
   it("refuses a delayed retry but permits a free zero-budget first attempt", async () => {
     const root = tempRoot("delayed-retry-deadline");
     const setup = await open(root);

@@ -64,7 +64,7 @@ afterEach(() => {
   observation.inputs.length = 0;
   vi.mocked(readHostLeases).mockClear();
 });
-const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+const turn = () => new Promise<void>(resolve => setTimeout(resolve, 120));
 const claimed = (name: string): BridgePresence => {
   const id = `session:${name}-00000000`;
   const identity = { id, name, kind: "main" as const, sessionId: `${name}-00000000` };
@@ -224,7 +224,7 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     m.expectAttempts(Array<boolean>(7).fill(false));
   });
 
-  it("rejects two obsolete SQLite captures and accepts only the fenced third", async () => {
+  it("rejects obsolete SQLite captures and accepts a third only after an out-of-fence resnapshot", async () => {
     const f = await fixture();
     f.subscribe();
     const baseline = frames().at(-1)!;
@@ -255,10 +255,24 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       .toEqual(["obsolete-0", "obsolete-1", "idle"]);
     expect(frames().at(-1)).toEqual(baseline);
     expect(f.changes).toEqual([]); // Discarded captures cannot become the subscriber's baseline.
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([false, false]);
-    expect(m.revisions).toHaveBeenCalledTimes(2);
+    expect(m.proofs.mock.results.map(result => result.value)).toEqual([false, false, true]);
+    expect(m.revisions).toHaveBeenCalledTimes(3);
     expect(m.fences).toHaveBeenCalledTimes(3);
-    m.expectAttempts([false, false, true]);
+    m.expectAttempts([false, false, false]);
+  });
+
+  it("bounds repeated SQLite churn without ever taking a full snapshot inside the fence", async () => {
+    const f = await fixture();
+    f.subscribe();
+    clearInputs();
+    const m = measure(f);
+    m.proofs.mockReturnValue(false);
+    await f.fire();
+    expect(m.revisions).toHaveBeenCalledTimes(3);
+    expect(m.fences).toHaveBeenCalledTimes(3);
+    expect(m.proofs.mock.results.map(result => result.value)).toEqual(Array(3).fill(false));
+    m.expectAttempts(Array(3).fill(false));
+    expect(f.failures).toEqual([]);
   });
 
   it.each(["participants", "host-leases"] as const)("rejects directory-only %s churn even when the state revision still proves unchanged", async directory => {
@@ -293,7 +307,7 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     });
     await f.fire();
     expect(f.store.stateRevision()).toBe(revision);
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([true, true]);
+    expect(m.proofs.mock.results.map(result => result.value)).toEqual([true, true, true]);
     expect(m.fences).toHaveBeenCalledTimes(3);
     if (fileEntry) {
       expect(frames().map(frame => JSON.parse(frame.content).native.participants[0].status))
@@ -306,7 +320,7 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       expect(frames().at(-1)!.topology).toBe(baseline.topology);
       expect(f.changes).toEqual(["lease"]);
     }
-    m.expectAttempts([false, false, true]);
+    m.expectAttempts([false, false, false]);
   });
 
   it.each(["hosts", "participants", "lease"] as const)("detects externally removed mirror %s and repairs real held authority", async removed => {

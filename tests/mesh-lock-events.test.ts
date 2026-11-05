@@ -153,8 +153,9 @@ describe("lock events across processes", () => {
       holder: { pid: holder.pid, op: "custody", host } });
     expect(heldEvent.heldMs).toBeGreaterThanOrEqual(1_500);
     expect(typeof heldEvent.holder.process).toBe("string");
-    expect(Object.keys(timeout)).toEqual(["v", "at", "kind", "store", "class", "waitedMs", "holder", "waiter"]);
+    expect(Object.keys(timeout)).toEqual(["v", "at", "kind", "store", "class", "waitedMs", "maxGapMs", "holderRead", "holder", "waiter"]);
     expect(timeout).toMatchObject({ v: 1, kind: "wait-timeout", store: "sqlite", class: "put/delete",
+      maxGapMs: expect.any(Number), holderRead: { state: "present", pid: holder.pid, sampledAtMs: expect.any(Number) },
       holder: { pid: holder.pid, process: heldEvent.holder.process, op: null, host },
       waiter: { pid: waiter.pid, op: "put/delete" } });
     // Compare the real recorder's output with the holder's proc record captured during custody.
@@ -741,6 +742,23 @@ describe("lock events in one process", () => {
     expect(readEvents(eventsFile(root))).toHaveLength(1);
   });
 
+  it("upgrades a captured v4 timeout writer to persist fresh holder and terminal-gap diagnostics", () => {
+    const root = temp();
+    const original = createLockEvents("1")!;
+    const oldTimeout = vi.fn();
+    registry[eventsKey] = { version: 4, dispose() {}, events: { held: original.held, waitTimeout: oldTimeout,
+      queueExpired: original.queueExpired, get errors() { return original.errors; } } };
+    const current = createLockEvents("0")!;
+    const holderRead = { state: "absent", sampledAtMs: Date.now(), match: "none" } as const;
+    expect(current.waitTimeout).not.toBe(oldTimeout);
+    expect(current.queueExpired).toBe(original.queueExpired);
+    current.waitTimeout(root, "sqlite", "bridge", 11_000, undefined, { maxGapMs: 1_200, holderRead });
+    expect(oldTimeout).not.toHaveBeenCalled();
+    expect(readEvents(eventsFile(root))).toMatchObject([{
+      kind: "wait-timeout", maxGapMs: 1_200, holder: { pid: null }, holderRead,
+    }]);
+  });
+
   // smarty-dev#12036: pending incarnation is not contention. A shorter-budget cold acquisition
   // has its own retry code before it ever tries .lock, with no wait-timeout event.
   it("a cold protocol-2 pending acquisition records no wait-timeout event", async () => {
@@ -909,7 +927,15 @@ describe("lock events in one process", () => {
     ]);
   });
 
-  it("SQLite wait-timeout performs native holder lookup before the event append", async () => {
+  it.runIf(process.platform === "linux")("a successful fresh writer-lock read distinguishes absence", async () => {
+    const root = await initialisedRoot();
+    const { walWriterObservation } = await import("../src/mesh/wal-readers.js");
+    expect(walWriterObservation(path.join(root, "state.db"))).toMatchObject({
+      state: "absent", match: "none", sampledAtMs: expect.any(Number),
+    });
+  });
+
+  it("SQLite timeout records the terminal gap and a fresh holder read without bypassing the live writer", async () => {
     const { events, SqliteStateStore: Store } = await load();
     const root = await initialisedRoot();
     const order: string[] = [];
@@ -927,9 +953,17 @@ describe("lock events in one process", () => {
       return (readFileSync as (...args: unknown[]) => unknown)(file, ...rest);
     }) as typeof fs.readFileSync);
     syncBuiltinESMExports();
+    let cachedProcReads = 0;
     try {
+      if (process.platform === "linux") {
+        const { walWriterPid } = await import("../src/mesh/wal-readers.js");
+        expect(walWriterPid(store.file)).toBeUndefined(); // seed the 10 s cache while this DB has no writer
+        cachedProcReads = order.filter(step => step === "proc-locks").length;
+      }
       holder.exec("BEGIN IMMEDIATE");
       await expect(store.put({ key: "w/1", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(holder.isTransaction).toBe(true);
+      expect(store.get("w/1")).toBeUndefined();
     } finally {
       vi.mocked(fs.readFileSync).mockRestore();
       syncBuiltinESMExports();
@@ -938,9 +972,16 @@ describe("lock events in one process", () => {
       store.close();
     }
     expect(order.filter((step) => step === "event.append")).toHaveLength(1);
-    if (process.platform === "linux") expect(order.indexOf("proc-locks")).toBeGreaterThanOrEqual(0);
-    if (process.platform === "linux") expect(order.indexOf("proc-locks")).toBeLessThan(order.indexOf("event.append"));
-    expect(readEvents(eventsFile(root))).toMatchObject([{ kind: "wait-timeout", store: "sqlite", class: "put/delete" }]);
+    if (process.platform === "linux") {
+      expect(order.filter(step => step === "proc-locks")).toHaveLength(cachedProcReads + 1); // timeout bypasses the cached snapshot
+      expect(order.lastIndexOf("proc-locks")).toBeLessThan(order.indexOf("event.append"));
+    }
+    const [timeoutEvent] = readEvents(eventsFile(root));
+    expect(timeoutEvent).toMatchObject({ kind: "wait-timeout", store: "sqlite", class: "put/delete",
+      maxGapMs: expect.any(Number) });
+    if (process.platform === "linux") expect(timeoutEvent).toMatchObject({
+      holder: { pid: process.pid }, holderRead: { state: "present", pid: process.pid, sampledAtMs: expect.any(Number) },
+    });
   });
 
   it("a failing append never affects the lock: counted, warned at most once a minute", async () => {

@@ -9,6 +9,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import * as atomicWrite from "../src/core/atomic-write.js";
 import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, saveWorkerCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { ARCHIVE_PENDING_FILE, stageRunArchive } from "../src/agents/archive-custody.js";
 import type { AgentRunResult, AgentHandleInfo } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -305,6 +306,162 @@ describe("round 5 spawn-time completion authority", () => {
     expect(envelopes.find(value => value.result.id === queued.id)?.recipient.name).toBe("probe-lane");
     const manifest = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(queued.id)!, "completion-recipient.json"), "utf8"));
     expect(manifest.recipient.name).toBe("probe-lane");
+  });
+
+  it.each(["incremental", "main"] as const)("CA-006 D2 replays recipientless legacy archives through the %s recovery path", branch => {
+    const h = harness(); const owner = h.client("A", 100);
+    const dynamic = new ResidencyClient({ ...owner.client.options, mainName: () => "todayMain" }); clients.push(dynamic);
+    const admitted = { ...h.recipient, name: "probe-lane" };
+    const result = { ...h.result, logFile: path.join(h.root, "runs", h.result.id, "events.jsonl") };
+    const runDirectory = path.dirname(result.logFile!);
+    fs.mkdirSync(runDirectory, { recursive: true });
+    fs.writeFileSync(path.join(runDirectory, "completion-recipient.json"), JSON.stringify({ meshRoot: h.meshRoot, recipient: admitted }));
+    stageRunArchive(runDirectory, { format: 1, kind: "settlement", result });
+    const pendingFile = path.join(runDirectory, ARCHIVE_PENDING_FILE);
+    const archived = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
+    expect(archived.pending.settlement).not.toHaveProperty("recipient");
+    const onSettled = vi.fn((outcome: AgentRunResult, admittedRecipient?: CompletionRecipient) => {
+      dynamic.enqueueCompletion(outcome, admittedRecipient);
+    });
+    const manager = new AgentManager(h.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
+      runRoot: path.join(h.root, "runs"), meshRoot: h.meshRoot, onSettled,
+    });
+    managers.push(manager);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: branch === "main" ? "win32" : "linux" });
+      expect(manager.recoverPendingArchives(runDirectory)).toBe(1);
+    } finally { Object.defineProperty(process, "platform", platform); }
+    expect(onSettled).toHaveBeenCalledOnce();
+    expect(onSettled.mock.calls[0]).toHaveLength(2);
+    expect(onSettled.mock.calls[0]![1]).toEqual(admitted);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([{ format: 1, recipient: admitted, result }]);
+    expect(fs.existsSync(pendingFile)).toBe(false);
+  });
+
+  it("CA-006 D2 keeps an explicit archived recipient authoritative over a foreign result locator", () => {
+    const h = harness(); const owner = h.client("A", 100);
+    const dynamic = new ResidencyClient({ ...owner.client.options, mainName: () => "todayMain" }); clients.push(dynamic);
+    const admitted = { ...h.recipient, name: "probe-lane" };
+    const runDirectory = path.join(h.root, "runs", h.result.id); fs.mkdirSync(runDirectory, { recursive: true });
+    const callerManifest = path.join(runDirectory, "completion-recipient.json");
+    fs.writeFileSync(callerManifest, JSON.stringify({ meshRoot: h.meshRoot, recipient: { ...admitted, name: "caller-manifest" } }));
+    const foreignRun = path.join(h.root, "foreign-run"); fs.mkdirSync(foreignRun);
+    const foreignManifest = path.join(foreignRun, "completion-recipient.json");
+    fs.writeFileSync(foreignManifest, JSON.stringify({ meshRoot: h.meshRoot, recipient: {
+      ...h.recipient, rootId: "session:foreign", sessionId: "foreign", name: "foreign-lane", startedAt: 200,
+    } }));
+    const result = { ...h.result, logFile: path.join(foreignRun, "events.jsonl") };
+    stageRunArchive(runDirectory, { format: 1, kind: "settlement", result, recipient: admitted });
+    const onSettled = vi.fn((outcome: AgentRunResult, admittedRecipient?: CompletionRecipient) => {
+      dynamic.enqueueCompletion(outcome, admittedRecipient);
+    });
+    const manager = new AgentManager(h.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
+      runRoot: path.join(h.root, "runs"), meshRoot: h.meshRoot, onSettled,
+    });
+    managers.push(manager);
+    const read = vi.spyOn(fs, "readFileSync");
+    try {
+      expect(manager.recoverPendingArchives(runDirectory)).toBe(1);
+      expect(onSettled.mock.calls[0]).toHaveLength(2);
+      expect(onSettled.mock.calls[0]![1]).toEqual(admitted);
+      expect(pendingCompletions(h.meshRoot, h.root)).toEqual([{ format: 1, recipient: admitted, result }]);
+      expect(read.mock.calls.filter(([target]) => [callerManifest, foreignManifest].includes(String(target)))).toEqual([]);
+      expect(fs.existsSync(path.join(runDirectory, ARCHIVE_PENDING_FILE))).toBe(false);
+    } finally { read.mockRestore(); }
+  });
+
+  // Keep: CA-006's real queued-spawn catch crosses the caller-owned admission /
+  // foreign result-locator trust boundary. Exercise the real client and saved journal, not save-call counts.
+  it("CA-006 client forwarding distinguishes omitted admission from explicit undefined without reading a foreign manifest", () => {
+    const h = harness(); const owner = h.client("A", 100);
+    const admitted = { ...h.recipient, name: "probe-lane" };
+    const callerRun = path.join(h.root, "caller-run"); fs.mkdirSync(callerRun);
+    const foreignRun = path.join(h.root, "foreign-run"); fs.mkdirSync(foreignRun);
+    const callerManifest = path.join(callerRun, "completion-recipient.json");
+    const foreignManifest = path.join(foreignRun, "completion-recipient.json");
+    fs.writeFileSync(callerManifest, JSON.stringify({ meshRoot: h.meshRoot, recipient: admitted }));
+    fs.writeFileSync(foreignManifest, JSON.stringify({ meshRoot: h.meshRoot, recipient: {
+      ...h.recipient, rootId: "session:foreign", sessionId: "foreign", name: "foreign-lane", startedAt: 200,
+    } }));
+    const omitted = { ...h.result, logFile: path.join(callerRun, "events.jsonl") };
+    const absent = { ...h.result, id: "b".repeat(32), logFile: path.join(foreignRun, "events.jsonl") };
+    const read = vi.spyOn(fs, "readFileSync");
+    const asyncRead = vi.spyOn(fs.promises, "readFile");
+    owner.client.enqueueCompletion(omitted);
+    owner.client.enqueueCompletion(absent, undefined);
+    const envelopes = pendingCompletions(h.meshRoot, h.root);
+    expect(envelopes).toHaveLength(2);
+    expect(envelopes.find(value => value.result.id === omitted.id)).toEqual({ format: 1, recipient: admitted, result: omitted });
+    expect(envelopes.find(value => value.result.id === absent.id)).toEqual({ format: 1, recipient: h.recipient, result: absent });
+    expect(owner.client.statusAgent(absent.id)).toMatchObject({
+      text: absent.text, completionDelivery: { status: "undelivered", addressedTo: "A" },
+    });
+    // Positive control: only the literal one-argument call may consult its caller-owned manifest.
+    expect(read.mock.calls.filter(([target]) => String(target) === callerManifest)).toHaveLength(1);
+    expect(read.mock.calls.filter(([target]) => String(target) === foreignManifest)).toEqual([]);
+    expect(asyncRead.mock.calls.filter(([target]) => String(target) === foreignManifest)).toEqual([]);
+  });
+
+  it.each(["foreign", "corrupt"] as const)("CA-006 client forwarding keeps explicit host admission authoritative over a %s locator", fault => {
+    const h = harness(); const owner = h.client("A", 100);
+    const admitted = { ...h.recipient, name: "probe-lane" };
+    const run = path.join(h.root, "foreign-run"); fs.mkdirSync(run);
+    const file = path.join(run, "completion-recipient.json");
+    fs.writeFileSync(file, fault === "corrupt" ? "{torn" : JSON.stringify({ meshRoot: h.meshRoot, recipient: {
+      ...h.recipient, rootId: "session:foreign", sessionId: "foreign", name: "foreign-lane", startedAt: 200,
+    } }));
+    const result = { ...h.result, logFile: path.join(run, "events.jsonl") };
+    const read = vi.spyOn(fs, "readFileSync");
+    const asyncRead = vi.spyOn(fs.promises, "readFile");
+    owner.client.enqueueCompletion(result, admitted);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([{ format: 1, recipient: admitted, result }]);
+    expect(owner.client.statusAgent(result.id)).toMatchObject({
+      text: result.text, completionDelivery: { status: "undelivered", addressedTo: "A" },
+    });
+    expect(read.mock.calls.filter(([target]) => String(target) === file)).toEqual([]);
+    expect(asyncRead.mock.calls.filter(([target]) => String(target) === file)).toEqual([]);
+  });
+
+  it.each(["omitted", "explicit undefined"] as const)("CA-006 client forwarding retains fixed no-log fallback and inbox delivery with %s admission", async admission => {
+    const h = harness(); h.setLive([h.participant("A", 100)]);
+    const owner = h.client("A", 100); owner.client.start();
+    if (admission === "omitted") owner.client.enqueueCompletion(h.result);
+    else owner.client.enqueueCompletion(h.result, undefined);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([{ format: 1, recipient: h.recipient, result: h.result }]);
+    await waitFor(() => owner.completed.mock.calls.length === 1);
+    expect(owner.completed.mock.calls[0]![0]).toMatchObject({ id: h.result.id, text: h.result.text });
+    owner.turn(); owner.turn();
+    expect(owner.sendMessage).toHaveBeenCalledOnce();
+    expect(owner.sendMessage.mock.calls[0]![0].content).toContain(h.result.text);
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(true);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([]);
+  });
+
+  it("CA-006 client forwarding preserves the live-name no-log early return before a later admitted delivery", async () => {
+    const h = harness(); const owner = h.client("A", 100);
+    const dynamic = new ResidencyClient({ ...owner.client.options, mainName: () => "renamed-again" }); clients.push(dynamic);
+    const absent = { ...h.result, id: "b".repeat(32) };
+    dynamic.enqueueCompletion(h.result);
+    dynamic.enqueueCompletion(absent, undefined);
+    expect(fs.existsSync(path.join(h.meshRoot, "agent-completions"))).toBe(false);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([]);
+    expect(dynamic.hasAgent(h.result.id)).toBe(false); expect(dynamic.hasAgent(absent.id)).toBe(false);
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+    expect(completionConsumed(h.meshRoot, absent.id)).toBe(false);
+    const admitted = { ...h.result, id: "c".repeat(32) };
+    h.setLive([h.participant("A", 100)]); dynamic.start();
+    dynamic.enqueueCompletion(admitted, h.recipient);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([{ format: 1, recipient: h.recipient, result: admitted }]);
+    await waitFor(() => owner.completed.mock.calls.length === 1);
+    expect(owner.completed.mock.calls[0]![0]).toMatchObject({ id: admitted.id, text: admitted.text });
+    owner.turn(); owner.turn();
+    expect(owner.sendMessage).toHaveBeenCalledOnce();
+    expect(owner.sendMessage.mock.calls[0]![0].content).toContain(admitted.text);
+    expect(completionConsumed(h.meshRoot, admitted.id)).toBe(true);
+    expect(completionConsumed(h.meshRoot, h.result.id)).toBe(false);
+    expect(completionConsumed(h.meshRoot, absent.id)).toBe(false);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([]);
   });
 
   it("refuses missing, corrupt or foreign run manifests instead of relabeling a body to the current name", () => {

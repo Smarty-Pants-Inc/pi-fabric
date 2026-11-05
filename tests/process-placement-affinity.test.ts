@@ -35,14 +35,14 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; sshExit?
   ].join("\n"));
   const bin = path.join(root, "bin"); fs.mkdirSync(bin, { recursive: true });
   const fleet = path.join(bin, "smarty-task-ryzen2");
-  write(fleet, "#!/bin/sh\nprintf 'called\\n' >> \"$LAUNCH_CALLS\"\nprintf 'RYZEN2_TASK_ACCEPTED affinity on ryzen2\\n'\n"); fs.chmodSync(fleet, 0o700);
+  write(fleet, "#!/bin/sh\nprintf 'called\\n' >> \"$LAUNCH_CALLS\"\nprintf '%s\\n' \"$@\" > \"$LAUNCH_CALLS.args\"\nprintf 'RYZEN2_TASK_ACCEPTED affinity on ryzen2\\n'\n"); fs.chmodSync(fleet, 0o700);
   const picker = path.join(base, "smarty-pick-host-fixture");
   write(picker, `#!/bin/sh\nprintf 'called\\n' >> "$PICKER_CALLS"\nprintf '%s\\n' "$CANDIDATES"\nprintf 'eligible0=1 eligible1=1\\n' >&2\nexit "${options.pickerExit ?? 0}"\n`); fs.chmodSync(picker, 0o700);
   const pathBin = path.join(base, "path"); fs.mkdirSync(pathBin);
   const python = path.join(pathBin, "python3");
   write(python, "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n"); fs.chmodSync(python, 0o700);
   const ssh = path.join(pathBin, "ssh");
-  write(ssh, `#!/bin/sh\nprintf 'called\\n' >> "$SSH_CALLS"\n${options.executeRemote
+  write(ssh, `#!/bin/sh\nprintf 'called\\n' >> "$SSH_CALLS"\nprintf '%s\\n' "$@" > "$SSH_CALLS.args"\n${options.executeRemote
     ? 'for remote in "$@"; do :; done\nexec sh -c "$remote"'
     : `${options.sshExit === 3 ? "printf 'PREFLIGHT_MISSING 1\\n'" : ":"}\nexit "${options.sshExit ?? 0}"`}\n`); fs.chmodSync(ssh, 0o700);
   const cwd = path.join(base, "workspace"); fs.mkdirSync(cwd);
@@ -86,39 +86,47 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(result?.command.slice(result.command.indexOf("--host"), result.command.indexOf("--host") + 2)).toEqual(["--host", "intel1"]);
   });
 
-  it.each(["ineligible", "missing", "nonzero", "empty", "timeout"] as const)("runs a real local worker when picker admission is %s", async kind => {
-    const f = fixture({ candidates: kind === "empty" ? [] : ["intel1", "ryzen2"], pickerExit: kind === "nonzero" ? 3 : 0 });
+  it.each(["ineligible", "missing", "nonzero", "empty", "timeout", "malformed", "duplicate", "unmapped"] as const)("refuses picker admission %s as known-unlaunched without starting any worker", async kind => {
+    const candidates: Record<string, string[]> = { empty: [], malformed: ["ryzen2", "bad host"], duplicate: ["ryzen2", "ryzen2"], unmapped: ["unmapped"] };
+    const f = fixture({ candidates: candidates[kind] ?? ["intel1", "ryzen2"], pickerExit: kind === "nonzero" ? 3 : 0 });
     const command = [...f.config.command];
     if (kind === "ineligible") command[command.indexOf("--host") + 1] = "qs32729";
     const config = { ...f.config, command, ...(kind === "timeout" ? { commandTimeoutMs: 100 } : {}),
       ...(kind === "missing" ? { pickerCommand: [path.join(f.base, "absent-picker")] } : {}) };
     if (kind === "timeout") fs.writeFileSync(f.picker, "#!/bin/sh\nsleep 5\n");
-    vi.stubEnv("CANDIDATES", f.env.CANDIDATES); vi.stubEnv("PATH", f.env.PATH); vi.stubEnv("SSH_CALLS", f.sshCalls); vi.stubEnv("PICKER_CALLS", f.pickerCalls);
-    const runDir = path.join(f.base, "run"); fs.mkdirSync(runDir);
-    const taskFile = path.join(runDir, "task.txt"); fs.writeFileSync(taskFile, "portable task");
-    const marker = path.join(runDir, "local-worker.txt");
-    const workerPath = path.join(f.base, "worker.mjs");
-    fs.writeFileSync(workerPath, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'LOCAL');`);
-    const request = { ...f.request(f.cwd, [], false), workerPath, workerArguments: [
-      "--task-file", taskFile, "--status-file", path.join(runDir, "status.json"), "--log-file", path.join(runDir, "events.jsonl"), "--timeout-ms", "1000",
-    ] };
+    const local = localWorkerRequest(f);
     const started = Date.now();
-    const handle = await new ProcessTransport(undefined, config).launch(request);
-    await handle.waitForClose?.();
-    expect(Date.now() - started).toBeLessThan(10_000);
-    expect(fs.readFileSync(marker, "utf8")).toBe("LOCAL");
-    expect(fs.existsSync(f.sshCalls)).toBe(false);
-    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
-    expect(events).toContain("placement.local");
-    expect(events).toContain("placement-picker-local:");
-    if (kind === "ineligible") expect(events).toContain("host qs32729 is not picker-eligible");
+    const pending = new ProcessTransport(undefined, config).launch(local.request);
+    await expect(pending).rejects.toBeInstanceOf(AgentInputError);
+    await expect(pending).rejects.toMatchObject({ code: "FABRIC_AGENT_INPUT_ERROR", field: "placement", launchOutcome: "unlaunched" });
+    await expect(pending).rejects.toThrow("placement unavailable; no task started");
+    if (kind === "ineligible") await expect(pending).rejects.toThrow("host qs32729 is not picker-eligible");
+    expect(Date.now() - started).toBeLessThan(2_000);
+    for (const file of [local.marker, local.events, f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
+    if (!["missing", "timeout"].includes(kind)) expect(fs.readFileSync(f.pickerCalls, "utf8")).toBe("called\ncalled\n");
   });
 
-  it("refuses an explicit host omitted from the live eligible list before SSH", async () => {
-    const f = fixture({ candidates: ["intel1", "ryzen2"] });
-    const command = [...f.config.command]; command[command.indexOf("--host") + 1] = "qs32729";
-    await expect(preflightFleetPlacement(f.request(), f.config, command, "task", f.env)).rejects.toThrow(/qs32729/);
-    expect(fs.existsSync(f.sshCalls)).toBe(false);
+  it("does not retry selection or dispatch after the shared five-second preflight budget expires", async () => {
+    const f = fixture({ pickerExit: 3 });
+    const local = localWorkerRequest(f);
+    const now = Date.now();
+    // The native picker's first receipt exhausts the original budget, even when
+    // the launcher's configured timeout is longer. No real five-second sleep.
+    vi.spyOn(Date, "now").mockImplementation(() => fs.existsSync(f.pickerCalls) ? now + 5_000 : now);
+    const pending = new ProcessTransport(undefined, { ...f.config, commandTimeoutMs: 30_000 }).launch(local.request);
+    await expect(pending).rejects.toMatchObject({ field: "placement", launchOutcome: "unlaunched" });
+    expect(fs.readFileSync(f.pickerCalls, "utf8")).toBe("called\n");
+    for (const file of [local.marker, local.events, f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it.each(["ineligible", "unmapped"] as const)("refuses an explicit %s host before SSH rather than switching to another eligible host", async kind => {
+    const f = fixture({ candidates: kind === "unmapped" ? ["unmapped", "ryzen2"] : ["intel1", "ryzen2"] });
+    const host = kind === "unmapped" ? "unmapped" : "qs32729";
+    const command = [...f.config.command]; command[command.indexOf("--host") + 1] = host;
+    const pending = preflightFleetPlacement(f.request(), f.config, command, "task", f.env);
+    await expect(pending).rejects.toMatchObject({ field: "placement", launchOutcome: "unlaunched" });
+    await expect(pending).rejects.toThrow(`host=${host}`);
+    for (const file of [f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
   });
 
   it.each([{ candidates: [] }, { candidates: ["intel1"], pickerExit: 3 }])("fails closed when live picker yields no usable result", async options => {
@@ -158,8 +166,17 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     for (const file of [f.pickerCalls, f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
   });
 
-  it("keeps a portable shared Git repo remote after the same target-cwd SSH check", async () => {
-    const f = fixture({ executeRemote: true });
+  it.each(["eligible-first", "unmapped-first", "transient-picker-failure"] as const)("keeps a portable shared Git repo remote with %s", async kind => {
+    const f = fixture({ executeRemote: true, ...(kind === "unmapped-first" ? { candidates: ["unmapped", "ryzen2"] } : {}) });
+    if (kind === "transient-picker-failure") fs.writeFileSync(f.picker, [
+      "#!/bin/sh",
+      'if [ ! -e "$PICKER_CALLS" ]; then',
+      '  printf "called\\n" >> "$PICKER_CALLS"',
+      '  printf "temporarily unavailable\\n" >&2; exit 3',
+      "fi",
+      'printf "called\\n" >> "$PICKER_CALLS"',
+      'printf "%s\\n" "$CANDIDATES"',
+    ].join("\n"));
     execFileSync("git", ["init", "--quiet", f.cwd]);
     const local = localWorkerRequest(f);
     const result = path.join(f.base, "results", "affinity"); fs.mkdirSync(result, { recursive: true });
@@ -168,8 +185,77 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(handle.sessionId).toBe("placement:affinity");
     expect(await handle.isAlive()).toBe(false);
     expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.remote"');
+    expect(fs.readFileSync(`${f.launchCalls}.args`, "utf8")).toContain("--host\nryzen2\n");
+    expect(fs.readFileSync(`${f.sshCalls}.args`, "utf8")).toContain("r2-agent\n");
+    expect(fs.existsSync(local.marker)).toBe(false);
+    expect(fs.readFileSync(f.pickerCalls, "utf8")).toBe(kind === "transient-picker-failure" ? "called\ncalled\n" : "called\n");
+    for (const file of [f.sshCalls, f.launchCalls]) expect(fs.readFileSync(file, "utf8")).toBe("called\n");
+  });
+
+  it("launches an unshared Git --src remotely without requiring the source cwd on the target", async () => {
+    const f = fixture({ executeRemote: true });
+    execFileSync("git", ["init", "--quiet", f.cwd]);
+    fs.writeFileSync(path.join(f.cwd, "source.txt"), "portable source");
+    const local = localWorkerRequest(f);
+    const config = { ...f.config,
+      command: [f.config.command[0]!, "--host", "auto", "--src", "{cwd}", "--", "{task}"] };
+    delete config.sharedMounts;
+    const result = path.join(f.base, "results", "affinity"); fs.mkdirSync(result, { recursive: true });
+    fs.writeFileSync(path.join(result, "rc"), "0"); fs.writeFileSync(path.join(result, "result.md"), "REMOTE SOURCE");
+    const handle = await new ProcessTransport(undefined, config).launch(local.request);
+    expect(handle.sessionId).toBe("placement:affinity");
+    expect(await handle.isAlive()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(f.base, "run/status.json"), "utf8"))).toMatchObject({ status: "completed", text: "REMOTE SOURCE" });
+    expect(fs.readFileSync(`${f.launchCalls}.args`, "utf8").trim().split("\n")).toEqual(["--host", "ryzen2", "--src", f.cwd, "--", "portable task"]);
+    expect(fs.readFileSync(`${f.sshCalls}.args`, "utf8")).not.toContain("test -e");
+    expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.remote"');
     expect(fs.existsSync(local.marker)).toBe(false);
     for (const file of [f.pickerCalls, f.sshCalls, f.launchCalls]) expect(fs.readFileSync(file, "utf8")).toBe("called\n");
+  });
+
+  it("still refuses missing target-only inputs before launching an unshared Git --src", async () => {
+    const f = fixture({ executeRemote: true });
+    execFileSync("git", ["init", "--quiet", f.cwd]);
+    const local = localWorkerRequest(f);
+    const required = f.request().requires![0]!;
+    local.request.requires = [required];
+    expect(fs.existsSync(required)).toBe(false);
+    const config = { ...f.config,
+      command: [f.config.command[0]!, "--host", "auto", "--src", "{cwd}", "--", "{task}"] };
+    delete config.sharedMounts;
+    const pending = new ProcessTransport(undefined, config).launch(local.request);
+    await expect(pending).rejects.toMatchObject({ name: "RequiredInputMissingError", field: "requires", launchOutcome: "unlaunched", path: required, index: 0 });
+    await expect(pending).rejects.toThrow(required);
+    expect(fs.readFileSync(f.sshCalls, "utf8")).toBe("called\n");
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+    expect(fs.existsSync(local.marker)).toBe(false);
+  });
+
+  it.each(["tmp-lexical", "tmp-canonical", "state-lexical", "state-canonical"])("keeps an unshared %s Git --src local before remote subprocesses", async kind => {
+    const f = fixture();
+    execFileSync("git", ["init", "--quiet", f.cwd]);
+    const home = path.join(f.base, "home"); fs.mkdirSync(home);
+    vi.spyOn(os, "homedir").mockReturnValue(home);
+    const root = kind.startsWith("tmp") ? f.callerTmp : path.join(home, ".local/state");
+    fs.mkdirSync(root, { recursive: true });
+    let cwd: string;
+    if (kind.endsWith("lexical")) {
+      // A lexical scratch/state path cannot escape the fence by pointing at a portable Git repo.
+      cwd = path.join(root, "escape"); fs.symlinkSync(f.cwd, cwd, "dir");
+    } else {
+      const repo = path.join(root, "repo"); fs.mkdirSync(repo);
+      execFileSync("git", ["init", "--quiet", repo]);
+      cwd = path.join(f.base, "source-alias"); fs.symlinkSync(repo, cwd, "dir");
+    }
+    const local = localWorkerRequest(f, cwd);
+    const config = { ...f.config,
+      command: [f.config.command[0]!, "--host", "auto", "--src", "{cwd}", "--", "{task}"] };
+    delete config.sharedMounts;
+    const handle = await new ProcessTransport(undefined, config).launch(local.request);
+    await handle.waitForClose?.();
+    expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
+    expect(fs.readFileSync(local.events, "utf8")).toContain("caller-local cwd");
+    for (const file of [f.pickerCalls, f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
   });
 
   it("refuses a target-only missing cwd as known-unlaunched before the launcher or local worker", async () => {

@@ -1,4 +1,3 @@
-import { diagnostics } from "../core/diagnostics.js";
 import path from "node:path";
 import fs from "node:fs";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
@@ -15,8 +14,10 @@ export interface AgentPlacementConfig {
   pickerCommand?: string[];
   /** Local/shared directory template containing result.md and the terminal rc marker. */
   resultDirectory?: string;
-  /** Alternatively, prints JSON {rc:null} while pending, {rc,text,stderr?} after native exit. */
+  /** Alternatively, prints JSON {rc:null} while pending, {rc,text,stderr?,worker?,sessionExport?} after native exit. */
   resultCommand?: string[];
+  /** Host-only declaration that launch/result commands implement the native packet v1 contract. */
+  workerProtocol?: "fabric-v1";
   /** Host-owned work-host name -> SSH alias mapping for post-launch {sshAlias}. */
   sshAliases?: Record<string, string>;
   /** Must request cancellation; only the terminal rc marker proves exit. */
@@ -49,6 +50,8 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
   if (input.default !== undefined && input.default !== "local" && input.default !== "remote") throw new Error("Invalid agents.placement.default");
   const capabilities = normalizeAgentCapabilityTokens(input.capabilities ?? [], "agents.placement.capabilities")!;
   if (capabilities.includes("local")) throw new AgentInputError("agents.placement.capabilities", 'Invalid agents.placement.capabilities: "local" is a reserved need, never a launcher capability');
+  if (input.workerProtocol !== undefined && input.workerProtocol !== "fabric-v1") throw new Error("Invalid agents.placement.workerProtocol");
+  if (input.workerProtocol === "fabric-v1" && input.resultCommand === undefined) throw new Error("agents.placement.workerProtocol fabric-v1 requires resultCommand");
   if ((input.resultDirectory === undefined) === (input.resultCommand === undefined)) throw new Error("agents.placement requires exactly one of resultDirectory or resultCommand");
   if (input.resultDirectory !== undefined && (typeof input.resultDirectory !== "string" || !path.isAbsolute(input.resultDirectory))) throw new Error("agents.placement.resultDirectory must be absolute");
   let sharedMounts: string[] | undefined;
@@ -86,46 +89,10 @@ export const normalizeAgentPlacement = (value: unknown): AgentPlacementConfig | 
     ...(sshAliases ? { sshAliases } : {}),
     ...(input.resultDirectory !== undefined ? { resultDirectory: template(input.resultDirectory, "resultDirectory") } : {}),
     ...(input.resultCommand !== undefined ? { resultCommand: argv(input.resultCommand, "resultCommand") } : {}),
+    ...(input.workerProtocol === "fabric-v1" ? { workerProtocol: input.workerProtocol } : {}),
     cancelCommand: argv(input.cancelCommand, "cancelCommand"),
     pollIntervalMs: bound(input.pollIntervalMs, 1_000, 10, 60_000, "pollIntervalMs"),
     commandTimeoutMs: bound(input.commandTimeoutMs, 30_000, 100, 120_000, "commandTimeoutMs"),
-  };
-};
-
-/** Placement-only, host-owned policy refresh at launch; no watchers or config migration. */
-export const liveAgentPlacement = (file: string, initial?: AgentPlacementConfig): (() => AgentPlacementConfig | undefined) => {
-  let current = initial;
-  let stamp: string | undefined;
-  let lastError: string | undefined;
-  return () => {
-    try {
-      let next: string;
-      try {
-        const stat = fs.statSync(file);
-        // Include identity and ctime/size for atomic replacement and coarse mtime filesystems.
-        next = `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        next = "missing";
-      }
-      if (next === stamp) return current;
-      stamp = next; // Do not repeatedly parse/log an unchanged malformed edit.
-      if (next === "missing") {
-        current = undefined;
-      } else {
-        const document: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (!document || typeof document !== "object" || Array.isArray(document)) throw new Error("Invalid host Fabric configuration");
-        const agents = (document as Record<string, unknown>).agents;
-        if (agents !== undefined && (!agents || typeof agents !== "object" || Array.isArray(agents))) throw new Error("Invalid host agents configuration");
-        current = normalizeAgentPlacement((agents as Record<string, unknown> | undefined)?.placement);
-      }
-      lastError = undefined;
-    } catch (error) {
-      const message = String(error);
-      if (message !== lastError) diagnostics.warn("src/agents/placement-config.ts", `[pi-fabric] agents.placement live refresh failed (${file}); retaining last valid policy: ${message}`);
-      lastError = message;
-    }
-    return current;
   };
 };
 

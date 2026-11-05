@@ -34,8 +34,11 @@ const realpathWithMissingTail = (file: string): string => {
   }
 };
 
-/** Caller-owned scratch/state wins over even an explicitly declared shared mount. */
-export const placementLocalPathReason = (cwd: string, config: AgentPlacementConfig): string | undefined => {
+/** Caller-owned scratch/state wins over shared mounts and source staging.
+ * Source staging skips only the shared-mount requirement; the caller must still
+ * validate that --src will use the Git manifest, never recursive copying.
+ */
+export const placementLocalPathReason = (cwd: string, config: AgentPlacementConfig, stagesSource = false): string | undefined => {
   if (!path.isAbsolute(cwd)) return undefined;
   const localReason = `caller-local cwd requires the local worker: ${cwd}`;
   const localRoots = [process.env.TMPDIR || os.tmpdir(), "/srv/scratch", path.join(os.homedir(), ".local", "state")]
@@ -54,6 +57,7 @@ export const placementLocalPathReason = (cwd: string, config: AgentPlacementConf
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     return `caller-local cwd cannot be inspected safely: ${cwd}`;
   }
+  if (stagesSource) return undefined;
   for (const root of config.sharedMounts ?? []) {
     if (!path.isAbsolute(root)) continue;
     try {
@@ -127,6 +131,12 @@ const fleetRoot = (config: AgentPlacementConfig, cwd: string): string | undefine
     ? path.join(os.homedir(), ".local", "share", "smarty-dev", "factory", "current") : path.dirname(bin);
 };
 
+/** Identifies the installed fleet-helper protocol, not a proven relay. GitHub
+ * still needs its read-only compatibility handshake and selected-host probe.
+ * A custom picker alone does not opt a generic launcher into this protocol.
+ */
+export const usesFleetPlacementHelper = (config: AgentPlacementConfig, cwd: string): boolean => fleetRoot(config, cwd) !== undefined;
+
 const hostSlot = (command: readonly string[]): number | undefined => {
   const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
   const slots = command.slice(1, end).flatMap((entry, index) => entry === "--host" ? [index + 1] : []);
@@ -135,30 +145,46 @@ const hostSlot = (command: readonly string[]): number | undefined => {
   return slots[0];
 };
 
-export type FleetPlacementSelection = { host: string } | { localReason: string };
+export type FleetPlacementSelection = { host: string };
 
-/** Decision C: only --list-room's eligible hosts may receive remote work, even
- * for explicit --host. Missing/broken/slow picker safely selects the local worker.
+/** Only --list-room's eligible hosts with trusted aliases may receive remote
+ * work, even for explicit --host. Retry one read-only selection within the same
+ * preflight deadline; unavailable placement leaves the work undispatched.
  * An injected host-only picker opts a custom launcher into the same contract.
  */
 export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: string, signal?: AbortSignal, preflightDeadline?: number, environment: NodeJS.ProcessEnv = taskAgentEnvironment()): Promise<FleetPlacementSelection | undefined> => {
+  let requested = "auto";
   try {
     const root = fleetRoot(config, cwd);
     if (!root && !config.pickerCommand) return undefined;
     const picker = config.pickerCommand ?? [path.join(root!, "bin/smarty-pick-host")];
     const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     const slot = hostSlot(config.command);
-    const requested = slot === undefined ? "auto" : config.command[slot + 1]!;
+    requested = slot === undefined ? "auto" : config.command[slot + 1]!;
     if (requested !== "auto" && !hostName.test(requested)) throw new Error("Invalid --host option");
-    const picked = await query(picker[0]!, [...picker.slice(1), "--list-room"], deadline, environment, signal);
-    const hosts = picked.stdout.trim().split(/\r?\n/u).filter(Boolean);
-    if (picked.code !== 0 || !hosts.length || hosts.some(host => !hostName.test(host)) || new Set(hosts).size !== hosts.length) throw new Error(`picker refused: ${picked.stderr.trim() || "no eligible host"}`);
-    const host = requested === "auto" ? hosts[0]! : requested;
-    if (!hosts.includes(host)) throw new Error(`host ${host} is not picker-eligible${picked.stderr.trim() ? `: ${picked.stderr.trim()}` : ""}`);
-    if (!Object.hasOwn(config.sshAliases ?? {}, host) || !hostName.test(config.sshAliases![host]!)) throw new Error(`host ${host} has no trusted placement sshAliases entry`);
-    return { host };
+    const mapped = (host: string): boolean => {
+      const alias = config.sshAliases?.[host];
+      return Object.hasOwn(config.sshAliases ?? {}, host) && typeof alias === "string" && hostName.test(alias);
+    };
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const picked = await query(picker[0]!, [...picker.slice(1), "--list-room"], deadline, environment, signal);
+        const hosts = picked.stdout.trim().split(/\r?\n/u).filter(Boolean);
+        if (picked.code !== 0) throw new Error(`picker refused (exit ${picked.code}): ${picked.stderr.trim() || "no eligible host"}`);
+        if (!hosts.length) throw new Error("picker returned no eligible host");
+        if (hosts.some(host => !hostName.test(host)) || new Set(hosts).size !== hosts.length) throw new Error("picker returned malformed or duplicate eligible hosts");
+        const host = requested === "auto" ? hosts.find(mapped) : requested;
+        if (!host) throw new Error(`no picker-eligible host has a trusted placement sshAliases entry: ${hosts.join(", ")}`);
+        if (!hosts.includes(host)) throw new Error(`host ${host} is not picker-eligible${picked.stderr.trim() ? `: ${picked.stderr.trim()}` : ""}`);
+        if (!mapped(host)) throw new Error(`host ${host} has no trusted placement sshAliases entry`);
+        if (Date.now() >= deadline || signal?.aborted) throw new Error("Preflight cancelled or deadline expired");
+        return { host };
+      } catch (error) {
+        if (attempt >= 1 || Date.now() >= deadline || signal?.aborted) throw error;
+      }
+    }
   } catch (error) {
-    return { localReason: `placement-picker-local: ${error instanceof Error ? error.message : String(error)}` };
+    throw new AgentInputError("placement", `placement unavailable; no task started; host=${requested}: ${error instanceof Error ? error.message : String(error)}; retry placement when a suitable eligible host is available`);
   }
 };
 
@@ -176,7 +202,6 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     if (!selectedHost) {
       const selection = await selectFleetPlacement({ ...config, command }, request.cwd, request.signal, deadline, environment);
       if (!selection) throw new Error("No fleet placement selection");
-      if ("localReason" in selection) throw new Error(selection.localReason);
       host = selection.host;
     }
     const alias = config.sshAliases?.[host];
@@ -192,17 +217,32 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     const pairs: [string, string][] = [];
     if (targetCwd) pairs.push([targetCwd, targetCwd]);
     let guard = ":";
+    let relayGithub = false;
     if (root) {
-      // Reuse installed literal-path/corpus inference, not another prompt scanner.
-      const source = path.join(root, "setup/factory/task-preflight.py");
-      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || need === "corpus")], deadline, environment, request.signal, task);
+      // Keep admission, compatibility and the target guard on the same helper
+      // bytes. No independent prompt scanner or credential lookup lives here.
+      const source = fs.readFileSync(path.join(root, "setup/factory/task-preflight.py"), "utf8");
+      const admitted = await query("python3", ["-I", "-c", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? [])], deadline, environment, request.signal, task);
       const fields = admitted.stdout.split("\0");
       if (fields.at(-1) === "") fields.pop();
       const guards = Number(fields[3]);
       if (admitted.code !== 0 || fields.length < 4 || !/^\d+$/u.test(fields[3]!) || !Number.isSafeInteger(guards) || guards > fields.length - 4 || (fields.length - 4 - guards) % 2) throw new Error(`Installed task admission failed: ${admitted.stderr.trim()}`);
-      if (fields[0] || fields[1]) throw new Error(fields[0] || `needs ${fields[1]}: ${fields[2]}`);
+      if (fields[0]) throw new Error(fields[0]);
+      const needs = [...new Set([...(request.needs ?? []), ...fields[1]!.split(/\s+/u).filter(Boolean)])];
+      if (needs.some(need => need !== "github")) throw new Error(`needs ${needs.join(" ")}: ${fields[2]}`);
+      relayGithub = needs.includes("github");
+      if (relayGithub) {
+        // Old --probe silently accepts unknown --host/--needs as relative
+        // paths. Its exit 0 is NOT evidence that it checked the GitHub relay.
+        // This handshake shares the original <=5s budget with every query.
+        const capabilities = await query("python3", ["-I", "-c", source, "--capabilities"], deadline, environment, request.signal);
+        if (capabilities.code !== 0 || !capabilities.stdout.split(/\r?\n/u).includes("github-relay-v1")) {
+          throw new Error("Installed task helper lacks github-relay-v1 capability; GitHub relay cannot be verified");
+        }
+      }
       for (let index = 4 + guards; index < fields.length; index += 2) pairs.push([fields[index]!, fields[index + 1]!]);
-      guard = ["python3", "-I", "-c", fs.readFileSync(source, "utf8"), "--probe", "--root", project, "--workspace", targetCwd, ...fields.slice(4, 4 + guards)].map(quote).join(" ");
+      guard = ["python3", "-I", "-c", source, "--probe", "--root", project, "--workspace", targetCwd,
+        ...(relayGithub ? ["--host", host, "--needs", needs.join(" ")] : []), ...fields.slice(4, 4 + guards)].map(quote).join(" ");
     } else {
       // Explicit injected/custom protocol: honor declared literal inputs only.
       pairs.push(...requires.map(file => [file, file] as [string, string]));
@@ -226,13 +266,16 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
       throw new Error(`Read-only SSH preflight failed: ${probed.stdout.trim() || probed.stderr.trim() || `exit ${probed.code}`}`);
     }
     const pinned = [...command];
+    // Preserve explicit GitHub work even when the original prompt names no
+    // tool. The fleet launcher rechecks this union on the final target too.
+    if (relayGithub) pinned.splice(end, 0, "--needs", "github");
     const slot = hostSlot(pinned);
     if (slot !== undefined) pinned[slot + 1] = host;
     else pinned.splice(end, 0, "--host", host);
     if (Date.now() >= deadline || request.signal?.aborted) throw new Error("Preflight cancelled or deadline expired");
     return { host, command: pinned, environment };
   } catch (error) {
-    if (error instanceof RequiredInputMissingError) throw error;
+    if (error instanceof AgentInputError) throw error;
     throw failure(host, error instanceof Error ? error.message : String(error));
   }
 };

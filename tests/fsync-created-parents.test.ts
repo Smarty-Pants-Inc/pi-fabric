@@ -138,27 +138,29 @@ describe.skipIf(process.platform === "win32")("#14179 created-parent durability 
     const indexDepth = chain(indexLeaf).length, liveDepth = chain(root).length;
     const fileSyncs = held.filter(b => !b.directory && b.kind === "fsync");
     const dataSyncs = held.filter(b => b.kind === "fdatasync");
-    // Non-negotiable file/leaf barriers: three index versions, intent, live file, receipt, segment.
-    expect(fileSyncs).toHaveLength(6); expect(dataSyncs).toHaveLength(1);
-    expect(fileSyncs.filter(b => b.file.startsWith(path.join(indexLeaf, "2.json.")))).toHaveLength(3);
+    // Non-negotiable file/leaf barriers: two index versions (reservation, live confirmation);
+    // the advisory committed:true rewrite is gone (#1831). Intent, live file, receipt, segment stay.
+    expect(fileSyncs).toHaveLength(5); expect(dataSyncs).toHaveLength(1);
+    expect(fileSyncs.filter(b => b.file.startsWith(path.join(indexLeaf, "2.json.")))).toHaveLength(2);
     expect(fileSyncs.filter(b => b.file.includes("event-receipts"))).toHaveLength(2);
     expect(fileSyncs.filter(b => b.file === path.join(root, "events.jsonl"))).toHaveLength(1);
-    expect(index.filter(b => b.file === indexLeaf)).toHaveLength(3);
+    expect(index.filter(b => b.file === indexLeaf)).toHaveLength(2);
     const order = measured.events;
     const indexRenames = order.flatMap((e, i) => e === `rename:${path.join(indexLeaf, "2.json")}` ? [i] : []);
     const intentRename = order.findIndex(e => e.startsWith("rename:") && e.endsWith(".pending.json"));
     const receiptRename = order.findIndex(e => e.startsWith(`rename:${path.join(root, "event-receipts")}`) && !e.endsWith(".pending.json"));
     const intentUnlink = order.findIndex(e => e.startsWith("remove:") && e.endsWith(".pending.json"));
     const liveAppend = order.indexOf(`append:${path.join(root, "events.jsonl")}`);
-    expect(indexRenames).toHaveLength(3);
+    expect(indexRenames).toHaveLength(2);
     expect(indexRenames[0]).toBeLessThan(intentRename);
     expect(intentRename).toBeLessThan(order.findIndex(e => e.startsWith("fdatasync:")));
     expect(indexRenames[1]).toBeLessThan(liveAppend);
-    expect(liveAppend).toBeLessThan(indexRenames[2]!);
-    expect(indexRenames[2]).toBeLessThan(receiptRename);
+    expect(liveAppend).toBeLessThan(receiptRename);
+    expect(order.slice(liveAppend + 1).filter(e => e.startsWith(`open:${indexLeaf}${path.sep}`) ||
+      e.startsWith(`rename:${indexLeaf}${path.sep}`))).toEqual([]);
     expect(receiptRename).toBeLessThan(intentUnlink);
     for (const [i, renameAt] of indexRenames.entries()) {
-      const nextBoundary = [intentRename, liveAppend, receiptRename][i]!;
+      const nextBoundary = [intentRename, liveAppend][i]!;
       expect(order.slice(renameAt + 1, nextBoundary).indexOf(`fsync:${indexLeaf}`)).toBeGreaterThanOrEqual(0);
     }
     expect(heldDirs.filter(b => b.file === path.join(root, "event-receipts"))).toHaveLength(3);
@@ -173,17 +175,17 @@ describe.skipIf(process.platform === "win32")("#14179 created-parent durability 
     console.log("FSYNC_ACCOUNTING " + JSON.stringify(accounting));
     const expectedIndex = reduced ? chain(indexLeaf).slice(0, chain(indexLeaf).indexOf(root) + 1) : chain(indexLeaf);
     // Canonical request 1–3: allow FULL first unknown/unproven guard, never existence-as-receipt;
-    // the exact three mesh-root-bounded walks are the depth-independent oracle, regardless of scratch path.
+    // the exact two mesh-root-bounded walks are the depth-independent oracle, regardless of scratch path.
     if (reduced) {
-      expect(index.length, "#14179: exactly three index barriers per directory from the leaf through the mesh root")
-        .toBe(3 * expectedIndex.length);
+      expect(index.length, "#14179: exactly two index barriers per directory from the leaf through the mesh root")
+        .toBe(2 * expectedIndex.length);
       expect(expectedIndex.length).toBeLessThan(chain(indexLeaf).length);
     }
-    expect(index.map(b => b.file)).toEqual([...expectedIndex, ...expectedIndex, ...expectedIndex]);
+    expect(index.map(b => b.file)).toEqual([...expectedIndex, ...expectedIndex]);
     expect(barriers.filter(b => b.directory && b.stack.includes("confirmEventFile")).map(b => b.file))
       .toEqual(reduced ? [root] : chain(root));
     // This fixture creates a fresh topic day (four directory barriers), unlike the warm prefix fixture.
-    expect(heldDirs).toHaveLength(3 * expectedIndex.length + (reduced ? 1 : liveDepth) + 4 + 3);
+    expect(heldDirs).toHaveLength(2 * expectedIndex.length + (reduced ? 1 : liveDepth) + 4 + 3);
   });
 
   it("fresh directories: every new link barrier precedes file use and rename; external-parent failure prevents use", () => {

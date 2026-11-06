@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,13 +11,18 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { registerMainInbox } from "../src/topology/stall-alarms.js";
+import type { FabricState } from "../src/fabric-state.js";
+import { createDashboardSnapshot } from "../src/ui/snapshot.js";
 
 // Keep reason: data safety across the foreign-registry/ownership trust boundary.
 // Real registries and reconciliation are used; no worker needs to run.
-const fixtures: Array<{ root: string; directory: ActorDirectory; manager: AgentManager }> = [];
+const fixtures: Array<{ root: string; directories: ActorDirectory[]; participants: ParticipantDirectory[]; manager: AgentManager }> = [];
 afterEach(async () => {
-  for (const { root, directory, manager } of fixtures.splice(0)) {
-    await directory.close();
+  for (const { root, directories, participants, manager } of fixtures.splice(0)) {
+    for (const participant of participants) await participant.close();
+    for (const directory of directories) await directory.close();
     await manager.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -31,12 +37,18 @@ const open = (canManageActor?: (id: string, fresh?: boolean) => boolean | undefi
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
   const actorRoots = { project: path.join(mesh.root, "actors"), session: path.join(mesh.root, "actors", "current") };
-  const directory = new ActorDirectory([
-    "current", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 60_000 }, manager, () => {},
-    { persistent: true, rootId: identity.id, lineageAlive: () => true, ...(canManageActor ? { canManageActor } : {}) },
-  ], actorRoots, "project");
-  fixtures.push({ root, directory, manager });
-  return { directory, manager, mesh, actorRoots };
+  const directories: ActorDirectory[] = [], participants: ParticipantDirectory[] = [];
+  const newDirectory = () => {
+    const directory = new ActorDirectory([
+      "current", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 60_000 }, manager, () => {},
+      { persistent: true, rootId: identity.id, lineageAlive: () => true, ...(canManageActor ? { canManageActor } : {}) },
+    ], actorRoots, "project");
+    directories.push(directory);
+    return directory;
+  };
+  const directory = newDirectory();
+  fixtures.push({ root, directories, participants, manager });
+  return { directory, manager, mesh, actorRoots, identity, participants, newDirectory };
 };
 
 // Match the existing orphan-provider fixture: observe ESRCH rather than assuming
@@ -133,6 +145,147 @@ describe("ActorDirectory read-only list snapshots", () => {
     await directory.reconcileSessionOrphans();
     expect(directory.list().map(actor => actor.id)).toContain(unknown.actor.id);
   });
+});
+
+const participantKey = (id: string) => `topology/participants/${createHash("sha256").update(id).digest("hex")}`;
+
+// Same unrelated-service floor as dashboard-snapshot.test.ts, but BOTH actor and
+// participant reads are real, including the runtime's exact terminal callback.
+const dashboardState = (fixture: ReturnType<typeof open>, actors = fixture.directory): FabricState => {
+  const { mesh, identity, manager } = fixture;
+  const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
+    identity, reapDeadHosts: false, terminalActor: entry => actors.validateSessionActorTombstone(entry) });
+  fixture.participants.push(participants);
+  return {
+    activity: { runs: () => [] }, agents: manager, actors,
+    participantInfos: (options: Parameters<FabricState["participantInfos"]>[0]) => participants.list(options),
+    peerInfos: (options: Parameters<FabricState["peerInfos"]>[0]) => participants.peers(undefined, options),
+    mainAgentInfo: () => ({ ...identity, status: "idle", runner: "pi", transport: "host", cwd: process.cwd(),
+      startedAt: 1, updatedAt: 1, pendingMessages: false, local: true }),
+    globalActors: { list: () => [] }, config: { mesh: { enabled: false } }, mesh,
+  } as unknown as FabricState;
+};
+
+const settleDashboardOrphan = async (fixture: ReturnType<typeof open>) => {
+  const { mesh, identity, directory } = fixture;
+  const foreign = seedForeign(mesh);
+  const actor = { ...foreign.actor, project: "dashboard-project" };
+  foreign.store.write([actor]);
+  const old: MeshIdentity = { id: actor.rootId, sessionId: "old", name: "Old Main", kind: "main" };
+  registerMainInbox(mesh.root, old, "old", undefined, "native-lead", actor.project);
+  registerMainInbox(mesh.root, identity, "current", undefined, "native-lead", actor.project);
+  const ownerPath = path.join(mesh.root, "main-followups", "old.owner.json");
+  fs.writeFileSync(ownerPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(ownerPath, "utf8")),
+    pid: absentPid(), processStartedAt: "1" }));
+  fs.utimesSync(ownerPath, new Date(actor.updatedAt), new Date(actor.updatedAt));
+  writeHostLease(mesh.root, { id: identity.id, rootId: identity.id, identityId: identity.id,
+    updatedAt: Date.now(), expiresAt: Date.now() + 60_000,
+    writer: { pid: process.pid, host: os.hostname(), startedAt: Date.now(), releaseSha: "test", lockProtocol: 1, stateBackend: "file" } });
+  const clock = vi.spyOn(Date, "now").mockReturnValue(actor.updatedAt);
+  try {
+    await mesh.put({ identity: old, key: `actors/old/${actor.id}`, value: actor });
+    await mesh.put({ identity: old, key: participantKey(actor.id), value: { format: 1, id: actor.id, kind: "actor",
+      name: actor.name, rootId: old.id, ownerHostId: old.id, ownerIdentityId: old.id, residency: "session", runner: "pi",
+      transport: "host", capabilities: [], controlProtocol: "legacy", status: "running",
+      startedAt: actor.createdAt, updatedAt: actor.updatedAt } });
+  } finally { clock.mockRestore(); }
+  expect(await directory.reconcileSessionOrphans()).toBe(1);
+  const terminal = mesh.get(participantKey(actor.id), { fresh: true })!;
+  expect(terminal.value).toMatchObject({ id: actor.id, status: "stopped", stopReason: "owner-root-gone" });
+  return { ...foreign, actor, terminal };
+};
+
+// Count only the foreign-root discovery boundary, not ordinary mesh/participant
+// directory reads. This is the same distinction as the direct-list regression.
+const foreignScans = (enumerate: { mock: { calls: unknown[][] } }, actorRoot: string) =>
+  enumerate.mock.calls.filter(([input, options]) => String(input).startsWith(`${actorRoot}${path.sep}old`) ||
+    (String(input) === actorRoot && options !== null && typeof options === "object" &&
+      "withFileTypes" in options && options.withFileTypes === true));
+
+describe("full dashboard settled-orphan reads", () => {
+  it("does not discover foreign actor roots when no settled tombstone exists", () => {
+    const fixture = open();
+    const foreign = seedForeign(fixture.mesh);
+    const state = dashboardState(fixture);
+    const enumerate = vi.spyOn(fs, "readdirSync");
+    for (let read = 0; read < 3; read++) {
+      expect((createDashboardSnapshot(state, []).participants ?? []).map(entry => entry.id)).not.toContain(foreign.actor.id);
+    }
+    expect(foreignScans(enumerate, fixture.actorRoots.project)).toEqual([]);
+    expect(foreign.store.records()[0]).toMatchObject({ status: "running" });
+  });
+
+  it("retains a settled terminal across repeated full snapshots without rediscovering foreign roots", async () => {
+    const fixture = open();
+    const state = dashboardState(fixture);
+    expect(createDashboardSnapshot(state, []).participants).toEqual([]);
+    const enumerate = vi.spyOn(fs, "readdirSync");
+    const { actor, store } = await settleDashboardOrphan(fixture);
+    // Explicit maintenance DID discover the fixture; dashboard reads must not.
+    expect(foreignScans(enumerate, fixture.actorRoots.project).length).toBeGreaterThan(0);
+    enumerate.mockClear();
+    const before = store.snapshot().bytes;
+    const reconcile = vi.spyOn(fixture.directory, "reconcileSessionOrphans");
+    const validate = vi.spyOn(fixture.directory, "validateSessionActorTombstone");
+    for (let read = 0; read < 3; read++) {
+      validate.mockClear();
+      expect(createDashboardSnapshot(state, []).main.id).toBe(fixture.identity.id);
+      // Dashboard defaults hide stale participants, but still revalidate their
+      // terminals before filtering. Observe the real callback, never stub it.
+      expect(validate.mock.results.map(result => result.value)).toContainEqual(expect.objectContaining({
+        id: actor.id, name: actor.name, status: "stopped", stopReason: "owner-root-gone", capabilities: [],
+      }));
+    }
+    expect.soft(foreignScans(enumerate, fixture.actorRoots.project)).toEqual([]);
+    expect.soft(reconcile).not.toHaveBeenCalled();
+    expect(store.snapshot().bytes).toBe(before);
+    expect(fixture.participants[0]!.list({ includeStale: true })).toContainEqual(expect.objectContaining({
+      id: actor.id, name: actor.name, status: "stopped", stopReason: "owner-root-gone",
+    }));
+    // A cached referenced store must still read a newly committed generation.
+    await store.update(rows => ({ actors: rows.map(row => ({ ...row, name: "fresh-terminal-name" })), value: true }));
+    enumerate.mockClear();
+    validate.mockClear();
+    createDashboardSnapshot(state, []);
+    expect(validate.mock.results.map(result => result.value)).toContainEqual(expect.objectContaining({
+      id: actor.id, name: "fresh-terminal-name", status: "stopped", stopReason: "owner-root-gone",
+    }));
+    expect(foreignScans(enumerate, fixture.actorRoots.project)).toEqual([]);
+  });
+
+  it("validates an exact referenced terminal on a cold directory without catalog warming or discovery", async () => {
+    const fixture = open();
+    const { actor, terminal } = await settleDashboardOrphan(fixture);
+    const cold = fixture.newDirectory(); // No list/reconcile/resolve on this directory.
+    const state = dashboardState(fixture, cold);
+    const enumerate = vi.spyOn(fs, "readdirSync");
+    expect(cold.validateSessionActorTombstone(terminal)).toMatchObject({ id: actor.id, status: "stopped" });
+    createDashboardSnapshot(state, []);
+    expect.soft(foreignScans(enumerate, fixture.actorRoots.project)).toEqual([]);
+    expect(fixture.participants[0]!.list({ includeStale: true })).toContainEqual(expect.objectContaining({
+      id: actor.id, status: "stopped", stopReason: "owner-root-gone",
+    }));
+  });
+
+  it.each(["tampered-terminal", "changed-owner", "missing-private-receipt"] as const)(
+    "still rejects a %s rather than treating cached registry knowledge as proof", async mode => {
+      const fixture = open();
+      const { terminal, store } = await settleDashboardOrphan(fixture);
+      expect(fixture.directory.validateSessionActorTombstone(terminal)).toBeDefined();
+      if (mode === "tampered-terminal") {
+        const value = terminal.value as Record<string, unknown>;
+        expect(fixture.directory.validateSessionActorTombstone({ ...terminal, value: { ...value, ownerRootGoneBy: "session:forged" } }))
+          .toBeUndefined();
+      } else {
+        await store.update(rows => ({ actors: rows.map(row => mode === "changed-owner"
+          ? { ...row, rootId: "session:successor" }
+          : { ...row, sessionOrphan: { ...(row.sessionOrphan as object), directorySettlement: undefined } }), value: true }));
+        expect(fixture.directory.validateSessionActorTombstone(terminal)).toBeUndefined();
+        createDashboardSnapshot(dashboardState(fixture), []);
+        expect(fixture.participants[0]!.list({ includeStale: true }).map(entry => entry.id))
+          .not.toContain((terminal.value as Record<string, unknown>).id);
+      }
+    });
 });
 
 const scopes: FabricActorStorageScope[] = ["project", "session"];

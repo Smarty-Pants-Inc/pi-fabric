@@ -225,6 +225,20 @@ export class SessionActorOrphans {
     } catch { return []; }
   }
 
+  /** Terminal reads name one foreign root; they must not discover the catalog. */
+  #referencedRegistry(rootId: string): { sessionId: string; store: ActorRegistryStore } | undefined {
+    if (!rootId.startsWith("session:")) return undefined;
+    const sessionId = rootId.slice(8);
+    if (!sessionId || sessionId === "." || sessionId === ".." || sessionId === this.ownSessionId ||
+        path.basename(sessionId) !== sessionId) return undefined;
+    const root = path.join(this.actorRoot, sessionId);
+    // Match discovery's Dirent.isDirectory(): a symlink root is not a directory entry.
+    if (!fs.lstatSync(root).isDirectory() || !fs.existsSync(path.join(root, "actors.json"))) return undefined;
+    let store = this.#stores.get(root);
+    if (!store) { store = new ActorRegistryStore(root); this.#stores.set(root, store); }
+    return { sessionId, store };
+  }
+
   #rows(store: ActorRegistryStore): ReturnType<ActorRegistryStore["snapshot"]>["actors"] {
     const snapshot = store.snapshot();
     // smarty-dev#7791: snapshot() returns the same object while the file is unchanged; parse its bytes once.
@@ -393,7 +407,7 @@ export class SessionActorOrphans {
       if (!time(entry.updatedAt) || !Number.isSafeInteger(entry.version) || entry.version < 1 ||
           !value || value.stopReason !== "owner-root-gone" || value.status !== "stopped" || typeof value.id !== "string" ||
           typeof value.rootId !== "string" || entry.updatedBy.kind !== "main") return undefined;
-      const registry = this.#registries().find(item => `session:${item.sessionId}` === value.rootId);
+      const registry = this.#referencedRegistry(value.rootId);
       const row = registry && this.#rows(registry.store).find(item => item.id === value.id);
       const marker = record(row?.sessionOrphan), current = record(marker?.directorySettlement);
       const receipt = settlementReceipt(entry, settlementReceipts(current));

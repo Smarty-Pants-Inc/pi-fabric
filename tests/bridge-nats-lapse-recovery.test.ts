@@ -151,16 +151,28 @@ describe("NATS carrier bounded lapse recovery", () => {
 
   it.each(["before-write", "after-rename"])("retains the same first timestamp after a %s failure", async mode => {
     const f = await fixture(); f.lapse(); const d = await f.deliver("write-failure", 1);
-    const realWrite = atomic.writeJsonAtomic, realSync = fs.fsyncSync;
+    const realWrite = atomic.writeJsonAtomic;
+    let afterRenameFaultFired = false;
+    if (mode === "after-rename") expect(fs.existsSync(f.lapsePath)).toBe(false);
     const fault = mode === "before-write" ? vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
       if (file === f.lapsePath) throw Object.assign(new Error("injected pre-write fault"), { code: "ENOSPC" });
       return realWrite(file, value, options);
-    }) : vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
-      if (fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("injected directory barrier fault"), { code: "EIO" });
-      return realSync(fd);
+    }) : vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file !== f.lapsePath) return realWrite(file, value, options);
+      return realWrite(file, value, { ...options, syncDirectory: directory => {
+        expect(directory).toBe(path.dirname(f.lapsePath));
+        expect(fs.existsSync(f.lapsePath)).toBe(true);
+        afterRenameFaultFired = true;
+        throw Object.assign(new Error("injected directory barrier fault"), { code: "EIO" });
+      } });
     });
     await expect(f.link.remote.read(0)).rejects.toMatchObject({ code: mode === "before-write" ? "ENOSPC" : "EIO" });
-    fault.mockRestore(); expect(d.acked).toBe(0); expect(d.termed).toEqual([]);
+    fault.mockRestore();
+    if (mode === "after-rename") {
+      expect(afterRenameFaultFired).toBe(true);
+      expect(fs.existsSync(f.lapsePath)).toBe(true);
+    }
+    expect(d.acked).toBe(0); expect(d.termed).toEqual([]);
     f.advance(WINDOW); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
     expect(f.saved()[0]!.startedAt).toBe(f.initial); expect(d.termed).toHaveLength(1);
   });

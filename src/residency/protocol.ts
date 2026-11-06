@@ -454,7 +454,7 @@ export interface ResidentHostOwner {
   releaseRoot?: string;
   configDigest?: string;
   handover?: { abi: "fabric-resident-1"; launcher: ResidentLauncherIdentity };
-  /** Loaded owner supports reversible cooperative drain, NOT automatic containment/exit. */
+  /** Loaded owner supports cooperative drain and explicit graceful exit, NOT automatic containment or target launch. */
   drain?: { abi: "fabric-resident-drain-1" };
   /** Launcher-custody receipt for this exact native generation, not permission to reopen the scope. */
   launchAttestation?: AttemptLaunchReceipt;

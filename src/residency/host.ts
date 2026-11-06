@@ -39,6 +39,8 @@ interface ResidentDrainIngress {
 }
 interface ResidentHeldDrain {
   receipt: ResidentDrainReceipt;
+  exit: boolean;
+  closing?: boolean;
   caller: ResidentActorCaller;
   checkpointAbort: AbortController;
   timer: NodeJS.Timeout;
@@ -136,7 +138,7 @@ import {
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { ensureResidentGenerations, recordResidentGenerationError, recordResidentGenerationExit } from "./generation-exit.js";
+import { ensureResidentGenerations, readResidentGenerationExit, recordResidentGenerationError, recordResidentGenerationExit } from "./generation-exit.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
@@ -1264,7 +1266,10 @@ export class ResidentHost {
           if (this.#transportAbort === transportAbort) this.#transportAbort = undefined;
           if (this.#transport === transport) this.#transport = undefined;
           try { await transport?.close(); }
-          finally { try { this.mesh?.closeState(); } finally { this.#releaseLock(); } }
+          finally {
+            try { this.mesh?.closeState(); }
+            finally { if (!this.#drain?.closing) this.#releaseLock(); }
+          }
         }
       }
     }
@@ -1272,7 +1277,8 @@ export class ResidentHost {
 
   async #close(): Promise<void> {
     this.#closed = true;
-    if (this.#drain) this.#finishDrain(this.#drain, "needs-operator", "HOST_CLOSED", "Resident closed during cooperative drain");
+    if (this.#drain?.closing) this.#drain.resolveResumed(); // release a parked wake reader, never admission
+    else if (this.#drain) this.#finishDrain(this.#drain, "needs-operator", "HOST_CLOSED", "Resident closed during cooperative drain");
     this.#containmentClient?.dispose(); this.#containmentClient = undefined;
     // Stops with the host (shutdown and the release handover's exit alike): the lease is released
     // so the successor host's projector takes over at once.
@@ -1324,7 +1330,7 @@ export class ResidentHost {
           // so Windows can remove or migrate state.db once the host is gone (pi-fabric#640).
           try { this.mesh?.closeState(); } catch { /* best effort at teardown */ }
         }
-      } finally { if (!this.#transport && !this.#transportAbort) this.#releaseLock(); }
+      } finally { if (!this.#transport && !this.#transportAbort && !this.#drain?.closing) this.#releaseLock(); }
     }
   }
 
@@ -2281,6 +2287,26 @@ export class ResidentHost {
     }
   }
 
+  /** Exit never waits for or interrupts accepted work. Queued actor events are checkpointable, not running custody. */
+  #assertDrainExitQuiet(ownRequestId?: string): void {
+    const refuse = (code: string, reason: string): never => { throw new ResidentDrainRefusedError(code, reason); };
+    if (this.#admissions || this.#boundaryRequests.size || residentProcessWorkPending(this.processWorkSessionId) || this.#wakeRecoveryPending ||
+        fs.readdirSync(this.#requestsPath).some(entry => entry.endsWith(".json")) ||
+        fs.readdirSync(this.#processingPath).some(entry => entry.endsWith(".json") && (ownRequestId === undefined || entry !== `${ownRequestId}.json`))) {
+      refuse("DRAIN_EXIT_REQUESTS_BUSY", "Graceful resident exit refused: in-flight requests, processing files or host work remain");
+    }
+    if (this.#publicationFailed || this.#publications.size || this.#flushingDeliveries || this.#deliveryCommits.hasUnconfirmed() ||
+        !this.#deliveryRetry.idle || (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")))) {
+      refuse("DRAIN_EXIT_OUTBOX_DEBT", "Graceful resident exit refused: producer outbox or publication debt remains");
+    }
+    if (this.actors.inFlightActorIds().length || this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length) {
+      refuse("DRAIN_EXIT_ACTORS_BUSY", "Graceful resident exit refused: running actors or actor setup/removal custody remains");
+    }
+    if (this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") || this.agents.hasRetainedCustody()) {
+      refuse("DRAIN_EXIT_WORKERS_BUSY", "Graceful resident exit refused: running/queued workers or unconfirmed worker custody remains");
+    }
+  }
+
   #prepareDrain(command: Extract<ResidentCommand, { operation: "releaseDrain" }>): ResidentDrainReceipt {
     this.#authorizeResidentSetter(command.caller);
     this.#assertDrainChannelOwned(command);
@@ -2326,6 +2352,7 @@ export class ResidentHost {
     if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.config.residencyRoot)))) {
       return refuse("DRAIN_BUSY", "A resident handover is in custody");
     }
+    if (command.exit === true) this.#assertDrainExitQuiet(command.requestId);
     if (Date.now() >= deadlineAt) return refuse("DRAIN_TIMEOUT", "Drain deadline elapsed during read-only validation; nothing was held");
     const receipt = newResidentDrainReceipt({ rootId: this.config.rootId, owner: command.expected.owner,
       launcher: launch.launcher, previous, target: command.target, main: command.main, phase: "held", outcome: "held",
@@ -2338,7 +2365,7 @@ export class ResidentHost {
     const timer = setTimeout(() => {
       if (this.#drain === held) this.#finishDrainTimeout(held);
     }, Math.max(0, deadlineAt - Date.now()));
-    const held: ResidentHeldDrain = { receipt, caller: structuredClone(command.caller), checkpointAbort, timer, resumed, resolveResumed };
+    const held: ResidentHeldDrain = { receipt, exit: command.exit === true, caller: structuredClone(command.caller), checkpointAbort, timer, resumed, resolveResumed };
     // Single synchronous boundary: no await between resident state and manager gates.
     this.#drain = held;
     try {
@@ -2369,17 +2396,30 @@ export class ResidentHost {
     if (JSON.stringify(readResidentDrainReceipt(this.config.residencyRoot, held.receipt.id, held.receipt)) !== JSON.stringify(held.receipt)) {
       throw new Error("Resident held drain receipt changed");
     }
+    if (held.exit) this.#assertDrainExitQuiet();
   }
 
   #finishDrainTimeout(held: ResidentHeldDrain): void {
-    this.#finishDrain(held, "resumed", "DRAIN_TIMEOUT", "Drain deadline elapsed; A resumed without aborting accepted work");
+    this.#finishDrain(held, "resumed", "DRAIN_TIMEOUT", held.exit
+      ? "Graceful resident exit deadline elapsed; admissions remain held for operator inspection"
+      : "Drain deadline elapsed; A resumed without aborting accepted work");
   }
 
   #finishDrain(held: ResidentHeldDrain, outcome: "resumed" | "containment-unavailable" | "needs-operator", code: string, reason: string): void {
-    if (this.#drain !== held) return;
+    if (this.#drain !== held || held.receipt.terminal) return;
     clearTimeout(held.timer);
     // Cancels checkpoint validity ONLY. Never pass this signal to a worker/accepted handler.
     held.checkpointAbort.abort(new Error(reason));
+    if (held.exit) {
+      // An explicit exit must never reopen admission on an uncertain checkpoint/close.
+      // Keep #drain installed as the host, control, lifecycle and manager gate.
+      held.resolveResumed();
+      held.receipt = { ...held.receipt, phase: "needs-operator", outcome: "needs-operator", code, reason,
+        at: Date.now(), admissionHeld: true, terminal: true };
+      try { writeResidentDrainReceipt(this.config.residencyRoot, held.receipt); }
+      catch (error) { diagnostics.error("src/residency/host.ts", `[pi-fabric] resident exit terminal receipt unavailable: ${errorMessage(error)}`); }
+      return;
+    }
     this.#drain = undefined;
     let resumeFailed = false;
     if (!this.#closed) {
@@ -2421,7 +2461,7 @@ export class ResidentHost {
   }
 
   async #advanceDrain(held: ResidentHeldDrain): Promise<void> {
-    if (this.#pollingRequests || this.#drainCheckpointPending) return;
+    if (this.#pollingRequests || this.#drainCheckpointPending || held.receipt.terminal || held.closing) return;
     try {
       this.#drainStillCurrent(held);
       if (this.#admissions || this.#boundaryRequests.size || this.actors.releaseCustodyCount() || this.actors.pendingRemovals().length ||
@@ -2432,6 +2472,10 @@ export class ResidentHost {
       this.#drainCheckpointPending = pending;
       try { await pending; }
       finally { if (this.#drainCheckpointPending === pending) this.#drainCheckpointPending = undefined; }
+      // The serial command response is durable and its processing file is gone before
+      // this poll can advance. Join the checkpoint BEFORE close; neither close's
+      // request join nor the checkpoint can now wait on the continuation calling it.
+      if (held.exit) await this.#exitDrain(held);
     } catch (error) {
       if (this.#drain === held) {
         // The wall deadline owns terminal timeout classification even when this
@@ -2482,6 +2526,7 @@ export class ResidentHost {
       checkpoint, checkpointReadback: true, quiet: { admissions: 0, actors: 0, agents: 0, removals: 0,
         publications: 0, producerOutbox: 0, boundaryRequests: 0, businessAdmissions: this.#businessAdmissions } };
     writeResidentDrainReceipt(this.config.residencyRoot, held.receipt);
+    if (held.exit) return; // Explicit shutdown is not containment, handover, or permission to start B.
     // Drain operation IDs are NOT launch attempt IDs. Only a trusted launch
     // attestation may select the launcher-custody channel; no scope path is opened.
     await step(async () => {
@@ -2508,6 +2553,39 @@ export class ResidentHost {
     try { assertAutomaticReleaseRecovery(); }
     catch (error) { this.#finishDrain(held, "containment-unavailable", "CONTAINMENT_UNAVAILABLE", errorMessage(error)); return; }
     this.#finishDrain(held, "containment-unavailable", "CONTAINMENT_UNAVAILABLE", "Cooperative endpoint does not own containment or release movement");
+  }
+
+  async #exitDrain(held: ResidentHeldDrain): Promise<void> {
+    this.#drainStillCurrent(held);
+    held.closing = true;
+    try {
+      // Wake runResidentHost's existing stop lifecycle FIRST, so beforeRelease
+      // reports stopped rather than its default error. Direct hosts close here too.
+      this.onIdle("stopped");
+      await this.close();
+      // Planned exit retains the root fence through teardown and final publication.
+      // Never publish exited merely because close started or a UI list was quiet.
+      if (!this.#holdsRoot()) throw new Error("Resident root fence changed during graceful close");
+      recordResidentGenerationExit(this.config.residencyRoot,
+        { format: 1, generation: this.generation, writer: "host", reason: "stopped", pid: process.pid, at: Date.now() });
+      const exit = readResidentGenerationExit(this.config.residencyRoot, this.generation);
+      if (exit?.writer !== "host" || exit.reason !== "stopped" || exit.pid !== process.pid) {
+        throw new Error("Graceful resident close has no host-written stopped generation receipt");
+      }
+      if (!held.receipt.terminal) {
+        if (Date.now() >= held.receipt.deadlineAt) this.#finishDrainTimeout(held);
+        else {
+          held.receipt = writeResidentDrainReceipt(this.config.residencyRoot, { ...held.receipt,
+            phase: "exited", outcome: "exited", code: "DRAIN_EXITED",
+            reason: "Resident checkpointed and gracefully closed; no target was launched", at: Date.now(), admissionHeld: true, terminal: true });
+          clearTimeout(held.timer);
+          held.checkpointAbort.abort(new Error("Resident graceful exit completed"));
+        }
+      }
+      this.#releaseLock();
+    } catch (error) {
+      this.#finishDrain(held, "needs-operator", "DRAIN_EXIT_UNCERTAIN", errorMessage(error));
+    }
   }
 
   #releaseCheckpointReadback(): unknown {

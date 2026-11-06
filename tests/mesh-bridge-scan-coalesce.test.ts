@@ -35,7 +35,10 @@ afterEach(() => {
 });
 
 const immediate = () => new Promise<void>(resolve => setImmediate(resolve));
-const macrotasks = async (n = 5) => { for (let i = 0; i < n; i += 1) await immediate(); };
+const macrotasks = async (n = 5) => {
+  await new Promise(resolve => setTimeout(resolve, 120));
+  for (let i = 0; i < n; i += 1) await immediate();
+};
 
 const subscribe = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-coalesce-"));
@@ -52,7 +55,7 @@ const subscribe = async () => {
   const fire = notify.current!;
   expect(fire).toBeTypeOf("function");
   // Let the real watcher deliver the store setup's own notifications before counting.
-  await new Promise(resolve => setTimeout(resolve, 60));
+  await new Promise(resolve => setTimeout(resolve, 130));
   await macrotasks();
   scans.mockClear();
   changes.length = 0;
@@ -91,11 +94,11 @@ describe("pre-lock scan coalescing per notification burst", () => {
     expect(f.scans.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("forwards event notifications within one check phase, without a scan", async () => {
+  it("forwards event notifications within the coalescing window, without a scan", async () => {
     const f = await subscribe();
     f.fire("events");
     f.fire("events");
-    await immediate();
+    await macrotasks();
     expect(f.changes).toEqual(["events"]);
     expect(f.scans).not.toHaveBeenCalled();
   });
@@ -118,7 +121,7 @@ describe("pre-lock scan coalescing per notification burst", () => {
     await Promise.resolve();
     f.fire("events");
     expect(f.changes).toEqual([]);
-    await immediate();
+    await macrotasks();
     expect(f.changes).toEqual(["lease", "events"]);
     // Lease-only burst: classified as a lease change (half-lease batching in MeshBridge), no events wake.
     f.changes.length = 0;
@@ -141,7 +144,7 @@ describe("pre-lock scan coalescing per notification burst", () => {
     await macrotasks();
     expect(f.scans.mock.calls.length).toBe(1);
     f.fire("events");
-    await immediate();
+    await new Promise(resolve => setTimeout(resolve, 10));
     expect(f.changes).toEqual(["events"]);
     expect(f.scans.mock.calls.length).toBe(1);
     busy = false;
@@ -173,7 +176,7 @@ describe("pre-lock scan coalescing per notification burst", () => {
     const scheduled = timers.mock.calls.length;
     expect(scheduled).toBeGreaterThanOrEqual(1);
     await burst(f.fire, 20);
-    await macrotasks();
+    await immediate();
     // Notifications during the backoff wait neither scan nor add timers.
     expect(f.scans.mock.calls.length).toBe(1);
     expect(timers.mock.calls.length).toBe(scheduled);

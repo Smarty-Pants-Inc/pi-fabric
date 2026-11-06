@@ -128,6 +128,12 @@ const clearInputs = () => { observation.inputs.length = 0; vi.mocked(readHostLea
 const measure = (f: Fixture) => {
   let fenced = false;
   const reads: Array<{ prefix: string; fresh: boolean; fenced: boolean }> = [];
+  const leaseReads: boolean[] = [];
+  const readLeases = vi.mocked(readHostLeases).getMockImplementation()!;
+  vi.mocked(readHostLeases).mockImplementation((...args) => {
+    leaseReads.push(fenced);
+    return readLeases(...args);
+  });
   const original = SqliteStateBackend.prototype.listAll;
   vi.spyOn(SqliteStateBackend.prototype, "listAll").mockImplementation(function (this: InstanceType<typeof SqliteStateBackend>, prefix = "", options = {}) {
     if (this.root === f.root) reads.push({ prefix, fresh: options.fresh === true, fenced });
@@ -149,9 +155,10 @@ const measure = (f: Fixture) => {
       inside.map(inFence => ({ prefix, fresh: true, fenced: inFence })),
     );
     expect(vi.mocked(readHostLeases).mock.calls).toEqual(inside.map(() => [f.root]));
+    expect(leaseReads).toEqual(inside);
     expect(frames()).toHaveLength(inside.length);
   };
-  return { fences, revisions, proofs, expectAttempts };
+  return { fences, revisions, proofs, reads, leaseReads, expectAttempts };
 };
 
 // Keep: trust-boundary/freshness fences, and the recorded snapshot CPU/read amplification
@@ -222,6 +229,73 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     ]));
     expect(f.changes.splice(0)).toEqual(["presence"]);
     m.expectAttempts(Array<boolean>(7).fill(false));
+  });
+
+  it("debounces renewMirroredLeases without hiding native lease changes or leaving retries", async () => {
+    const f = await fixture();
+    const unsubscribe = f.subscribe();
+    clearInputs();
+    vi.useFakeTimers();
+    try {
+      const notify = observation.notify.get(f.root)!;
+      const source = f.direct.hosts[0]!;
+      // The installed mirror was observed at NOW. A slightly newer local clock lets each
+      // valid source sample advance its exact file version while every callback stays in-window.
+      const renewalSide = new StoreBridgeSide(f.store, "far", () => NOW + 1_000);
+      for (let step = 1; step <= 3; step += 1) {
+        const observedAt = NOW + step * 100;
+        await renewalSide.renewMirroredLeases([{
+          record: { ...source.record, updatedAt: observedAt },
+          expiresAt: observedAt + 20_000,
+          observedAt,
+        }], observedAt);
+        notify("presence");
+        await vi.advanceTimersByTimeAsync(20); // A separate event-loop turn, still before 100 ms.
+        expect(frames()).toEqual([]);
+      }
+      expect(readHostLease(f.root, source.record.id)?.mirror).toMatchObject({
+        remoteHost: "far", observedAt: NOW + 300, sourceObservedAt: NOW + 300,
+        sourceUpdatedAt: NOW + 300, sourceExpiresAt: NOW + 20_300,
+      });
+
+      vi.mocked(readHostLeases).mockClear();
+      const m = measure(f);
+      await vi.advanceTimersByTimeAsync(40);
+      expect(frames()).toHaveLength(1);
+      expect(f.changes).toEqual([]); // Mirror-only renewal fields are not presence changes.
+      m.expectAttempts([false]); // Three fresh prefixes and one lease scan, all outside the fence.
+      expect(m.reads.every(read => !read.fenced)).toBe(true);
+      expect(m.leaseReads).toEqual([false]);
+      expect(vi.getTimerCount()).toBe(0);
+
+      // A real native lease extension is still visible in the next independent burst.
+      f.renew(NOW + 90_000);
+      notify("presence");
+      await vi.advanceTimersByTimeAsync(99);
+      expect(frames()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(frames()).toHaveLength(2);
+      expect(JSON.parse(frames().at(-1)!.content).native.hosts[0].expiresAt).toBe(NOW + 90_000);
+      expect(f.changes.splice(0)).toEqual(["lease"]);
+      m.expectAttempts([false, false]);
+
+      // Unsubscribe cancels a newly queued notification; it cannot turn into retries or scans.
+      const settledFrames = frames();
+      notify("presence");
+      await vi.advanceTimersByTimeAsync(50);
+      expect(vi.getTimerCount()).toBe(1);
+      unsubscribe();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(frames()).toEqual(settledFrames);
+      expect(f.changes).toEqual([]);
+      expect(f.failures).toEqual([]);
+      m.expectAttempts([false, false]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      unsubscribe();
+      vi.useRealTimers();
+    }
   });
 
   it("rejects obsolete SQLite captures and accepts a third only after an out-of-fence resnapshot", async () => {

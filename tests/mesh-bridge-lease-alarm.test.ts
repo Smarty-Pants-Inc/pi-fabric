@@ -11,7 +11,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { BRIDGE_STALL_ALARM_TOPIC, bridgeStallReasonPath, isBridgedTopic, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { BRIDGE_LEASE_ALARM_AFTER_MS } from "../src/topology/bridge-alarms.js";
 import { rootPresenceAlarms } from "../src/topology/stall-alarms.js";
-import { MIRROR_FRESH_MS, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, MIRROR_FRESH_MS, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 import { processIncarnation, readPhysicalHostIdentity } from "../src/core/atomic-write.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 const owner: MeshIdentity = { id: "session:11111111-1111-4111-8111-111111111111", name: "owner", kind: "main" };
@@ -367,7 +367,19 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
       lease.expiresAt = now - 30_001;
       writeHostLease(root, lease);
     }
-    await rootPresenceAlarms(mesh, owner, owner.id, [], 900_000, Date.now());
+    // #18579: this runs on every committed owner heartbeat, not only the 15-minute GC.
+    // Retained file-only hosts must not turn the alarm check into a whole-directory scan.
+    const orphanFiles = new Set<string>();
+    for (let n = 0; n < 64; n++) {
+      const id = `orphan:${n}`; orphanFiles.add(hostLeasePath(root, id));
+      writeHostLease(root, { id, rootId: id, identityId: id, updatedAt: 1, expiresAt: 2 });
+    }
+    const listings = vi.spyOn(fs, "readdirSync"), stats = vi.spyOn(fs, "statSync");
+    try {
+      await rootPresenceAlarms(mesh, owner, owner.id, [], 900_000, Date.now());
+      expect(listings.mock.calls.filter(([file]) => String(file) === path.join(root, "host-leases"))).toEqual([]);
+      expect(stats.mock.calls.filter(([file]) => orphanFiles.has(String(file)))).toEqual([]);
+    } finally { listings.mockRestore(); stats.mockRestore(); }
     const alarms = mesh.read({ topic: "ops.owner", after: 0, limit: 100 });
     expect(alarms).toHaveLength(1);
     expect(alarms[0]).toMatchObject({ kind: "bridge.lease.alarm", data: { link: "stalled" } });

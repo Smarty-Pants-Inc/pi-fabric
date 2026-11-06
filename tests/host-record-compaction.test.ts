@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, MeshLockTimeoutError, type MeshBatchView, type MeshStateEntry } from "../src/mesh/store.js";
 import { compactExpiredHostRecords, HOST_RECORD_COMPACTION_BATCH, HOST_RECORD_RETENTION_MS } from "../src/topology/host-record-compaction.js";
-import { writeHostLease, readHostLease } from "../src/topology/host-leases.js";
+import { writeHostLease, readHostLease, hostLeasePath } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 const roots: string[] = [], directories: ParticipantDirectory[] = [];
@@ -39,6 +39,24 @@ describe("native/resident topology host compaction", () => {
     const ops = compactExpiredHostRecords(view([stored]), r, identity.id, now); expect(ops).toHaveLength(1);
     writeHostLease(r, lease);
     expect(ops[0]?.kind === "delete" && ops[0].condition?.(() => stored)).toBe(false);
+    expect(compactExpiredHostRecords(view([stored]), r, identity.id, now)).toEqual([]);
+  });
+  it("never uses a cached expired lease as destructive authority when current bytes are unreadable", () => {
+    const r = root(), now = Date.now(), stored = entry("resident:uncertain", now);
+    const old = { id: "resident:uncertain", rootId: "session:parent", identityId: identity.id, startedAt: 1,
+      updatedAt: now - HOST_RECORD_RETENTION_MS - 1000, expiresAt: now - HOST_RECORD_RETENTION_MS - 1 };
+    writeHostLease(r, old); expect(readHostLease(r, old.id)).toEqual(old);
+    const selected = compactExpiredHostRecords(view([stored]), r, identity.id, now);
+    expect(selected).toHaveLength(1);
+    writeHostLease(r, { ...old, updatedAt: now, expiresAt: now + 15_000 });
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((file, options) => {
+      if (String(file) === hostLeasePath(r, old.id)) throw Object.assign(new Error("current lease unreadable"), { code: "EACCES" });
+      return read(file, options as never);
+    });
+    // The compatibility point-reader deliberately retains its prior expired answer.
+    expect(readHostLease(r, old.id)).toEqual(old);
+    expect(selected[0]?.kind === "delete" && selected[0].condition?.(() => stored)).toBe(false);
     expect(compactExpiredHostRecords(view([stored]), r, identity.id, now)).toEqual([]);
   });
   it("joins one existing verified write; does not remove participants, deliveries, or recent returning hosts", async () => {

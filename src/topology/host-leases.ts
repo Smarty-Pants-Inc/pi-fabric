@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
-import { isMeshLockTimeout, readFileRetrying, writeJsonAtomic, type PhysicalHostIdentity } from "../core/atomic-write.js";
+import { isMeshLockTimeout, readFileRetrying, requireNamespaceBarrier, writeJsonAtomic, type PhysicalHostIdentity } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
@@ -491,10 +491,21 @@ export const writeHostLeaseVersionIf = (meshRoot: string, expected: FabricHostLe
   return true;
 };
 
+/** One immutable-addressed receipt per exact lease body, outside the active lease namespace. */
+export const hostLeaseArchivePath = (meshRoot: string, hostId: string, leaseSha256: string): string =>
+  path.join(meshRoot, "host-lease-archive", fileName(hostId), `${leaseSha256}.json`);
+
 /** Reaper compare-and-delete. Caller holds the TARGET's leaseCustody gate, as renew/claim do.
- * The detached-file check also keeps an unfenced historical replacement rather than unlinking it. */
-export const removeHostLeaseVersionUnderCustody = (meshRoot: string, expected: FabricHostLease): boolean =>
-  removeHostLeaseIf(meshRoot, expected.id, current => sameHostLeaseVersion(current, expected));
+ * Archive the exact detached bytes durably BEFORE unlinking; an archive/barrier failure restores
+ * the lease. A retry of the same body re-confirms the barriers at the same receipt address. */
+export const removeHostLeaseVersionUnderCustody = (meshRoot: string, expected: FabricHostLease, archivedAt = Date.now()): boolean =>
+  removeHostLeaseIf(meshRoot, expected.id, current => sameHostLeaseVersion(current, expected), bytes => {
+    requireNamespaceBarrier(platform => new Error(`Host lease archive namespace is not durable on ${platform}`));
+    const leaseSha256 = createHash("sha256").update(bytes).digest("hex");
+    writeJsonAtomic(hostLeaseArchivePath(meshRoot, expected.id, leaseSha256), {
+      format: 1, hostId: expected.id, archivedAt, leaseSha256, leaseBase64: bytes.toString("base64"),
+    }, { durable: true });
+  });
 
 export const removeHostLease = (meshRoot: string, hostId: string): void =>
   fs.rmSync(path.join(meshRoot, LEASE_DIR, fileName(hostId)), { force: true });
@@ -504,10 +515,13 @@ export const removeHostLease = (meshRoot: string, hostId: string): void =>
  * lease another owner wrote (a replacement that wrote its file before its state record) is kept.
  * An absent, unreadable or invalid file is never removed. The file is renamed aside before the
  * final check, so the lease judged is the lease removed; a lease that changed owner in between is
- * linked back, unless a newer lease already took the name (the newer one wins). Returns whether
- * a lease was removed.
+ * linked back, unless a newer lease already took the name (the newer one wins). An optional
+ * beforeRemove must establish any required archive barrier on the exact detached bytes.
+ * Failure restores the canonical name; if restoration itself fails, retain the aside copy.
+ * Returns whether a lease was removed.
  */
-export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (lease: FabricHostLease) => boolean): boolean => {
+export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (lease: FabricHostLease) => boolean,
+  beforeRemove?: (bytes: Buffer) => void): boolean => {
   const current = readHostLeaseCurrent(meshRoot, hostId);
   if (!current || !owned(current)) return false;
   const file = hostLeasePath(meshRoot, hostId);
@@ -518,14 +532,27 @@ export const removeHostLeaseIf = (meshRoot: string, hostId: string, owned: (leas
   } catch {
     return false; // Gone already, or busy (Windows): keep; an unremoved mirror lease lapses.
   }
+  let discard = false;
   try {
+    let bytes: Buffer | undefined;
     let taken: FabricHostLease | undefined;
-    try { taken = leaseOf(fs.readFileSync(aside, "utf8"), fileName(hostId)); } catch { taken = undefined; }
-    if (taken && owned(taken)) return true;
-    try { fs.linkSync(aside, file); } catch { /* EEXIST: a newer lease holds the name */ }
+    try { bytes = fs.readFileSync(aside); taken = leaseOf(bytes.toString("utf8"), fileName(hostId)); } catch { taken = undefined; }
+    if (taken && bytes && owned(taken)) {
+      try { beforeRemove?.(bytes); } catch { return false; }
+      discard = true;
+      return true;
+    }
     return false;
   } finally {
-    fs.rmSync(aside, { force: true });
+    if (!discard) {
+      try { fs.linkSync(aside, file); discard = true; }
+      catch (error) {
+        // A successor wins the canonical name. Reaper failures still retain the detached bytes;
+        // never destroy the only copy of an unarchived lease when restoring its name fails.
+        discard = beforeRemove === undefined && (error as NodeJS.ErrnoException).code === "EEXIST";
+      }
+    }
+    if (discard) fs.rmSync(aside, { force: true });
   }
 };
 
@@ -724,7 +751,9 @@ const cachedLease = (
   // NTFS IDs can exceed Number.MAX_SAFE_INTEGER, so distinct replacements can have the
   // same numeric ino. Nanosecond timestamps also avoid rounding away a change when a
   // filesystem lacks useful dev/ino values.
-  if (slot && slot.dev === stat.dev && slot.ino === stat.ino && slot.size === stat.size &&
+  // A census must retry readability as well as list membership: an unchanged cached body
+  // cannot hide a current open/read failure. Ordinary point/list reads keep the parse cache.
+  if (problems === undefined && slot && slot.dev === stat.dev && slot.ino === stat.ino && slot.size === stat.size &&
     slot.mtimeNs === stat.mtimeNs && slot.ctimeNs === stat.ctimeNs) return slot.lease ?? invalid();
   const parsed = parseLease(path.join(dir, name), name);
   if (!parsed.read) {                                       // unreadable for now: keep the last answer

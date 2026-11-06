@@ -112,6 +112,38 @@ write; a returning host/incarnation is retained. Own/recent/malformed records ar
 This path does not touch participants, deliveries, completion claims, result journals,
 residency directories or lineage receipts, and creates no new timer/standalone write.
 
+### Incremental host-lease reads and retirement
+
+Topology readers already have host IDs from validated state records. Directory liveness,
+mirrored control ownership and the committed-owner bridge alarm pass point-read only those
+IDs. Each point read checks current file metadata, including independent atomic renewals and
+synchronous directory replacement; unchanged metadata can reuse the parsed lease. Retained
+file-only orphans therefore add no listing or per-orphan stat work to these heartbeat paths.
+Full lease enumeration remains available for maintenance and a fresh, complete census.
+
+The existing dead-host sweep also handles lease files left after host-record compaction.
+It selects at most 500 target hosts per pass, excluding its own host and leases that expired
+less than or exactly 6 hours ago. Selection is not deletion authority: current state liveness,
+target custody, exact observed versions and a detached-file recheck protect returning hosts.
+No new timer, controller or notification protocol is introduced.
+
+Before unlinking an expired lease, the reaper writes an archive receipt durably at
+`host-lease-archive/<host lease filename>/<SHA-256 of exact bytes>.json`. Its fields are
+`format: 1`, `hostId`, `archivedAt`, `leaseSha256` and `leaseBase64`; the last field preserves
+the exact removed bytes, including unknown fields and original encoding. The content-addressed
+path prevents duplicate receipt files for the same body. File and namespace barriers precede
+removal. An archive failure restores the canonical lease; if restoration also fails, the detached
+copy is retained, never silently unlinked. Windows retains leases because the existing strict
+namespace-durability barrier is unsupported there. No raw session traces are touched.
+
+This reuses established lease-lifecycle and incremental-observation patterns:
+[Kubernetes Leases](https://kubernetes.io/docs/concepts/architecture/leases/) with existing
+[garbage collection](https://kubernetes.io/docs/concepts/architecture/garbage-collection/),
+and [etcd lease revocation and watches](https://etcd.io/docs/v3.7/learning/api/).
+Deploying Kubernetes or etcd would add infrastructure without replacing the existing file
+transport's ownership contract; the existing reaper and fresh by-ID reader provide the needed
+behavior without a second runtime.
+
 ## Diagnosis and measurements
 
 #468 (`ec455d4d`) is an ancestor of RC2 (`e7bc3f24`). It coalesced idle observers, but public

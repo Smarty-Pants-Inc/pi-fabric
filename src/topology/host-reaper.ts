@@ -186,7 +186,8 @@ const staleDirectoryDeletes = (
  * version-fenced; host/participant deletes additionally require their host still be gone
  * at commit: the two scans above are separate reads, and a host that renews after
  * them (with or without rewriting its participants) must keep every record (smarty-dev#367).
- * Returns how many it removed.
+ * Also archives/removes expired file leases whose state row was already compacted. Returns removed
+ * records plus file-only removals (a host row and its lease count once).
  */
 export const reapDeadHostRecords = async (
   mesh: Pick<MeshStore, "listAll" | "writeBatch" | "custody"> & Partial<Pick<MeshStore, "leaseCustody">> & { root?: string },
@@ -194,9 +195,16 @@ export const reapDeadHostRecords = async (
   options: DeadHostOptions & { withCommitFence?: <T>(operation: () => T | Promise<T>) => Promise<T> },
 ): Promise<number> => {
   const fenced = options.withCommitFence ?? (async <T>(operation: () => T | Promise<T>): Promise<T> => operation());
-  const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
+  const now = options.now ?? Date.now();
+  const cutoff = now - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const selectedLeases = fileLeases(mesh);
   const found = deadHostRecords(mesh, options, selectedLeases);
+  // Host-record compaction can precede this sweep. File-only victims must keep maintenance
+  // running even when no state/participant row remains; selection is NOT deletion authority.
+  const selectedTargets = new Set(found.map(item => item.hostId));
+  const expiredLeases = [...selectedLeases.values()].filter(lease => lease.id !== options.ownHostId &&
+    !selectedTargets.has(lease.id) && effectiveLiveness(undefined, lease).expiresAt < cutoff)
+    .slice(0, MAX_REAP_BATCH - selectedTargets.size);
   const bookkeeping = staleDirectoryDeletes(mesh, identity, options);
   // Leftovers of per-key lock operations whose process died (security pass S5 on #142).
   if (typeof mesh.root === "string") {
@@ -209,12 +217,12 @@ export const reapDeadHostRecords = async (
     // (smarty-dev#6622). Live pids' temps, including ours, are never touched.
     try { sweepAbandonedStateTemporaries(root); } catch { /* Best-effort; the next sweep retries. */ }
   }
-  if (found.length === 0 && bookkeeping.length === 0) return 0;
+  if (found.length === 0 && bookkeeping.length === 0 && expiredLeases.length === 0) return 0;
   const dead = found.filter((item) => !item.file);
   // A changed directory retries one bracketed read outside state custody, never a full scan
   // inside prepare. Exhaustion defers this maintenance pass without deleting records or files.
   let leases: ReadonlyMap<string, FabricHostLease> = new Map();
-  const targets = [...new Set(found.map(item => item.hostId))].sort();
+  const targets = [...selectedTargets, ...expiredLeases.map(lease => lease.id)].sort();
   const changed = new Error("Reaper target lease renewed or replaced");
   const root = mesh.root;
   const assertTarget = (hostId: string, expected: FabricHostLease | undefined): void => {
@@ -255,6 +263,7 @@ export const reapDeadHostRecords = async (
       prepare: (view, fileRead) => {
         // Rootless test adapters have no file leases. A real backend supplies the bracketed Map.
         if (typeof root === "string") leases = fileRead as ReadonlyMap<string, FabricHostLease>;
+        reapable.clear(); // A bracket retry must not retain authority from an earlier state view.
         for (const hostId of targets) {
           const host = view.get(hostKey(hostId));
           if (!host || leaseGone(host, cutoff, leases)) reapable.add(hostId);
@@ -266,11 +275,11 @@ export const reapDeadHostRecords = async (
       // Still inside every target's gate. Renew/claim cannot cross the state COMMIT
       // and exact-version lease removal. Never re-read/adopt a later renewal as a victim.
       commitOutbox: () => {
-        if (typeof root !== "string") return;
+        if (typeof root !== "string" || !mesh.leaseCustody) return;
         for (const hostId of reapable) {
           const expected = selectedLeases.get(hostId);
-          if (expected && effectiveLiveness(undefined, expected).expiresAt <= cutoff &&
-            removeHostLeaseVersionUnderCustody(root, expected)) retired.add(hostId);
+          if (expected && effectiveLiveness(undefined, expected).expiresAt < cutoff &&
+            removeHostLeaseVersionUnderCustody(root, expected, now)) retired.add(hostId);
         }
       },
     })));
@@ -279,7 +288,8 @@ export const reapDeadHostRecords = async (
       "code" in error && error.code === "FABRIC_MESH_STATE_FILE_READ_CHANGED")) return 0;
     throw error;
   }
-  let removed = results.filter(result => result.applied).length;
+  const removedKeys = new Set(results.filter(result => result.applied).map(result => result.key));
+  let removed = removedKeys.size + [...retired].filter(hostId => !removedKeys.has(hostKey(hostId))).length;
   if (typeof root === "string") {
     // Lock order remains participant key -> target gate -> own gate -> state.
     // A new claim after the shared commit keeps ALL remaining participant files.

@@ -46,7 +46,6 @@ import {
   participantLeaseGraceMs,
   waitForHostLeaseRenewal,
   type RoutingLeaseWaitOptions,
-  readHostLeases,
   removeHostLeaseIf,
   removeOwnedHostLease,
   FabricHostLeaseSupersededError,
@@ -2167,13 +2166,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   // Valid host records by id, each with its effective expiry: the later of its shared-state
   // lease and its file lease (smarty-dev#816).
-  #liveHosts(entries: Iterable<MeshStateEntry>, leases: ReadonlyMap<string, FabricHostLease> = readHostLeases(this.mesh.root)): Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }> {
+  #liveHosts(entries: Iterable<MeshStateEntry>, leases?: ReadonlyMap<string, FabricHostLease>): Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }> {
     const hosts = new Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }>();
+    const observed = new Map<string, FabricHostLease>();
+    const currentLeases = leases ?? observed;
     for (const entry of entries) {
       const host = hostFromEntry(entry);
-      const mirror = host && hostMirrorLease(leases, host);
-      if (host) hosts.set(host.id, { ...host, ...hostLiveness(leases, host),
-        ...(mirror ? { mirror } : host.remoteHost && (host.mirrorLease === 1 || leases.get(host.id)?.mirrorLease === 1)
+      if (!host) continue;
+      // State already names every host this operation can use. Point reads reuse parsed-file
+      // metadata, but stat anew even on fresh synchronous reads and independent atomic renewals.
+      // Orphan lease files belong to maintenance/census, not every Pi's directory heartbeat.
+      if (leases === undefined) {
+        const lease = readHostLease(this.mesh.root, host.id);
+        if (lease) observed.set(host.id, lease);
+      }
+      const mirror = hostMirrorLease(currentLeases, host);
+      hosts.set(host.id, { ...host, ...hostLiveness(currentLeases, host),
+        ...(mirror ? { mirror } : host.remoteHost && (host.mirrorLease === 1 || currentLeases.get(host.id)?.mirrorLease === 1)
           ? { bridgeStale: true as const } : {}) });
     }
     return hosts;
@@ -2279,8 +2288,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       participant.ownerHostId !== ownerHostId ||
       participant.ownerIdentityId !== ownerIdentityId
     ) return undefined;
-    const leases = readHostLeases(this.mesh.root);
-    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read), leases);
+    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
     const owner = hosts.get(ownerHostId);
     if (
       !owner ||

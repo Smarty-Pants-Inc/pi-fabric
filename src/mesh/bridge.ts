@@ -1150,7 +1150,26 @@ export class StoreBridgeSide implements BridgeSide {
       return { native, observedAt, until, digest: contentDigest({ native: content, mirrored, relays }),
         topology: contentDigest({ topology, mirrored, relays }) };
     };
-    const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
+    // Parent-directory stamps can alias across a real atomic replacement (including on
+    // POSIX). Validate the complete JSON filename set and each leaf's bigint identity on
+    // every platform, as the Windows directory-stamp path does, without opening JSON.
+    const files = (): string | undefined => {
+      try {
+        return [PARTICIPANT_FILE_DIR, HOST_LEASE_DIR].map(name => {
+          const directory = path.join(this.store.root, name);
+          let names: string[];
+          try { names = fs.readdirSync(directory).filter(file => file.endsWith(".json")).sort(); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return `${name}:absent`;
+            throw error;
+          }
+          return JSON.stringify([name, names, [directory, ...names.map(file => path.join(directory, file))].map(file => {
+            const stat = fs.statSync(file, { bigint: true });
+            return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+          })]);
+        }).join("|");
+      } catch { return undefined; } // A missing/unreadable listed leaf is unstable, not unchanged.
+    };
     // A WAL fs hint can precede COMMIT with NO later notification. A read transaction alone
     // cannot settle it: unchangedSince sees committed rows, not the pending writer. Retain one
     // short, zero-wait writer barrier for changed/unknown raw database evidence. Its stamp is
@@ -1170,9 +1189,9 @@ export class StoreBridgeSide implements BridgeSide {
         }).join("|");
       } catch { return undefined; } // Unknown evidence always requires settlement, never reuse.
     };
-    let observed: { value: ReturnType<typeof snapshot>; revision: string | undefined; files: string; raw: string | undefined } | undefined;
+    let observed: { value: ReturnType<typeof snapshot>; revision: string | undefined; files: string | undefined; raw: string | undefined } | undefined;
     const reusable = (): boolean => {
-      if (!observed || observed.revision === undefined) return false;
+      if (!observed || observed.revision === undefined || observed.files === undefined) return false;
       const now = this.now();
       return now >= observed.value.observedAt && now < observed.value.until &&
         this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) && files() === observed.files;
@@ -1196,7 +1215,7 @@ export class StoreBridgeSide implements BridgeSide {
       // Files or WAL frames changing during capture invalidate this attempt, not a second
       // in-tick fence/scan. Watch callbacks latch a trailing tick; the retry also covers a
       // pre-COMMIT hint whose writer emits nothing further. Unknown raw stamps are not cached.
-      if (!next || files() !== next.files || (raw !== undefined && rawState() !== raw)) {
+      if (!next || next.files === undefined || files() !== next.files || (raw !== undefined && rawState() !== raw)) {
         deferredCaptures += 1;
         const now = Date.now();
         if (now - deferredLoggedAt >= 60_000) {

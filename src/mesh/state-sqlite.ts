@@ -1180,7 +1180,18 @@ export class SqliteStateStore {
         return { stamp, commit, complete: false, changed: [] };
       }
       const keys = new Set<string>();
-      if (after < commit) for (const row of this.#sql.changesSince.all(after)) keys.add(String(row.key));
+      // As in unchangedSince, the retention floor alone cannot prove every commit is covered.
+      // A missing commit must rebuild the snapshot, not re-stamp its old entries as current.
+      let covered = after;
+      if (after < commit) for (const row of this.#sql.changesSince.all(after)) {
+        const changedCommit = Number(row.commit_no);
+        if (changedCommit !== covered) {
+          if (changedCommit !== covered + 1) return { stamp, commit, complete: false, changed: [] };
+          covered = changedCommit;
+        }
+        keys.add(String(row.key));
+      }
+      if (covered !== commit) return { stamp, commit, complete: false, changed: [] };
       const changed: SqliteDeltaKey[] = [];
       for (const key of keys) {
         const row = this.#sql.kvGet.get(key);

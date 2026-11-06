@@ -155,6 +155,14 @@ export class TranscriptAccumulator {
     return entry;
   }
 
+  #finishedTool(id: string): FabricTranscriptEntry | undefined {
+    for (let index = this.entries.length - 1; index >= 0; index--) {
+      const entry = this.entries[index]!;
+      if (entry.kind === "tool" && entry.id === id) return entry.status !== "running" ? entry : undefined;
+    }
+    return undefined;
+  }
+
   #finishTool(id: string | undefined, label: string, result: unknown, failed: boolean): void {
     const safeLabel = terminalSafe(label) || "tool";
     if (id) {
@@ -162,10 +170,15 @@ export class TranscriptAccumulator {
       this.#toolResultMetadata.delete(id);
     }
     const anonymous = this.#anonymousTools.get(safeLabel);
-    const entry = id ? this.#tools.get(id) : anonymous?.shift();
+    // A metadata-only end removes the active call immediately. Its later
+    // guarded payload upgrades that same entry, retaining the actual parent.
+    // A new explicit start wins over older finished entries with a reused ID.
+    const entry = id ? this.#tools.get(id) ?? this.#finishedTool(id) : anonymous?.shift();
     if (anonymous?.length === 0) this.#anonymousTools.delete(safeLabel);
     const safeResult = result === undefined ? undefined : redact(result);
     if (entry) {
+      // A repeated metadata end cannot erase or downgrade a final payload.
+      if (safeResult === undefined && entry.result !== undefined) return;
       entry.status = failed ? "failed" : "completed";
       if (safeResult !== undefined) entry.result = safeResult;
       if (failed && result !== undefined) {
@@ -222,9 +235,9 @@ export class TranscriptAccumulator {
     }
     if (message.role === "toolResult") {
       const toolId = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
-      // Old RPC logs already completed the call with a full execution-end
-      // result. New logs defer that payload to this canonical message.
-      if (toolId && this.#finishedTools.has(toolId)) return;
+      // Old full execution-end results remain authoritative. Metadata-only
+      // completions can still receive the canonical payload on the same entry.
+      if (toolId && this.#finishedTools.has(toolId) && this.#finishedTool(toolId)?.result !== undefined) return;
       const label = typeof message.toolName === "string" ? message.toolName : "tool";
       const metadata = toolId ? this.#toolResultMetadata.get(toolId) : undefined;
       this.#finishTool(

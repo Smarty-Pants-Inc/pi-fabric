@@ -490,18 +490,25 @@ if (process.argv.includes('--descendant')) {
     const stub = { type: "image", elided: true, bytes: ((5 * 1024 * 1024 + 4) * 3) / 4, mimeType: "image/png" };
     const ends = events.filter((event) => event.type === "tool_execution_end");
     const canonicals = events.filter((event) => event.type === "message_end" && event.message?.role === "toolResult");
-    expect(ends).toHaveLength(1);
-    expect(canonicals).toHaveLength(1);
-    const end = ends[0];
+    // Raw completion carries allowlisted metadata only. The final guarded
+    // message supplies exactly one result, without a duplicate canonical copy.
+    const guardedEnds = ends.filter((event) => Object.hasOwn(event, "result"));
+    const metadataEnds = ends.filter((event) => !Object.hasOwn(event, "result"));
+    expect(guardedEnds).toHaveLength(1);
+    expect(metadataEnds).toEqual([
+      { type: "tool_execution_end", toolCallId: "read-1", toolName: "read", isError: false },
+    ]);
+    expect(canonicals).toHaveLength(0);
+    const end = guardedEnds[0];
     const content = [{ type: "text", text: "Read image file [image/png]" }, stub];
     expect(end).toMatchObject({ toolCallId: "read-1", toolName: "read", isError: false });
-    expect(canonicals[0].message).toEqual({ role: "toolResult", toolCallId: "read-1", toolName: "read", content });
     // This ordinary, uniquely paired log is well within every work bound.
     // A platform-wide durability failure must not masquerade as an accepted fallback.
     expect(result.compactionSkipped).toBeUndefined();
     // The projected result (image data stubbed) is small, so it stays inline (B72 small-result contract).
     expect(Buffer.byteLength(JSON.stringify({ content }), "utf8")).toBeLessThanOrEqual(8192);
-    expect(end.result).toEqual({ content });
+    expect(end).toEqual({ type: "tool_execution_end", toolCallId: "read-1", toolName: "read",
+      isError: false, result: { content } });
   }, 30_000);
 
   it.each(["oversized-final", "oversized-error"])(
@@ -524,17 +531,11 @@ if (process.argv.includes('--descendant')) {
     expect(result.status).toBe("completed");
     expect(result.text).toBe("after oversized");
     expect(result.warnings).toHaveLength(1);
-    expect(result.warnings![0]).toContain("Dropped an oversized agent event line (message_end");
-    const artifactPath = result.warnings![0]!.match(/saved to: (.+)$/)?.[1];
-    expect(artifactPath).toBeDefined();
-    expect(path.dirname(artifactPath!)).toBe(path.dirname(result.logFile!));
-
-    const prefix = fs.readFileSync(artifactPath!, "utf8");
-    expect(prefix).toHaveLength(4 * 1024 * 1024);
-    expect(prefix).toMatch(/^\{"type":"message_end","message":\{"role":"assistant","content":"x+/);
-    if (process.platform !== "win32") {
-      expect(fs.statSync(artifactPath!).mode & 0o777).toBe(0o600);
-    }
+    expect(result.warnings![0]).toMatch(
+      /^Dropped an oversized agent event line \(message_end, \d+ characters > \d+\); raw prefix not retained$/,
+    );
+    expect(result.warnings![0]).not.toContain("saved to:");
+    expect(fs.existsSync(path.join(path.dirname(result.logFile!), "oversized-event-prefix.txt"))).toBe(false);
   }, 30_000);
 
   describe("agent session usage export", () => {

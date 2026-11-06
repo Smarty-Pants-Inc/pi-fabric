@@ -306,11 +306,32 @@ process.stdin.on("end", () => {
         }
       } else {
         expect(result.compactionSkipped).toBeUndefined();
-        expect(fs.statSync(file).ino).not.toBe(receipt.ino);
-        expect(bytes.length).toBeLessThan(receipt.bytes);
-        const ends = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line)).filter((event) => event.type === "tool_execution_end");
-        expect(ends).toHaveLength(scenario === "near-deadline" ? 400 : 1);
-        expect(ends.every((event) => event.result.elided === true && event.resultMetadata.terminate === true)).toBe(true);
+        // Metadata-only raw ends have no body to compact. Each guarded result
+        // remains once, with no canonical duplicate or generation to replace.
+        expect(fs.statSync(file).ino).toBe(receipt.ino);
+        const originalPrefix = bytes.subarray(0, receipt.bytes);
+        expect(originalPrefix.byteLength).toBe(receipt.bytes);
+        expect(createHash("sha256").update(originalPrefix).digest("hex")).toBe(receipt.sha256);
+        expect(fs.existsSync(`${file}.original`)).toBe(false);
+        const events = bytes.toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+        const ends = events.filter((event) => event.type === "tool_execution_end");
+        const guardedEnds = ends.filter((event) => Object.hasOwn(event, "result"));
+        const metadataEnds = ends.filter((event) => !Object.hasOwn(event, "result"));
+        const pairs = scenario === "near-deadline" ? 400 : 1;
+        expect(guardedEnds).toHaveLength(pairs);
+        expect(metadataEnds).toHaveLength(pairs);
+        for (const [index, event] of metadataEnds.entries()) {
+          expect(event).toEqual({ type: "tool_execution_end", toolCallId: `real-${index}`,
+            toolName: "bash", isError: false });
+        }
+        for (const [index, event] of guardedEnds.entries()) {
+          expect(event).toEqual({ type: "tool_execution_end", toolCallId: `real-${index}`,
+            toolName: "bash", isError: false,
+            result: { content: [{ type: "text", text: "x".repeat(16 * 1024) }] } });
+          expect(event).not.toHaveProperty("terminate");
+          expect(event).not.toHaveProperty("resultMetadata");
+        }
+        expect(events.filter((event) => event.type === "message_end" && event.message?.role === "toolResult")).toHaveLength(0);
       }
     } finally { spy.mockRestore(); await manager.close(); }
   }, 25_000);
@@ -341,6 +362,42 @@ describe("worker run log", () => {
     expect(outcome.compacted).toBe(1);
     expect(readEntries(compacted)).toEqual(readEntries(live));
     expect(readTranscript(compacted).streaming).toEqual(readTranscript(live).streaming);
+  });
+
+  it("elides structuredContent from terminal resultMetadata while preserving safe canonical content and control metadata", () => {
+    // Data-safety regression: supplementary bodies must not survive as metadata.
+    const rawFake = "FAKE/compactor supplement";
+    const encodedFake = "%46%41%4B%45%2Fcompactor%20supplement";
+    const { events, end, message } = capEvents(largeResultText("safe canonical content"), true, {
+      structuredContent: { raw: rawFake, encoded: encodedFake },
+      terminate: true,
+      opaque: { values: [null, false, 7] },
+    });
+    const live = write(events, true, false).text;
+    expect(live).toContain(rawFake);
+    expect(live).toContain(encodedFake);
+    const file = logFile(live);
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      const outcome = compactTerminalRunLog(file, "completed");
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.compactionSkipped).toBeUndefined();
+      expect(outcome.compacted).toBe(1);
+    } finally { clock.mockRestore(); }
+    const compacted = fs.readFileSync(file, "utf8");
+    const records = compacted.trimEnd().split("\n").map((line) => JSON.parse(line));
+    expect(compacted).not.toContain("structuredContent");
+    expect(compacted).not.toContain("FAKE");
+    expect(compacted).not.toContain(encodedFake);
+    expect(records.find((event) => event.type === "tool_execution_end")).toEqual({
+      ...end,
+      result: { elided: true, bytes: Buffer.byteLength(JSON.stringify(end.result), "utf8") },
+      resultMetadata: { terminate: true, opaque: { values: [null, false, 7] } },
+    });
+    expect(records.find((event) => event.type === "message_end")).toEqual({ type: "message_end", message });
+    expect(records[0]).toEqual(events[0]);
+    // The legacy source remains unchanged; only the compacted reader view elides it.
+    expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(live);
   });
 
   it("exports the small-result retention threshold as exactly 8KiB", () => {

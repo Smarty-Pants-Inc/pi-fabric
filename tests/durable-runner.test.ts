@@ -60,6 +60,44 @@ describe("published Pi durable hosted adapter", () => {
     expect(state.context.idempotencyKey).toBe(result.id);
   });
 
+  it.each([false, true])("persists only hosted tool metadata without changing model content (isError=%s)", async isError => {
+    const f = setup();
+    const fakeText = "FAKE hosted tool text 🧪";
+    const fakeDetails = "FAKE nested tool details";
+    const fakeStructured = "FAKE structured tool content";
+    const encodedSupplement = encodeURIComponent("FAKE supplement /+=🧪");
+    const args = { input: "FAKE raw tool argument" };
+    const content = [{ type: "text" as const, text: fakeText }, { type: "text" as const, text: encodedSupplement }];
+    const details = { nested: { text: fakeDetails, structuredContent: { text: fakeStructured, supplement: encodedSupplement } } };
+    const configuredResult = { content, details, structuredContent: { text: fakeStructured }, isError };
+    const execute = vi.fn(async (_args: { input: string }) => configuredResult);
+    f.registry.install(defineExtension({ name: "tools", tools: [defineTool({ name: "fixture", description: "configured fake result", parameters: Type.Object({ input: Type.String() }), execute })] }));
+    const toolCallId = "hosted-fixture-call";
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("fixture", args, { id: toolCallId }), { stopReason: "toolUse" }),
+      transcript => {
+        expect(transcript.messages.find(message => message.role === "toolResult")).toMatchObject({ toolName: "fixture", toolCallId, content, details, isError });
+        return fauxAssistantMessage("normal execution complete");
+      },
+    ]);
+    const runner = f.make(); cleanup.push(registerAgentRunner(runner));
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, { runRoot: path.join(f.root, "runs"), fullCodeMode: false }); cleanup.push(() => manager.close());
+    const result = await manager.run({ task: "run the configured fixture", runner: runner.id, model: "offline/test", tools: ["fixture"], thinking: "off", recursive: false });
+    expect(result).toMatchObject({ status: "completed", transport: "hosted", text: "normal execution complete", toolCalls: 1 });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0]?.[0]).toEqual(args);
+    expect(f.faux.state.callCount).toBe(2);
+    const log = fs.readFileSync(path.join(manager.runDirectory(result.id)!, "events.jsonl"), "utf8");
+    const events = log.trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
+    expect(events.filter(event => event.type === "tool_execution_start")).toEqual([
+      { type: "tool_execution_start", toolName: "fixture", toolCallId, argsBytes: Buffer.byteLength(JSON.stringify(args), "utf8") },
+    ]);
+    expect(events.filter(event => event.type === "tool_execution_end")).toEqual([
+      { type: "tool_execution_end", toolName: "fixture", toolCallId, isError, resultBytes: Buffer.byteLength(JSON.stringify(content), "utf8") },
+    ]);
+    for (const payload of [fakeText, fakeDetails, fakeStructured, encodedSupplement, args.input]) expect(log).not.toContain(payload);
+  });
+
   it("duplicate starts and persistent reopen attach do not duplicate submission or effects", async () => {
     const f = setup(true); let effects = 0;
     const tool = defineTool({ name: "effect", description: "effect", parameters: Type.Object({}), execute: async () => { effects++; return { content: [{ type: "text", text: "effect done" }] }; } });

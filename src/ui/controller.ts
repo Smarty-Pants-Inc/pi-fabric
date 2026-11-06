@@ -904,7 +904,9 @@ export class FabricUiController {
         // Explicit refreshes promise a full payload; only scheduled closed
         // refreshes may reuse the widget-only unchanged-input proof.
         const previous = reuseClosedSnapshot ? this.#snapshotCache.get(inputs) : undefined;
-        if (previous) this.#snapshot = previous;
+        // The hit proves only that the widget projection is unchanged. Shell
+        // output/monitor metadata was already collected and must remain live.
+        if (previous) this.#snapshot = { ...previous, shells: observed.shells };
         else {
           this.#snapshotCache.clear();
           this.#snapshot = createDashboardSnapshot(

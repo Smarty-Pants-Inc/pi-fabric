@@ -650,7 +650,7 @@ describe("F1 shell monitor closed-cache comparison", () => {
     shell.batch("progress 3");
     await vi.advanceTimersByTimeAsync(5_000);
     expect(buildSnapshot).toHaveBeenCalledTimes(2); // Explicit refresh seeded the existing cache.
-    expect(h.controller.snapshot().shells?.[0]?.eventCount).toBe(2);
+    expect(h.controller.snapshot().shells?.[0]?.eventCount).toBe(3);
     await h.openDashboard();
     expect(h.controller.snapshot().shells).toEqual(shell.list());
     const buildsAtOpen = buildSnapshot.mock.calls.length;
@@ -734,5 +734,164 @@ describe("F1 shell monitor closed-cache comparison", () => {
     expect(buildSnapshot).toHaveBeenCalledTimes(counts[1]!);
     expect(collect).toHaveBeenCalledTimes(counts[0]! + 1);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// D1 keep reason: the independent delta audit caught already-collected shell
+// metadata being discarded on a widget-only cache hit. Exercise the mounted
+// controller subscription path, not a replacement widget, scheduler or builder.
+describe("D1 live shell metadata on closed-cache hits", () => {
+  it("publishes output, monitor and acknowledgement metadata without rereading or repainting unchanged rows", async () => {
+    const h = harness();
+    const shell = attachShells(h, [{ ...monitoredShell(), eventCount: 2, unread: false,
+      lastOutputAt: 8_000, lastEvent: { at: 9_000, lines: ["progress 2"], omitted: 0 } }]);
+    const collect = vi.spyOn(snapshots, "collectDashboardSnapshotInputs");
+    h.controller.start(h.context);
+    const before = h.widgetText();
+    expect(before).toContain("Build monitor");
+    expect(before).toContain("monitor:ui");
+    expect(h.controller.snapshot().shells?.[0]).toMatchObject({ eventCount: 2, unread: false });
+    const expensive = [h.state.actors.instructions, h.state.actors.messages, h.state.globalActors.list,
+      h.state.peerInfos, h.state.componentGraph, h.state.mesh.list].map(read => vi.mocked(read));
+    const counts = expensive.map(read => read.mock.calls.length);
+    const stat = vi.spyOn(fs, "statSync");
+    const read = vi.spyOn(fs, "readFileSync");
+    const watch = vi.spyOn(fs, "watch");
+    h.widgetRender.mockClear();
+
+    await vi.advanceTimersByTimeAsync(10);
+    shell.output(); // Nonempty output precedes its later monitor batch.
+    expect(shell.jobs[0]!.lastOutputAt).toBe(10_010);
+    await vi.advanceTimersByTimeAsync(1_000);
+    shell.batch("progress 3"); // The actual start() subscriber owns the data deadline.
+    expect(shell.jobs[0]).toMatchObject({ eventCount: 3, unread: true,
+      lastOutputAt: 10_010, lastEvent: { at: 11_010, lines: ["progress 3"] } });
+    await vi.advanceTimersByTimeAsync(3_989);
+    expect(collect).toHaveBeenCalledTimes(1);
+    expect(h.controller.snapshot().shells?.[0]?.eventCount).toBe(2); // No premature observation.
+    await vi.advanceTimersByTimeAsync(1);
+    expect.soft(h.controller.snapshot().shells).toEqual(shell.jobs);
+    expect(h.widgetText()).toBe(before);
+    expect(h.widgetRender).not.toHaveBeenCalled();
+    expect(buildSnapshot).toHaveBeenCalledTimes(1);
+    expect(collect).toHaveBeenCalledTimes(2);
+    expect(shell.list).toHaveBeenCalledTimes(2); // One collector read, no hit-time second read.
+
+    // Snapshot callers own a clone, not the newly observed payload itself.
+    const copy = h.controller.snapshot();
+    copy.shells![0]!.lastEvent!.lines[0] = "caller mutation";
+    expect.soft(h.controller.snapshot().shells?.[0]?.lastEvent?.lines).toEqual(["progress 3"]);
+    shell.jobs[0]!.unread = false;
+    shell.emit("acknowledged");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect.soft(h.controller.snapshot().shells).toEqual(shell.jobs);
+    expect.soft(h.controller.snapshot().shells?.[0]).toMatchObject({ eventCount: 3, unread: false,
+      lastOutputAt: 10_010, lastEvent: { at: 11_010, lines: ["progress 3"] } });
+    expect(h.widgetText()).toBe(before);
+    expect(h.widgetRender).not.toHaveBeenCalled();
+    expect(buildSnapshot).toHaveBeenCalledTimes(1);
+    expect(collect).toHaveBeenCalledTimes(3);
+    expect(shell.list).toHaveBeenCalledTimes(3);
+    expect(expensive.map(read => read.mock.calls.length)).toEqual(counts);
+    for (const io of [stat, read, watch]) expect(io).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the latest hit metadata through a cheap 30s retention paint without moving pending data", async () => {
+    const h = harness();
+    const shell = attachShells(h, [{ ...monitoredShell(), status: "exited", finishedAt: 10_000,
+      exitCode: 0, eventCount: 2, unread: true,
+      lastEvent: { at: 9_000, lines: ["final progress"], omitted: 0 } }]);
+    const collect = vi.spyOn(snapshots, "collectDashboardSnapshotInputs");
+    h.controller.start(h.context);
+    expect(h.widgetText()).toContain("Build monitor");
+    await vi.advanceTimersByTimeAsync(1_000);
+    shell.jobs[0]!.unread = false;
+    shell.emit("acknowledged");
+    await vi.advanceTimersByTimeAsync(4_000); // Admit an unchanged completed-shell cache hit.
+    expect.soft(h.controller.snapshot().shells).toEqual(shell.jobs);
+    expect(buildSnapshot).toHaveBeenCalledTimes(1);
+    expect(h.widgetText()).toContain("Build monitor");
+    const observations = [collect, buildSnapshot, shell.list, h.state.mainAgentInfo,
+      h.state.actors.list, h.state.agents.listForUi, h.state.participantInfos, h.state.mesh.tail];
+    const counts = observations.map(read => vi.mocked(read).mock.calls.length);
+    h.state.config.ui.refreshMs = 60_000;
+    h.records[0] = { ...h.records[0]!, currentTool: "pending-after-shell-hit", updatedAt: Date.now() };
+    h.emit("agent"); // Original deadline remains 60000ms after the admitted cache hit.
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(h.widgetText()).toContain("Build monitor"); // No independent expiry timer.
+    const stat = vi.spyOn(fs, "statSync");
+    const read = vi.spyOn(fs, "readFileSync");
+    const watch = vi.spyOn(fs, "watch");
+    h.widgetRender.mockClear();
+    shell.emit("acknowledged"); // First existing notification at exactly 30s.
+    expect(h.widgetText()).not.toContain("Build monitor");
+    expect(h.widgetText()).not.toContain("pending-after-shell-hit");
+    expect(h.widgetRender).toHaveBeenCalledTimes(1);
+    expect.soft(h.controller.snapshot().shells).toEqual(shell.jobs);
+    expect(observations.map(read => vi.mocked(read).mock.calls.length)).toEqual(counts);
+    for (const io of [stat, read, watch]) expect(io).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(34_999);
+    expect(h.widgetText()).not.toContain("pending-after-shell-hit");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.widgetText()).toContain("pending-after-shell-hit");
+    expect(h.controller.snapshot().shells).toEqual(shell.jobs);
+    expect(buildSnapshot).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("D1 conversation full-consumer boundary", () => {
+  it("takes fresh shell metadata before attachment and keeps open-conversation notifications live", async () => {
+    const { initTheme } = await import("@earendil-works/pi-coding-agent");
+    const { FabricConversationView } = await import("../src/ui/conversation.js");
+    initTheme("dark", false);
+    const h = harness();
+    const shell = attachShells(h);
+    const collect = vi.spyOn(snapshots, "collectDashboardSnapshotInputs");
+    h.controller.start(h.context);
+    shell.output();
+    shell.batch("closed progress");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(buildSnapshot).toHaveBeenCalledTimes(1);
+    expect(h.controller.snapshot().shells).toEqual(shell.jobs);
+    shell.output();
+    shell.batch("before conversation"); // Pending data must not wait for the closed deadline.
+    vi.mocked(h.state.actors.instructions).mockReturnValue("Fresh conversation shell control");
+    let view: InstanceType<typeof FabricConversationView> | undefined;
+    let close = () => {};
+    let attached = () => {};
+    const ready = new Promise<void>(resolve => { attached = resolve; });
+    const tui = { terminal: { rows: 40 }, requestRender: vi.fn() } as unknown as TUI;
+    vi.spyOn(h.context.ui, "custom").mockImplementation(((factory: (
+      tui: TUI, theme: Theme, keys: unknown, done: () => void,
+    ) => InstanceType<typeof FabricConversationView>) => new Promise<void>(resolve => {
+      close = resolve;
+      expect(h.controller.snapshot().shells).toEqual(shell.jobs);
+      expect(h.controller.snapshot().shells?.[0]?.eventCount).toBe(2);
+      expect(h.controller.snapshot().actors[0]?.instructions).toBe("Fresh conversation shell control");
+      view = factory(tui, theme, { matches: () => false, getKeys: () => [] }, resolve);
+      attached();
+    })) as ExtensionContext["ui"]["custom"]);
+    const pending = h.controller.openConversation(h.context, "agent-1");
+    try {
+      await Promise.race([ready, pending.then(() => { throw new Error("conversation did not attach"); })]);
+      expect(view).toBeInstanceOf(FabricConversationView);
+      expect(view!.render(160).join("\n")).toContain("reader");
+      expect(buildSnapshot).toHaveBeenCalledTimes(2);
+      shell.output();
+      shell.batch("open progress");
+      // The previously armed closed deadline remains owned by the same scheduler.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(buildSnapshot).toHaveBeenCalledTimes(3);
+      expect(collect).toHaveBeenCalledTimes(2); // Open builds bypass the controller's closed-cache gate.
+      expect(h.controller.snapshot().shells).toEqual(shell.jobs);
+      expect(h.controller.snapshot().shells?.[0]).toMatchObject({ eventCount: 3, unread: true });
+      expect(view!.render(160).join("\n")).toContain("reader");
+    } finally {
+      close();
+      await pending;
+    }
   });
 });

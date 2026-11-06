@@ -168,6 +168,8 @@ const lazyEntryPoints = [
   "src/type-error-guidance.ts",
   "src/speculation/scanner.ts",
   "src/speculation/python-scanner.ts",
+  // The unchanged controller loads immediately before first activated TUI start.
+  "src/ui/controller.ts",
   "src/ui/dashboard.ts",
   "src/ui/shell-tasks.ts",
   "src/ui/image-overlays.ts",

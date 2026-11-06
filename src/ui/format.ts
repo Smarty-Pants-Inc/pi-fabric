@@ -1,4 +1,38 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { FabricUiAgent } from "./types.js";
+
+// Shared by eager command registration and the first-use widget/controller.
+export const FABRIC_CONVERSATION_SHORTCUT = "ctrl+shift+a";
+export const FABRIC_CONVERSATION_HINT = "ctrl+shift+a chat";
+
+export const activeStatuses = new Set([
+  "queued",
+  "preparing",
+  "waiting",
+  "pending",
+  "ready",
+  "claimed",
+  "running",
+  "finishing",
+  "in_progress",
+  "blocked",
+  "loading",
+  "active",
+  "unloading",
+]);
+
+export const isActiveStatus = (status: string): boolean => activeStatuses.has(status);
+
+export const orderAgentsByCreation = (agents: FabricUiAgent[]): FabricUiAgent[] =>
+  agents
+    .map((agent, index) => ({ agent, index }))
+    .sort(
+      (left, right) =>
+        (left.agent.startedAt ?? Number.MAX_SAFE_INTEGER) -
+          (right.agent.startedAt ?? Number.MAX_SAFE_INTEGER) ||
+        left.index - right.index,
+    )
+    .map(({ agent }) => agent);
 
 export const safeText = (value: unknown): string =>
   String(value ?? "")

@@ -23,7 +23,7 @@ import { awaitPeerSettle, buildPeerCards } from "../topology/peer-settle.js";
 
 export interface FabricCommandDeps {
   state: FabricState;
-  fabricUi: FabricUiController;
+  fabricUi: FabricUiController | undefined;
   capturedTools: CapturedToolCatalog;
   applyFabricMode: () => void;
   suspendToolCapture: () => void;
@@ -139,7 +139,7 @@ const armPrewalk = async (
 };
 
 export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps): void {
-  const { state, fabricUi } = deps;
+  const { state } = deps;
   const unsubscribePrewalkRequests = pi.events?.on?.(FABRIC_PREWALK_REQUEST_EVENT, (value) => {
     const request = readFabricPrewalkRequestV1(value);
     if (!request || !request.claim()) return;
@@ -220,8 +220,11 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     handler: async (context) => {
       if (context.mode !== "tui") return;
       try {
-        await state.ensure(context);
-        await fabricUi.openConversation(context);
+        const lifecycle = await state.ensure(context);
+        if (lifecycle && !lifecycle.current()) return;
+        const fabricUi = deps.fabricUi;
+        if (fabricUi) await fabricUi.openConversation(context);
+        else context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning");
       } catch (error) {
         context.ui.notify(safeText(error instanceof Error ? error.message : String(error)), "error");
       }
@@ -232,8 +235,18 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     description: "Inspect Fabric background shell tasks",
     handler: async (context) => {
       if (context.mode !== "tui") return;
-      try { await state.ensure(context); await fabricUi.openTasks(context); }
-      catch (error) { context.ui.notify(safeText(error instanceof Error ? error.message : String(error)), "error"); }
+      try {
+        const lifecycle = await state.ensure(context);
+        if (lifecycle && !lifecycle.current()) return;
+        const fabricUi = deps.fabricUi;
+        if (fabricUi) await fabricUi.openTasks(context);
+        else {
+          const jobs = state.shellJobs;
+          if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
+          void jobs.durable?.resume();
+          context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning");
+        }
+      } catch (error) { context.ui.notify(safeText(error instanceof Error ? error.message : String(error)), "error"); }
     },
   });
 
@@ -294,7 +307,8 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         return matches.map(job => ({ value: `tasks ${job.id}`, label: job.id.slice(0, 8), description: safeText(job.description ?? job.command).slice(0, 120) }));
       }
       if (subcommand === "chat") {
-        const snapshot = fabricUi.snapshot();
+        const snapshot = deps.fabricUi?.snapshot();
+        if (!snapshot) return null;
         const seen = new Set<string>();
         const targets = [snapshot.main, ...snapshot.peers, ...snapshot.actors, ...snapshot.agents, ...(snapshot.participants ?? [])];
         const matches = targets.filter((target) => {

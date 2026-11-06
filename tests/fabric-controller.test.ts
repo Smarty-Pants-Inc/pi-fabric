@@ -177,13 +177,13 @@ describe("FabricUiController dashboard wiring", () => {
       const history = controller.snapshot().runs[1];
       expect(controller.snapshot().runs[0]!.calls[0]).not.toHaveProperty("args");
       activity.updateCall("live", "call", { type: "progress", message: "working" });
-      await vi.advanceTimersByTimeAsync(110);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       // The public snapshot() API deliberately returns isolated copies.
       expect(controller.snapshot().runs[1]).toEqual(history);
       expect(controller.snapshot().runs[0]!.calls[0]!.progress).toBe("working");
       vi.mocked(state.mainAgentInfo).mockClear();
       for (let i = 0; i < 100; i++) activity.updateCall("live", "call", { type: "progress", message: "working" });
-      await vi.advanceTimersByTimeAsync(110);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(state.mainAgentInfo).not.toHaveBeenCalled();
       await controller.openDashboard(context);
       expect(controller.snapshot().runs[0]!.calls[0]).not.toHaveProperty("args");
@@ -521,10 +521,10 @@ describe("FabricUiController dashboard wiring", () => {
       controller.start(context);
       expect(state.activity.runs).toHaveBeenCalledTimes(1);
       onActor();
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(state.activity.runs).toHaveBeenCalledTimes(2);
       onAgent();
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(state.activity.runs).toHaveBeenCalledTimes(3);
     } finally {
       controller.stop();
@@ -532,7 +532,7 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("coalesces bursty activity updates into a 10 Hz refresh", async () => {
+  it("coalesces bursty activity updates into the configured 500ms refresh slot", async () => {
     vi.useFakeTimers();
     const state = stubState();
     state.config.ui.refreshMs = 500;
@@ -550,7 +550,7 @@ describe("FabricUiController dashboard wiring", () => {
       controller.start(context);
       expect(state.activity.runs).toHaveBeenCalledTimes(1);
       for (let index = 0; index < 25; index++) onActivity();
-      await vi.advanceTimersByTimeAsync(99);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs - 1);
       expect(state.activity.runs).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(1);
       expect(state.activity.runs).toHaveBeenCalledTimes(2);
@@ -604,12 +604,12 @@ describe("FabricUiController dashboard wiring", () => {
       );
       await vi.advanceTimersByTimeAsync(10_001);
       onActor();
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(notify).toHaveBeenCalledTimes(1);
 
       cause = "different activity failure";
       onActor();
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(notify).toHaveBeenCalledTimes(2);
       expect(notify).toHaveBeenLastCalledWith(
         "Fabric dashboard refresh failed: different activity failure",
@@ -688,7 +688,7 @@ describe("FabricUiController dashboard wiring", () => {
         // warning throttle would have expired; resume-style lifecycle also resets it.
         await vi.advanceTimersByTimeAsync(10_001);
         onActor();
-        await vi.advanceTimersByTimeAsync(100);
+        await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
         expect(context.ui.notify).not.toHaveBeenCalled();
         controller.stop();
         controller.start(context);
@@ -698,7 +698,7 @@ describe("FabricUiController dashboard wiring", () => {
         // can be read again, a normal event refresh restores it to the real UI.
         goneExists = true;
         onActor();
-        await vi.advanceTimersByTimeAsync(100);
+        await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
         expect(controller.snapshot().actors.map(actor => actor.id)).toContain(gone.id);
         expect(context.ui.notify).not.toHaveBeenCalled();
       } finally {
@@ -761,10 +761,10 @@ describe("FabricUiController dashboard wiring", () => {
       expect(state.activity.runs).not.toHaveBeenCalled();
       expect(controller.snapshot().runs[0]?.name).toBe("summary view");
 
-      // Streaming updates stay on the cheap path at the 10 Hz cadence.
+      // Streaming updates stay on the cheap path at the configured closed slot.
       revision = 2;
       onActivity();
-      await vi.advanceTimersByTimeAsync(110);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(runSummaries).toHaveBeenCalledTimes(2);
       expect(state.activity.runs).not.toHaveBeenCalled();
 
@@ -1343,7 +1343,7 @@ describe("FabricUiController dashboard wiring", () => {
       controller.start(context);
       vi.mocked(tui.requestRender).mockImplementation(() => { throw new Error("disposed TUI"); });
       activity.beginCall("live", { callId: "disposed", ref: "pi.read", args: {} });
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(context.ui.notify).toHaveBeenCalledWith(expect.stringContaining("disposed TUI"), "warning");
       expect(vi.getTimerCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(5_000);
@@ -1379,7 +1379,7 @@ describe("FabricUiController dashboard wiring", () => {
     try {
       controller.start(context);
       activity.start("live", { name: "T06 slice A" });
-      await vi.advanceTimersByTimeAsync(110);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(widget).toBeDefined();
       const reserved = widget!.render(80);
       expect(reserved).toHaveLength(6);
@@ -1388,7 +1388,7 @@ describe("FabricUiController dashboard wiring", () => {
         activity.beginCall("live", { callId, ref: "pi.read", args: { path: `${index}.ts` } });
         activity.finishCall("live", callId, { success: true, result: "ok" });
       }
-      await vi.advanceTimersByTimeAsync(1_100);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(widget).toBeDefined();
       const first = widget!.render(80).join("\n");
       expect(first).toContain("T06 slice A");
@@ -1411,14 +1411,14 @@ describe("FabricUiController dashboard wiring", () => {
       expect(requestRender).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
       activity.beginCall("live", { callId: "progress", ref: "pi.read", args: {} });
-      await vi.advanceTimersByTimeAsync(110);
+      await vi.advanceTimersByTimeAsync(state.config.ui.refreshMs);
       expect(requestRender).toHaveBeenCalled();
       expect(controller.snapshot().now).toBeGreaterThan(eventTime);
       expect(widget!.render(80).join("\n")).toContain("6/7 calls");
       expect(vi.getTimerCount()).toBe(0);
       activity.finish("live", true);
       vi.mocked(state.mainAgentInfo).mockReturnValue({ ...state.mainAgentInfo(), status: "idle" });
-      await vi.advanceTimersByTimeAsync(110);
+      controller.setHostStreaming(false);
       expect(widget!.render(80).length).toBeLessThan(reserved.length);
     } finally {
       controller.stop();

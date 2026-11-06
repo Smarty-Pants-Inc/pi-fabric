@@ -104,7 +104,8 @@ describe("LifecycleBroker state-projection wakes (pi-fabric#7978 L1)", () => {
       const stop = receiver.subscribeStateChanges(listener);
       return () => { unsubscribe(); stop(); };
     });
-    const drains = vi.spyOn(mesh, "listAll");
+    const drains = vi.spyOn(mesh, "listAllShared");
+    restores.push(() => drains.mockRestore());
     broker.start();
     expect(subscribe).toHaveBeenCalledTimes(1);
     await flush();
@@ -258,7 +259,10 @@ describe("LifecycleBroker sqlite cross-process state wakes (pi-fabric#7978 L1)",
     const events = fs.statSync(path.join(root, "events.jsonl"));
 
     const child = await runChild(root, FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "sub1", subscription("sub1"));
-    expect(child).toMatchObject({ code: 0, stdout: "committed\n", stderr: "" });
+    expect(child).toMatchObject({ code: 0, stdout: "committed\n" });
+    // The inherited local deletion guard announces report mode in Node children.
+    // Still reject every other diagnostic from the actual cross-process writer.
+    expect(child.stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "")).toBe("");
     await until(() => delivered.length > 0);
     await flush();
     expect(delivered.map((entry) => entry.id)).toEqual([event.id]);

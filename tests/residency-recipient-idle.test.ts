@@ -55,8 +55,8 @@ describe("ResidencyClient completion recipient metadata", () => {
       if (directory === meshRoot) notify = callback;
       return Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher;
     }) as unknown as typeof fs.watch);
-    const reads = vi.spyOn(client.options.mesh, "listAll");
-    const polls = () => reads.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
+    const snapshots = vi.spyOn(client.options.mesh, "stateToken");
+    const polls = () => snapshots.mock.calls.length;
     try {
       client.start();
       await vi.advanceTimersByTimeAsync(0);

@@ -4,7 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
-import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, type FabricLifecycleEvent } from "../src/lifecycle/types.js";
+import { FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX, FABRIC_PARTICIPANT_LIFECYCLE_TOPIC,
+  type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../src/lifecycle/types.js";
+import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
@@ -47,16 +49,18 @@ const fakeWatch = () => {
   return { watchers, spy, root: (meshRoot: string) => watchers.filter((entry) => entry.directory === meshRoot).at(-1)! };
 };
 
-const setup = async (deliver: (event: FabricLifecycleEvent) => unknown) => {
+const setup = async (deliver: (event: FabricLifecycleEvent) => unknown, stateBackend?: "file" | "sqlite") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-wakes-")); roots.push(root);
-  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const broker = new LifecycleBroker(mesh, target, participants(), { enabled: true, pollMs: 20, maxReadEvents: 100 },
+  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, stateBackend ? { stateBackend } : {});
+  restores.push(() => mesh.closeState());
+  const directory = participants();
+  const broker = new LifecycleBroker(mesh, target, directory, { enabled: true, pollMs: 20, maxReadEvents: 100 },
     (_subscription, event) => deliver(event) as void);
   brokers.push(broker);
   await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: target.id, delivery: "followUp", triggerTurn: false });
   const settle = (occurredAt: number) => mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled",
     from: sourceIdentity, data: { version: 1, event: "pi.agent_settled", source, occurredAt } });
-  return { mesh, broker, settle };
+  return { mesh, broker, settle, directory };
 };
 
 const flush = async () => { for (let index = 0; index < 50; index++) await new Promise((resolve) => setImmediate(resolve)); };
@@ -70,6 +74,238 @@ afterEach(async () => {
 });
 
 describe("LifecycleBroker wakes", () => {
+  it("retains SQLite prefix selections across unrelated commits, with one full refresh for a feed gap", async () => {
+    const fake = fakeWatch();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-deltas-")); roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const foreign = await SqliteStateStore.open(meshRoot, 64 * 1024, 100, { changesRetained: 1 });
+    restores.push(() => foreign.close());
+    const subscription: FabricLifecycleSubscription = {
+      format: 1, id: "sub", from: source.id, events: ["pi.agent_settled"], to: target.id,
+      delivery: "followUp", triggerTurn: false, once: false, afterSequence: 0,
+      createdAt: 1, updatedAt: 1, createdBy: target,
+    };
+    await foreign.writeBatch({ identity: target, ops: [
+      { kind: "put", key: FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + subscription.id, value: subscription },
+      ...Array.from({ length: 512 }, (_, index) => ({ kind: "put" as const, key: `noise/${index}`, value: { index } })),
+    ] });
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "sqlite" });
+    restores.push(() => mesh.closeState());
+    expect(mesh.stateBackend).toBe("sqlite");
+    const deliver = vi.fn();
+    const broker = new LifecycleBroker(mesh, target, participants(), { enabled: true, pollMs: 20, maxReadEvents: 100 }, deliver);
+    brokers.push(broker);
+    const scans = vi.spyOn(SqliteStateStore.prototype, "listAll");
+    const exports = vi.spyOn(SqliteStateStore.prototype, "exportLive");
+    const deltas = vi.spyOn(SqliteStateStore.prototype, "readDelta");
+    const feeds = vi.spyOn(SqliteStateStore.prototype, "changesSince");
+    const selections = vi.spyOn(mesh, "listAllShared");
+    restores.push(() => { scans.mockRestore(); exports.mockRestore(); deltas.mockRestore(); feeds.mockRestore(); selections.mockRestore(); });
+    broker.start();
+    await flush();
+    expect(selections).toHaveBeenCalledTimes(1);
+    const writes = 16;
+    const updates: Array<{ key: string; version: number }> = [];
+    for (let index = 0; index < writes; index++) {
+      updates.push(await foreign.put({ key: `noise/${index}`, value: { updated: index }, identity: target }));
+      fake.root(mesh.root).callback("change", "state.db-wal");
+      await flush();
+    }
+    // A delta-only snapshot still filters the whole sorted mesh here. Prefix proofs must
+    // avoid that CPU work as well as avoiding SQL value-row reads on these unrelated wakes.
+    expect(selections).toHaveBeenCalledTimes(1);
+    expect(exports).toHaveBeenCalledTimes(1);
+    expect(deltas).not.toHaveBeenCalled();
+    expect(feeds).toHaveBeenCalledTimes(writes);
+    expect(feeds.mock.results.map(result => result.value.changes)).toEqual(
+      updates.map(({ key, version }) => [expect.objectContaining({ key, version, deleted: false })]),
+    );
+    // Miss enough commits for the real bounded feed to trim past the drain's last snapshot.
+    for (let index = 0; index < 150; index++) {
+      await foreign.put({ key: "noise/gap", value: index, identity: target });
+    }
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    // The first commit after gap recovery must be incremental again.
+    await foreign.put({ key: "noise/after-gap", value: true, identity: target });
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    expect(scans).not.toHaveBeenCalled();
+    expect(exports).toHaveBeenCalledTimes(2); // startup and the one actual feed gap only
+    expect(selections).toHaveBeenCalledTimes(2); // startup and gap; not the unrelated post-gap wake
+    expect(deltas).toHaveBeenCalledTimes(1);
+    expect(deltas.mock.results[0]!.value).toMatchObject({ complete: false, changed: [] });
+    expect(feeds).toHaveBeenCalledTimes(writes + 2);
+    const steps = feeds.mock.results.map(result => result.value as ReturnType<SqliteStateStore["changesSince"]>);
+    expect(steps.filter(step => !step.complete)).toHaveLength(1);
+    expect(steps.filter(step => step.complete).map(step => step.changes.length)).toEqual(Array(writes + 1).fill(1));
+    expect(deliver).not.toHaveBeenCalled();
+    expect(mesh.listAllShared(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX, { snapshot: mesh.stateToken() }))
+      .toMatchObject([{ value: subscription }]);
+  });
+
+  it("SQLite: delivers new event-only wakes even when the subscription snapshot is unchanged", async () => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup(event => { delivered.push(event); }, "sqlite");
+    const selections = vi.spyOn(mesh, "listAllShared");
+    restores.push(() => selections.mockRestore());
+    broker.start();
+    await flush();
+    const initialSelections = selections.mock.calls.length;
+    for (const occurredAt of [11, 12]) {
+      const snapshot = mesh.stateToken();
+      await settle(occurredAt);
+      expect(mesh.stateToken()).toBe(snapshot); // no state/subscription change can select this work
+      expect(delivered).toHaveLength(occurredAt - 11);
+      fake.root(mesh.root).callback("change", "events.jsonl");
+      await flush();
+      expect(delivered.map(event => event.occurredAt)).toEqual(occurredAt === 11 ? [11] : [11, 12]);
+      expect(mesh.get(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + broker.list()[0]!.id)?.value)
+        .toMatchObject({ afterSequence: mesh.latestSequence(), lastEventId: delivered.at(-1)!.id });
+      // The first event replays the retained selection; the second refreshes only because
+      // the preceding delivery changed its cursor, not because an event-only wake needs it.
+      expect(selections).toHaveBeenCalledTimes(initialSelections + occurredAt - 11);
+    }
+  });
+
+  it("SQLite: sees relevant-prefix filter updates, deletes and recreation after retaining a selection", async () => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup(event => { delivered.push(event); }, "sqlite");
+    const initial = broker.list()[0]!;
+    const key = FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + initial.id;
+    const foreign = await SqliteStateStore.open(mesh.root, 64 * 1024, 100);
+    restores.push(() => foreign.close());
+    const selections = vi.spyOn(mesh, "listAllShared");
+    restores.push(() => selections.mockRestore());
+    broker.start();
+    await flush();
+    const initialSelections = selections.mock.calls.length;
+    await foreign.put({ key, value: { ...initial, events: ["pi.agent_start"] }, identity: target });
+    await settle(21);
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    expect(delivered).toEqual([]);
+    expect(selections).toHaveBeenCalledTimes(initialSelections + 1);
+    await foreign.delete({ key });
+    await settle(22);
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    expect(delivered).toEqual([]);
+    expect(selections).toHaveBeenCalledTimes(initialSelections + 2);
+    await foreign.put({ key, value: { ...initial, afterSequence: mesh.latestSequence() }, identity: target });
+    await settle(23);
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([23]);
+    expect(selections).toHaveBeenCalledTimes(initialSelections + 3);
+  });
+
+  it("SQLite: never advances a retained witness past a concurrent write after the proof", async () => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup(event => { delivered.push(event); }, "sqlite");
+    const initial = broker.list()[0]!;
+    const key = FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + initial.id;
+    const foreign = await SqliteStateStore.open(mesh.root, 64 * 1024, 100);
+    restores.push(() => foreign.close());
+    broker.start();
+    await flush();
+    const captured = mesh.stateRevision()!;
+    const prove = mesh.stateUnchangedSince.bind(mesh);
+    let concurrent: Promise<unknown> | undefined;
+    const proofs = vi.spyOn(mesh, "stateUnchangedSince").mockImplementationOnce((revision, prefixes) => {
+      const unchanged = prove(revision, prefixes);
+      expect(unchanged).toBe(true);
+      // The native uncontended writer commits synchronously before its promise resolves:
+      // this is a real commit strictly after proof, before a buggy post-proof stamp read.
+      concurrent = foreign.put({ key, value: { ...initial, events: ["pi.agent_start"] }, identity: target });
+      expect(foreign.stateStamp()).not.toBe(captured);
+      return unchanged;
+    });
+    restores.push(() => proofs.mockRestore());
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    expect(concurrent).toBeDefined();
+    await concurrent;
+    await settle(24);
+    fake.root(mesh.root).callback("change", "events.jsonl");
+    await flush();
+    expect(proofs.mock.calls[1]?.[0]).toBe(captured);
+    expect(delivered).toEqual([]); // the concurrent filter update was not skipped
+    await foreign.put({ key, value: initial, identity: target });
+    await settle(25);
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([25]);
+  });
+
+  it.each(["proof", "selection"] as const)("SQLite: keeps the previous witness/entries pair when %s throws and retries", async failure => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup(event => { delivered.push(event); }, "sqlite");
+    const initial = broker.list()[0]!;
+    const key = FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + initial.id;
+    const foreign = await SqliteStateStore.open(mesh.root, 64 * 1024, 100);
+    restores.push(() => foreign.close());
+    broker.start();
+    await flush();
+    const previous = mesh.stateRevision()!;
+    const proofs = vi.spyOn(mesh, "stateUnchangedSince");
+    const selections = vi.spyOn(mesh, "listAllShared");
+    restores.push(() => { proofs.mockRestore(); selections.mockRestore(); });
+    const fail = () => { throw new Error("transient selection read failed"); };
+    if (failure === "proof") proofs.mockImplementationOnce(fail);
+    else selections.mockImplementationOnce(fail);
+    await foreign.put({ key, value: { ...initial, events: ["pi.agent_start"] }, identity: target });
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    // No more notification: the existing bounded failed-drain retry must finish this read.
+    await vi.waitFor(() => expect(selections).toHaveBeenCalledTimes(failure === "proof" ? 1 : 2), { timeout: 2_000, interval: 10 });
+    expect(proofs.mock.calls.slice(0, 2).map(([revision]) => revision)).toEqual([previous, previous]);
+    await settle(26);
+    fake.root(mesh.root).callback("change", "events.jsonl");
+    await flush();
+    expect(delivered).toEqual([]); // no stale old-filter replay after the failed refresh
+    const started = await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_start",
+      from: sourceIdentity, data: { version: 1, event: "pi.agent_start", source, occurredAt: 27 } });
+    fake.root(mesh.root).callback("change", "events.jsonl");
+    await flush();
+    expect(delivered.map(event => event.id)).toEqual([started.id]);
+  });
+
+  it("SQLite: replays unchanged subscriptions after target movement and a gated wake", async () => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle, directory } = await setup(event => { delivered.push(event); }, "sqlite");
+    const targetRecord = directory.get(target.id)!;
+    targetRecord.local = false;
+    directory.publishes = id => directory.get(id)?.local === true;
+    broker.start();
+    await flush();
+    await settle(13);
+    fake.root(mesh.root).callback("change", "events.jsonl");
+    await flush();
+    expect(delivered).toEqual([]);
+    const snapshot = mesh.stateToken();
+    targetRecord.local = true; // host/lease ownership can move without a subscription change
+    fake.root(mesh.root).callback("change", "state.db-wal");
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([13]);
+    expect(snapshot).not.toBe(mesh.stateToken()); // only the delivery's cursor changed state
+    broker.pause();
+    const pausedSnapshot = mesh.stateToken();
+    await settle(14);
+    fake.root(mesh.root).callback("change", "events.jsonl");
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([13]);
+    expect(mesh.stateToken()).toBe(pausedSnapshot);
+    broker.resume();
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([13, 14]);
+  });
+
   it("drains at start and then holds no recurring timer while idle", async () => {
     fakeWatch();
     const delivered: FabricLifecycleEvent[] = [];
@@ -134,7 +370,7 @@ describe("LifecycleBroker wakes", () => {
     fake.spy.mockImplementation(() => { throw Object.assign(new Error("ENOSPC: watcher limit"), { code: "ENOSPC" }); });
     const delivered: FabricLifecycleEvent[] = [];
     const { mesh, broker, settle } = await setup((event) => { delivered.push(event); });
-    const reads = vi.spyOn(mesh, "listAll");
+    const reads = vi.spyOn(mesh, "listAllShared");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     broker.start();
     await vi.advanceTimersByTimeAsync(63_000);
@@ -186,14 +422,14 @@ describe("LifecycleBroker wakes", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("retries a failed delivery on a one-shot backoff without another notification", async () => {
+  it.each(["file", "sqlite"] as const)("retries a failed delivery on a one-shot backoff without another notification (%s)", async stateBackend => {
     fakeWatch();
     let failures = 1;
     const delivered: FabricLifecycleEvent[] = [];
     const { broker, settle } = await setup((event) => {
       if (failures-- > 0) throw new Error("target busy");
       delivered.push(event);
-    });
+    }, stateBackend);
     await settle(5);
     broker.start();
     await vi.waitFor(() => expect(delivered.map((event) => event.occurredAt)).toEqual([5]), { timeout: 2_000, interval: 10 });

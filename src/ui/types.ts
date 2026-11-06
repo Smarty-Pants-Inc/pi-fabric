@@ -92,31 +92,4 @@ export interface FabricDashboardSnapshot {
   events: MeshEvent[];
 }
 
-export const activeStatuses = new Set([
-  "queued",
-  "preparing",
-  "waiting",
-  "pending",
-  "ready",
-  "claimed",
-  "running",
-  "finishing",
-  "in_progress",
-  "blocked",
-  "loading",
-  "active",
-  "unloading",
-]);
-
-export const isActiveStatus = (status: string): boolean => activeStatuses.has(status);
-
-export const orderAgentsByCreation = (agents: FabricUiAgent[]): FabricUiAgent[] =>
-  agents
-    .map((agent, index) => ({ agent, index }))
-    .sort(
-      (left, right) =>
-        (left.agent.startedAt ?? Number.MAX_SAFE_INTEGER) -
-          (right.agent.startedAt ?? Number.MAX_SAFE_INTEGER) ||
-        left.index - right.index,
-    )
-    .map(({ agent }) => agent);
+export { activeStatuses, isActiveStatus, orderAgentsByCreation } from "./format.js";

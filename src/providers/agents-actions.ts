@@ -952,7 +952,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setTopics",
-    description: "Replace a locally owned ordinary actor's exact mesh-topic subscriptions, or a global template's topics. Native slot-bound topics are immutable; live changes from or into protected topics are refused. An empty list stops topic intake while accepted work drains; direct messages, addressed mesh events and host-event subscriptions are unchanged. Restoring a topic accepts new events again, without replaying events already passed by the monitor.",
+    description: "Replace an ordinary actor's exact mesh-topic subscriptions, or a global template's topics. Session actors remain local; the owning Main can update durable actors through the existing resident mutation route when a live owner and current command support are available. There is no resident auto-start or generic foreign-root/remote forwarding. Native slot-bound topics are immutable; live changes from or into protected topics are refused. An empty list stops topic intake while accepted work drains; direct messages, addressed mesh events and host-event subscriptions are unchanged. Restoring a topic accepts new events again, without replaying events already passed by the monitor.",
     inputSchema: {
       type: "object",
       properties: {
@@ -967,7 +967,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setEvents",
-    description: "Replace a persistent actor's session-bound Pi and synthetic tool_error event subscriptions",
+    description: "Replace a persistent actor's session-bound Pi and synthetic tool_error event subscriptions. Session actors remain local; the owning Main can update durable actors through the existing resident mutation route when a live owner and current command support are available. There is no resident auto-start or generic foreign-root/remote forwarding.",
     inputSchema: {
       type: "object",
       properties: {

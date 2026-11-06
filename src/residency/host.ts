@@ -3006,7 +3006,7 @@ export class ResidentHost {
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
           command.operation === "setThinking" || command.operation === "setBatching" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
-          command.operation === "resetSession" || command.operation === "stop" || command.operation === "requeueArchived") {
+          command.operation === "setTopics" || command.operation === "setEvents" || command.operation === "resetSession" || command.operation === "stop" || command.operation === "requeueArchived") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
         }
@@ -3052,6 +3052,16 @@ export class ResidentHost {
           case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt, command.deadLetterReplayMaxAgeMs,
             command.dropQueued === true ? { dropQueued: true } : {}); break;
           case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
+          case "setTopics": {
+            if (!Array.isArray(command.topics)) throw new Error("topics must be an array of strings");
+            updated = await this.actors.setTopics(actor.id, command.topics, commit);
+            break;
+          }
+          case "setEvents": {
+            if (!Array.isArray(command.events)) throw new Error("events must be an array of host events");
+            updated = await this.actors.setEvents(actor.id, command.events, commit);
+            break;
+          }
           default: throw new Error("Unknown resident actor operation");
         }
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, ...(requeued ? { requeued } : {}), completedAt: Date.now() };

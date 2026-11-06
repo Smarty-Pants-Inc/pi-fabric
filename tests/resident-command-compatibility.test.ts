@@ -51,7 +51,7 @@ const stop = async (child: ChildProcess, output: () => string) => {
   }
   finally { clearTimeout(timer); }
 };
-const operations = ["actorStatus", "setInstructions", "setModel", "setThinking", "setTools"] as const;
+const operations = ["actorStatus", "setInstructions", "setModel", "setThinking", "setTools", "setTopics", "setEvents"] as const;
 
 describe.skipIf(!fs.existsSync(legacyHost))("real B70 mixed-release resident compatibility", () => {
   it.each((["Main", "proxy"] as const).flatMap(clientKind => operations.map(operation => [clientKind, operation] as const)))("%s refuses %s before dispatch, preserving identity, registry and queued mailbox", async (clientKind, operation) => {
@@ -94,6 +94,8 @@ describe.skipIf(!fs.existsSync(legacyHost))("real B70 mixed-release resident com
           operation === "setInstructions" ? { operation, id: actor.id, instructions: "Changed" } :
           operation === "setModel" ? { operation, id: actor.id, model: "fixture/visible", scope: "project" } :
           operation === "setThinking" ? { operation, id: actor.id, thinking: "high", scope: "project" } :
+          operation === "setTopics" ? { operation, id: actor.id, topics: ["subscriptions.changed"] } :
+          operation === "setEvents" ? { operation, id: actor.id, events: ["input"] } :
           { operation, id: actor.id, tools: ["read"] }, undefined, caller)).catch(error => error);
         // Assert preservation even on the destructive base, before checking the refusal.
         await delay(150);
@@ -144,6 +146,8 @@ describe("rollback-safe resident actor command envelopes", () => {
           operation === "setInstructions" ? { operation, id, instructions: "Changed" } :
           operation === "setModel" ? { operation, id, model: "fixture/visible", scope: "project" } :
           operation === "setThinking" ? { operation, id, thinking: "high", scope: "project" } :
+          operation === "setTopics" ? { operation, id, topics: ["subscriptions.changed"] } :
+          operation === "setEvents" ? { operation, id, events: ["input"] } :
           operation === "setActivationFilter" ? { operation, id, activationFilter: null } :
           { operation: "setTools", id, tools: ["read"] }, abort.signal, caller)).catch(error => error);
       const requests = path.join(config.residencyRoot, "requests");

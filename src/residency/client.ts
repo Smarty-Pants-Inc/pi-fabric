@@ -27,6 +27,7 @@ import { ownedShortTmpdir, recordedShortTmpdir } from "../agents/short-tmpdir.js
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { sealResidentLaunchBinaries } from "./launch-config.js";
 import {
   RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
@@ -364,7 +365,7 @@ export class ResidencyClient {
   syncPiModels(): void {
     this.#refreshPiModels();
     if (fs.existsSync(this.options.config.residencyRoot)) {
-      atomicWrite(this.#configPath, this.options.config);
+      this.#persistConfig();
     }
   }
 
@@ -379,7 +380,7 @@ export class ResidencyClient {
     if (wakeText) agents.wakeText = structuredClone(wakeText);
     else delete agents.wakeText;
     if (fs.existsSync(this.options.config.residencyRoot)) {
-      atomicWrite(this.#configPath, this.options.config);
+      this.#persistConfig();
     }
   }
 
@@ -391,8 +392,18 @@ export class ResidencyClient {
     this.options.config.modelGuidance = snapshot;
     this.#refreshPiModels();
     if (fs.existsSync(this.options.config.residencyRoot)) {
-      atomicWrite(this.#configPath, this.options.config);
+      this.#persistConfig();
     }
+  }
+
+  #persistConfig(): void {
+    const config = this.options.config;
+    const releaseRoot = path.resolve(path.dirname(config.fabricExtensionPath), "..");
+    const binaries = sealResidentLaunchBinaries(config, releaseRoot, { deferErrors: true });
+    atomicWrite(this.#configPath, { ...config, ...binaries });
+    // Retain sealed selections (including absence) after a successful write;
+    // unresolved selectors stay raw for strict launch-time validation.
+    Object.assign(config, binaries);
   }
 
   async ensureHost(): Promise<ResidentHostOwner> {
@@ -419,7 +430,7 @@ export class ResidencyClient {
     if (this.#closed) throw new Error("Fabric residency client is closed");
     await this.#stopStartingLauncher();
     this.#refreshPiModels();
-    atomicWrite(this.#configPath, this.options.config);
+    this.#persistConfig();
     const existing = this.#readyOwner();
     if (existing) return existing;
     assertNoWatchdogCustody(this.options.config.residencyRoot);

@@ -217,6 +217,11 @@ describe("MeshStore.withStateReadSnapshot (real SQLite WAL)", () => {
 
   it.each(["only", "leading", "middle", "trailing"] as const)("treats %s missing change-feed commits as unknown, not unchanged", async (gap) => {
     const { root, reader, writer } = await fixture();
+    // #1845's parsed-cache delta path must not restamp the old owner over a raw gap.
+    // Warm actual rows and the token before ANY intervening commits, not just metadata.
+    expect(reader.stateView()?.view.get(KEY)?.value).toBe("old");
+    const token = reader.stateToken();
+    expect(reader.get(KEY, { snapshot: token })?.value).toBe("old");
     const before = reader.stateRevision()!;
     const connection = openNodeSqlite(path.join(root, "state.db"));
     rawConnections.push(connection);
@@ -231,8 +236,15 @@ describe("MeshStore.withStateReadSnapshot (real SQLite WAL)", () => {
     } finally { if (connection.isTransaction) connection.exec("ROLLBACK"); }
     if (gap !== "trailing" && gap !== "only") await writer.put({ key: "unrelated/after", value: 2, identity });
     expect(sqliteOf(reader).changesSince(1).complete).toBe(true); // Floor-only proof is insufficient.
+    // This behavioral assertion also runs RED on untouched main before the new API is called.
+    expect(reader.stateView()?.view.get(KEY)?.value).toBe("raw-owner");
+    expect(reader.stateUnchangedSince(before, ["authority/"])).toBe(false);
+    expect(reader.stateUnchangedSince(before, ["authority/"], new Set([KEY]))).toBe(false);
     reader.withStateReadSnapshot(() => {
+      expect(reader.stateView()?.view.get(KEY)?.value).toBe("raw-owner");
+      expect(reader.stateToken()).not.toBe(token);
       expect(reader.get(KEY)?.value).toBe("raw-owner");
+      expect(reader.get(KEY, { snapshot: token })?.value).toBe("raw-owner");
       expect(reader.stateUnchangedSince(before, ["authority/"])).toBe(false);
       expect(reader.stateUnchangedSince(before, ["authority/"], new Set([KEY]))).toBe(false);
     });
@@ -240,6 +252,8 @@ describe("MeshStore.withStateReadSnapshot (real SQLite WAL)", () => {
 
   it("still proves unrelated real commits unchanged when every distinct commit is covered", async () => {
     const { reader, writer } = await fixture();
+    expect(reader.stateView()?.view.get(KEY)?.value).toBe("old");
+    const token = reader.stateToken();
     const before = reader.stateRevision()!;
     await writer.writeBatch({ identity, ops: [
       { kind: "put", key: "unrelated/a", value: 1 },
@@ -248,6 +262,10 @@ describe("MeshStore.withStateReadSnapshot (real SQLite WAL)", () => {
     await writer.put({ key: "unrelated/a", value: 3, identity });
     reader.withStateReadSnapshot(() => {
       expect(reader.stateRevision()).not.toBe(before);
+      expect(reader.stateView()?.view.get(KEY)?.value).toBe("old");
+      expect(reader.stateView()?.view.get("unrelated/a")?.value).toBe(3);
+      expect(reader.stateView()?.view.get("unrelated/b")?.value).toBe(2);
+      expect(reader.stateToken()).not.toBe(token);
       expect(reader.stateUnchangedSince(before, ["authority/"])).toBe(true);
       expect(reader.stateUnchangedSince(before, ["unrelated/"])).toBe(false);
     });

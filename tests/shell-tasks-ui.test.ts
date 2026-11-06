@@ -95,7 +95,7 @@ describe("background shell UI", () => {
     const h = fixture(); h.controller.start(h.context);
     expect(vi.getTimerCount()).toBe(0);
     const job = h.jobs.begin("bash", "sleep 30", { description: "Watch CI" }); job.spill();
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(1000);
     const snapshot = h.controller.snapshot();
     expect(snapshot.shells).toHaveLength(1);
     expect(shouldShowFabricWidget(snapshot, "auto")).toBe(true);
@@ -107,7 +107,7 @@ describe("background shell UI", () => {
     h.requestRender.mockClear();
     const eventTime = h.controller.snapshot().now;
     expect(vi.getTimerCount()).toBe(0);
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(2100);
     expect(actors).not.toHaveBeenCalled();
     expect(h.requestRender).not.toHaveBeenCalled();
     expect(h.controller.snapshot().now).toBe(eventTime);

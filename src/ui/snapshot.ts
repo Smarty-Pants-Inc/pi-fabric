@@ -67,7 +67,7 @@ const stateEntry = (entry: MeshStateEntry): FabricUiStateEntry => {
   };
 };
 
-/** Optional memoization for snapshot consumers; controller event refreshes bypass this cache. */
+/** Snapshot memoization; hits advance the event-driven widget retention clock. */
 export class FabricDashboardSnapshotCache {
   private inputs: unknown;
   private snapshot: FabricDashboardSnapshot | undefined;
@@ -97,14 +97,16 @@ export class FabricDashboardSnapshotCache {
   }
 }
 
-export const createDashboardSnapshot = (
+/** Public observations shared by the closed-widget gate and the full projection.
+ * Actor lists retain their registry caches; participant listing still checks liveness.
+ * No mesh stamp alone proves these externally owned domains unchanged.
+ */
+export const collectDashboardSnapshotInputs = (
   state: FabricState,
-  events: MeshEvent[],
   context?: ExtensionContext,
   activityRuns?: FabricActivityRun[],
-  cache?: FabricDashboardSnapshotCache,
-  immutableActivity = false,
-): FabricDashboardSnapshot => {
+  main = state.mainAgentInfo(context),
+) => {
   const runs = activityRuns ?? state.activity.runs();
   const agentRecords =
     typeof state.agents.listForUi === "function"
@@ -117,9 +119,25 @@ export const createDashboardSnapshot = (
   // read displayOnly, and the state listing opts in directly. Deciders keep bound reads.
   const participants = typeof state.participantInfos === "function"
     ? state.participantInfos({ scope: "project", background: true }) : [];
+  const actorRecords = state.actors.list();
+  const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
+  return { runs, agentRecords, participants, actorRecords, main, shells,
+    widgetDismissedAt: state.widgetDismissedAt };
+};
+
+export const createDashboardSnapshot = (
+  state: FabricState,
+  events: MeshEvent[],
+  context?: ExtensionContext,
+  activityRuns?: FabricActivityRun[],
+  cache?: FabricDashboardSnapshotCache,
+  immutableActivity = false,
+  observed = collectDashboardSnapshotInputs(state, context, activityRuns),
+): FabricDashboardSnapshot => {
+  const { runs, agentRecords, participants, main, shells } = observed;
   // Listings can include foreign session-orphan/cleanup rows with no local details,
   // or lose an actor to a registry refresh. Reconcile before caching the view.
-  const actorRecords = state.actors.list().flatMap((actor) => {
+  const actorRecords = observed.actorRecords.flatMap((actor) => {
     try {
       return [{
         ...actor,
@@ -131,7 +149,6 @@ export const createDashboardSnapshot = (
       throw error;
     }
   });
-  const main = state.mainAgentInfo(context);
   // Project participants already carry this refresh's liveness/collision checks. Let the
   // directory project peers with its own rootId, rather than listing the project twice.
   const peerOptions: FabricPeerListOptions = { background: true,
@@ -141,7 +158,6 @@ export const createDashboardSnapshot = (
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
   const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true, displayOnly: true }) : [];
-  const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
   const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
     globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };
   const previous = cache?.get(inputs);

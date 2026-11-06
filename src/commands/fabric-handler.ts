@@ -86,19 +86,20 @@ export async function runFabricCommand(
   armPrewalk: (task: string) => Promise<unknown>,
   { restoreBorrowedInPlaceMain, truncateMiddle, setActiveCompiledSurface }: CommandHelpers,
 ): Promise<void> {
-  const { state, fabricUi, capturedTools, applyFabricMode, suspendToolCapture } = deps;
-  await state.ensure(context);
+  const { state, capturedTools, applyFabricMode, suspendToolCapture } = deps;
+  const lifecycle = await state.ensure(context);
+  if (lifecycle && !lifecycle.current()) return;
   const [command = "dashboard", ...argumentsList] = argumentsText
     .trim()
     .split(/\s+/)
     .filter(Boolean);
   if (command === "reload") {
-    fabricUi.stop();
+    deps.fabricUi?.stop();
     suspendToolCapture();
     try {
       await state.initialize(context);
     } catch (error) {
-      fabricUi.stop();
+      deps.fabricUi?.stop();
       suspendToolCapture();
       throw error;
     }
@@ -233,11 +234,25 @@ export async function runFabricCommand(
     return;
   }
   if (command === "tasks") {
-    await fabricUi.openTasks(context, argumentsList[0]);
+    const fabricUi = deps.fabricUi;
+    if (fabricUi) await fabricUi.openTasks(context, argumentsList[0]);
+    else {
+      // RPC and disabled sessions never need a controller for task inspection.
+      const jobs = state.shellJobs;
+      if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
+      void jobs.durable?.resume();
+      const query = argumentsList[0];
+      const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
+      if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
+      if (context.mode !== "tui") context.ui.notify(JSON.stringify(query ? candidates[0] : jobs.list(), null, 2), "info");
+      else context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning");
+    }
     return;
   }
   if (command === "chat") {
-    await fabricUi.openConversation(context, argumentsList.join(" ") || undefined);
+    const fabricUi = deps.fabricUi;
+    if (fabricUi) await fabricUi.openConversation(context, argumentsList.join(" ") || undefined);
+    else context.ui.notify(context.mode !== "tui" ? "Fabric conversations are available in TUI mode" : "The Fabric UI is disabled by ui.enabled", "warning");
     return;
   }
   if (command === "decisions") {
@@ -251,7 +266,9 @@ export async function runFabricCommand(
     return;
   }
   if (command === "dashboard" || command === "ui") {
-    await fabricUi.openDashboard(context);
+    const fabricUi = deps.fabricUi;
+    if (fabricUi) await fabricUi.openDashboard(context);
+    else context.ui.notify(context.mode !== "tui" ? "The Fabric dashboard is available in TUI mode" : "The Fabric UI is disabled by ui.enabled", "warning");
     return;
   }
   if (command === "providers") {

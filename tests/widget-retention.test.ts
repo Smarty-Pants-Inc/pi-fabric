@@ -183,6 +183,12 @@ describe("controller idle expiry repaint", () => {
     const records = [participant("older", 10_000), participant("newer", 15_000),
       { ...participant("root", 1), kind: "root" as const }];
     const stored = structuredClone(records); const h = controllerFixture(refreshMs, records);
+    let suppliedRecords = records;
+    const dataReadTimes: number[] = [];
+    vi.spyOn(h.controller.state, "participantInfos").mockImplementation(() => {
+      dataReadTimes.push(Date.now());
+      return suppliedRecords;
+    });
     try {
       h.controller.start(h.context);
       expect(h.widget().render(160)).toHaveLength(3);
@@ -201,12 +207,32 @@ describe("controller idle expiry repaint", () => {
       await vi.advanceTimersByTimeAsync(4_799);
       await event(h);
       expect(h.widget().render(160).join("\n")).toContain("newer");
+      // Queue unobserved live work without mutating records or the cached snapshot.
+      suppliedRecords = [...records, { ...participant("queued-live"), status: "running" }];
+      const dataDeadline = dataReadTimes.at(-1)! + refreshMs;
+      const observationsBeforeExpiry = dataReadTimes.length;
       await vi.advanceTimersByTimeAsync(1);
       await event(h);
       expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
       expect(h.controller.snapshot().agents).toHaveLength(2);
       expect(h.controller.snapshot().participants).toEqual(stored);
       expect(records).toEqual(stored);
+      // Auto-hide must preserve the original pending full-data refresh.
+      expect(vi.getTimerCount()).toBe(1);
+      expect(dataReadTimes).toHaveLength(observationsBeforeExpiry);
+      expect(dataDeadline).toBeGreaterThan(Date.now());
+      await vi.advanceTimersByTimeAsync(dataDeadline - Date.now() - 1);
+      expect(h.controller.snapshot().agents.map(row => row.id)).not.toContain("queued-live");
+      expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
+      expect(dataReadTimes).toHaveLength(observationsBeforeExpiry);
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(dataReadTimes).toHaveLength(observationsBeforeExpiry + 1);
+      expect(dataReadTimes.at(-1)).toBe(dataDeadline);
+      expect(h.controller.snapshot().agents.find(row => row.id === "queued-live")?.status).toBe("running");
+      expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", expect.any(Function), { placement: "aboveEditor" });
+      expect(h.widget().render(160).join("\n")).toContain("queued-live");
+      expect(h.controller.snapshot().now).toBe(dataDeadline);
       expect(vi.getTimerCount()).toBe(0);
     } finally { h.controller.stop(); }
   });
@@ -235,7 +261,11 @@ describe("controller idle expiry repaint", () => {
     try {
       h.controller.start(h.context); h.widget().render(160);
       await vi.advanceTimersByTimeAsync(20_000);
-      records[0]!.updatedAt = 30_000; await event(h);
+      records[0]!.updatedAt = 30_000;
+      // Explicit controls force real cache misses; a heartbeat alone is not a data slot.
+      h.controller.setHostStreaming(true);
+      h.controller.setHostStreaming(false);
+      await event(h);
       expect(h.widget().render(160).join("\n")).toContain("legacy");
       await vi.advanceTimersByTimeAsync(9_799);
       await event(h);

@@ -119,7 +119,7 @@ import {
   type FabricToolPlacementMode,
 } from "./protocol.js";
 import type { AgentToolResultMessage } from "./agents/types.js";
-import { FabricUiController } from "./ui/controller.js";
+import type { FabricUiController } from "./ui/controller.js";
 import { installFabricEscapeHalt } from "./ui/escape-halt.js";
 import { installFabricShellHangKeys } from "./ui/shell-hang-keys.js";
 import { FabricToolDisplayController } from "./ui/tool-display.js";
@@ -318,12 +318,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // Tools an extension hid from Pi stay out of every Fabric listing, prompt and
   // invocation, including while Fabric owns the model's tools (smarty-dev#5492).
   capturedTools.setHostVisibility(hostToolVisibility(pi));
-  const fabricUi = new FabricUiController(state, codePreviewSettings, {
-    // Rendering past calls needs the definition even when the tool is now hidden.
-    getToolDefinition: (name) => name === "fabric_exec" ? fabricTool : capturedTools.getRegistered(name)?.definition,
-    get markdownTransformers() { return capturedTools.runner?.getMarkdownTransformers(); },
-    getMessageRenderer: (type) => capturedTools.runner?.getMessageRenderer(type),
-  });
+  let fabricUi: FabricUiController | undefined;
+  let uiActivationContext: ExtensionContext | undefined;
+  let hostStreaming: boolean | undefined;
   const toolDisplay = new FabricToolDisplayController();
 
   const capturePolicy = () => effectiveToolCaptureConfig(state.config);
@@ -545,7 +542,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (!state.config.ui.haltOnEscape || (!state.config.mesh.enabled && !state.config.jev.enabled)) return;
     haltOnEscapeUnsubscribe = installFabricEscapeHalt(context, {
       enabled: () => state.initialized && (state.config.mesh.enabled || state.config.jev.enabled) && state.config.ui.haltOnEscape,
-      ownsInput: () => fabricUi.ownsInput,
+      ownsInput: () => fabricUi?.ownsInput ?? false,
       // Called only for a recognized lone Escape: latch it even when nothing was left to halt.
       halted: () => { escapeLatched = true; state.haltMain(); return state.advisorsHalted; },
       halt: () => state.haltAdvisors(),
@@ -569,7 +566,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     uninstallShellHangKeys();
     shellHangKeysUnsubscribe = installFabricShellHangKeys(context, {
       enabled: () => state.initialized,
-      ownsInput: () => fabricUi.ownsInput,
+      ownsInput: () => fabricUi?.ownsInput ?? false,
       jobs: () => state.shellJobs,
     });
   };
@@ -590,15 +587,38 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   const cleanupActivationSideEffects = (): void => {
+    uiActivationContext = undefined;
     uninstallHaltOnEscape();
     uninstallShellHangKeys();
-    fabricUi.stop();
+    fabricUi?.stop();
   };
   state.setActivationHook(async (context) => {
+    uiActivationContext = context;
+    const config = state.config;
+    // The existing rollback/deactivation owner retires a pending first-use load.
+    // A bootstrap may replace config before it can await this activation, and SDK
+    // disposal invalidates the context without emitting session_shutdown.
+    const assertCurrent = (): void => {
+      if (uiActivationContext !== context || state.config !== config || !extensionContextLive(context)) {
+        throw new Error("Pi Fabric UI activation was superseded or disposed");
+      }
+    };
     refreshCodePreviewSettings();
     await autoArmPrewalk(context);
+    assertCurrent();
     applyFabricMode();
-    fabricUi.start(context);
+    if (config.ui.enabled && context.mode === "tui") {
+      const { FabricUiController } = await import("./ui/controller.js");
+      assertCurrent();
+      fabricUi ??= new FabricUiController(state, codePreviewSettings, {
+        // Rendering past calls needs the definition even when the tool is now hidden.
+        getToolDefinition: (name) => name === "fabric_exec" ? fabricTool : capturedTools.getRegistered(name)?.definition,
+        get markdownTransformers() { return capturedTools.runner?.getMarkdownTransformers(); },
+        getMessageRenderer: (type) => capturedTools.runner?.getMessageRenderer(type),
+      });
+      fabricUi.start(context);
+      if (hostStreaming !== undefined) fabricUi.setHostStreaming(hostStreaming);
+    }
     installHaltOnEscape(context);
     installShellHangKeys(context);
   }, cleanupActivationSideEffects, cleanupActivationSideEffects);
@@ -965,9 +985,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
-    uninstallHaltOnEscape();
-    uninstallShellHangKeys();
-    fabricUi.stop();
+    cleanupActivationSideEffects();
+    hostStreaming = undefined;
     suspendToolCapture();
     proxyContract.reset();
     refreshProxyLedger(context);
@@ -1093,12 +1112,14 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   });
 
   pi.on("agent_start", (event) => {
-    fabricUi.setHostStreaming(true);
+    hostStreaming = true;
+    fabricUi?.setHostStreaming(true);
     if (state.initialized) void state.publishHostLifecycle("pi.agent_start", event).catch(reportLifecyclePublishFailure);
   });
 
   pi.on("agent_end", async (event, context) => {
-    fabricUi.setHostStreaming(false);
+    hostStreaming = false;
+    fabricUi?.setHostStreaming(false);
     try {
       // Turn-scoped thinking overrides revert here, even before activation.
       await state.thinking.agentEnded(context);
@@ -1748,7 +1769,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     } finally {
       uninstallHaltOnEscape();
       uninstallShellHangKeys();
-      fabricUi.stop();
+      cleanupActivationSideEffects();
+      hostStreaming = undefined;
       suspendToolCapture();
       toolOwnership.release();
       fabricToolLifecycle.clear();
@@ -1812,7 +1834,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
 
   registerFabricCommand(pi, {
     state,
-    fabricUi,
+    get fabricUi() { return fabricUi; },
     capturedTools,
     applyFabricMode,
     suspendToolCapture,

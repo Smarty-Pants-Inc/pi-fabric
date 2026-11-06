@@ -125,6 +125,24 @@ async function fixture(protocolOnly = true) {
 }
 
 describe.skipIf(process.platform !== "linux")("resident release plan and idle-point custody", () => {
+  it("L8 restore replaces a closed Main generation even when the restored owner incarnation is dead", async () => {
+    const f = await fixture(false);
+    try {
+      await f.host.close();
+      const closed = { nonce: "closed:checkpoint-runtime", pid: process.pid, processStartTime: "0",
+        rootId: f.config.rootId, sessionId: f.config.sessionId, releaseRoot: f.previous.releaseRoot };
+      fs.writeFileSync(mainGenerationPath(f.config.residencyRoot), JSON.stringify(closed));
+      await f.client.reconcileRelease();
+      const current = readHandoverJson<recoveryPolicy.ResidentMainGeneration>(mainGenerationPath(f.config.residencyRoot))!;
+      expect(current.nonce).not.toBe(closed.nonce);
+      expect(current).toMatchObject({ pid: process.pid, processStartTime: processStartTime(process.pid), rootId: closed.rootId, sessionId: closed.sessionId });
+      await f.client.reconcileRelease();
+      expect(readHandoverJson(mainGenerationPath(f.config.residencyRoot))).toEqual(current);
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(false);
+      expect(f.state()).toBeUndefined();
+    } finally { await f.close(); }
+  });
+
   it.each(["broken-B", "disposed-Main"] as const)("defers %s before A exits and serves the same acknowledged queue on A", async kind => {
     const f = await fixture(false);
     try {

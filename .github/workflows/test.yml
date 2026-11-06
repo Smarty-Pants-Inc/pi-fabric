@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main, 'refactor/sd-6477-**', 'feat/sd-6477-**']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -573,3 +574,101 @@ jobs:
         env:
           NATS_AUTH_REQUIRED: '1'
         run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts tests/nats-reconnect-auth.test.ts --retry=0
+
+  windows-i9:
+    name: Windows i9 affected (serial 10 shards)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, Windows, X64, smarty-ci-windows-x64]
+    continue-on-error: true
+    # The hosted bridge suite takes ~25-35 min; timing flakes are being fixed in #1835.
+    # Bound hangs so this sole runner and its shared lock are released.
+    timeout-minutes: 90
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+      PI_TEST_BASE: ${{ github.event.before || 'HEAD^' }}
+    steps:
+      - name: Hold shared heavy lock
+        shell: pwsh
+        env:
+          SMARTY_HEAVY_LOCK_MARKER: ${{ runner.temp }}\smarty-heavy-lock-${{ github.run_id }}-windows-i9-${{ github.run_attempt }}.marker
+        run: |
+          & 'C:\ProgramData\smarty-heavy-lock\heavy-lock.ps1' -Hold $env:SMARTY_HEAVY_LOCK_MARKER
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/check-setup
+        with:
+          runner-environment: self-hosted
+      - name: Report hosted-only exclusions on i9
+        shell: pwsh
+        run: |
+          # The existing runtime policy excludes these suites on self-hosted. GitHub-hosted jobs still cover them; no admission markers are spoofed here.
+          Write-Output @'
+          tests/actor-child-completion-idle-preflight.test.ts # Bun enqueue releases a claim lock through unguarded fs.
+          tests/actor-manager.test.ts # real src/worker.ts launch selects Bun; its cleanup is not guarded.
+          tests/actor-remove-dead-root.test.ts # revert rule: real /dev/shm cross-device fixture lies outside TMPDIR.
+          tests/agent-manager.test.ts # worktree cleanup delegates deletion to git worktree remove --force.
+          tests/agent-release-observation.test.ts # successful cleanup removes a real worktree through git.
+          tests/agents-provider.test.ts # public cleanup's worktree=true cases invoke git worktree remove.
+          tests/residency-commit-fence.test.ts # direct Bun owner fixture deletes participant/lock/census state.
+          tests/residency-stopped-writer-retention.test.ts # durable cleanup removes a real worktree through git.
+          tests/residency.test.ts # restored/tampered worktree cleanup and fixture teardown invoke git removal.
+          tests/routed-session-boundaries.test.ts # rollback and successful cleanup invoke git worktree remove.
+          tests/stall-alarms.test.ts # nice/bun crash fixture reaches MeshStore/lock cleanup before its crash.
+          tests/task-write-policy.test.ts # sentinel run's native proof timed out; unproven slice stays hosted-only (#13018).
+          tests/mesh-state-windows-acl.test.ts # native ACL fixtures are created/removed below USERPROFILE, outside TMPDIR.
+          tests/verified-remove-windows.test.ts # fabric-win-remove.exe deletes by handle, outside Node fs.
+          tests/windows-temp-root-native.test.ts # diskpart formats a native NTFS VHD mounted outside TMPDIR.
+          '@
+      - name: Fetch the pinned zig for the Windows helper
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'zig.zip'
+          Invoke-WebRequest -Uri 'https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e') { throw 'zig zip sha256 mismatch' }
+          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $env:RUNNER_TEMP
+          "FABRIC_WIN_ZIG=$(Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.16.0\zig.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Type check
+        run: bun run typecheck
+      - name: Build
+        run: bun run build
+      - name: Affected tests (10 serial shards)
+        shell: pwsh
+        run: |
+          $reportRoot = Join-Path $env:RUNNER_TEMP 'affected-i9'
+          for ($shard = 1; $shard -le 10; $shard++) {
+            $reportDir = Join-Path $reportRoot "affected-windows-latest-$shard"
+            New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+            $env:PI_TEST_REPORT_DIR = $reportDir
+            bun run test:affected "--shard=$shard/10"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Discover unsharded affected test files (no test execution)
+        shell: bash
+        run: node scripts/test-affected.mjs --list-only > "$RUNNER_TEMP/unsharded-selection.json"
+      - name: Merge i9 shard receipts and require file-level parity
+        shell: bash
+        run: set -o pipefail; node scripts/ci-test-counts.mjs "$RUNNER_TEMP/affected-i9" windows-latest 10 "$RUNNER_TEMP/unsharded-selection.json" | tee "$RUNNER_TEMP/merged-affected-windows-i9.md"
+      - uses: ./.github/actions/check-regressions
+      - name: Test Windows type-checker regression
+        run: bunx vitest run tests/type-checker.test.ts
+      - name: Platform smoke floor
+        run: bun run test:smoke
+      - name: Upload i9 affected receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-windows-i9-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/affected-i9/
+            ${{ runner.temp }}/merged-affected-windows-i9.md
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Release shared heavy lock
+        if: always()
+        shell: pwsh
+        env:
+          SMARTY_HEAVY_LOCK_MARKER: ${{ runner.temp }}\smarty-heavy-lock-${{ github.run_id }}-windows-i9-${{ github.run_attempt }}.marker
+        run: |
+          & 'C:\ProgramData\smarty-heavy-lock\heavy-lock.ps1' -Release $env:SMARTY_HEAVY_LOCK_MARKER

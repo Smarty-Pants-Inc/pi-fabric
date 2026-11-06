@@ -1111,6 +1111,7 @@ export class StoreBridgeSide implements BridgeSide {
       return digest;
     };
     const snapshot = () => {
+      const observedAt = this.now();
       const leases = readHostLeases(this.store.root);
       const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
         : this.store.listAll(HOST_PREFIX, { fresh: true });
@@ -1142,35 +1143,71 @@ export class StoreBridgeSide implements BridgeSide {
       const projection = fileState ? { ...native, participants: native.participants.map(fingerprint) } : native;
       const topology = { ...projection, hosts: native.hosts.map(host => settled(host.record as unknown as Record<string, unknown>)) };
       const content = { ...projection, hosts: native.hosts.map(({ observedAt: _observedAt, ...host }) => host) };
-      return { native, digest: contentDigest({ native: content, mirrored, relays }), topology: contentDigest({ topology, mirrored, relays }) };
+      // Shared/file stamps cannot detect clock-only expiry, including a native lease voiding a
+      // handoff. Never reuse across the earliest live/dead boundary or a backwards clock jump.
+      const until = Math.min(leaseLivenessWindow(leases, observedAt).through,
+        ...native.hosts.map(host => host.expiresAt));
+      return { native, observedAt, until, digest: contentDigest({ native: content, mirrored, relays }),
+        topology: contentDigest({ topology, mirrored, relays }) };
     };
-    // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
-    // read then sees old state and may receive no later fs event. Fence the observation
-    // against the pending writer; failed proofs retry only with bounded backoff, never idle polling.
-    // The fence exists because a WAL write may be observed before its writer's COMMIT/wal-index publication;
-    // that read can see old state and receive no later fs event. A successful fence proves the out-of-fence
-    // observation followed the pending writer and that neither the relevant rows nor file directories changed.
-    // Previously a final in-fence full snapshot guaranteed progress after failed proofs, but its rows/files/hash
-    // scan held the SQLite write lock and amplified every notification. Retry only bounded out-of-fence captures;
-    // if churn defeats all proofs, defer to the next notification/retry rather than widening the lock.
     const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
+    // A WAL fs hint can precede COMMIT with NO later notification. A read transaction alone
+    // cannot settle it: unchangedSince sees committed rows, not the pending writer. Retain one
+    // short, zero-wait writer barrier for changed/unknown raw database evidence. Its stamp is
+    // sampled INSIDE custody, never advanced by a read. Directory-only/duplicate hints can then
+    // reuse that settlement; a writer without new frames has no pending WAL hint to swallow.
+    // These are invalidation stamps, not ownership evidence (and never cached /proc diagnostics).
+    const rawState = (): string | undefined => {
+      try {
+        return ["state.db", "state.db-wal", "state.db-journal"].map(name => {
+          try {
+            const stat = fs.statSync(path.join(this.store.root, name), { bigint: true });
+            return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+            throw error;
+          }
+        }).join("|");
+      } catch { return undefined; } // Unknown evidence always requires settlement, never reuse.
+    };
+    let observed: { value: ReturnType<typeof snapshot>; revision: string | undefined; files: string; raw: string | undefined } | undefined;
+    const reusable = (): boolean => {
+      if (!observed || observed.revision === undefined) return false;
+      const now = this.now();
+      return now >= observed.value.observedAt && now < observed.value.until &&
+        this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) && files() === observed.files;
+    };
     const capture = (): ReturnType<typeof snapshot> | undefined => {
       if (this.store.stateBackend !== "sqlite") return snapshot();
-      for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS; attempt += 1) {
-        const revision = this.store.stateRevision();
-        const stamps = files();
-        const value = snapshot();
-        if (revision !== undefined && this.store.withStateWriteFence(() =>
-          this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
+      let raw = rawState();
+      if (raw === undefined || observed?.raw === undefined || raw !== observed.raw) {
+        // Admission's R20 writer fence is separate and unchanged: it must exclude takeover
+        // through each synchronous append. Only notification settlement is coalesced here.
+        raw = this.store.withStateWriteFence(rawState);
       }
-      deferredCaptures += 1;
-      const now = Date.now();
-      if (now - deferredLoggedAt >= 60_000) {
-        log?.(`bridge ${this.peer}: capture deferred: ${deferredCaptures} in last 60s (retry ${retryMs}ms)`);
-        deferredCaptures = 0;
-        deferredLoggedAt = now;
+      let next = observed;
+      if (raw === undefined || !reusable()) {
+        next = this.store.withStateReadSnapshot(() => {
+          const revision = this.store.stateRevision();
+          const stamps = files();
+          return { value: snapshot(), revision, files: stamps, raw };
+        });
       }
-      return undefined;
+      // Files or WAL frames changing during capture invalidate this attempt, not a second
+      // in-tick fence/scan. Watch callbacks latch a trailing tick; the retry also covers a
+      // pre-COMMIT hint whose writer emits nothing further. Unknown raw stamps are not cached.
+      if (!next || files() !== next.files || (raw !== undefined && rawState() !== raw)) {
+        deferredCaptures += 1;
+        const now = Date.now();
+        if (now - deferredLoggedAt >= 60_000) {
+          log?.(`bridge ${this.peer}: capture deferred: ${deferredCaptures} in last 60s (retry ${retryMs}ms)`);
+          deferredCaptures = 0;
+          deferredLoggedAt = now;
+        }
+        return undefined;
+      }
+      observed = { ...next, raw };
+      return next.value;
     };
     const flush = (): void => {
       queued = false;

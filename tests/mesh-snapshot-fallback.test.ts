@@ -53,6 +53,8 @@ const scratch = (): string => {
   return root;
 };
 const pause = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+// Used only in the 20s large-snapshot test; stays below its suite timeout and the child's 20s hard stop.
+const COLD_WRITER_STARTUP_TIMEOUT_MS = 8_000;
 const bounded = async <T>(promise: Promise<T>, label: string, ms = 5_000): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -61,8 +63,8 @@ const bounded = async <T>(promise: Promise<T>, label: string, ms = 5_000): Promi
     })]);
   } finally { clearTimeout(timer); }
 };
-const waitUntil = async (check: () => boolean, label: string): Promise<void> => {
-  const until = Date.now() + 4_000;
+const waitUntil = async (check: () => boolean, label: string, timeoutMs = 4_000): Promise<void> => {
+  const until = Date.now() + timeoutMs;
   while (!check()) {
     if (Date.now() >= until) throw new Error(`${label}: no receipt`);
     await pause(10);
@@ -128,7 +130,7 @@ await store.closeState();
 `;
 type Receipt = { id: number; count: number; times: number[]; pid: number; locked: boolean };
 type Command = { ops?: MeshBatchOperation[]; lease?: Record<string, unknown>; inspect?: boolean };
-const writer = async (root: string) => {
+const writer = async (root: string, startupTimeoutMs = 4_000) => {
   const control = scratch();
   const child: ChildProcessWithoutNullStreams = spawn(process.execPath, ["--input-type=module", "-e", WRITER, root, control], {
     cwd: process.cwd(), env: { ...process.env, PI_FABRIC_MESH_ROOT: root, PI_FABRIC_MESH_STATE_BACKEND: "file", PI_FABRIC_LOCK_STATS: "0" },
@@ -144,7 +146,7 @@ const writer = async (root: string) => {
     child.stdin.end();
     expect(await bounded(closed, `writer close: ${stderr}`)).toBe(0);
   });
-  await waitUntil(() => output.includes("ready"), `writer startup: ${stderr}`);
+  await waitUntil(() => output.includes("ready"), `writer startup: ${stderr}`, startupTimeoutMs);
   const read = fs.readFileSync.bind(fs);
   const latest = (): Receipt | undefined => {
     try { return JSON.parse(read(path.join(control, "ack.json"), "utf8")) as Receipt; } catch { return undefined; }
@@ -164,7 +166,7 @@ const writer = async (root: string) => {
       Atomics.wait(sleeper, 0, 0, 2);
     }
   };
-  await waitUntil(() => (latest()?.count ?? 0) >= 1, "initial writer commit");
+  await waitUntil(() => (latest()?.count ?? 0) >= 1, "initial writer commit", startupTimeoutMs);
   return { child, latest, request };
 };
 
@@ -242,7 +244,7 @@ const noStaging = (root: string): void => {
 
 describe("bridge callback snapshot fallback (smarty-dev#14050)", () => {
   it("commits fresh mirrors over stdio despite continuous independent same-root commits, and measures actual fallback holds", async () => {
-    const root = scratch(), store = await seed(root, true), competitor = await writer(root);
+    const root = scratch(), store = await seed(root, true), competitor = await writer(root, COLD_WRITER_STARTUP_TIMEOUT_MS);
     const bytes = fs.statSync(path.join(root, "state.json")).size;
     expect(bytes).toBeGreaterThan(650_000); expect(bytes).toBeLessThan(850_000);
     // Warm for >=1s, proving commits, not merely a live child or scheduled ticks.

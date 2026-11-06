@@ -186,10 +186,9 @@ export class ActorDirectory extends ActorManager {
     return pending;
   }
   override list(): FabricActorInfo[] {
-    // Synchronous internal/UI reads schedule work; public provider reads await it.
-    void this.reconcileSessionOrphans().catch(() => undefined);
+    // UI snapshots observe known registries; explicit/maintenance reconciliation discovers foreign roots.
     const actors = new Map(this.#localActors().map(actor => [actor.id, actor]));
-    for (const orphan of this.#sessionOrphans?.list() ?? []) actors.set(orphan.id, orphan);
+    for (const orphan of this.#sessionOrphans?.list({ discover: false }) ?? []) actors.set(orphan.id, orphan);
     return [...actors.values()];
   }
   override listOwned(registryView = false, onError?: (id: string, error: unknown) => void): FabricActorInfo[] {

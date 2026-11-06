@@ -238,8 +238,10 @@ export class SessionActorOrphans {
     return wellFormed ? snapshot.actors : [];
   }
 
-  list(): FabricActorInfo[] {
-    return this.#registries().flatMap(({ sessionId, store }) => {
+  list({ discover = true }: { discover?: boolean } = {}): FabricActorInfo[] {
+    // Display reads reuse the catalog, but still observe each store's current generation.
+    const registries = discover ? this.#registries() : [...this.#stores].map(([root, store]) => ({ sessionId: path.basename(root), store }));
+    return registries.flatMap(({ sessionId, store }) => {
       try { return this.#rows(store).flatMap(row => {
         if (row.status !== "stopped" || !record(row.sessionOrphan)) return [];
         const view = this.#view(row, sessionId, store);

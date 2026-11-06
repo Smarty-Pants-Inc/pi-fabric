@@ -1,0 +1,20 @@
+{
+  "configVersion": 4,
+  "fullCodeMode": false,
+  "capture": {
+    "enabled": false,
+    "hideFromModel": false
+  },
+  "compaction": {
+    "engine": "pi"
+  },
+  "entropy": {
+    "compile": false
+  },
+  "mesh": {
+    "root": "/home/paul/.local/share/smarty-dev/fabric-mesh/fleet",
+    "announce": true,
+    "actorScope": "session"
+  },
+  "components": []
+}

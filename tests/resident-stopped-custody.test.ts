@@ -9,6 +9,7 @@ import {
   ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS, ACTOR_STOPPED_ALARM_AFTER_MS,
   FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorAlarmDedupeKey, actorAlarmKey,
 } from "../src/actors/manager.js";
+import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MainAgentController } from "../src/main-agent.js";
@@ -27,6 +28,7 @@ import { installInProcessResidentFence } from "./helpers/in-process-resident-fen
 // No fake timers: mesh locks, native watches and worker custody continue to use their real scheduling.
 const MINUTE = 60_000;
 const RETENTION_MS = 15 * MINUTE;
+const DEAD_LETTER_REPLAY_WINDOW_MS = DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS;
 const STOP_NOTICE = "Fabric host notice: actor-stopped;";
 const cleanup: Array<() => Promise<void>> = [];
 beforeEach(() => installInProcessResidentFence());
@@ -331,6 +333,68 @@ describe("resident stopped alarm custody", () => {
     for (let n = 0; n < 3; n++) await s.tick();
     expect(s.notices().map(item => item.deliveryId)).toEqual([notice.deliveryId]);
     expect(s.sentNotices()).toHaveLength(1);
+  }, 30_000);
+
+  it.each([
+    { boundary: "just before", offsetMs: -1_000 },
+    { boundary: "just after", offsetMs: 1_000 },
+  ])("replays a filter-held stop alarm after resident restart $boundary the 6h window without re-announcing Main", async ({ offsetMs }) => {
+    const s = await fixture();
+    const observer = await s.host.actors.create({ name: "stop-alarm observer", instructions: "Inspect the event.",
+      residency: "durable", transport: "process", responseMode: "directive", delivery: "mailbox", triggerTurn: false,
+      topics: [FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC], coalesce: false });
+    await s.host.actors.setBatching(observer.id, { batchWindowMs: 7 * 60 * MINUTE });
+    const stopped = await stoppedActor(s);
+    const since = s.row(stopped.id).stoppedAt!;
+    await s.tickUntil(() => s.alarms(stopped.id).length === 1 && s.host.actors.status(observer.id).queued === 1,
+      "published stop alarm waits in the subscriber's batch window");
+    const alarm = s.alarms(stopped.id)[0]!;
+    const heldResult = await s.host.actors.setActivationFilter(observer.id, [{ id: "hold-stop-alarm",
+      topic: [FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC], kind: ["actor-stopped"],
+      where: [{ path: "data.actorId", equals: stopped.id }] }], undefined, undefined, undefined, { dropQueued: true });
+    expect(heldResult).toMatchObject({ queued: 0, movedToDeadLetter: 1 });
+    const actorDir = path.join(s.config.actorRoot, observer.id);
+    const deadLetterFile = path.join(actorDir, "dead-letter.jsonl");
+    const deadLetters = () => fs.existsSync(deadLetterFile)
+      ? fs.readFileSync(deadLetterFile, "utf8").split("\n").filter(Boolean)
+        .map(line => JSON.parse(line) as { at: number; event: { id: string }; heldBy?: { reason: string; movedAt: number } })
+      : [];
+    expect(deadLetters()).toHaveLength(1);
+    expect(deadLetters()[0]).toMatchObject({ event: { id: alarm.id }, heldBy: { reason: "activationFilter" } });
+    expect(deadLetters()[0]!.at).toBe(deadLetters()[0]!.heldBy!.movedAt);
+
+    // This subscriber's input dead-letter is separate from the Main-notice outbox and journal.
+    s.client.start();
+    await s.tickUntil(() => s.notices().length === 1 && s.deliveries().length === 0, "Main admits the original stop notice once");
+    await s.tickUntil(() => s.row(stopped.id).stoppedAlarmSince === since, "Main acknowledgement checkpoints the same stop episode");
+    const notice = s.notices()[0]!;
+    expect(notice.deliveryId).toMatch(/^resident:/);
+    expect(s.sentNotices()).toHaveLength(1);
+    expect(s.outboxFiles()).toHaveLength(0);
+
+    await s.restart();
+    s.client.start();
+    const persisted = deadLetters()[0]!;
+    s.clock.skew += persisted.at + DEAD_LETTER_REPLAY_WINDOW_MS + offsetMs - Date.now();
+    await s.host.actors.setBatching(observer.id, { batchWindowMs: 0 });
+    await s.host.actors.setActivationFilter(observer.id, null);
+    const runTasks = () => {
+      const runs = path.join(actorDir, "runs");
+      return fs.existsSync(runs) ? fs.readdirSync(runs).flatMap(run => {
+        const task = path.join(runs, run, "task.txt");
+        return fs.existsSync(task) ? [fs.readFileSync(task, "utf8")] : [];
+      }) : [];
+    };
+    await waitFor(() => runTasks().some(task => task.includes(alarm.id)) &&
+      s.host.actors.status(observer.id).status === "idle" && deadLetters().length === 0,
+      "released dead letter executes the original alarm event");
+    expect(runTasks().filter(task => task.includes(alarm.id))).toHaveLength(1);
+    for (let n = 0; n < 3; n++) await s.tick();
+    expect(s.alarms(stopped.id).map(event => event.id)).toEqual([alarm.id]);
+    expect(s.row(stopped.id)).toMatchObject({ stoppedAt: since, stoppedAlarmSince: since });
+    expect(s.notices().map(item => item.deliveryId)).toEqual([notice.deliveryId]);
+    expect(s.sentNotices()).toHaveLength(1);
+    expect(s.outboxFiles()).toHaveLength(0);
   }, 30_000);
 
   it("reuses consumed delivery custody after Main confirms but the actor marker checkpoint is lost", async () => {

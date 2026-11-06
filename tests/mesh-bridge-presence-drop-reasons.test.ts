@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance as monotonicClock } from "node:perf_hooks";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { admitPresence, boundPresence, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { PRESENCE_DROP_REASONS, PRESENCE_KEY_CLASSES, PresenceDropReasons } from "../src/mesh/presence-drop-reasons.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -14,6 +15,8 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
 const roots: string[] = [];
 const stores: MeshStore[] = [];
 const closes: Array<() => Promise<void>> = [];
+// Keep unrelated membership-duration logs deterministic on slow CI; the actual sync/drop/RPC path remains real.
+beforeEach(() => vi.spyOn(monotonicClock, "now").mockReturnValue(0));
 afterEach(async () => {
   for (const close of closes.splice(0)) await close();
   for (const store of stores.splice(0)) store.closeState();

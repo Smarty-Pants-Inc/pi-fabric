@@ -130,12 +130,32 @@ describe("LifecycleBroker state-projection wakes (pi-fabric#7978 L1)", () => {
     expect(delivered.map((entry) => entry.id)).toEqual([event.id]);
     expect(mesh.latestSequence()).toBe(event.sequence);
 
-    // An unrelated projected change wakes a drain but does not redeliver the processed event.
+    // Fleet-shaped unrelated projections do not drain or reread the event log.
+    const eventReads = vi.spyOn(mesh, "read");
+    restores.push(() => eventReads.mockRestore());
     const afterDelivery = drains.mock.calls.length;
-    await remote.put({ key: "unrelated/key", value: 1, identity: sourceIdentity });
-    await until(() => mesh.get("unrelated/key") !== undefined);
+    await remote.writeBatch({ identity: sourceIdentity, ops: Array.from({ length: 455 }, (_, index) => ({
+      kind: "put" as const, key: `unrelated/${index}`, value: index,
+    })) });
+    await until(() => mesh.get("unrelated/454") !== undefined);
+    await flush();
+    expect(drains.mock.calls.length).toBe(afterDelivery);
+    expect(eventReads).not.toHaveBeenCalled();
+    expect(delivered).toHaveLength(1);
+
+    // Updating or deleting the relevant projected subscription still wakes a canonical drain.
+    const key = FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "sub1";
+    const current = remote.get(key)!;
+    await remote.put({ key, value: { ...(current.value as FabricLifecycleSubscription), triggerTurn: true }, identity: sourceIdentity });
+    await until(() => (mesh.get(key)?.value as FabricLifecycleSubscription)?.triggerTurn === true);
     await flush();
     expect(drains.mock.calls.length).toBeGreaterThan(afterDelivery);
+    expect(delivered).toHaveLength(1);
+    const afterUpdate = drains.mock.calls.length;
+    await remote.delete({ key });
+    await until(() => mesh.get(key) === undefined);
+    await flush();
+    expect(drains.mock.calls.length).toBeGreaterThan(afterUpdate);
     expect(delivered).toHaveLength(1);
 
     // close() disposes the projection callback: later projections wake nothing.
@@ -234,8 +254,81 @@ const runChild = (root: string, key: string, value: unknown): Promise<{ code: nu
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.once("error", reject);
-    child.once("close", (code) => resolve({ code, stdout, stderr }));
+    // The local deletion guard announces itself before the child runs; retain every other stderr byte.
+    child.once("close", (code) => resolve({ code, stdout,
+      stderr: stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/, "") }));
   });
+
+describe("LifecycleBroker canonical state-file relevance", () => {
+  it.each([
+    ["file", "file", false],
+    ["sqlite", "sqlite", false],
+    ["sqlite with Windows cached notifications", "sqlite", true],
+  ] as const)("%s: unrelated real state commits do not drain, but a subscription commit delivers the existing event", async (_name, stateBackend, deferredStateHints) => {
+    // Keep reason: pi-fabric#1735's Windows failure. ReadDirectoryChangesW can defer size/last-write
+    // hints until cached writes are flushed. Control only that OS boundary; state and checkpoints stay native.
+    const files = deferredStateHints ? fakeWatch() : undefined;
+    const root = tempRoot();
+    // A long file read-cache window must not hide a commit carried by the only state-file hint.
+    const mesh = new MeshStore(root, 64 * 1024, 100, { stateBackend, readCacheMs: 60_000 });
+    const writer = new MeshStore(root, 64 * 1024, 100, { stateBackend });
+    expect(mesh.stateBackend).toBe(stateBackend);
+    cleanups.push(() => { writer.closeState(); mesh.closeState(); });
+    if (files) {
+      const backend = writer.stateBackendHandle;
+      const sync = backend.sync.bind(backend);
+      const synced = vi.spyOn(backend, "sync").mockImplementation(async budgetMs => {
+        await sync(budgetMs);
+        files.fire(root, "state.db");
+      });
+      restores.push(() => synced.mockRestore());
+    }
+    const event = await settleEvent(mesh);
+    await mesh.put({ key: FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "caught-up", identity: target, ifVersion: 0,
+      value: { ...subscription("caught-up"), afterSequence: event.sequence } });
+    const delivered: FabricLifecycleEvent[] = [];
+    const broker = new LifecycleBroker(mesh, target, participants(), { enabled: true, pollMs: 20, maxReadEvents: 100 },
+      (_subscription, event) => { delivered.push(event); });
+    brokers.push(broker);
+    broker.start();
+    await flush();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(delivered).toEqual([]);
+    const events = fs.statSync(path.join(root, "events.jsonl"));
+    const drains = vi.spyOn(mesh, "listAll"), reads = vi.spyOn(mesh, "read"), projections = vi.spyOn(mesh, "listAllShared");
+    restores.push(() => { drains.mockRestore(); reads.mockRestore(); projections.mockRestore(); });
+
+    await writer.writeBatch({ identity: sourceIdentity, ops: Array.from({ length: 455 }, (_, index) => ({
+      kind: "put" as const, key: `unrelated/${index}`, value: index,
+    })) });
+    // NORMAL WAL commits are visible to SQLite readers before Windows must report a file change.
+    // Flush through SQLite's own checkpoint API, never an extra fd on a live database file:
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw
+    if (stateBackend === "sqlite") await writer.stateBackendHandle.sync(1_000);
+    // Prove a state-file notification reached the receiver, not merely that nothing happened.
+    await until(() => projections.mock.calls.length > 0 || drains.mock.calls.length > 0);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await flush();
+    expect(mesh.get("unrelated/454", { fresh: true })?.value).toBe(454);
+    expect(drains).not.toHaveBeenCalled();
+    expect(reads).not.toHaveBeenCalled();
+    expect(delivered).toEqual([]);
+    expect(projections).toHaveBeenCalled();
+
+    // Same native watcher, same event log, no event-file write: only the relevant subscription changes.
+    await writer.put({ key: FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "sub1", value: subscription("sub1"),
+      identity: sourceIdentity, ifVersion: 0 });
+    if (stateBackend === "sqlite") await writer.stateBackendHandle.sync(1_000);
+    await until(() => delivered.length > 0);
+    await flush();
+    files?.fire(root, "state.db"); // A duplicate post-flush hint must not repeat delivery.
+    await flush();
+    expect(delivered.map(entry => entry.id)).toEqual([event.id]);
+    expect(drains).toHaveBeenCalled();
+    const after = fs.statSync(path.join(root, "events.jsonl"));
+    expect([after.size, after.mtimeMs]).toEqual([events.size, events.mtimeMs]);
+  }, 30_000);
+});
 
 describe("LifecycleBroker sqlite cross-process state wakes (pi-fabric#7978 L1)", () => {
   it.skipIf(process.platform !== "linux")("a subscription committed by another process wakes the receiver through state.db notifications, with no event-file write", async () => {

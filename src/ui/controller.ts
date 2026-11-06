@@ -18,7 +18,7 @@ import type { FabricThinking } from "../thinking.js";
 import type { MeshEvent } from "../mesh/store.js";
 import type { FabricDashboardMessageTarget } from "./dashboard.js";
 import type { ModelSource } from "./model-picker.js";
-import { createDashboardSnapshot } from "./snapshot.js";
+import { collectDashboardSnapshotInputs, createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { extensionContextLive } from "../session-liveness.js";
 import { isPrincipalDiagnostics, notifyDiagnostic } from "../core/diagnostics.js";
@@ -102,6 +102,7 @@ export class FabricUiController {
   #activeConversationReader: string | undefined;
   #refreshGeneration = 0;
   readonly #widgetRetention = new FabricWidgetRetention();
+  readonly #snapshotCache = new FabricDashboardSnapshotCache();
 
   constructor(
     readonly state: FabricState,
@@ -170,6 +171,7 @@ export class FabricUiController {
     this.#meshOffset = 0;
     this.#snapshot = emptySnapshot();
     this.#widgetRetention.clear();
+    this.#snapshotCache.clear();
     this.#reportedRefreshErrors.clear();
     this.#lastRefreshAt = 0;
     this.#dashboardOpen = false;
@@ -700,22 +702,47 @@ export class FabricUiController {
   }
 
   #scheduleRefresh(): void {
-    if (this.#scheduledRefresh || !this.#liveTuiContext() || !this.state.initialized) return;
+    const context = this.#liveTuiContext();
+    if (!context || !this.state.initialized) return;
     // No consumer exists when every Fabric surface is explicitly hidden.
     if (!this.#dashboardTui && !this.#conversationTui && this.state.config.ui.widget === "hidden") return;
     // Model discovery can mark the dashboard open before a TUI is attached.
     if (this.#dashboardOpen && !this.#dashboardTui) return;
+    if (!this.#dashboardOpen && !this.#conversationOpen) {
+      this.#runBackground(this.#epoch, () => {
+        const now = Date.now();
+        const expiry = this.#widgetRetention.nextExpiryDelay(this.#snapshot, this.#snapshot.now);
+        if (expiry === undefined || now - this.#snapshot.now < expiry) return;
+        // Existing notifications may retire cached rows before the next data
+        // slot. This view-clock copy neither observes inputs nor moves that slot.
+        this.#snapshot = { ...this.#snapshot, now };
+        this.#renderWidget(context);
+        if (this.#widgetTui && this.#widget?.hasChanged()) this.#widgetTui.requestRender();
+      });
+    }
+    if (this.#scheduledRefresh) return;
     const elapsed = performance.now() - this.#lastRefreshAt;
     const delay = Math.max(
       0,
       (this.#dashboardOpen ? Math.max(DASHBOARD_REFRESH_MS, this.state.config.ui.refreshMs)
-        : Math.min(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs)) - elapsed,
+        : this.#conversationOpen ? Math.min(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs)
+          : Math.max(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs)) - elapsed,
     );
     const epoch = this.#epoch;
     this.#scheduledRefresh = setTimeout(() => {
       if (epoch !== this.#epoch) return;
       this.#scheduledRefresh = undefined;
-      this.#runBackground(epoch, () => this.#refresh());
+      this.#runBackground(epoch, () => {
+        // An explicit host refresh may have advanced the minimum since this
+        // timeout was armed. Preserve its pending work on the same scheduler;
+        // ordinary event storms never move an already-pending deadline.
+        if (!this.#dashboardOpen && !this.#conversationOpen &&
+            performance.now() - this.#lastRefreshAt < Math.max(ACTIVITY_REFRESH_MS, this.state.config.ui.refreshMs)) {
+          this.#scheduleRefresh();
+          return;
+        }
+        this.#refresh(true);
+      });
     }, delay);
     this.#scheduledRefresh.unref();
   }
@@ -815,7 +842,7 @@ export class FabricUiController {
     if (this.#conversationWatches.length === directories.size) this.#conversationWatchKey = key;
   }
 
-  #refresh(): void {
+  #refresh(reuseClosedSnapshot = false): void {
     this.#lastRefreshAt = performance.now();
     const context = this.#context;
     if (!context || !this.state.initialized) return;
@@ -853,9 +880,48 @@ export class FabricUiController {
         this.state.mesh.cachedStateStamp?.(true, true);
       }
       this.#refreshGeneration++;
-      this.#snapshot = createDashboardSnapshot(
-        this.state, this.#events, context, this.#activityRuns, undefined, this.#activityView !== undefined,
-      );
+      // Conversations are live snapshot consumers too, including target resolution
+      // before their TUI attaches. Only the closed widget may reuse this projection.
+      if (!this.#dashboardOpen && !this.#conversationOpen) {
+        const observed = collectDashboardSnapshotInputs(this.state, context, this.#activityRuns, main);
+        const inputs = {
+          ...observed,
+          main: { id: main.id, status: main.status },
+          // The collector already filters shell visibility. Preserve row order,
+          // identity and completion leases, not output/monitor-only metadata.
+          shells: observed.shells.map(job => ({
+            id: job.id, status: job.status, stopping: job.stopping,
+            startedAt: job.startedAt, finishedAt: job.finishedAt,
+            delivery: job.monitor?.delivery, label: job.description ?? job.command,
+          })),
+          // Actor detail/config payloads do not feed the widget. Keep recency:
+          // it orders actor worker rows in the shared full snapshot projection.
+          actorRecords: observed.actorRecords.map(({ id, name, status, updatedAt }) => ({ id, name, status, updatedAt })),
+          // Heartbeats renew metadata, not completion leases. Status/liveness,
+          // lineage and all other participant changes remain part of the key.
+          participants: observed.participants.map(({ updatedAt: _updatedAt, ...participant }) => participant),
+        };
+        // Explicit refreshes promise a full payload; only scheduled closed
+        // refreshes may reuse the widget-only unchanged-input proof.
+        const previous = reuseClosedSnapshot ? this.#snapshotCache.get(inputs) : undefined;
+        if (previous) this.#snapshot = previous;
+        else {
+          this.#snapshotCache.clear();
+          this.#snapshot = createDashboardSnapshot(
+            this.state, this.#events, context, this.#activityRuns, undefined, this.#activityView !== undefined, observed,
+          );
+          // An actor disappearing between list and details is uncertainty, not
+          // an unchanged proof. Retry details on the next admitted observation.
+          if (this.#snapshot.actors.length === observed.actorRecords.length) {
+            this.#snapshotCache.set(inputs, this.#snapshot, this.#activityView !== undefined);
+          }
+        }
+      } else {
+        this.#snapshotCache.clear();
+        this.#snapshot = createDashboardSnapshot(
+          this.state, this.#events, context, this.#activityRuns, undefined, this.#activityView !== undefined,
+        );
+      }
       if (this.#snapshot.main.status !== main.status) {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }

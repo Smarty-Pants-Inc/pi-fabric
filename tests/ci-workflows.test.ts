@@ -42,8 +42,12 @@ type ActionConfig = {
 const root = new URL("../", import.meta.url);
 const manifest = JSON.parse(fs.readFileSync(new URL("package.json", root), "utf8"));
 const workflowDirectory = fileURLToPath(new URL(".github/workflows/", root));
-const workflows = fs.readdirSync(workflowDirectory).filter((name) => /\.ya?ml$/.test(name));
+const workflows = fs.readdirSync(workflowDirectory).filter((name) => /\.y.*ml$/.test(name));
 const workflow = () => parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8")) as Workflow;
+const workflowInventory = () => Object.fromEntries(workflows.map((file) => [
+  file,
+  parse(fs.readFileSync(new URL(`.github/workflows/${file}`, root), "utf8")) as Workflow,
+]));
 const action = (name: string) => parse(fs.readFileSync(new URL(`.github/actions/${name}/action.yml`, root), "utf8")) as ActionConfig;
 const expandedSteps = ({ steps = [] }: Job): Step[] => steps.flatMap((step) =>
   step.uses?.startsWith("./.github/actions/")
@@ -52,6 +56,7 @@ const expandedSteps = ({ steps = [] }: Job): Step[] => steps.flatMap((step) =>
 const acceptance = (os: string) => workflow().jobs[`${os}-acceptance`] as Job;
 
 const i9JobId = "windows-i9";
+const i9WorkflowFile = "test.yml";
 const i9If = "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')";
 const originalPullRequestBranches = ["main", "refactor/sd-6477-**", "feat/sd-6477-**"];
 const hostedRunnerLabels = ["ubuntu-latest", "windows-latest"];
@@ -62,13 +67,24 @@ function isSelfHosted(job: Job): boolean {
   return labels.some((label) => typeof label === "string" && label.toLowerCase() === "self-hosted");
 }
 
-function assertI9RunnerAdmission(config: Workflow): void {
-  expect(config.jobs[i9JobId]).toBeDefined();
-  expect(Object.entries(config.jobs).filter(([, job]) => isSelfHosted(job)).map(([id]) => id)).toEqual([i9JobId]);
-  expect(config.jobs[i9JobId]!["runs-on"]).toEqual(["self-hosted", "Windows", "X64", "smarty-ci-windows-x64"]);
-  for (const [id, job] of Object.entries(config.jobs)) {
-    if (id === i9JobId) continue;
-    expect(hostedRunnerLabels).toContain(job["runs-on"]);
+function assertI9RunnerAdmission(inventory: Record<string, Workflow>): void {
+  expect(inventory[i9WorkflowFile]?.jobs[i9JobId]).toBeDefined();
+  const selfHostedJobs = Object.entries(inventory).flatMap(([file, config]) =>
+    Object.entries(config.jobs)
+      .filter(([, job]) => isSelfHosted(job))
+      .map(([id]) => `${file}:${id}`),
+  ).sort();
+  expect(selfHostedJobs).toEqual([`${i9WorkflowFile}:${i9JobId}`]);
+
+  for (const [file, config] of Object.entries(inventory)) {
+    for (const [id, job] of Object.entries(config.jobs)) {
+      if (file === i9WorkflowFile && id === i9JobId) {
+        expect(job["runs-on"]).toEqual(["self-hosted", "Windows", "X64", "smarty-ci-windows-x64"]);
+      } else {
+        // Unknown literals, expressions, and matrix selections fail closed.
+        expect(hostedRunnerLabels).toContain(job["runs-on"]);
+      }
+    }
   }
 }
 
@@ -273,16 +289,54 @@ describe("CI Node runtime prerequisites", () => {
 
 describe("Windows i9 test observation contract", () => {
   it("reserves exactly one named self-hosted job for windows-i9 and keeps every other job hosted", () => {
-    assertI9RunnerAdmission(workflow());
+    assertI9RunnerAdmission(workflowInventory());
   });
 
-  it("rejects any second self-hosted workflow job", () => {
-    const mutant = structuredClone(workflow());
-    mutant.jobs["other-self-hosted"] = {
-      ...mutant.jobs[i9JobId]!,
+  it("rejects any second self-hosted job within test.yml", () => {
+    const mutant = structuredClone(workflowInventory());
+    mutant[i9WorkflowFile]!.jobs["other-self-hosted"] = {
+      "runs-on": ["self-hosted", "Windows", "other"],
+    };
+    expect(() => assertI9RunnerAdmission(mutant)).toThrow();
+  });
+
+  it("allows hosted jobs in another .yaml workflow with only the exact i9 exception", () => {
+    const mutant = structuredClone(workflowInventory());
+    mutant["other.yaml"] = structuredClone(mutant["entropy.yml"]!);
+    assertI9RunnerAdmission(mutant);
+  });
+
+  it("rejects a self-hosted job added by another workflow", () => {
+    const mutant = structuredClone(workflowInventory());
+    mutant["newfile.yml"] = structuredClone(mutant["entropy.yml"]!);
+    mutant["newfile.yml"]!.jobs["other-self-hosted"] = {
       name: "unapproved self-hosted job",
       "runs-on": ["self-hosted", "windows", "other"],
     };
+    expect(() => assertI9RunnerAdmission(mutant)).toThrow();
+  });
+
+  it("rejects a duplicate windows-i9 exception in another workflow", () => {
+    const mutant = structuredClone(workflowInventory());
+    mutant["newfile.yml"] = structuredClone(mutant["entropy.yml"]!);
+    mutant["newfile.yml"]!.jobs[i9JobId] = structuredClone(mutant[i9WorkflowFile]!.jobs[i9JobId]!);
+    expect(() => assertI9RunnerAdmission(mutant)).toThrow();
+  });
+
+  const unresolvedRunnerMutations: Array<[string, (job: Job) => void]> = [
+    ["a direct string expression", (job) => { job["runs-on"] = "${{ inputs.runner }}"; }],
+    ["an expression in a runs-on array", (job) => { job["runs-on"] = ["${{ 'self-hosted' }}", "Windows"]; }],
+    ["a self-hosted matrix selection", (job) => {
+      job["runs-on"] = "${{ matrix.runner }}";
+      job.strategy = { matrix: { runner: ["ubuntu-latest", "self-hosted"] } };
+    }],
+  ];
+  it.each(unresolvedRunnerMutations)("fails closed for %s", (_case, configureJob) => {
+    const mutant = structuredClone(workflowInventory());
+    mutant["newfile.yml"] = structuredClone(mutant["entropy.yml"]!);
+    const job: Job = { "runs-on": "ubuntu-latest" };
+    configureJob(job);
+    mutant["newfile.yml"]!.jobs["unresolved-runner"] = job;
     expect(() => assertI9RunnerAdmission(mutant)).toThrow();
   });
 
@@ -403,7 +457,7 @@ describe("hosted sharded required checks", () => {
 
   it("keeps hosted-only admission, pinned brokers, systemd, and singleton smoke/cleanup/package semantics", () => {
     const config = workflow();
-    assertI9RunnerAdmission(config);
+    assertI9RunnerAdmission(workflowInventory());
     const setup = action("check-setup").runs!.steps as Step[];
     assertI9RunnerEnvironment(config, action("check-setup"));
     expect(setup.find((step) => step.name === "Install pinned nats-server for session-channel acceptance")?.run).toBe("bash scripts/install-pinned-nats-server.sh");

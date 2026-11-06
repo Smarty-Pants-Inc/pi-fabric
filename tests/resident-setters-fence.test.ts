@@ -219,6 +219,8 @@ for (const kind of ["Main", "proxy"] as const) {
       { operation: "setBatching", id: "", batchWindowMs: 300_000, batchMax: 50 },
       { operation: "setActivationFilter", id: "", activationFilter: null },
       { operation: "setTools", id: "", tools: ["read", "bash"] },
+      { operation: "setTopics", id: "", topics: ["subscriptions.changed"] },
+      { operation: "setEvents", id: "", events: ["input"] },
     ];
     for (const mutation of mutations) for (const ending of ["abort", "timeout"] as const) {
       it(`${mutation.operation} ${ending} after commit preserves known-ID receipt and rejects replay`, async () => {

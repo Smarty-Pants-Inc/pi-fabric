@@ -1745,6 +1745,9 @@ const main = async (): Promise<void> => {
   const processEvent = (line: string): void => {
     if (process.env.PI_FABRIC_INJECT_CRASH === "stream") throw new Error("simulated stream crash");
     if (!line.trim()) return;
+    // Claude's native session trace retains original admitted lines, including
+    // frames omitted from the projected run log below.
+    sessionStream?.write(`${line}\n`);
     let event: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(line);
@@ -1771,7 +1774,6 @@ const main = async (): Promise<void> => {
     const logEvent = projectToolResultLogEvent(event, options.runner);
     if (logEvent) {
       const logLine = logEvent === event ? line : JSON.stringify(logEvent);
-      sessionStream?.write(`${logLine}\n`);
       runLog.event(logLine, logEvent);
     }
     if (pendingWhitespaceStall) {

@@ -116,6 +116,44 @@ const boundedText = (value: string, max: number): string =>
 const questionText = (value: unknown, max: number): string | undefined =>
   typeof value === "string" ? detachedPreview(value, max) : undefined;
 
+/** Hosted adapters have no tool-result guard: persist only the transcript API's safe fields. */
+const projectHostedTranscriptEvent = (value: unknown): Record<string, unknown> | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const event = value as Record<string, unknown>;
+  const type = event.type;
+  if (type === "tool_execution_start" || type === "tool_execution_end") {
+    const projected: Record<string, unknown> = { type };
+    for (const field of ["toolCallId", "toolName"] as const) {
+      const value = event[field];
+      if (typeof value === "string") projected[field] = value;
+    }
+    if (typeof event.isError === "boolean") projected.isError = event.isError;
+    for (const field of ["argsBytes", "resultBytes"] as const) {
+      const value = event[field];
+      if (typeof value === "number" && Number.isFinite(value)) projected[field] = value;
+    }
+    return projected;
+  }
+  if (type === "message_end") {
+    if (typeof event.message !== "object" || event.message === null) return undefined;
+    const message = event.message as Record<string, unknown>;
+    const role = message.role;
+    if (role !== "assistant" && role !== "user") return undefined;
+    const content = message.content;
+    if (typeof content === "string") return { type, message: { role, content } };
+    if (!Array.isArray(content)) return undefined;
+    const text: Array<{ type: "text"; text: string }> = [];
+    for (const block of content) {
+      if (typeof block === "object" && block !== null && block.type === "text" && typeof block.text === "string") {
+        text.push({ type: "text", text: block.text });
+      }
+    }
+    return { type, message: { role, content: text } };
+  }
+  if (type === "extension_error" && typeof event.error === "string") return { type, error: event.error };
+  return undefined;
+};
+
 /**
  * One adapter-owned run. Fabric spawns no process: this object writes the same
  * status, lifecycle and transcript files a worker would, so the manager's
@@ -370,8 +408,8 @@ export class HostedRun {
   }
 
   #transcript(event: Parameters<FabricHostedReporter["transcript"]>[0]): void {
-    if (this.#closed || typeof event !== "object" || event === null || typeof event.type !== "string") return;
-    this.#appendLog(event);
+    if (this.#closed) return;
+    this.#appendLog(event, true);
   }
 
   async #question(question: FabricRunnerQuestion): Promise<AgentChildQuestionResponse> {
@@ -477,9 +515,10 @@ export class HostedRun {
     }
   }
 
-  #appendLog(event: unknown): void {
+  #appendLog(event: unknown, reportedTranscript = false): void {
     try {
-      const line = JSON.stringify(event);
+      // Internal log events stay unchanged; reported objects are never serialized directly.
+      const line = JSON.stringify(reportedTranscript ? projectHostedTranscriptEvent(event) : event);
       if (line === undefined || Buffer.byteLength(line) > MAX_TRANSCRIPT_EVENT_BYTES) return;
       fs.appendFileSync(this.files.logFile, `${line}\n`, { encoding: "utf8", mode: 0o600 });
     } catch {

@@ -42,6 +42,8 @@ try {
       operation === "setInstructions" ? { operation, id: actor.id, instructions: "Changed" } :
       operation === "setModel" ? { operation, id: actor.id, model: "fixture/visible", scope: "project" } :
       operation === "setThinking" ? { operation, id: actor.id, thinking: "high", scope: "project" } :
+      operation === "setTopics" ? { operation, id: actor.id, topics: ["subscriptions.changed"] } :
+      operation === "setEvents" ? { operation, id: actor.id, events: ["input"] } :
       operation === "setActivationFilter" ? { operation, id: actor.id, activationFilter: null } :
       { operation, id: actor.id, tools: ["read"] }, undefined, caller));
   const requests = fs.readdirSync(path.join(config.residencyRoot, "requests"));

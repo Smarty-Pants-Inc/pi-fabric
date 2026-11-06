@@ -2972,7 +2972,7 @@ export class ActorManager {
    * stops future topic admission without changing already-accepted work, direct
    * messages or host-event subscriptions. An empty list enables topic drain-only.
    */
-  async setTopics(id: string, topics: string[]): Promise<FabricActorInfo> {
+  async setTopics(id: string, topics: string[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     if (!Array.isArray(topics)) throw new Error("topics must be an array of strings");
     const next = [...new Set(topics)];
@@ -2990,6 +2990,7 @@ export class ActorManager {
     }
     this.#assertPresenceValue(this.#presencePreview(actor, { topics: next }));
     const previous = actor.topics;
+    beforeCommit?.(actor.id);
     actor.topics = next;
     actor.updatedAt = Date.now();
     try {
@@ -3011,13 +3012,15 @@ export class ActorManager {
    * Pass an empty array to pause host-event reactivity while keeping the actor
    * alive and reachable by direct messages and mesh topics.
    */
-  async setEvents(id: string, events: FabricActorHostEvent[]): Promise<FabricActorInfo> {
+  async setEvents(id: string, events: FabricActorHostEvent[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    if (!Array.isArray(events)) throw new Error("events must be an array of host events");
     const next = [...new Set(events)];
     for (const event of next) {
       if (!HOST_EVENTS.has(event)) throw new Error(`Unsupported Fabric actor event: ${event}`);
     }
     this.#assertPresenceValue(this.#presencePreview(actor, { events: next }));
+    beforeCommit?.(actor.id);
     actor.events = next;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor, true);

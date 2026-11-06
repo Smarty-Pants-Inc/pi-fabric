@@ -6038,7 +6038,7 @@ describe("AgentsProvider global actors", () => {
     const { provider, actors, agents } = setup([], [], undefined, { canManageActor: () => owned });
     const actor = await actors.create({ name: "topics-owner", instructions: "Work.", topics: ["topics.original"] });
     owned = false;
-    await expect(provider.invoke("setTopics", { id: actor.id, topics: [] }, context)).rejects.toThrow("owned by another host");
+    await expect(provider.invoke("setTopics", { id: actor.id, topics: [] }, context)).rejects.toThrow("Root resident host is not live");
     expect(actors.status(actor.id)).toMatchObject({ topics: ["topics.original"], queued: 0 });
     expect(agents.list()).toEqual([]);
   });

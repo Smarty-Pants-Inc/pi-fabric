@@ -1223,7 +1223,7 @@ interface FabricAgentsApi {
   setBatching(args: FabricActorBatching & { id: string; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   /** Refused when the new filter would skip queued items, unless dropQueued: true moves them to the dead-letter queue. */
   setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number; dropQueued?: boolean; scope?: "project" | "global" }): Promise<FabricActorInfo>;
-  /** Replace ordinary actor mesh topics; [] stops topic intake without discarding accepted work. Native slot-bound topics are immutable. Live actors require the local owner; global updates only the template. */
+  /** Replace ordinary actor mesh topics; [] stops topic intake without discarding accepted work. Native slot-bound topics are immutable. Session actors remain local; the owning Main can update durable actors through the resident mutation route when a live owner and current command are available. No resident auto-start or generic foreign-root/remote forwarding; global updates only the template. */
   setTopics(args: { id: string; topics: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
   setDeliveryPolicy(args: {

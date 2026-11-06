@@ -169,9 +169,10 @@ describe("LifecycleBroker", () => {
     expect(deliver).toHaveBeenCalledOnce();
   });
 
-  it.each([false, true])("blocks release on an unconfirmed delivered cursor/once deletion without replay (once=%s)", async (once) => {
+  it.each([["file", false], ["file", true], ["sqlite", false], ["sqlite", true]] as const)(
+    "blocks release on an unconfirmed delivered cursor/once deletion without replay (%s, once=%s)", async (stateBackend, once) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-")); roots.push(root);
-    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend });
     const deliveries = vi.fn();
     const broker = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
       { enabled: true, pollMs: 20, maxReadEvents: 100 }, deliveries);
@@ -201,6 +202,7 @@ describe("LifecycleBroker", () => {
     expect(deliveries).toHaveBeenCalledTimes(1);
     if (once) expect(successor.list().find(s => s.id === sub.id)).toBeUndefined();
     else expect(successor.list()[0]?.id).toBe(sub.id);
+    await successor.close(); mesh.closeState();
   });
 
 
@@ -299,10 +301,10 @@ describe("LifecycleBroker", () => {
       .toBe(0);
   });
 
-  it("delivers only new matching source events and removes one-shot subscriptions", async () => {
+  it.each(["file", "sqlite"] as const)("delivers only new matching source events and removes one-shot subscriptions (%s)", async stateBackend => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
     roots.push(root);
-    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend });
     const directory = participants(targetIdentity.id);
     const deliveries: Array<{
       subscription: FabricLifecycleSubscription;
@@ -380,6 +382,7 @@ describe("LifecycleBroker", () => {
       },
     });
     await waitFor(() => target.list().length === 0);
+    await target.close(); await publisher.close(); mesh.closeState();
   });
 
   // smarty-dev#557: the target's host saved the cursor after every new mesh event, a whole
@@ -426,10 +429,10 @@ describe("LifecycleBroker", () => {
     expect(delivered).toHaveLength(1);
   });
 
-  it("scans unsaved events again after a restart without delivering anything twice", async () => {
+  it.each(["file", "sqlite"] as const)("scans unsaved events again after a restart without delivering anything twice (%s)", async stateBackend => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-lifecycle-"));
     roots.push(root);
-    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend });
     const delivered: string[] = [];
     const broker = () => {
       const value = new LifecycleBroker(mesh, targetIdentity, participants(targetIdentity.id),
@@ -462,6 +465,7 @@ describe("LifecycleBroker", () => {
     await waitFor(() => delivered.length === 2);
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(new Set(delivered).size).toBe(2);
+    await second.close(); await publisher.close(); mesh.closeState();
   });
 
   // review/astra on #49: with the runtime read cache, a publisher's cached listing must not

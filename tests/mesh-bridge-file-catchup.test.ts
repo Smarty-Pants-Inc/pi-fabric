@@ -118,14 +118,17 @@ it("still detects file-backed participant edits, same-version replacements and m
   const changes: string[] = [];
   const unsubscribe = f.side.subscribeChanges(kind => changes.push(kind), error => { throw error; });
   cleanups.push(unsubscribe);
-  await settle();
-  changes.length = 0;
+  const observePresence = async (): Promise<void> => {
+    await vi.waitFor(() => expect(changes).toContain("presence"), { timeout: 2_000 });
+    // One subscriber/digest cache spans all stages. Each scan updates its baseline before the
+    // callback; later duplicate watch notifications capture the same digest and cannot satisfy
+    // the next stage's observation.
+    changes.length = 0;
+  };
   // Copy-on-read is intentionally retained on the public API.
   const participant = f.store.listAll("topology/participants/")[0]!;
   await f.store.put({ key: participant.key, identity: participant.updatedBy, value: { ...participant.value as object, status: "running" } });
-  await settle();
-  expect(changes).toContain("presence");
-  changes.length = 0;
+  await observePresence();
   // A legacy writer can change content without changing any revision label. Object identity,
   // not version, owns the digest cache. Strip generation markers just as a legacy writer does.
   const file = path.join(f.root, "state.json");
@@ -136,12 +139,9 @@ it("still detects file-backed participant edits, same-version replacements and m
   const replacement = path.join(f.root, "legacy.tmp");
   fs.writeFileSync(replacement, JSON.stringify(state));
   fs.renameSync(replacement, file);
-  await settle();
-  expect(changes).toContain("presence");
+  await observePresence();
   await f.remote.mirror(presence("session:hub-root-00000000", f.now));
-  await settle();
-  changes.length = 0;
+  await observePresence();
   await f.remote.mirror({ hosts: [], participants: [] });
-  await settle();
-  expect(changes).toContain("presence");
+  await observePresence();
 });

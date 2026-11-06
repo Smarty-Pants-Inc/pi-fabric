@@ -168,7 +168,8 @@ const instrument = (f: Fixture, plan: { fault?: Fault; rollbackAfterRefusals: nu
   const s = {
     steps, injectedError, lockPath, ownerPath, settled: settled.promise,
     raw: undefined as DatabaseSync | undefined, sqliteHeld: false,
-    started: false, inFlight: false, refusals: 0, appended: 0, injected: 0, ownerUnlinks: 0,
+    started: false, inFlight: false, refusals: 0, fenceScope: undefined as "ingress" | undefined,
+    appended: 0, injected: 0, ownerUnlinks: 0,
     faultActive: plan.fault !== undefined, armed: false,
     refused: undefined as { record: string; dev: number; ino: number } | undefined,
     successor: undefined as { record: string; ino: number } | undefined,
@@ -231,15 +232,21 @@ const instrument = (f: Fixture, plan: { fault?: Fault; rollbackAfterRefusals: nu
     if (first) void pending.then(() => settle(true), (error: unknown) => settle(false, error));
     return pending;
   });
-  // Pass-through: the hub's own state write fence, with the original receiver, arguments and thrown error. Records
-  // each refusal it throws during the first publication, with its own property descriptors as thrown.
-  vi.spyOn(f.hub, "withStateWriteFence").mockImplementation(function <T>(this: MeshStore, ...args: [() => T]): T {
+  // Pass-through: preserve the original receiver, both arguments and thrown error. The timing pair tags the
+  // actual held-ingress #heldFence call; the untimed snapshot-reader fence is deliberately outside this scope.
+  vi.spyOn(f.hub, "withStateWriteFence").mockImplementation(function <T>(this: MeshStore,
+    ...args: Parameters<MeshStore["withStateWriteFence"]>): T {
+    const timing = args[1];
+    const scope = timing?.operation === "bridge-notification-fence" && timing.phase === "notification-fence"
+      ? "ingress" as const : undefined;
+    const previousScope = s.fenceScope;
+    s.fenceScope = scope;
     try { return Reflect.apply(stateWriteFence, this, args) as T; }
     catch (error) {
-      try { if (s.inFlight) s.fenceRefusals.push({ error, own: Object.getOwnPropertyDescriptors(error) }); }
+      try { if (s.inFlight && scope === "ingress") s.fenceRefusals.push({ error, own: Object.getOwnPropertyDescriptors(error) }); }
       catch { /* observation never changes the call */ }
       throw error;
-    }
+    } finally { s.fenceScope = previousScope; }
   });
   vi.spyOn(f.hub, "publish").mockImplementation(input => {
     if (input.text === INGRESS_TEXT) mark("publish-start");
@@ -272,7 +279,9 @@ const instrument = (f: Fixture, plan: { fault?: Fault; rollbackAfterRefusals: nu
   vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (this: DatabaseSync, sql: string) {
     try { return exec.call(this, sql); }
     catch (error) {
-      if (s.inFlight && this !== s.raw && sql.trim().toUpperCase() === "BEGIN IMMEDIATE" && sqliteBusy(error)) {
+      if (s.inFlight && s.fenceScope === "ingress" && this !== s.raw &&
+          sql.trim().toUpperCase() === "BEGIN IMMEDIATE" && sqliteBusy(error)) {
+        // Count and release raw contention only at the tagged ingress acquire call site.
         s.refusals += 1;
         mark("refusal");
         if (!s.refused) {
@@ -452,7 +461,8 @@ describe.skipIf(process.platform !== "linux")("held ingress canonical release re
     observation("INGRESS_RELEASE_CONFIRMED", f, s, outcome);
     const kinds = s.kinds();
     expect(outcome.fulfilled).toBe(true);
-    expect(s.refusals).toBe(2);
+    expect(s.refusals, "both actual ingress write-fence refusals still count").toBe(2);
+    expect(s.fenceRefusals, "only the two actual ingress acquire errors are retained").toHaveLength(2);
     expect(s.injected).toBe(0);
     const appendAt = kinds.indexOf("append");
     // Each replay follows a native rmdir of the canonical lock (a confirmed release), then reacquires it.

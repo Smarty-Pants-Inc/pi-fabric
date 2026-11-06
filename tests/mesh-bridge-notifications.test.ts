@@ -535,9 +535,12 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     const farBatch = vi.spyOn(f.far, "writeBatch");
     const mirrors = vi.spyOn(f.local, "mirror");
     await vi.advanceTimersByTimeAsync(5_000);
+    const heartbeatExpiries = new Map<string, number>();
     for (const lane of lanes) {
+      const expiresAt = Date.now() + 15_000;
+      heartbeatExpiries.set(lane.id, expiresAt);
       writeHostLease(f.far.root, { id: lane.id, rootId: lane.id, identityId: lane.id, startedAt: lane.host.startedAt,
-        updatedAt: Date.now(), expiresAt: Date.now() + 15_000 });
+        updatedAt: Date.now(), expiresAt });
       await sleep(2); // separate native fs.watch deliveries, not one synchronous write burst
     }
     await settle();
@@ -551,7 +554,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     expect(farBatch).toHaveBeenCalledTimes(1);
     for (const lane of lanes) {
       expect(f.local.holds(lane.id)).toBe(true);
-      expect(readHostLeases(f.hub.root).get(lane.id)?.expiresAt).toBeGreaterThanOrEqual(lane.host.expiresAt + 5_000);
+      expect(readHostLeases(f.hub.root).get(lane.id)?.expiresAt).toBe(heartbeatExpiries.get(lane.id));
     }
     expect(live.failure()).toBeUndefined();
   });

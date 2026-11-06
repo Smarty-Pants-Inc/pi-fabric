@@ -37,7 +37,6 @@ const { MeshStore } = await import("../src/mesh/store.js");
 const { hostLeasePath, readHostLease, readHostLeases, writeHostLease } = await import("../src/topology/host-leases.js");
 const NOW = 1_800_000_000_000;
 const key = (kind: string, id: string) => `topology/${kind}/${createHash("sha256").update(id).digest("hex")}`;
-const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 const closers: Array<() => void> = [];
 afterEach(() => {
   for (const close of closers.splice(0).reverse()) close();
@@ -156,8 +155,7 @@ describe("real StoreBridgeSide keyed lease consumers", () => {
 
   it("classifies real notification snapshots identically without listing after each renewal", async () => {
     const f = await fixture();
-    // Let notifications from fixture setup clear before measuring subscription's initial cost.
-    await new Promise(resolve => setTimeout(resolve, 120)); // drain the bridge's 100 ms notification window
+    // The mocked notifier only registers callbacks; fixture setup precedes subscriptions and cannot enqueue events.
     const oracle: BridgeChange[] = [], keyed: BridgeChange[] = [], failures: Error[] = [];
     const beforeBaseline = f.listings();
     closers.push(f.side.subscribeChanges(kind => keyed.push(kind), error => failures.push(error)));
@@ -166,16 +164,22 @@ describe("real StoreBridgeSide keyed lease consumers", () => {
     closers.push(f.side.subscribeChanges(kind => oracle.push(kind), error => failures.push(error)));
     observation.full = false;
     const callbacks = [...observation.notify.get(f.root)!];
+    const proofs = vi.spyOn(f.store, "stateUnchangedSince");
+    const capture = async (callback: (kind: BridgeChange) => void) => {
+      const before = proofs.mock.calls.length;
+      callback("presence");
+      await vi.waitFor(() => expect(proofs.mock.calls.length).toBeGreaterThan(before), { timeout: 2_000, interval: 10 });
+    };
     const check = async (expected: BridgeChange[]) => {
       const before = f.listings();
-      callbacks[0]!("presence");
-      await new Promise(resolve => setTimeout(resolve, 120)); // drain the bridge's 100 ms notification window
-      await turn();
+      await capture(callbacks[0]!);
       expect(f.listings() - before, "one notification capture must not enumerate leases").toBe(0);
       observation.full = true;
-      callbacks[1]!("presence");
-      await turn();
-      observation.full = false;
+      try {
+        await capture(callbacks[1]!);
+      } finally {
+        observation.full = false;
+      }
       expect(keyed.splice(0)).toEqual(expected);
       expect(oracle.splice(0)).toEqual(expected);
       expect(failures).toEqual([]);

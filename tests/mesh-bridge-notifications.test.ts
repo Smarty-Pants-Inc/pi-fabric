@@ -299,7 +299,10 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     const program = path.join(f.root, "queued-hello.mjs");
     buildSync({ stdin: { contents: source, resolveDir: process.cwd() }, outfile: program, bundle: true, platform: "node", format: "esm", packages: "external" });
     const child = spawnSync(process.execPath, [program], { encoding: "utf8", timeout: 3_000 });
-    expect({ error: child.error?.message, status: child.status, stderr: child.stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
+    // NODE_OPTIONS makes the local deletion guard announce its hosted-only report mode in
+    // every child. Ignore only that exact harness notice; all other stderr remains strict.
+    const stderr = child.stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "");
+    expect({ error: child.error?.message, status: child.status, stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
     expect(JSON.parse(child.stdout.trim())).toEqual({ installed: 0, active: 0 });
   });
 

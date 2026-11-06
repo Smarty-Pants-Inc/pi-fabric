@@ -330,7 +330,7 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
         bytes.toString("utf8").trimEnd().length <= MAX_EVENT_LINE_CHARS - CANONICAL_ENVELOPE_RESERVE_CHARS &&
         hasEquivalentCanonical(source, record.offset, event, index.get(String(event.toolCallId)), checkWork)) {
         const result = event.result as EventRecord;
-        const { content: _content, details: _details, ...resultMetadata } = result;
+        const { content: _content, details: _details, structuredContent: _structuredContent, ...resultMetadata } = result;
         bytes = Buffer.from(`${JSON.stringify({
           ...event,
           result: { elided: true, bytes: resultBytes },

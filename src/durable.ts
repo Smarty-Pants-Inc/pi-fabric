@@ -254,8 +254,16 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
         if (message.role === "assistant" || message.role === "user") {
           const content = typeof message.content === "string" ? message.content : message.content.filter(block => block.type === "text").map(block => ({ type: "text" as const, text: block.text }));
           reporter.transcript({ type: "message_end", message: { role: message.role, content } });
-          if (message.role === "assistant") for (const block of message.content) if (block.type === "toolCall") reporter.transcript({ type: "tool_execution_start", toolCallId: block.id, toolName: block.name, args: block.arguments });
-        } else if (message.role === "toolResult") reporter.transcript({ type: "tool_execution_end", toolCallId: message.toolCallId, toolName: message.toolName, result: message.content, isError: message.isError });
+          if (message.role === "assistant") for (const block of message.content) if (block.type === "toolCall") {
+            const event = { type: "tool_execution_start" as const, toolCallId: block.id, toolName: block.name, argsBytes: Buffer.byteLength(JSON.stringify(block.arguments), "utf8") };
+            reporter.transcript(event);
+          }
+        } else if (message.role === "toolResult") {
+          // Hosted tools have no Pi tool_result middleware: persist metadata, never unguarded payloads.
+          // resultBytes measures the omitted model-facing content as UTF-8 JSON, not details or other fields.
+          const event = { type: "tool_execution_end" as const, toolCallId: message.toolCallId, toolName: message.toolName, resultBytes: Buffer.byteLength(JSON.stringify(message.content), "utf8"), isError: message.isError };
+          reporter.transcript(event);
+        }
       }
     }
     const assistants = view.entries.flatMap(entry => entry.model?.filter(message => message.role === "assistant") ?? []);

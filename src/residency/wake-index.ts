@@ -80,11 +80,12 @@ export const routesAt = (root: string): ResidentWakeRoutes | undefined => {
 /** Re-read persisted config and the host's exact snapshot at each actual wake start. */
 export const assertResidentWakeConfig = (root: string, launchConfig?: ResidentHostConfig): ResidentHostConfig => {
   const routes = retainedRoutesAt(root);
+  const retained = routes ? JSON.parse(routes.configJson) as ResidentHostConfig : undefined;
   const config = readWakeJson<ResidentHostConfig>(path.join(root, "config.json"));
-  if (!routes || !residentWakeConfigMatches(config, JSON.parse(routes.configJson)) ||
+  if (!retained || !residentWakeConfigMatches(config, retained) ||
       (launchConfig !== undefined && !residentWakeConfigMatches(config, launchConfig)))
     throw new ResidentWakeConfigMismatch(root);
-  return config!;
+  return retained;
 };
 export const residentDeliveryMatches = (routes: ResidentWakeRoutes, event: MeshEvent, lifecycle: readonly WakeSubscription[]): boolean => {
   const command = event.topic === "fabric.control.command" ? event.data as { targetId?: string } | undefined : undefined;

@@ -5,6 +5,10 @@ import { spawn, execFileSync } from "node:child_process";
 import { expect, it } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import type { FabricParticipantSource } from "../src/topology/types.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { residentLaunchSpec } from "../src/residency/handover.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig, type ResidentHostOwner } from "../src/residency/protocol.js";
 import { readWakeJson } from "../src/residency/wake.js";
 import { processStartTime, residentProcessAlive } from "../src/residency/process-identity.js";
@@ -25,7 +29,7 @@ const sample = (pid: number) => {
 // Exercises real native exit + compiled launcher + production ResidentHost; the Pi/model
 // transport is an explicitly fake executable so the test never spends credentials/inference.
 it.skipIf(process.platform !== "linux")("native dormant host exits, is woken by committed deliveries, drains FIFO once, and releases CPU/RSS", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-dormant-native-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-dormant-native-")));
   const bun = execFileSync("bun", ["-e", "console.log(process.execPath)"], { encoding: "utf8" }).trim();
   const pi = path.join(root, "fake-pi");
   const quote = (text: string) => "'" + text.replaceAll("'", "'\\''") + "'";
@@ -35,11 +39,15 @@ it.skipIf(process.platform !== "linux")("native dormant host exits, is woken by 
     meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(path.join(root, "mesh"), "session:dormant-native"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents }, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh },
     retention: { ...DEFAULT_FABRIC_CONFIG.retention }, workerPath: path.resolve("dist/worker.js"), fabricExtensionPath: path.resolve("dist/index.js"),
-    piBinary: pi, claudeBinary: pi, vedaBinary: pi, watchdog: { enabled: false },
+    // #19074: real optional-runner absence must survive sealing and the compiled wake launcher.
+    piBinary: pi, claudeBinary: path.join(root, "missing-claude"), vedaBinary: path.join(root, "missing-veda"), watchdog: { enabled: false },
   };
   fs.mkdirSync(config.residencyRoot, { recursive: true });
   const configPath = path.join(config.residencyRoot, "config.json");
-  fs.writeFileSync(configPath, JSON.stringify(config));
+  const configWriter = new ResidencyClient({ config,
+    mesh: new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents),
+    participants: {} as FabricParticipantSource, mainAgent: { local: true } as FabricMainAgentTarget,
+    hostPath: path.resolve("dist/residency/launcher.js") });
   const owned = new Map<number, string | undefined>();
   let first: ReturnType<typeof spawn> | undefined;
   let firstExit: Promise<number | null> | undefined;
@@ -52,6 +60,18 @@ it.skipIf(process.platform !== "linux")("native dormant host exits, is woken by 
     }) as Array<{ pid: number; processStartTime?: string }>; } catch { return []; }
   };
   try {
+    // Keep: #19074. Exercise Main's real writer, not raw config plus wake-time normalization.
+    configWriter.syncPiModels();
+    const sealed = JSON.parse(fs.readFileSync(configPath, "utf8")) as ResidentHostConfig;
+    expect(sealed).toEqual(residentLaunchSpec(config, path.resolve("dist/residency/pi-entry.js"), bun).config);
+    expect(sealed.piBinary).toBe(fs.realpathSync(pi));
+    for (const field of ["claudeBinary", "vedaBinary"] as const) {
+      expect(path.dirname(sealed[field])).toBe(path.resolve("dist/residency"));
+      expect(path.basename(sealed[field])).toMatch(/^unavailable-[0-9a-f]{64}\.js$/);
+      expect(fs.existsSync(sealed[field])).toBe(false);
+    }
+    await configWriter.close();
+    configWriter.options.mesh.closeState();
     first = spawn(process.execPath, [path.resolve("dist/residency/launcher.js"), "--config", configPath], { stdio: "ignore" });
     owned.set(first.pid!, processStartTime(first.pid!));
     firstExit = new Promise(resolve => first!.once("exit", code => resolve(code)));
@@ -120,6 +140,8 @@ it.skipIf(process.platform !== "linux")("native dormant host exits, is woken by 
     expect(new (await import("../src/actors/registry-store.js")).ActorRegistryStore(config.actorRoot).records().find(row => row.name === "native-listener")?.status).toBe("dormant");
     console.log("NATIVE_WAKE", JSON.stringify({ processed: [1, 2, 3], exactlyOnce: true, hostExited: true, allLaunchersExited: true }));
   } finally {
+    await configWriter.close();
+    configWriter.options.mesh.closeState();
     for (const row of launcherPids()) owned.set(row.pid, row.processStartTime);
     const current = owner(); if (current) owned.set(current.pid, current.processStartTime);
     for (const [pid, birth] of owned) if (residentProcessAlive(pid, birth)) { try { process.kill(pid, "SIGTERM"); } catch { /* exited */ } }

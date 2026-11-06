@@ -86,6 +86,8 @@ export class LifecycleBroker {
   readonly #unsaved = new Map<string, number>();
   /** Accepted delivery is never replayed to recover a storage receipt. */
   readonly #delivered = new Map<string, { entry: MeshStateEntry; subscription: FabricLifecycleSubscription }>();
+  /** Complete prefix selection and its conservative SQLite witness; never delivery/ownership authority. */
+  #selection: { revision: string; entries: readonly Readonly<MeshStateEntry>[] } | undefined;
 
   constructor(
     readonly mesh: MeshStore,
@@ -425,7 +427,25 @@ export class LifecycleBroker {
   }
 
   async #drain(): Promise<void> {
-    const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
+    // Capture BEFORE proof/listing: stamping after either could skip a concurrent prefix write.
+    // A cheap key/version feed proof avoids both SQL value reads and filtering the entire mesh
+    // array for unrelated commits. False/unknown/gap falls back to the backend's delta snapshot.
+    const revision = this.mesh.stateRevision?.();
+    const cached = this.#selection;
+    let selected: readonly Readonly<MeshStateEntry>[];
+    if (revision !== undefined && cached &&
+        this.mesh.stateUnchangedSince?.(cached.revision, [FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX])) {
+      selected = cached.entries;
+    } else {
+      const snapshot = this.mesh.stateToken();
+      selected = this.mesh.listAllShared(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX, { snapshot });
+    }
+    // Publish witness + complete entries together, only after a successful read/proof. A thrown
+    // read keeps the old pair for retry. Non-SQLite/missing capabilities retain the delta path.
+    this.#selection = revision === undefined ? undefined : { revision, entries: selected };
+    // Replay ALL subscriptions every pass: events, ownership movement and failed/gated work
+    // need not change state. Handlers may mutate their copy, never this retained selection.
+    const entries = selected.map((entry) => structuredClone(entry));
     const listed = new Set<string>();
     let latestSequence: number | undefined;
     // One directory rebuild serves every subscription in this cycle that still

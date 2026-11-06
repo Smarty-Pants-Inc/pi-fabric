@@ -34,8 +34,8 @@ const fixture = () => {
   const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
   const client = new ResidencyClient({ config, mesh, participants: {} as FabricParticipantSource,
     mainAgent: { local: true } as FabricMainAgentTarget });
-  const read = vi.spyOn(mesh, "listAll");
-  const drains = () => read.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
+  const read = vi.spyOn(mesh, "stateToken");
+  const drains = () => read.mock.calls.length;
   // A journal envelope lands by atomic rename (one notification), as a resident completion does.
   const landCompletion = (name: string) => {
     const temporary = path.join(root, `${name}.tmp`);
@@ -129,7 +129,7 @@ describe("resident client event-driven delivery", () => {
     });
     // Record deletion intent only: this local probe must not run source-retirement deletion.
     const deletion = vi.spyOn(mesh, "delete").mockResolvedValue({ deleted: true });
-    const reads = vi.spyOn(mesh, "listAll");
+    const reads = vi.spyOn(mesh, "stateToken");
     const key = residentDeliveryPrefix(config.rootId) + "remote";
     const envelope = { format: RESIDENT_HOST_FORMAT, id: "remote", rootId: config.rootId,
       from: { id: "actor:remote", name: "remote", kind: "actor" }, source: "actor-output",
@@ -243,13 +243,11 @@ describe("resident client event-driven delivery", () => {
       return Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher;
     }) as unknown as typeof fs.watch);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // Record intended source retirement and hide only its state-view result.
-    const retired = new Set<string>();
-    const list = MeshStore.prototype.listAll.bind(mesh);
-    const reads = vi.spyOn(mesh, "listAll").mockImplementation((...args) => list(...args).filter((entry) => !retired.has(entry.key)));
-    const deletion = vi.spyOn(mesh, "delete").mockImplementation(async ({ key }) => { retired.add(key); return { deleted: true }; });
+    // Record intended source retirement only. The unchanged shared row is not sent twice.
+    const reads = vi.spyOn(mesh, "stateToken");
+    const deletion = vi.spyOn(mesh, "delete").mockResolvedValue({ deleted: true });
     const journal = vi.spyOn(CompletionJournal.prototype, "drain");
-    const drains = () => reads.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
+    const drains = () => reads.mock.calls.length;
     vi.useFakeTimers();
     try {
       client.start();

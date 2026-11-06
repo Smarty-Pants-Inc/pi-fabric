@@ -266,6 +266,24 @@ export class ResidentActorClient {
         if (response?.format === RESIDENT_HOST_FORMAT && response.requestId === command.requestId) {
           if (acknowledgeResidentResponse(this.#residencyDir, response, Date.now(), command.format)) fs.rmSync(responsePath, { force: true });
           if (!response.ok) {
+            // A drain's precommit refusal has no durable operation file. Preserve
+            // its correlated terminal receipt for the operator instead of turning
+            // the known refusal into an abandoned/unknown actor mutation. All
+            // other operations keep their existing typed/generic throwing path.
+            if (command.operation === "releaseDrain") {
+              const drain = response.drain;
+              if (drain?.abi === drainProtocol!.RESIDENT_DRAIN_ABI && drain.rootId === command.rootId &&
+                  typeof drain.id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(drain.id) &&
+                  drain.phase === "refused" && drain.outcome === "refused" && drain.terminal === true && drain.admissionHeld === false &&
+                  Number.isFinite(drain.at) && Number.isFinite(drain.deadlineAt) && typeof drain.code === "string" && typeof drain.reason === "string" &&
+                  drainProtocol!.sameDrainOwner(drain.owner, command.expected.owner) &&
+                  drainProtocol!.sameDrainLauncher(drain.launcher, command.expected.launcher) &&
+                  drain.previous?.releaseRoot === command.expected.releaseRoot && drain.previous.digest === command.expected.configDigest &&
+                  JSON.stringify(drain.target) === JSON.stringify(command.target) && JSON.stringify(drain.main) === JSON.stringify(command.main)) {
+                dispatched = false; // a later outer abort must not abandon this known pre-effect refusal
+                return response;
+              }
+            }
             const slotError = residentSlotResponseError(response, signal);
             if (slotError) {
               if (slotError.code === "FABRIC_ACTOR_SLOT_CLAIM_REFUSED") dispatched = false;

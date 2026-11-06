@@ -14,16 +14,25 @@ import { residentHostId, residentRoot, type ResidentHostConfig, type ResidentHos
 import { processStartTime, residentProcessAlive } from "./residency/process-identity.js";
 import { ContainmentUnavailableError, type AttemptLaunchReceipt } from "./residency/attempt-containment-contract.js";
 import { readResidentLaunchAttestation } from "./residency/launch-attestation.js";
+import { residentGenerationExitPath, residentGenerationsPath, type ResidentGenerationExit } from "./residency/generation-exit.js";
 
-const usage = "Usage: fabric-resident-drain --resident <id-or-prefix-or-directory> --mesh-root <DIR> --expected-release <REAL_OLD_ROOT> --target-release <REAL_NEW_ROOT>";
+const usage = "Usage: fabric-resident-drain --resident <id-or-prefix-or-directory> --mesh-root <DIR> --expected-release <REAL_OLD_ROOT> --target-release <REAL_NEW_ROOT> [--exit]";
 const help = `${usage}
 
 Fail-closed cooperative drain; this command cannot switch a resident.
 A loaded host must advertise fabric-resident-drain-1 and releaseDrain. With a
 healthy immutable launch snapshot and the existing live owning Main attestation,
-this command asks A to hold/checkpoint/resume, then waits for its durable receipt.
-Containment is unavailable: A remains serving, B is never launched, and the result
-is nonzero containment-unavailable. This is partial delivery, not release success.
+the default asks A to hold/checkpoint/resume, then waits for its durable receipt.
+Without --exit, containment is unavailable: A remains serving, B is never launched,
+and the result is nonzero containment-unavailable, not release success.
+With --exit, an idle compatible host checkpoints, keeps admission held and closes
+gracefully. Success requires its exact correlated exited receipt, host-written
+stopped generation record and observed process exit. In-flight work refuses exit.
+This is a manual operator stop, not complete attempt containment or handover.
+Before --exit, reload the active owning Main onto the target release and confirm
+config.json selects it. --target-release does not update desired config. The
+CLI does not launch or verify the target; the active Main's ordinary recovery or
+a later ensureHost/wake uses the desired release through the existing launch path.
 All four flags are required. No environment or live-mesh default is used.
 Release roots must be absolute, canonical, existing directories (no symlink aliases).
 The expected release is checked against immutable owner.json launch fields, never
@@ -33,8 +42,8 @@ Legacy attested hosts are refused with DRAIN_ADMISSION_PROTOCOL_UNAVAILABLE:
 no current legacy request closes admission and checkpoints accepted work.
 setActivationFilter skips/consumes input rather than holding it; internal
 pauseForRelease is unavailable externally; releaseChange is unconditionally deferred.
-There is no unsafe bypass: no actor stop/control, shutdown, signals, custody-marker
-removal, ensureHost, reensure or target launch is attempted. Unsupported preflight
+There is no unsafe bypass: no actor stop/control, external shutdown, signals,
+custody-marker removal, ensureHost, reensure or target launch is attempted. Unsupported preflight
 never writes the resident root; negotiated control uses only the request channel.
 A scan, free lock, absent owner or empty process group is not a drain/exit proof.
 unchanged:true means this command did not mutate state, not that the concurrent
@@ -94,6 +103,7 @@ export interface ResidentDrainPublicEvidence {
   at: number;
   deadlineAt: number;
   resumedAt?: number;
+  hostExit?: { pid: number; reason: "stopped"; at: number; processExited: true };
 }
 
 const fingerprint = (token: string): string => `sha256:${createHash("sha256").update(token).digest("hex").slice(0, 16)}`;
@@ -186,7 +196,7 @@ function owningMain(meshRoot: string, root: string, previous: ResidentLaunchSpec
 }
 
 function sameOwner(root: string, owner: ResidentHostOwner, intent: ResidentDrainIntent,
-  launchAttestation: AttemptLaunchReceipt | undefined): boolean {
+  launchAttestation: AttemptLaunchReceipt | undefined, requireLive = true): boolean {
   // Compare with the initially pinned observation as well as the private record;
   // swapping both owner and record cannot silently replace the negotiated attempt.
   if (launchAttestation === undefined ? owner.launchAttestation !== undefined :
@@ -200,7 +210,31 @@ function sameOwner(root: string, owner: ResidentHostOwner, intent: ResidentDrain
     owner.handover?.abi === "fabric-resident-1" &&
     ["pid", "processStartTime", "token", "entry", "runtime"].every(key =>
       owner.handover!.launcher[key as keyof typeof intent.expected.launcher] === intent.expected.launcher[key as keyof typeof intent.expected.launcher]) &&
-    exactBirth(owner.pid, owner.processStartTime) && exactBirth(intent.expected.launcher.pid, intent.expected.launcher.processStartTime);
+    (!requireLive || (exactBirth(owner.pid, owner.processStartTime) && exactBirth(intent.expected.launcher.pid, intent.expected.launcher.processStartTime)));
+}
+
+/** Only ESRCH or a positively observed different birth proves this process gone. */
+function processExited(pid: number, birth: string): boolean {
+  const current = processStartTime(pid);
+  return current !== undefined ? current !== birth : !residentProcessAlive(pid, birth);
+}
+
+function stoppedHost(root: string, intent: ResidentDrainIntent, started: number,
+  probe?: ResidentChannelOwnerProbe): ResidentGenerationExit | undefined {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(intent.expected.owner.token)) {
+    throw new Error("Resident owner token cannot identify a native generation exit record");
+  }
+  const file = residentGenerationExitPath(root, intent.expected.owner.token);
+  let record: ResidentGenerationExit;
+  try { record = readOwnedJson<ResidentGenerationExit>(file, probe); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  if (record?.format !== 1 || record.generation !== intent.expected.owner.token || record.writer !== "host" ||
+      record.reason !== "stopped" || record.pid !== intent.expected.owner.pid || !Number.isSafeInteger(record.at) ||
+      record.at < started || record.at > Date.now() || record.diagnostic !== undefined ||
+      (record.code !== undefined && record.code !== 0) || (record.signal !== undefined && record.signal !== null)) {
+    throw new Error("Host stopped generation record does not match the exact negotiated owner");
+  }
+  return record;
 }
 
 function checkDrain(receipt: EndpointDrainReceipt, id: string, intent: ResidentDrainIntent, previous: ResidentLaunchSpec, started: number): void {
@@ -228,6 +262,7 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
   let target: string | null = null;
   let observed: ResidentDrainReceipt["observed"];
   let dispatched = false;
+  let exitRequested = false;
   const privateTokens = new Set<string>();
   const publicPath = (file: string | null): string | null => file === null ? null :
     path.relative(path.resolve(values["--mesh-root"] ?? process.cwd()), path.resolve(file)) || ".";
@@ -271,6 +306,11 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
       return 0;
     }
     for (let index = 0; index < argv.length; index++) {
+      if (argv[index] === "--exit") {
+        if (exitRequested) refuse("INVALID_ARGUMENTS", usage);
+        exitRequested = true;
+        continue;
+      }
       const option = argv[index] as Option;
       const value = argv[index + 1];
       if (!options.includes(option) || values[option] !== undefined || !value?.trim() || value.startsWith("-")) {
@@ -290,7 +330,8 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
     catch (error) { return refuse("RESIDENT_SELECTOR_INVALID", message(error)); }
     try {
       assertResidentChannelOwned([resident, path.join(resident, "config.json"), path.join(resident, "owner.json"),
-        path.join(resident, "requests"), path.join(resident, "responses")], ownerProbe);
+        path.join(resident, "requests"), path.join(resident, "responses"),
+        ...(exitRequested ? [residentGenerationsPath(resident)] : [])], ownerProbe);
     } catch (error) { return refuse("RESIDENT_CHANNEL_UNOWNED", message(error)); }
     let config: ResidentHostConfig;
     let owner: ResidentHostOwner;
@@ -387,14 +428,25 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
       path.join(target, "dist/residency/pi-entry.js"), previous.runtime);
       assertHandoverTopology(previous, targetSpec);
     } catch { return refuse("TARGET_SNAPSHOT_INVALID", "Target artifact/config cannot be pinned without changing the loaded topology"); }
+    if (exitRequested) {
+      if (config.fabricExtensionPath !== path.join(target, "dist/index.js") || config.workerPath !== path.join(target, "dist/worker.js")) {
+        refuse("CONFIG_RELEASE_MISMATCH", "Before --exit, reload the active Main onto the target release and confirm config.json selects it; --target-release does not update desired config");
+      }
+      try { assertHandoverTopology(previous, { ...targetSpec, config }); }
+      catch { return refuse("CONFIG_RELEASE_MISMATCH", "Desired target config must retain the loaded actor/session/mesh topology"); }
+    }
     let authority: ReturnType<typeof owningMain>;
     try { authority = owningMain(meshRoot, resident, previous, target, ownerProbe); }
     catch { return refuse("MAIN_AUTHORITY_UNAVAILABLE", "No current birth-bound local owning Main generation, root participant and session lease"); }
+    if (exitRequested && authority.main.releaseRoot !== target) {
+      refuse("ACTIVE_RELEASE_MISMATCH", "Before --exit, reload the current owning Main onto the target release so ordinary recovery cannot restart the old release");
+    }
     const timeoutMs = dependencies.timeoutMs ?? DRAIN_TIMEOUT_MS;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DRAIN_TIMEOUT_MS) refuse("INVALID_ARGUMENTS", "Drain deadline must be finite and bounded");
     const intent: ResidentDrainIntent = { caller: authority.caller, main: authority.main, target: targetSpec,
       expected: { releaseRoot: expected, configDigest: previous.digest,
-        owner: { pid: owner.pid, processStartTime: owner.processStartTime!, token: owner.token, hostId: owner.hostId }, launcher }, timeoutMs };
+        owner: { pid: owner.pid, processStartTime: owner.processStartTime!, token: owner.token, hostId: owner.hostId }, launcher }, timeoutMs,
+      ...(exitRequested ? { exit: true } : {}) };
     const requestStarted = Date.now();
     const requestTimeoutMs = Math.min(timeoutMs, REQUEST_TIMEOUT_MS);
     let deadline = requestStarted + requestTimeoutMs;
@@ -405,10 +457,11 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
     const notify = (): void => { dirty = true; wake?.(); };
     const watchers: fs.FSWatcher[] = [];
     let timer = setTimeout(() => { abort.abort(); notify(); }, requestTimeoutMs);
+    let exitGrace: ReturnType<typeof setTimeout> | undefined;
     try {
       // Subscribe before dispatch and read after every event: no lost-receipt
       // window, no polling, and a ref'd deadline for the standalone CLI.
-      for (const directory of [resident, ...authority.watch]) {
+      for (const directory of [resident, ...authority.watch, ...(exitRequested ? [residentGenerationsPath(resident)] : [])]) {
         const watcher = fs.watch(directory, { persistent: false }, notify);
         watcher.on("error", error => { watchError = error; notify(); });
         watchers.push(watcher);
@@ -428,11 +481,23 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
       dispatched = true;
       const response = await client.releaseDrain(intent, abort.signal);
       const initial = response.drain;
-      if (!response.ok || !initial || typeof initial.id !== "string" ||
+      if (!initial || typeof initial.id !== "string" ||
           !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(initial.id)) {
         throw new Error("Resident returned no correlated cooperative drain receipt");
       }
       checkDrain(initial, initial.id, intent, previous, requestStarted);
+      // A precommit refusal is returned on the fenced request exchange, not a
+      // committed drain file. Require complete correlation before reporting it.
+      if (initial.terminal === true && initial.phase === "refused" && initial.outcome === "refused" && !initial.admissionHeld) {
+        if (!sameOwner(resident, readOwnedJson<ResidentHostOwner>(path.join(resident, "owner.json"), ownerProbe), intent, launchAttestation)) {
+          throw new Error("Resident owner changed while refusing operator drain");
+        }
+        emit({ ...receipt(false, initial.code, "Resident refused cooperative drain; no target launch was authorized."),
+          phase: "refused", outcome: "refused", unchanged: false, transitionAttempted: true, drain: publicDrain(initial),
+          rollback: { status: "not-attempted", reason: "no-target-launch-authorized" } });
+        return 1;
+      }
+      if (!response.ok) throw new Error("Resident rejected drain without a correlated terminal refusal");
       if (abort.signal.aborted || initial.deadlineAt > requestStarted + requestTimeoutMs + timeoutMs ||
           initial.deadlineAt > Date.now() + timeoutMs) throw new Error("Unbounded or expired drain handshake");
       // The resident starts its finite drain clock on pickup, not publication.
@@ -454,7 +519,15 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
           continue;
         }
         dirty = false;
-        if (!sameOwner(resident, readOwnedJson<ResidentHostOwner>(path.join(resident, "owner.json"), ownerProbe), intent, launchAttestation)) {
+        let currentOwner: ResidentHostOwner | undefined;
+        try {
+          currentOwner = readOwnedJson<ResidentHostOwner>(path.join(resident, "owner.json"), ownerProbe);
+          if (!currentOwner || typeof currentOwner !== "object") throw new Error("Resident owner is not a valid identity record");
+        }
+        catch (error) { if (!exitRequested || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (exitRequested
+          ? currentOwner?.token === intent.expected.owner.token && !sameOwner(resident, currentOwner, intent, launchAttestation, false)
+          : !currentOwner || !sameOwner(resident, currentOwner, intent, launchAttestation)) {
           throw new Error("Exact resident owner changed or exited during drain; no successor is authorized by this CLI");
         }
         const currentMain = owningMain(meshRoot, resident, previous, target, ownerProbe);
@@ -465,6 +538,30 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
         catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { expired(); continue; } throw error; }
         checkDrain(durable, initial.id, intent, previous, requestStarted);
         if (durable.deadlineAt !== initial.deadlineAt || durable.at < initial.at) throw new Error("Drain receipt deadline/sequence changed");
+        if (durable.phase === "exited" || durable.outcome === "exited") {
+          if (!exitRequested || durable.phase !== "exited" || durable.outcome !== "exited" || durable.terminal !== true ||
+              durable.admissionHeld !== true || durable.checkpointReadback !== true || durable.resumedAt !== undefined) {
+            throw new Error("Unexpected or incomplete operator exit receipt");
+          }
+          const stopped = stoppedHost(resident, intent, requestStarted, ownerProbe);
+          if (!stopped || currentOwner?.token === intent.expected.owner.token || !processExited(intent.expected.owner.pid, intent.expected.owner.processStartTime)) {
+            // Native exit is not an fs.watch event for this non-parent CLI. Owner
+            // withdrawal/generation publication normally wake us; one short,
+            // non-recurring grace read covers publication just before process exit.
+            // The existing finite deadline remains the final safety-net read.
+            exitGrace ??= setTimeout(notify, RECEIPT_GRACE_MS);
+            expired();
+            continue;
+          }
+          emit({ ...receipt(true, durable.code, "Resident host exited after checkpoint; target was not launched or verified serving by this CLI. Ordinary recovery is a separate launch path."),
+            phase: "exited", outcome: "exited", unchanged: false, transitionAttempted: true,
+            drain: { ...publicDrain(durable), hostExit: { pid: stopped.pid, reason: "stopped", at: stopped.at, processExited: true } },
+            rollback: { status: "not-attempted", reason: "no-target-launch-authorized" } });
+          return 0;
+        }
+        if (!currentOwner || !sameOwner(resident, currentOwner, intent, launchAttestation)) {
+          throw new Error("Exact resident owner exited without a correlated operator exit receipt");
+        }
         // Always inspect durable terminal evidence once at the deadline before
         // reporting uncertainty; a same-turn timer must not hide a resume.
         if (!durable.terminal && ["held", "checkpointed"].includes(durable.phase) && ["held", "checkpointed"].includes(durable.outcome)) { expired(); continue; }
@@ -484,6 +581,7 @@ export async function main(argv: string[], io: { out: (text: string) => void } =
       }
     } finally {
       clearTimeout(timer);
+      if (exitGrace !== undefined) clearTimeout(exitGrace);
       for (const watcher of watchers) watcher.close();
     }
   } catch (error) {

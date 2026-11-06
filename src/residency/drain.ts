@@ -20,6 +20,8 @@ export interface ResidentDrainIntent {
     configDigest: string;
   };
   timeoutMs?: number;
+  /** Explicit graceful host shutdown after checkpoint; omitted/false keeps the reversible drain. */
+  exit?: boolean;
 }
 export interface ResidentDrainReceipt {
   abi: typeof RESIDENT_DRAIN_ABI;
@@ -31,7 +33,7 @@ export interface ResidentDrainReceipt {
   target: ResidentLaunchSpec;
   main: ResidentMainGeneration;
   phase: "refused" | "held" | "checkpointed" | "exited" | "target-ready" | "serving" | "rolled-back" | "needs-operator";
-  outcome: "held" | "checkpointed" | "containment-unavailable" | "resumed" | "refused" | "needs-operator";
+  outcome: "held" | "checkpointed" | "exited" | "containment-unavailable" | "resumed" | "refused" | "needs-operator";
   code: string;
   reason: string;
   at: number;
@@ -73,7 +75,7 @@ export function readResidentDrainReceipt(root: string, id: string, expected?: Re
   if (receipt.abi !== RESIDENT_DRAIN_ABI || receipt.id !== id || !Number.isFinite(receipt.at) ||
       !Number.isFinite(receipt.deadlineAt) || typeof receipt.admissionHeld !== "boolean" ||
       !["refused", "held", "checkpointed", "exited", "target-ready", "serving", "rolled-back", "needs-operator"].includes(receipt.phase) ||
-      !["held", "checkpointed", "containment-unavailable", "resumed", "refused", "needs-operator"].includes(receipt.outcome) ||
+      !["held", "checkpointed", "exited", "containment-unavailable", "resumed", "refused", "needs-operator"].includes(receipt.outcome) ||
       (expected && (receipt.rootId !== expected.rootId || receipt.deadlineAt !== expected.deadlineAt ||
         !sameDrainOwner(receipt.owner, expected.owner) || !sameDrainLauncher(receipt.launcher, expected.launcher) ||
         JSON.stringify(receipt.previous) !== JSON.stringify(expected.previous) ||

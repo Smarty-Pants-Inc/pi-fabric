@@ -106,8 +106,14 @@ describe("resident watchdog", () => {
       { id: "a", rootId: config.rootId, residency: "durable", status: "idle" },
     ] }));
     const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
-    const read = vi.spyOn(client.options.mesh, "listAll").mockImplementation(() => {
-      throw new MeshLockTimeoutError("fixture delivery outage", 1, 100);
+    let outageReads = 0;
+    const acquireSnapshot = client.options.mesh.stateToken.bind(client.options.mesh);
+    const read = vi.spyOn(client.options.mesh, "stateToken").mockImplementation(() => {
+      if (outageReads < 3) {
+        outageReads++;
+        throw new MeshLockTimeoutError("fixture delivery outage", 1, 100);
+      }
+      return acquireSnapshot();
     });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.useFakeTimers();
@@ -127,15 +133,13 @@ describe("resident watchdog", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(read).toHaveBeenCalledTimes(3);
       expect(warn).toHaveBeenCalledOnce();
-      read.mockReturnValue([]);
+      // The fourth snapshot acquisition succeeds after the 4 s retry.
       await vi.advanceTimersByTimeAsync(4_000);
-      // Successor completion reconciliation also scans claims after a successful delivery pass.
-      const deliveryReads = () => read.mock.calls.filter(([prefix]) => prefix?.startsWith("residency/deliveries/")).length;
-      expect(deliveryReads()).toBe(4);
+      expect(read).toHaveBeenCalledTimes(4);
       expect(warn).toHaveBeenCalledOnce();
       // Recovered: no further delivery reads without an event.
       await vi.advanceTimersByTimeAsync(600_000);
-      expect(deliveryReads()).toBe(4);
+      expect(read).toHaveBeenCalledTimes(4);
       await client.close();
       expect(vi.getTimerCount()).toBe(0);
     } finally {

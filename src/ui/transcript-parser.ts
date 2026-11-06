@@ -22,7 +22,10 @@ type FabricTranscriptEntryStatus = "running" | "completed" | "failed";
 export class TranscriptAccumulator {
   readonly entries: FabricTranscriptEntry[] = [];
   readonly #tools = new Map<string, FabricTranscriptEntry>();
-  readonly #finishedTools = new Set<string>();
+  // Presence guards repeated metadata/compact ends; the value records whether
+  // the latest completion has a payload authoritative over canonical copies.
+  readonly #finishedTools = new Map<string, boolean>();
+  readonly #awaitingCanonicalTools = new Map<string, FabricTranscriptEntry>();
   readonly #toolResultMetadata = new Map<string, Record<string, unknown>>();
   readonly #anonymousTools = new Map<string, FabricTranscriptEntry[]>();
   readonly #activeTools: FabricTranscriptEntry[] = [];
@@ -127,6 +130,7 @@ export class TranscriptAccumulator {
     // Every explicit start ends any prior awaiting-canonical correlation,
     // including reused IDs whose compact end kept the entry in #tools.
     this.#toolResultMetadata.delete(id);
+    this.#awaitingCanonicalTools.delete(id);
     const existing = this.#tools.get(id);
     const safeArgs = args === undefined ? undefined : redactRecord(args);
     if (existing) {
@@ -155,19 +159,33 @@ export class TranscriptAccumulator {
     return entry;
   }
 
-  #finishTool(id: string | undefined, label: string, result: unknown, failed: boolean): void {
+  #finishTool(
+    id: string | undefined,
+    label: string,
+    result: unknown,
+    failed: boolean,
+    metadataOnly = false,
+  ): void {
     const safeLabel = terminalSafe(label) || "tool";
-    if (id) {
-      this.#finishedTools.add(id);
-      this.#toolResultMetadata.delete(id);
-    }
     const anonymous = this.#anonymousTools.get(safeLabel);
-    const entry = id ? this.#tools.get(id) : anonymous?.shift();
+    // Only metadata-only execution ends await a later guarded payload. Other
+    // completed calls with the same ID are distinct missing-start lifecycles.
+    const entry = id ? this.#tools.get(id) ?? this.#awaitingCanonicalTools.get(id) : anonymous?.shift();
+    if (id) {
+      // A repeated metadata end must not create a call or downgrade a payload.
+      if (!entry && metadataOnly && this.#finishedTools.has(id)) return;
+      this.#finishedTools.set(id, result !== undefined);
+      this.#toolResultMetadata.delete(id);
+      this.#awaitingCanonicalTools.delete(id);
+    }
     if (anonymous?.length === 0) this.#anonymousTools.delete(safeLabel);
     const safeResult = result === undefined ? undefined : redact(result);
     if (entry) {
+      // A repeated metadata end cannot erase or downgrade a final payload.
+      if (safeResult === undefined && entry.result !== undefined) return;
       entry.status = failed ? "failed" : "completed";
       if (safeResult !== undefined) entry.result = safeResult;
+      if (id && metadataOnly) this.#awaitingCanonicalTools.set(id, entry);
       if (failed && result !== undefined) {
         const failure = compactRedactedValue(safeResult);
         entry.text = clip(
@@ -180,7 +198,7 @@ export class TranscriptAccumulator {
       if (activeIndex >= 0) this.#activeTools.splice(activeIndex, 1);
       return;
     }
-    this.entries.push({
+    const completed: FabricTranscriptEntry = {
       id: id ?? `tool-${this.#sequence++}`,
       kind: "tool",
       label: safeLabel,
@@ -188,7 +206,9 @@ export class TranscriptAccumulator {
       status: failed ? "failed" : "completed",
       ...(safeResult !== undefined ? { result: safeResult } : {}),
       ...(failed && safeResult !== undefined ? { text: compactRedactedValue(safeResult) } : {}),
-    });
+    };
+    this.entries.push(completed);
+    if (id && metadataOnly) this.#awaitingCanonicalTools.set(id, completed);
   }
 
   #appendSessionMessage(event: Record<string, unknown>, message: Record<string, unknown>): void {
@@ -222,9 +242,9 @@ export class TranscriptAccumulator {
     }
     if (message.role === "toolResult") {
       const toolId = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
-      // Old RPC logs already completed the call with a full execution-end
-      // result. New logs defer that payload to this canonical message.
-      if (toolId && this.#finishedTools.has(toolId)) return;
+      // Old full execution-end results remain authoritative. Metadata-only
+      // completions can still receive the canonical payload on the same entry.
+      if (toolId && this.#finishedTools.get(toolId) === true && !this.#awaitingCanonicalTools.has(toolId)) return;
       const label = typeof message.toolName === "string" ? message.toolName : "tool";
       const metadata = toolId ? this.#toolResultMetadata.get(toolId) : undefined;
       this.#finishTool(
@@ -487,6 +507,7 @@ export class TranscriptAccumulator {
         label,
         event.result,
         event.isError === true,
+        event.result === undefined,
       );
       return;
     }

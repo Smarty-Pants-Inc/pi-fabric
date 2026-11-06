@@ -113,6 +113,13 @@ const loadWorkerRunLog = async (): Promise<WorkerRunLogModule> => {
   return import(sourceModulePath) as Promise<WorkerRunLogModule>;
 };
 
+type WorkerToolResultLogModule = typeof import("./worker/tool-result-log.js");
+const loadWorkerToolResultLog = async (): Promise<WorkerToolResultLogModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/tool-result-log.js");
+  const sourceModulePath = "./worker/tool-result-log.ts";
+  return import(sourceModulePath) as Promise<WorkerToolResultLogModule>;
+};
+
 type WorkerModelControlModule = typeof import("./worker/model-control.js");
 
 const loadWorkerModelControl = async (): Promise<WorkerModelControlModule> => {
@@ -341,7 +348,7 @@ const main = async (): Promise<void> => {
   await custodyReady;
   assertWorkerRuntime();
   crossSpawn = (await import("cross-spawn")).default;
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PI_PROVIDER_RESUME_DELAYS_MS, recoveryTimeScale }, { createRunLogWriter, compactTerminalRunLog, MAX_EVENT_LINE_CHARS }, { ToolCallStreamGuard }, { projectToolResultLogEvent }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -351,6 +358,7 @@ const main = async (): Promise<void> => {
     loadWorkerRecovery(),
     loadWorkerRunLog(),
     loadToolCallStreamGuard(),
+    loadWorkerToolResultLog(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -1737,17 +1745,21 @@ const main = async (): Promise<void> => {
   const processEvent = (line: string): void => {
     if (process.env.PI_FABRIC_INJECT_CRASH === "stream") throw new Error("simulated stream crash");
     if (!line.trim()) return;
+    // Claude's native session trace retains original admitted lines, including
+    // frames omitted from the projected run log below.
     sessionStream?.write(`${line}\n`);
     let event: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(line);
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        runLog.event(line, undefined);
+        appendLog(`${JSON.stringify({ type: "worker_event_discarded", reason: "non_object", chars: line.length })}\n`);
         return;
       }
       event = parsed as Record<string, unknown>;
     } catch {
-      runLog.event(line, undefined);
+      // An invalid/truncated frame can contain a pre-hook result. Never retain
+      // its bytes as a diagnostic or pass it to the run writer's raw fallback.
+      appendLog(`${JSON.stringify({ type: "worker_event_discarded", reason: "invalid_json", chars: line.length })}\n`);
       // pi-fabric#1034 round 6: an unparsable Pi frame (cut at close, or a projection sentinel) may have been a tool
       // start or end; the receipt cannot vouch for it.
       if (isPi && line.trim() && !receiptLineDropped) {
@@ -1757,7 +1769,13 @@ const main = async (): Promise<void> => {
       }
       return;
     }
-    runLog.event(line, event);
+    // Persistence is a separate projection. Accounting, receipts and lifecycle
+    // below continue to consume the original native frame, including raw ends.
+    const logEvent = projectToolResultLogEvent(event, options.runner);
+    if (logEvent) {
+      const logLine = logEvent === event ? line : JSON.stringify(logEvent);
+      runLog.event(logLine, logEvent);
+    }
     if (pendingWhitespaceStall) {
       compactControl.observe(event); // Preserve the compaction fence during abort/drain.
       if (event.type === "response" && event.id === `whitespace-abort-${options.id}` && event.success === true) {
@@ -2427,11 +2445,11 @@ const main = async (): Promise<void> => {
   steerTimer?.unref?.();
 
   // smarty-dev#1907: an event line above the cap is dropped, not fatal. The run
-  // keeps its child; the warning names the event and its size, and a bounded
-  // prefix is kept as evidence. Memory stays bounded: the rest of the line is
-  // counted, never buffered.
+  // keeps its child; the warning names a recognized event type and its size.
+  // A prefix stays in memory for admission/lost-result handling only: it may
+  // contain a pre-hook tool result, so no diagnostic artifact may retain it.
+  // Memory stays bounded: the rest of the line is counted, never buffered.
   let oversized: { chars: number; prefix: string } | undefined;
-  let oversizedCount = 0;
   const startOversizedEvent = (text: string): void => {
     toolCallStreamGuard.discardedEvent();
     if (isPi) {
@@ -2444,25 +2462,15 @@ const main = async (): Promise<void> => {
     if (!oversized) return;
     const { chars, prefix } = oversized;
     oversized = undefined;
-    oversizedCount += 1;
-    let artifactPath: string | undefined;
-    try {
-      artifactPath = path.join(
-        path.dirname(options.logFile),
-        oversizedCount === 1 ? "oversized-event-prefix.txt" : `oversized-event-prefix-${oversizedCount}.txt`,
-      );
-      fs.writeFileSync(artifactPath, prefix, { encoding: "utf8", mode: 0o600 });
-    } catch {
-      artifactPath = undefined;
-    }
     const head = prefix.slice(0, 4096);
-    const type = /^\{"type":"([^"]{1,64})"/.exec(head)?.[1] ?? "unknown";
-    const tool = /"toolName":"([^"]{1,128})"/.exec(head)?.[1];
+    const nativeType = /^\{"type":"([^"]{1,64})"/.exec(head)?.[1];
+    // Never echo arbitrary prefix fields (including toolName) into diagnostics.
+    const type = nativeType && ["message_start", "message_update", "message_end", "response",
+      "tool_execution_start", "tool_execution_update", "tool_execution_end", "turn_end", "agent_end"].includes(nativeType)
+      ? nativeType : "unknown";
     const role = /"role":"([^"]{1,64})"/.exec(head)?.[1];
     const warning =
-      `Dropped an oversized agent event line (${type}${tool ? `, tool ${tool}` : ""}, ` +
-      `${chars} characters > ${MAX_EVENT_LINE_CHARS})` +
-      (artifactPath ? `; first ${prefix.length} characters saved to: ${artifactPath}` : "");
+      `Dropped an oversized agent event line (${type}, ${chars} characters > ${MAX_EVENT_LINE_CHARS}); raw prefix not retained`;
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
     process.stderr.write(`[pi-fabric] ${warning}\n`);
     record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);

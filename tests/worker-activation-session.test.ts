@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager, createBashToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { ActivationSession } from "../src/worker/activation-session.js";
@@ -13,8 +13,15 @@ const root = () => {
   return dir;
 };
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const dir of roots.splice(0)) fs.rmSync(dir, {recursive: true, force: true});
 });
+const archivedBytes = (dir: string): Buffer[] => {
+  const archive = path.join(dir, "session-archive");
+  if (!fs.existsSync(archive)) return [];
+  return fs.readdirSync(archive).filter(name => name !== "MANIFEST.jsonl")
+    .map(name => fs.readFileSync(path.join(archive, name)));
+};
 const user = (content: string) => ({role: "user" as const, content, timestamp: 1});
 const assistant = (text: string): AssistantMessage => ({
   role: "assistant", content: [{type: "text", text}], api: "openai-completions", provider: "test", model: "test",
@@ -89,7 +96,9 @@ describe("activation journal retention", () => {
     const before = fs.existsSync(journal) ? fs.readFileSync(journal) : Buffer.alloc(0);
     const priorLeaf = existing ? SessionManager.open(journal).getLeafId() : null;
     const {activation, original, activationId} = compactedActivation(journal, dir);
+    const raw = fs.readFileSync(activation.file);
     activation.retain();
+    expect(archivedBytes(dir)).toContainEqual(raw);
     const after = fs.readFileSync(journal);
     expect(after.subarray(0, before.length)).toEqual(before);
     const restored = SessionManager.open(journal);
@@ -142,6 +151,90 @@ describe("activation journal retention", () => {
     expect(context).toContain("CURRENT_ACTIVATION_DIRECTIONS");
     expect(context).not.toContain("GLOBAL_RETAINED_SENTINEL");
     expect(context).not.toContain("GENUINE_GLOBAL_SUMMARY");
+  });
+
+  it("preserves raw whitespace, CRLF and a missing final newline rather than reserializing evidence", () => {
+    const dir = root();
+    const journal = path.join(dir, "actor.jsonl");
+    const activation = new ActivationSession(journal, path.join(dir, "raw"), dir);
+    const session = SessionManager.open(activation.file);
+    session.appendMessage(user("BYTE_EXACT_λ"));
+    session.appendMessage(assistant("raw reply"));
+    const raw = Buffer.from(" \t" + fs.readFileSync(activation.file, "utf8").trimEnd().replaceAll("\n", " \r\n"));
+    fs.writeFileSync(activation.file, raw);
+    activation.retain();
+    expect(archivedBytes(dir)).toContainEqual(raw);
+    expect(JSON.stringify(SessionManager.open(journal).buildSessionContext().messages)).toContain("BYTE_EXACT_λ");
+    expect(fs.existsSync(activation.file)).toBe(false);
+  });
+
+  it("archives a header-only child byte-for-byte before unlinking it", () => {
+    const dir = root();
+    const journal = path.join(dir, "actor.jsonl");
+    const activation = new ActivationSession(journal, path.join(dir, "empty"), dir);
+    const raw = fs.readFileSync(activation.file);
+    const unlink = fs.unlinkSync.bind(fs);
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (file === activation.file) expect(archivedBytes(dir)).toContainEqual(raw);
+      return unlink(file);
+    });
+    activation.retain();
+    expect(archivedBytes(dir)).toContainEqual(raw);
+    expect(fs.existsSync(activation.file)).toBe(false);
+    expect(fs.existsSync(journal)).toBe(false);
+  });
+
+  it.each(["", "{broken header\n", '{"type":"not-session","id":"bad"}\n',
+    '{"type":"session","id":"bad","timestamp":"invalid","cwd":"x"}\n'])
+    ("archives invalid raw evidence before refusing its semantic merge: %s", raw => {
+      const dir = root();
+      const journal = path.join(dir, "actor.jsonl");
+      const activation = new ActivationSession(journal, path.join(dir, "invalid"), dir);
+      fs.writeFileSync(activation.file, raw);
+      expect(() => activation.retain()).toThrow();
+      expect(fs.readFileSync(activation.file, "utf8")).toBe(raw);
+      expect(archivedBytes(dir)).toContainEqual(Buffer.from(raw));
+      expect(fs.existsSync(journal)).toBe(false);
+    });
+
+  it.each(["writeSync", "readSync", "fsyncSync"] as const)("keeps original and journal unchanged when archive %s fails", operation => {
+    const dir = root();
+    const journal = path.join(dir, "actor.jsonl");
+    const prior = SessionManager.open(journal);
+    prior.appendMessage(user("EARLIER_ACTIVATION"));
+    prior.appendMessage(assistant("earlier reply"));
+    const {activation} = compactedActivation(journal, dir);
+    const raw = fs.readFileSync(activation.file);
+    const before = fs.readFileSync(journal);
+    vi.spyOn(fs, operation).mockImplementation(() => { throw new Error("archive I/O failed"); });
+    expect(() => activation.retain()).toThrow(/archive I\/O failed/);
+    vi.restoreAllMocks();
+    expect(fs.readFileSync(activation.file)).toEqual(raw);
+    expect(fs.readFileSync(journal)).toEqual(before);
+  });
+
+  it.each([false, true])("keeps the original if archive readback fails (empty child: %s)", empty => {
+    const dir = root();
+    const journal = path.join(dir, "actor.jsonl");
+    const activation = empty ? new ActivationSession(journal, path.join(dir, "empty-failure"), dir)
+      : compactedActivation(journal, dir).activation;
+    const raw = fs.readFileSync(activation.file);
+    const open = fs.openSync.bind(fs), read = fs.readSync.bind(fs);
+    const readers = new Set<number>();
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, flags: number | string, mode?: number) => {
+      const fd = open(target, flags, mode);
+      if (typeof target === "string" && target.startsWith(path.join(dir, "session-archive") + path.sep) &&
+          typeof flags === "number" && !(flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR))) readers.add(fd);
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "readSync").mockImplementation(((fd: number, ...args: unknown[]) => {
+      if (readers.has(fd)) throw new Error("archive readback failed");
+      return Reflect.apply(read, fs, [fd, ...args]);
+    }) as typeof fs.readSync);
+    expect(() => activation.retain()).toThrow(/archive readback failed/);
+    vi.restoreAllMocks();
+    expect(fs.readFileSync(activation.file)).toEqual(raw);
+    expect(fs.existsSync(journal)).toBe(false);
   });
 
   it("refuses concurrent durable journal changes and leaves isolated evidence recoverable", () => {

@@ -27,6 +27,7 @@ import {
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import { ownedStat } from "../storage/scratch.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { archiveTraceCopy, archiveTraceTreeCopy, type TraceCopy } from "../storage/trace-archive.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
@@ -186,19 +187,107 @@ async function captureWedgeEvidence(root: string, config: ResidentHostConfig, at
   return dir;
 }
 
-/** Keep the five newest wedge evidence directories. smarty-dev#7916: each is judged with its owned stat and only
- * that inode is removed (off Linux main's removal). Exported for tests. */
-export const pruneWedgeEvidence = (wedges: string): void => {
-  const judged = new Map<string, fs.Stats | undefined>();
-  const keep = fs.readdirSync(wedges).filter(name => {
-    if (name === "reports" || !fs.statSync(path.join(wedges, name)).isDirectory()) return false;
-    judged.set(name, ownedStat(path.join(wedges, name)));
-    return true;
-  }).sort();
-  for (const old of keep.slice(0, Math.max(0, keep.length - 5))) {
-    const target = path.join(wedges, old), stat = judged.get(old);
-    verifiedRemove(target, stat, { deleter: "wedgeEvidence", fallback: () => { fs.rmSync(target, { recursive: true, force: true }); return true; } });
+// A sibling of the resident root, never a child-log candidate or part of the pruned wedges tree.
+const residentTraceArchive = (root: string): string => `${path.resolve(root)}.trace-archive`;
+const sameTraceState = (a: fs.Stats | undefined, b: fs.Stats, renamed = false, extraLinks = 0): boolean => !!a &&
+  a.dev === b.dev && a.ino === b.ino && a.uid === b.uid && a.gid === b.gid && a.mode === b.mode &&
+  a.nlink === b.nlink + extraLinks && a.size === b.size && a.mtimeMs === b.mtimeMs &&
+  (!b.isFile() || renamed || a.ctimeMs === b.ctimeMs);
+
+/** Keep deletion bound to the copied bytes, not just dev/ino/mtime: a writer may restore mtime.
+ * The fd follows verifiedRemove's graveyard rename; that rename changes ctime, so rehash before unlink. */
+const removeArchivedResidentLog = (file: string, stat: fs.Stats, copy: TraceCopy, deleter: string): boolean => {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    if (!sameTraceState(fs.fstatSync(fd), stat) || !sameTraceState(copy.stat, stat)) return false;
+    const copiedBytesRemain = (): boolean => {
+      if (!sameTraceState(fs.fstatSync(fd), copy.stat, true)) return false;
+      const hash = createHash("sha256"), buffer = Buffer.allocUnsafe(64 * 1024);
+      for (let offset = 0; offset < copy.bytes;) {
+        const read = fs.readSync(fd, buffer, 0, Math.min(buffer.length, copy.bytes - offset), offset);
+        if (!read) return false;
+        hash.update(buffer.subarray(0, read)); offset += read;
+      }
+      return sameTraceState(fs.fstatSync(fd), copy.stat, true) && hash.digest("hex") === copy.sha256;
+    };
+    return verifiedRemove(file, stat, { deleter, proceed: copiedBytesRemain, fallback: () => {
+      if (!sameTraceState(fs.lstatSync(file), stat) || !copiedBytesRemain()) return false;
+      fs.unlinkSync(file); return true;
+    } }).removed;
+  } finally { fs.closeSync(fd); }
+};
+
+/** Exact pre-archive inventory, including directories: a late nested trace must not gain deletion authority. */
+const wedgeInventory = (directory: string, heldRoot?: fs.Stats): Map<string, fs.Stats> => {
+  const inventory = new Map<string, fs.Stats>();
+  const walk = (relative: string, depth: number): void => {
+    const file = path.join(directory, relative);
+    const stat = relative === "" && heldRoot ? heldRoot : fs.lstatSync(file);
+    if (depth > 64 || (!stat.isDirectory() && !stat.isFile())) throw new Error("Unarchivable wedge entry");
+    inventory.set(relative, stat);
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file)) walk(path.join(relative, name), depth + 1);
+  };
+  walk("", 0);
+  return inventory;
+};
+const wedgeInventoryMatches = (directory: string, inventory: Map<string, fs.Stats>, heldRoot?: fs.Stats): boolean => {
+  const current = wedgeInventory(directory, heldRoot);
+  return current.size === inventory.size && [...inventory].every(([name, stat]) => sameTraceState(current.get(name), stat));
+};
+/** Off Linux's path-based fallback still unlinks ONLY archived files and rmdirs ONLY empty directories. */
+const removeArchivedWedge = (directory: string, inventory: Map<string, fs.Stats>): boolean => {
+  if (!wedgeInventoryMatches(directory, inventory)) return false;
+  for (const [name, stat] of inventory) {
+    if (!stat.isFile()) continue;
+    const file = path.join(directory, name);
+    if (!sameTraceState(fs.lstatSync(file), stat)) return false;
+    fs.unlinkSync(file);
   }
+  for (const [name, stat] of [...inventory].filter(([, stat]) => stat.isDirectory()).sort(([a], [b]) => b.length - a.length)) {
+    const file = path.join(directory, name), current = fs.lstatSync(file);
+    // Our child removals change directory size/mtime, but never its identity or mode.
+    if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || current.uid !== stat.uid || current.mode !== stat.mode) return false;
+    fs.rmdirSync(file); // Non-recursive: any unknown late trace keeps its directory.
+  }
+  return true;
+};
+
+/** Keep five hot wedge directories; retain every older byte in a readback-verified archive first.
+ * Each deletion still uses the judged inode. Failure is diagnostics-only and must not stop watchdog recovery. */
+export const pruneWedgeEvidence = (wedges: string): void => {
+  try {
+    const judged = new Map<string, fs.Stats>();
+    for (const name of fs.readdirSync(wedges)) {
+      const stat = name === "reports" ? undefined : ownedStat(path.join(wedges, name));
+      if (stat?.isDirectory()) judged.set(name, stat);
+    }
+    const names = [...judged.keys()].sort();
+    for (const old of names.slice(0, Math.max(0, names.length - 5))) {
+      let held: number | undefined;
+      try {
+        const target = path.join(wedges, old), stat = judged.get(old)!;
+        const inventory = wedgeInventory(target);
+        if (!sameTraceState(inventory.get(""), stat)) continue;
+        if (process.platform === "linux") {
+          held = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+          if (!sameTraceState(fs.fstatSync(held), stat)) continue;
+        }
+        const archived = archiveTraceTreeCopy(target, residentTraceArchive(path.dirname(wedges)), { deleter: "wedgeEvidence" }, stat);
+        const files = [...inventory].filter(([, stat]) => stat.isFile());
+        if (archived.files.length !== files.length || new Set(archived.files.map(file => file.path)).size !== files.length ||
+            archived.files.some(file => {
+              const source = inventory.get(file.path.split("/").join(path.sep));
+              return !source?.isFile() || source.size !== file.bytes;
+            }) || !wedgeInventoryMatches(target, inventory)) continue;
+        // verifiedRemove snapshots AFTER archival. Bind its final check to our earlier inventory, using the
+        // pinned directory even after its graveyard move. Its own exact-name rechecks guard later arrivals.
+        verifiedRemove(target, stat, { deleter: "wedgeEvidence",
+          proceed: () => held !== undefined && wedgeInventoryMatches(`/proc/self/fd/${held}`, inventory, fs.fstatSync(held)),
+          fallback: () => removeArchivedWedge(target, inventory) });
+      } catch { /* Keep the original evidence; recovery must continue even when archival is unavailable. */ }
+      finally { if (held !== undefined) fs.closeSync(held); }
+    }
+  } catch { /* Best effort diagnostics, including entries disappearing during enumeration. */ }
 };
 
 const signalChild = (attempt: Attempt, signal: NodeJS.Signals): void => {
@@ -240,14 +329,33 @@ function stopAttempt(attempt: Attempt): Promise<void> {
   })();
 }
 
-/** Size cap of launcher.log and each child-*.log: one rotated generation (.1) is kept (smarty-dev#3252). */
+/** Hot size cap of launcher.log and each child-*.log; archived generations are retained indefinitely. */
 export const RESIDENT_LOG_MAX_BYTES = 8 * 1024 * 1024;
-/** Per-transaction child logs older than this are removed when a new child starts. */
+/** Per-transaction child logs older than this are archived when a new child starts. */
 const RESIDENT_CHILD_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
-/** Append, rotating the file to `<file>.1` (replacing the previous generation) once it exceeds the cap. */
+/** Append, rotating to `<file>.1` only after both generations have verified archival copies.
+ * Archival failure waives the cap, never loses bytes or stops ordinary logging/inference. */
 export const appendResidentLog = (file: string, data: string | Buffer, maxBytes = RESIDENT_LOG_MAX_BYTES): void => {
-  try { if (fs.statSync(file).size >= maxBytes) fs.renameSync(file, `${file}.1`); }
-  catch { /* absent, or rotation failed: append to the current file */ }
+  try {
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (data.length > 0 && stat?.isFile() && stat.size > 0 && stat.size >= maxBytes) {
+      const archive = residentTraceArchive(path.dirname(file)), previous = `${file}.1`;
+      const prior = fs.lstatSync(previous, { throwIfNoEntry: false });
+      const copy = archiveTraceCopy(file, archive, { deleter: "residentLogRotation" }, stat);
+      const priorCopy = prior && archiveTraceCopy(previous, archive, { deleter: "residentLogRotation" }, prior);
+      if (!sameTraceState(fs.lstatSync(file), stat)) throw new Error("Resident log changed during archival");
+      if (prior && priorCopy && !removeArchivedResidentLog(previous, prior, priorCopy, "residentLogRotation"))
+        throw new Error("Resident log rotation retained the prior generation");
+      if (fs.lstatSync(previous, { throwIfNoEntry: false }) || !sameTraceState(fs.lstatSync(file), stat))
+        throw new Error("Resident log changed before rotation");
+      // link is exclusive: unlike rename it can NEVER overwrite an unarchived .1 arriving after the check.
+      fs.linkSync(file, previous);
+      const linked = fs.lstatSync(file);
+      if (!sameTraceState(linked, stat, true, 1) || !sameTraceState(fs.lstatSync(previous), linked) ||
+          !removeArchivedResidentLog(file, linked, { ...copy, stat: linked }, "residentLogRotation"))
+        throw new Error("Resident log rotation retained the current generation");
+    }
+  } catch { /* Absent, changed, or archive/rotation failed: retain bytes and append beyond the cap. */ }
   fs.appendFileSync(file, data);
 };
 /** smarty-dev#7916: the judged lstat (owned) is the only inode removed; off Linux main's removal. Exported for tests. */
@@ -259,7 +367,10 @@ export const pruneResidentChildLogs = (root: string, keep: string, now = Date.no
       if (file === keep || file === `${keep}.1`) continue;
       const stat = fs.lstatSync(file, { throwIfNoEntry: false }); // the judgment; verifiedRemove proves ownership
       if (stat?.isFile() && now - stat.mtimeMs > RESIDENT_CHILD_LOG_RETENTION_MS) {
-        verifiedRemove(file, stat, { deleter: "residentChildLogs", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+        try {
+          const copy = archiveTraceCopy(file, residentTraceArchive(root), { deleter: "residentChildLogs" }, stat);
+          removeArchivedResidentLog(file, stat, copy, "residentChildLogs");
+        } catch { /* Keep this generation and continue starting the child / checking other diagnostics. */ }
       }
     }
   } catch { /* diagnostics only; the next launch retries */ }

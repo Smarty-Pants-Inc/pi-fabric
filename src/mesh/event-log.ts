@@ -12,6 +12,7 @@ import { consumeInitialMeshLockAdmission, withInitialMeshLockAcquisition, delay,
 import type { LockTimingContext } from "./commit-stats.js";
 import { jsonClone } from "./state-file.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { archiveTraceCopy } from "../storage/trace-archive.js";
 import { prepareKeyedPublishNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
@@ -1672,6 +1673,10 @@ export class EventLog {
       const newline = retentionBoundary === 0 ? -1 : captured.indexOf(0x0a, retentionBoundary);
       const retainedStart = retentionBoundary === 0 ? 0 : newline >= 0 ? newline + 1 : captured.length;
       const retained = captured.subarray(retainedStart);
+      // Parsed event archives omit malformed rows and do not exist on every root. Preserve
+      // this complete raw generation before replacing it, still under the publish lock.
+      archiveTraceCopy(this.#eventsPath, path.join(this.root, "trace-archive"),
+        { reason: "mesh-event-log-compaction" }, fs.fstatSync(descriptor));
       fs.closeSync(descriptor);
       descriptor = undefined;
       // Persist both the retained bytes and the rename. Later intents may name offsets in
@@ -1687,7 +1692,8 @@ export class EventLog {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r+");
-      const size = fs.fstatSync(descriptor).size;
+      const stat = fs.fstatSync(descriptor);
+      const size = stat.size;
       if (size === 0) return;
       const lastByte = Buffer.allocUnsafe(1);
       fs.readSync(descriptor, lastByte, 0, 1, size - 1);
@@ -1697,9 +1703,14 @@ export class EventLog {
       fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
       const newline = tail.lastIndexOf(0x0a);
       consumeInitialMeshLockAdmission(this.root);
+      // Repair changes delivery, not raw-trace retention: even an invalid UTF-8 suffix
+      // must be copied and verified before its first byte can be cut.
+      archiveTraceCopy(this.#eventsPath, path.join(this.root, "trace-archive"),
+        { reason: "mesh-event-log-repair" }, stat);
       fs.ftruncateSync(descriptor, newline >= 0 ? size - readBytes + newline + 1 : 0);
     } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
+      // Only a missing input is a no-op. ENOENT from the preservation step must fail closed.
+      if (descriptor !== undefined || errorCode(error) !== "ENOENT") throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }

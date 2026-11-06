@@ -167,16 +167,33 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       continue;
     }
     try {
-      // smarty-dev#7916: Linux loads the helper at its first eligible removal, BEFORE the final rechecks: the import is
-      // an async window, and nothing may await between the last recheck and the removal. Type-only edge otherwise.
+      // Both optional helpers load only at the first eligible cleanup, BEFORE the final checks: imports are async
+      // windows. Archival, the repeated checks and removal below are synchronous, with no intervening await.
       const remover = process.platform === "linux" ? (await import("./verified-remove.js")).verifiedRemove : undefined;
-      // Recheck identity, contents and liveness, not merely that a directory exists.
-      if (!unchanged(candidate.root, ownedStat(candidate.directory))) continue;
-      const names = await fs.promises.readdir(candidate.directory);
-      if (names.length !== candidate.files.size || names.some(name => !candidate.files.has(name))) continue;
-      if ([...candidate.files].some(([name, stat]) => !unchanged(stat, ownedStat(path.join(candidate.directory, name))))) continue;
-      if (candidate.owner.closedAt === undefined && processAlive(candidate.owner.pid)) continue;
-      if (candidate.childPid !== undefined && processAlive(candidate.childPid)) continue;
+      if (remover && (typeof process.getuid !== "function" || typeof process.geteuid !== "function")) {
+        // This helper always refuses without ownership proof. Preserve its counted warning without making copies
+        // for a removal that cannot happen (and never use the off-Linux fallback here).
+        remover(candidate.directory, candidate.root, { deleter: "sweepScratch" });
+        continue;
+      }
+      const { archiveTraceTreeCopy } = await import("./trace-archive.js");
+      const stillUnchanged = (): boolean => {
+        // Recheck the exact judged tree and liveness, not merely that a directory exists.
+        if (!unchanged(candidate.root, ownedStat(candidate.directory))) return false;
+        const names = fs.readdirSync(candidate.directory);
+        if (names.length !== candidate.files.size || names.some(name => !candidate.files.has(name))) return false;
+        if ([...candidate.files].some(([name, stat]) => !unchanged(stat, ownedStat(path.join(candidate.directory, name))))) return false;
+        if (candidate.owner.closedAt === undefined && processAlive(candidate.owner.pid)) return false;
+        return candidate.childPid === undefined || !processAlive(candidate.childPid);
+      };
+      if (!stillUnchanged()) continue;
+      // Retain ALL known bytes (including output.log/checkpoint), not a preview or just JSONL. This sibling does not
+      // match a scratch prefix, so future age/pressure sweeps cannot select it. The copy helper verifies SHA-256 by
+      // reading the archive back and never removes its source; any failure leaves the original tree in place.
+      archiveTraceTreeCopy(candidate.directory, path.join(options.tempRoot, ".fabric-scratch-archive"),
+        { deleter: "sweepScratch", kind: candidate.owner.kind }, candidate.root);
+      // Copying is not deletion authority: late entries, rewrites, replacement or reactivation still veto removal.
+      if (!stillUnchanged()) continue;
       const directory = candidate.directory;
       if (!remover) {
         // pi-fabric#1014 SEC P2-2: off Linux, scratch only, main's (c0b67ef) removal after every recheck above, else

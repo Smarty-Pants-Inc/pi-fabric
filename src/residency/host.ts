@@ -2797,13 +2797,14 @@ export class ResidentHost {
         // must preserve the background completion notification as well as files.
         await this.agents.join(command.id);
         commit(command.id);
-        await this.agents.cleanup(command.id, command.deleteBranch);
+        const retained = await this.agents.cleanup(command.id, command.deleteBranch);
         fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
         fs.rmSync(residentResultPath(this.config.residencyRoot, command.id), { force: true });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,
           ok: true,
+          ...retained,
           completedAt: Date.now(),
         };
       } else if (command.operation === "createActor") {

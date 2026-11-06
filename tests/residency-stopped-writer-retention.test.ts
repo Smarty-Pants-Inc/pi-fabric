@@ -7,6 +7,7 @@ import { installInProcessResidentFence } from "./helpers/in-process-resident-fen
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import * as processUtils from "../src/agents/transports/process-utils.js";
 import { canRemoveTerminalRun, hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
 import { cancellationError } from "../src/async-settlement.js";
@@ -424,6 +425,20 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
     await waitFor(() => fs.existsSync(observation));
     const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number; statusFile: string };
     const run = host.agents.runDirectory(handle.id)!;
+    const rawFiles = new Map([
+      [path.join(run, "cleanup-retention.ndjson.backup"), Buffer.from("root backup raw trace\0\r\n\xff", "latin1")],
+      [path.join(path.dirname(child.statusFile), "cleanup-session.jsonl.bak"), Buffer.from("nested backup raw trace\0\r\n\xfe", "latin1")],
+    ]);
+    for (const [file, bytes] of rawFiles) fs.writeFileSync(file, bytes);
+    const archive = `${config.residencyRoot}.trace-archive`;
+    const archiveFiles = (directory: string): string[] => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+      const file = path.join(directory, entry.name);
+      return entry.isDirectory() ? archiveFiles(file) : entry.isFile() ? [file] : [];
+    });
+    const expectRawArchived = () => {
+      const files = archiveFiles(archive);
+      for (const bytes of rawFiles.values()) expect(files.some(file => fs.readFileSync(file).equals(bytes))).toBe(true);
+    };
     const metadata = path.join(config.residencyRoot, "agents", `${handle.id}.json`);
     const result = path.join(config.residencyRoot, "results", `${handle.id}.json`);
     fs.writeFileSync(crash, "crash only primary");
@@ -450,6 +465,8 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
     expect(fs.readFileSync(result, "utf8")).toBe(saved);
     expect(client.hasAgent(handle.id)).toBe(true);
     expect(committed()).toEqual([]); // Veto precedes the cancellation/commit fence.
+    for (const [file, bytes] of rawFiles) expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(fs.existsSync(archive)).toBe(false);
     const { sessionId: _pid, ...legacy } = JSON.parse(output);
     fs.writeFileSync(child.statusFile, JSON.stringify({ ...legacy, status: "completed" }));
     await expect(client.cleanupAgent(handle.id)).rejects.toThrow(/unknown descendant identity/);
@@ -459,8 +476,24 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
     fs.writeFileSync(release, "checked nested exit");
     await waitFor(() => !processAlive(child.pid));
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
-    await expect(client.cleanupAgent(handle.id)).resolves.toEqual({ cleaned: true });
-    for (const file of [run, metadata, result, handle.worktree!]) expect(fs.existsSync(file), file).toBe(false);
+    // Keep registration and checked-exit proof real, but record the destructive
+    // Git action: this test never runs a native worktree removal.
+    const nativeExecute = processUtils.executeFile;
+    const removedWorktrees: string[] = [];
+    const execute = vi.spyOn(processUtils, "executeFile").mockImplementation(async (command, args, options) => {
+      if (command === "git" && args[0] === "worktree" && args[1] === "remove") {
+        expectRawArchived();
+        removedWorktrees.push(args.at(-1)!);
+        return { stdout: "", stderr: "" };
+      }
+      return nativeExecute(command, args, options);
+    });
+    try { await expect(client.cleanupAgent(handle.id)).resolves.toEqual({ cleaned: true }); }
+    finally { execute.mockRestore(); }
+    expect(removedWorktrees).toEqual([handle.worktree]);
+    expectRawArchived();
+    for (const file of [run, metadata, result]) expect(fs.existsSync(file), file).toBe(false);
+    expect(fs.existsSync(handle.worktree!)).toBe(true); // Recorded Git removal leaves the private fixture intact.
     expect(client.hasAgent(handle.id)).toBe(false);
     expect(committed()).toHaveLength(1);
     if (owner === "closed") {

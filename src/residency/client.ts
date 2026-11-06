@@ -174,6 +174,13 @@ const registeredWorktree = async (gitRoot: string, worktreePath: string): Promis
   return match;
 };
 
+interface ResidentCleanupResult {
+  /** Logical receipt cleanup; custody is retained, not deleted. */
+  cleaned: boolean;
+  custody?: Array<{ source: string; destination: string }>;
+  deferred?: string[];
+}
+
 export interface ResidencyClientOptions {
   config: ResidentHostConfig;
   mesh: MeshStore;
@@ -844,7 +851,7 @@ export class ResidencyClient {
     return residentHostStateNote(this.options.config.residencyRoot);
   }
 
-  async cleanupAgent(id: string, deleteBranch = false, signal?: AbortSignal): Promise<{ cleaned: boolean }> {
+  async cleanupAgent(id: string, deleteBranch = false, signal?: AbortSignal): Promise<ResidentCleanupResult> {
     throwIfAborted(signal);
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
@@ -869,14 +876,15 @@ export class ResidencyClient {
     if (!response.ok) throw new Error(response.error ?? `Failed to clean durable Fabric agent ${id}`);
     this.#completions.forget(id);
     this.options.onResultConsumed?.(id);
-    return { cleaned: true };
+    return { cleaned: true, ...(response.custody === undefined ? {} : { custody: response.custody }),
+      ...(response.deferred === undefined ? {} : { deferred: response.deferred }) };
   }
 
   async #cleanupTerminalFiles(
     metadata: ResidentAgentMetadata,
     deleteBranch: boolean,
     signal?: AbortSignal,
-  ): Promise<{ cleaned: boolean }> {
+  ): Promise<ResidentCleanupResult> {
     throwIfAborted(signal);
     const status = this.statusAgent(metadata.id);
     if (!("startedAt" in status) || !terminal(status.status)) {
@@ -884,7 +892,8 @@ export class ResidencyClient {
     }
     // A proven absent tree has no descendant files left to remove (saved-result
     // cleanup). Other stat errors fail closed; every existing tree needs strict exit evidence.
-    const runDirectoryPresent = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false }) !== undefined;
+    const runStat = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false });
+    const runDirectoryPresent = runStat !== undefined;
     const exitVeto = runDirectoryPresent ? runTreeExitVeto(metadata.runDirectory, 0, undefined, true) : undefined;
     if (exitVeto) {
       throw new Error(
@@ -894,6 +903,8 @@ export class ResidencyClient {
     }
     const command: ResidentCommand = { format: RESIDENT_EXPIRING_COMMAND_FORMAT, operation: "cleanup", requestId: newResidentRequestId(),
       rootId: this.options.config.rootId, id: metadata.id, deleteBranch, createdAt: Date.now() };
+    const custody: Array<{ source: string; destination: string; receipt: string; state: "prepared" | "moved" | "rename-failed" }> = [];
+    const deferred: string[] = [];
     let commitAttempted = false;
     const commit = (): void => {
       throwIfAborted(signal);
@@ -902,43 +913,77 @@ export class ResidencyClient {
       commitResidentRequest(this.options.config.residencyRoot, command, metadata.id, this.hostId);
     };
     try {
-      if (metadata.handle.worktree) {
-        const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
-        const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
-        commit();
-        await executeFile(
-          "git",
-          ["worktree", "remove", "--force", worktree],
-          { cwd: gitRoot, timeoutMs: 60_000 },
-        );
-        if (deleteBranch && metadata.handle.branch) {
-          throwIfAborted(signal);
-          await executeFile(
-            "git",
-            ["branch", "-D", metadata.handle.branch],
-            { cwd: gitRoot, timeoutMs: 30_000 },
-          );
-        }
-      } else if (deleteBranch) {
+      const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
+      const worktree = metadata.handle.worktree ? await registeredWorktree(gitRoot, metadata.handle.worktree) : undefined;
+      if (!worktree && deleteBranch) {
         throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
-      } else {
-        commit();
       }
       throwIfAborted(signal);
-      if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      if (worktree) {
+        deferred.push(`Git worktree registration cleanup deferred: ${JSON.stringify(gitRoot)} still registers ${JSON.stringify(worktree)}; no Git metadata repair or prune was attempted.`);
+        if (deleteBranch && metadata.handle.branch) deferred.push(`Git branch deletion deferred: ${metadata.handle.branch} was not deleted.`);
+      }
+      // Explicit cleanup transfers whole roots into custody, regardless of
+      // retainRuns. rename preserves inodes, open-FD appends, symlinks and FIFOs
+      // without inventorying/copying payloads or following entries. EXDEV is a
+      // refusal, never permission to fall back to copy-and-delete.
+      const archive = `${this.options.config.residencyRoot}.trace-archive`;
+      const saveCustody = (move: typeof custody[number], error?: unknown): void => atomicWrite(move.receipt, {
+        format: 1, reason: "durable agent cleanup custody", rootId: command.rootId,
+        id: metadata.id, requestId: command.requestId, source: move.source,
+        destination: move.destination, state: move.state, deferred,
+        ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
+      });
+      const prepare = (source: string, kind: string): void => {
+        fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+        // mkdtemp creates a fresh 0700 directory. Its never-used child cannot
+        // overwrite another custody root, even for repeated agent IDs.
+        const container = fs.mkdtempSync(path.join(archive, `${metadata.id}-${kind}-`));
+        const move: typeof custody[number] = { source, destination: path.join(container, "tree"),
+          receipt: path.join(container, "custody.json"), state: "prepared" };
+        custody.push(move);
+        saveCustody(move);
+      };
+      if (runStat) prepare(metadata.runDirectory, "run");
+      if (worktree) prepare(worktree, "worktree");
+      // The first root move is already an effect, so preserve the existing
+      // cancellation/known-ID uncertainty fence BEFORE it, not after archival.
+      commit();
+      for (const move of custody) {
+        throwIfAborted(signal);
+        try { fs.renameSync(move.source, move.destination); }
+        catch (error) {
+          move.state = "rename-failed";
+          try { saveCustody(move, error); } catch { /* The prepared receipt and logged paths remain. */ }
+          throw error;
+        }
+        move.state = "moved";
+        saveCustody(move);
+      }
+      // Never remove an old source path: a new canonical occupant may already
+      // exist there. Git removal would also destroy trees/refs, not just receipts.
+      if (deferred.length) diagnostics.warn("src/residency/client.ts", `[pi-fabric] resident cleanup ${metadata.id}: ${deferred.join(" ")}`);
+      throwIfAborted(signal);
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.#completions.forget(metadata.id);
       this.options.onResultConsumed?.(metadata.id);
       acknowledgeResidentResponse(this.options.config.residencyRoot, { format: 1, requestId: command.requestId, ok: true, completedAt: Date.now() }, Date.now(), command.format);
-      return { cleaned: true };
+      return { cleaned: true, ...(custody.length ? { custody: custody.map(({ source, destination }) => ({ source, destination })) } : {}),
+        ...(deferred.length ? { deferred } : {}) };
     } catch (error) {
-      if (!commitAttempted) throw error;
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      const detail = new Error(`Resident cleanup refused for ${metadata.id}: ${code ? `${code}: ` : ""}${error instanceof Error ? error.message : String(error)}. ` +
+        `Custody paths: ${JSON.stringify(custody)}. ${deferred.join(" ")} No root rollback or source-path deletion was attempted.`, { cause: error });
+      diagnostics.warn("src/residency/client.ts", `[pi-fabric] ${detail.message}`);
+      if (!commitAttempted) throw detail;
       let decision;
       try { decision = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unknown fence */ }
-      if (decision?.state === "abandoned") throw error;
-      // Partial cleanup or an unreadable fence is not a proved rejection either.
-      throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      if (decision?.state === "abandoned") throw detail;
+      // A prior root may already be in custody. Keep it there, keep the failed
+      // source in place, and preserve known-ID uncertainty; never roll back over
+      // a new canonical occupant or claim that the whole operation was rejected.
+      throw new ResidentOutcomeUnknownError(command, decision, detail, signal);
     }
   }
 

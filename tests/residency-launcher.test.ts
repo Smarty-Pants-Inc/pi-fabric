@@ -107,6 +107,78 @@ describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher
   });
 });
 
+// Keep: data safety and real watchdog recovery. Archive failure may waive evidence retention limits,
+// but must not turn a recoverable stall into an evidence-capture refusal or lose any older trace.
+describe.skipIf(!hasLauncher || process.platform !== "linux")("resident launcher watchdog with unavailable archival", () => {
+  it("retains all old wedge bytes and still terminates its stalled child through the real launcher", { timeout: 25_000 }, async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-archive-recovery-"));
+    const root = path.join(base, "resident"), wedges = path.join(root, "wedges");
+    fs.mkdirSync(wedges, { recursive: true, mode: 0o700 });
+    const originals = new Map<string, Buffer>();
+    for (let n = 0; n < 7; n++) {
+      const dir = path.join(wedges, `2026-01-0${n + 1}`);
+      fs.mkdirSync(dir, { mode: 0o700 });
+      const file = path.join(dir, "session.jsonl"), bytes = Buffer.from(`old raw wedge ${n}\0\r\n`);
+      fs.writeFileSync(file, bytes); originals.set(file, bytes);
+    }
+    fs.writeFileSync(`${root}.trace-archive`, "archive path unavailable");
+    const marker = path.join(root, "watchdog-term.json");
+    const hostBinary = path.join(base, "stalled-host.mjs");
+    fs.writeFileSync(hostBinary, `import fs from 'node:fs'; import path from 'node:path'; import {createHash} from 'node:crypto';
+const root = ${JSON.stringify(root)}, hostId = 'archive-failure-fixture';
+const fields = fs.readFileSync('/proc/self/stat', 'utf8');
+const startedAt = Date.now();
+fs.writeFileSync(path.join(root, 'owner.json'), JSON.stringify({hostId, pid: process.pid, startedAt,
+  token: process.env.PI_FABRIC_RESIDENT_GENERATION, processStartTime: fields.slice(fields.lastIndexOf(')') + 2).split(' ')[19]}));
+const leases = path.join(root, 'mesh', 'host-leases'); fs.mkdirSync(leases, {recursive:true});
+fs.writeFileSync(path.join(leases, createHash('sha256').update(hostId).digest('hex').slice(0,32) + '.json'),
+  JSON.stringify({format:1, id:hostId, rootId:'archive-failure-root', identityId:hostId, updatedAt:Date.now(), expiresAt:Date.now()+1000}));
+process.on('SIGUSR2', () => {});
+process.on('SIGTERM', () => {
+  fs.writeFileSync(${JSON.stringify(`${marker}.tmp`)}, JSON.stringify({pid:process.pid}));
+  fs.renameSync(${JSON.stringify(`${marker}.tmp`)}, ${JSON.stringify(marker)}); process.exit(0);
+});
+console.error('stalled fixture raw output'); setInterval(() => {}, 1000);
+`);
+    const configPath = path.join(root, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({ cwd: base, piBinary: hostBinary, residencyRoot: root,
+      rootId: "archive-failure-root", meshRoot: path.join(root, "mesh"), watchdog: { intervalMs: 25, stallMs: 50, coldStartMs: 0 } }));
+    const events = (): Array<{ event: string; evidenceDir?: string; proofCheck?: number }> => {
+      try { return fs.readFileSync(path.join(root, "launcher.log"), "utf8").trim().split("\n").map(line => JSON.parse(line)); }
+      catch { return []; }
+    };
+    let recovered!: () => void;
+    const recovery = new Promise<void>(resolve => { recovered = resolve; });
+    // Filesystem events drive the assertion; one finite deadline bounds a missed notification or broken watchdog.
+    const watcher = fs.watch(root, () => {
+      if (fs.existsSync(marker) && events().some(row => row.event === "watchdog-deferred" && row.proofCheck)) recovered();
+    });
+    const launcher = spawn(process.execPath, [launcherPath, "--config", configPath], { cwd: base, stdio: "ignore" });
+    const exited = new Promise<void>((resolve, reject) => { launcher.once("error", reject); launcher.once("exit", () => resolve()); });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([recovery, exited.then(() => { throw new Error("Launcher exited before watchdog recovery"); }),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Watchdog archive-failure deadline")), 15_000); })]);
+      const stopping = events().find(row => row.event === "watchdog-stopping");
+      expect(stopping?.evidenceDir).toBeDefined();
+      expect(fs.existsSync(path.join(stopping!.evidenceDir!, "child-log-tail"))).toBe(true);
+      expect(events().some(row => row.event === "watchdog-evidence-error")).toBe(false);
+      for (const [file, bytes] of originals) {
+        const actual = fs.readFileSync(file);
+        expect(actual).toEqual(bytes);
+        expect(createHash("sha256").update(actual).digest("hex")).toBe(createHash("sha256").update(bytes).digest("hex"));
+      }
+      expect(fs.readdirSync(wedges).filter(name => name !== "reports")).toHaveLength(8);
+    } finally {
+      if (timer) clearTimeout(timer);
+      watcher.close();
+      if (launcher.exitCode === null && launcher.signalCode === null) launcher.kill("SIGTERM");
+      await exited;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 // #10068: fake timers kept the test runner alive after supervise returned and hid the native-process loss.
 // Keep: the real launcher/child lifetime and durable MeshStore boundary are the regression target here.
 describe.skipIf(!hasLauncher || process.platform === "win32")("resident launcher native unhosted alarm", () => {

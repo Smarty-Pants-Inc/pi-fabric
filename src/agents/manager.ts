@@ -123,7 +123,7 @@ import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/termi
 import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
-import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
+import { WorktreeManager, retainCleanupRoot, type AgentWorktreeResult, type CleanupCustody, type RootCustody } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
   AgentWriteRootOverlapError,
@@ -5438,7 +5438,35 @@ export class AgentManager {
     return this.#settledResult(managed);
   }
 
-  async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
+  /** Explicit cleanup transfers roots only after the caller's existing exit/result fences. */
+  async #retainCleanupTrees(id: string, runDirectory: string, deleteBranch: boolean, knownTemporary?: string): Promise<{ cleaned: boolean } & CleanupCustody> {
+    const custody: RootCustody[] = [];
+    const deferred: string[] = [];
+    try {
+      const temporary = !this.config.retainRuns ? recordedShortTmpdir(runDirectory, id, knownTemporary) : undefined;
+      if (temporary && fs.lstatSync(temporary, { throwIfNoEntry: false }) && !ownedShortTmpdir(temporary)) {
+        throw new Error(`Short TMPDIR custody refused: ${temporary} is not a real directory owned by this user`);
+      }
+      const cleaned = await this.#worktrees.cleanup(id, deleteBranch, result => {
+        custody.push(...result.custody ?? []);
+        deferred.push(...result.deferred ?? []);
+      });
+      if (!this.config.retainRuns) {
+        for (const source of [runDirectory, ...(temporary ? [temporary] : [])]) {
+          const move = retainCleanupRoot(source, `${this.#runRoot}.trace-archive`, id);
+          if (move) custody.push(move);
+        }
+      }
+      return { cleaned: cleaned || !fs.existsSync(runDirectory),
+        ...(custody.length ? { custody } : {}), ...(deferred.length ? { deferred } : {}) };
+    } catch (error) {
+      const detail = new Error(`Agent cleanup ${id} incomplete: ${String(error)}. Retained custody: ${JSON.stringify(custody)}. ${deferred.join(" ")} No root rollback or deletion was attempted.`, { cause: error });
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${detail.message}`);
+      throw detail;
+    }
+  }
+
+  async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean } & CleanupCustody> {
     const queued = this.#queued.get(id);
     if (queued) {
       if (!queued.terminal) throw new Error("Cannot clean up a queued agent");
@@ -5450,12 +5478,11 @@ export class AgentManager {
       const exitVeto = runTreeExitVeto(runDirectory);
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
-      const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-      if (!this.config.retainRuns) await this.#removeRunTree(runDirectory, id);
+      const retained = await this.#retainCleanupTrees(id, runDirectory, deleteBranch);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
-      return { cleaned: cleaned || !fs.existsSync(runDirectory) };
+      return retained;
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
@@ -5487,15 +5514,12 @@ export class AgentManager {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
     this.markForeground(id);
-    const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-    if (!this.config.retainRuns) {
-      await this.#removeRunTree(managed.runDirectory, id, managed.temporaryDirectory);
-    }
+    const retained = await this.#retainCleanupTrees(id, managed.runDirectory, deleteBranch, managed.temporaryDirectory);
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
-    return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
+    return retained;
   }
 
   readLog(id: string, opts: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
@@ -6678,8 +6702,7 @@ export class AgentManager {
         this.#markLost(managed, reason);                       // it may still use its files
         throw new Error(reason);
       }
-      // Keep an append-only record of every relaunch; the status and lifecycle
-      // files below are replaced by the new attempt.
+      // Keep an append-only record of every relaunch; only status is replaced.
       fs.appendFileSync(
         path.join(managed.runDirectory, "relaunches.jsonl"),
         `${JSON.stringify({
@@ -6693,10 +6716,21 @@ export class AgentManager {
         })}\n`,
         { encoding: "utf8", mode: 0o600 },
       );
-      // The relaunched child owns a fresh status/lifecycle pair, so drain what
-      // the previous attempt published (token usage above all) before discarding
-      // the journal it landed in.
-      this.#drainLifecycle(managed);
+      // Independently archive every raw byte before superseding this dead worker.
+      // Keep the canonical journal append-only, even for late path occupants.
+      // The optional copy engine loads only on retry.
+      if (fs.lstatSync(managed.lifecycleFile, { throwIfNoEntry: false })) {
+        const { archiveTraceCopy } = await import("../storage/trace-archive.js");
+        if (cancelled()) return false;
+        this.#drainLifecycle(managed);
+        managed.lifecycleOffset = archiveTraceCopy(managed.lifecycleFile,
+          path.join(managed.runDirectory, "session-archive"), { reason: resume ? "resume" : "startup-retry", runId: managed.id }).bytes;
+        // Seal but skip the old torn suffix. A fresh worker's first appended row
+        // must not be glued to it, nor may old usage/questions be replayed.
+        fs.appendFileSync(managed.lifecycleFile, "\n");
+        managed.lifecycleOffset++;
+      } else managed.lifecycleOffset = 0;
+      managed.lifecycleRemainder = Buffer.alloc(0);
       // Once this attempt is superseded, a supervisor crash must not promote its old failure
       // while the already-launched retry is still running. The previous worker has exited.
       if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
@@ -6715,11 +6749,6 @@ export class AgentManager {
       }
 
       fs.rmSync(managed.statusFile, { force: true });
-      // Reset the superseded journal before launching its replacement. A launch
-      // already accepted before PREPARE may finish without deleting new output.
-      managed.lifecycleOffset = 0;
-      managed.lifecycleRemainder = Buffer.alloc(0);
-      fs.rmSync(managed.lifecycleFile, { force: true });
       if (cancelled()) return false;
       if (this.#meshTransport?.transport === "nats") {
         presenceAttempted = true;

@@ -798,6 +798,10 @@ export interface ResidentCommandResponse {
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;
+  /** Cleanup retained whole roots at these paths rather than deleting them. */
+  custody?: Array<{ source: string; destination: string }>;
+  /** Cleanup bookkeeping not performed (including deferred Git operations). */
+  deferred?: string[];
   /** requeueArchived (smarty-dev#16416). */
   requeued?: import("../actors/types.js").FabricActorRequeueResult;
   error?: string;

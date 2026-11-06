@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
+import { archiveTraceCopy } from "../storage/trace-archive.js";
 import type { MeshEvent } from "./store.js";
 import type { IndexDirectoryBarrier } from "./receipt-namespace.js";
 
@@ -215,10 +216,14 @@ const writeDurable = (file: string, text: string): void => {
 };
 
 // Truncate through its own read-write handle: Windows refuses to truncate through an append one.
-const truncateTo = (file: string, size: number): void => {
+const truncateTo = (file: string, size: number, archiveDir: string): void => {
   const descriptor = fs.openSync(file, "r+");
   try {
-    if (fs.fstatSync(descriptor).size <= size) return;
+    const stat = fs.fstatSync(descriptor);
+    if (stat.size <= size) return;
+    // All callers hold the mesh publish lock. Rollback may hide an event semantically,
+    // but neither it nor torn-tail recovery may discard any original journal bytes.
+    archiveTraceCopy(file, archiveDir, { reason: "mesh-archive-truncate", retainedBytes: size }, stat);
     fs.ftruncateSync(descriptor, size);
     fs.fdatasyncSync(descriptor);
   } finally {
@@ -541,7 +546,7 @@ export class MeshArchive {
       if (plan.pendingRepair) {
         const { file, size, digest } = plan.pendingRepair;
         const absolute = path.join(this.dir, file);
-        truncateTo(absolute, size);
+        truncateTo(absolute, size, path.join(this.dir, "trace-archive"));
         this.#saveDigest(file, digest, fs.statSync(absolute));
       }
       // ponytail: PENDING.json read above and removed in one synchronous .lock hold (see commit()).
@@ -582,10 +587,16 @@ export class MeshArchive {
           const absolute = path.join(this.dir, relative);
           fs.mkdirSync(path.dirname(absolute), { recursive: true, mode: 0o700 });
           const descriptor = fs.openSync(absolute, "a+", 0o600);
-          const { last, digest } = this.#repairAndLoadDigest(descriptor, relative);
-          this.#advanceDigest(descriptor, relative, digest, { bytes: ARCHIVE_DIGEST_SLICE_BYTES });
-          file = { descriptor, last, relative, digest };
-          open.set(relative, file);
+          try {
+            const { last, digest } = this.#repairAndLoadDigest(descriptor, relative);
+            this.#advanceDigest(descriptor, relative, digest, { bytes: ARCHIVE_DIGEST_SLICE_BYTES });
+            file = { descriptor, last, relative, digest };
+            open.set(relative, file);
+          } catch (error) {
+            // Repair can refuse a failed raw copy before this handle enters the open set.
+            fs.closeSync(descriptor);
+            throw error;
+          }
         }
         const previous = file.last;
         last = { sequence: event.sequence, id: event.id, file: relative };
@@ -806,13 +817,15 @@ export class MeshArchive {
   }
 
   #cutBack(pending: MeshArchivePending): void {
+    const absolute = path.join(this.dir, pending.file);
     try {
-      const absolute = path.join(this.dir, pending.file);
-      truncateTo(absolute, pending.size);
+      truncateTo(absolute, pending.size, path.join(this.dir, "trace-archive"));
       if (pending.digestBefore) this.#saveDigest(pending.file, pending.digestBefore, fs.statSync(absolute));
       if (pending.indexed) this.reserveLookup(pending.sequence);
     } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
+      // A missing source retains the old no-op behavior. A missing preservation
+      // destination must not clear PENDING or its positive index while bytes remain.
+      if (errorCode(error) !== "ENOENT" || fs.existsSync(absolute)) throw error;
     }
     // ponytail: the caller's PENDING.json, read in this synchronous .lock hold (see commit()).
     fs.rmSync(path.join(this.dir, "PENDING.json"), { force: true });
@@ -890,7 +903,7 @@ export class MeshArchive {
     let tail = this.#lastLines(descriptor, size);
     if (tail.length && tail[tail.length - 1] !== 0x0a) {
       const cut = tail.lastIndexOf(0x0a) + 1;
-      truncateTo(file, size - tail.length + cut);
+      truncateTo(file, size - tail.length + cut, path.join(this.dir, "trace-archive"));
       size = size - tail.length + cut;
       tail = this.#lastLines(descriptor, size);
     }

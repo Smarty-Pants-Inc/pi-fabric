@@ -4,6 +4,46 @@ import { addCloneFirstWorktree } from "./clone-first-worktree.js";
 import { executeFile } from "./transports/process-utils.js";
 import { fabricWorktreePath } from "./worktree-paths.js";
 
+/** Whole-root retention, never a copy or a deletion certificate. */
+export interface RootCustody {
+  source: string;
+  destination: string;
+}
+export interface CleanupCustody {
+  custody?: RootCustody[];
+  deferred?: string[];
+}
+
+/** First-use only: keep even unclassified raw bytes, symlinks and open-FD appends. */
+export const retainCleanupRoot = (source: string, archive: string, id: string): RootCustody | undefined => {
+  if (!fs.lstatSync(source, { throwIfNoEntry: false })) return undefined;
+  fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+  const container = fs.mkdtempSync(path.join(archive, "cleanup-"));
+  const move = { source, destination: path.join(container, "tree") };
+  const receipt = path.join(container, "custody.json");
+  const save = (state: string, error?: unknown): void => fs.writeFileSync(receipt, JSON.stringify({
+    format: 1, reason: "agent cleanup whole-root custody", id, ...move, state,
+    ...(error === undefined ? {} : { error: String(error) }),
+  }) + "\n", { mode: 0o600 });
+  save("prepared");
+  try {
+    // The never-used child of mkdtemp cannot overwrite earlier retained trees.
+    // EXDEV is an explicit refusal: no recursive walk, copy fallback or rm.
+    fs.renameSync(source, move.destination);
+  } catch (error) {
+    try { save("rename-failed", error); } catch { /* The prepared paths remain. */ }
+    const code = (error as NodeJS.ErrnoException).code;
+    const refusal = new Error(`Cleanup custody refused${code ? ` (${code})` : ""}: ${source} -> ${move.destination}; original retained, no copy/delete fallback: ${String(error)}`, { cause: error });
+    console.warn(`[pi-fabric] ${refusal.message}`); // Rollback callers may catch the exception.
+    throw refusal;
+  }
+  // If receipt publication fails, never roll back over a new canonical occupant.
+  try { save("moved"); }
+  catch (error) { throw new Error(`Cleanup root retained at ${move.destination} (from ${source}); custody receipt update failed: ${String(error)}`, { cause: error }); }
+  console.warn(`[pi-fabric] cleanup retained whole root: ${source} -> ${move.destination}; receipt: ${receipt}`);
+  return move;
+};
+
 export interface WorktreeLease {
   gitRoot: string;
   path: string;
@@ -184,19 +224,22 @@ export class WorktreeManager {
     return result;
   }
 
-  async cleanup(id: string, deleteBranch = false): Promise<boolean> {
+  async cleanup(id: string, deleteBranch = false, onCustody?: (result: CleanupCustody) => void): Promise<boolean> {
     const lease = this.#leases.get(id);
     if (!lease) return false;
-    await executeFile("git", ["worktree", "remove", "--force", lease.path], {
-      cwd: lease.gitRoot,
-      timeoutMs: 60_000,
-    });
-    if (deleteBranch) {
-      await executeFile("git", ["branch", "-D", lease.branch], {
-        cwd: lease.gitRoot,
-        timeoutMs: 30_000,
-      });
+    // Applies to every caller, including prelaunch failure rollback. Git remove
+    // destroys raw worktree payloads; even after rename it is not a metadata-only
+    // operation. Leave registration/branch repair to an explicit later action.
+    let move: RootCustody | undefined;
+    try { move = retainCleanupRoot(lease.path, `${path.dirname(lease.path)}.trace-archive`, id); }
+    catch (error) {
+      console.warn(`[pi-fabric] worktree cleanup refused for ${id}; source ${lease.path}, Git root ${lease.gitRoot}, branch ${lease.branch} retained: ${String(error)}`);
+      throw error;
     }
+    const deferred = [`Git worktree registration cleanup deferred: ${JSON.stringify(lease.gitRoot)} still registers ${JSON.stringify(lease.path)}; no remove or prune was attempted.`,
+      ...(deleteBranch ? [`Git branch deletion deferred: ${lease.branch} was not deleted.`] : [])];
+    console.warn(`[pi-fabric] cleanup ${id}: ${deferred.join(" ")}`);
+    onCustody?.({ ...(move ? { custody: [move] } : {}), deferred });
     this.#leases.delete(id);
     return true;
   }

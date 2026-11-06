@@ -8,6 +8,19 @@ import { platformRemovalSkips, startRemovalTally, stopRemovalTally, verifiedRemo
 import { spawnSync } from "node:child_process";
 import { build } from "esbuild";
 
+const nativePlatform = vi.hoisted(() => process.platform);
+// Only scratch's dispatch is simulated. The real archiver must use the filesystem's native directory-fsync
+// behavior (forcing darwin on Windows cannot make Windows directory descriptors support fsync).
+vi.mock("../src/storage/trace-archive.js", async original => {
+  const archive = await original<typeof import("../src/storage/trace-archive.js")>();
+  return { ...archive, archiveTraceTreeCopy: (...args: Parameters<typeof archive.archiveTraceTreeCopy>) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: nativePlatform });
+    try { return archive.archiveTraceTreeCopy(...args); }
+    finally { Object.defineProperty(process, "platform", platform); }
+  } };
+});
+
 // pi-fabric#1014 SEC P2-2: off Linux, managed scratch keeps main's (c0b67ef) path-based removal after every candidate
 // recheck; the verified helper's platform/no-uid refusal stays for every other deleter, now counted and logged with a
 // synchronous warning on each key's 1st, 10th, 100th and 1000th skip.
@@ -73,14 +86,15 @@ const changeAfterJudgment = (directory: string, change: () => void) => {
 
 describe("off Linux, scratch keeps main's removal after every candidate recheck (recorded, never executed)", () => {
   for (const platform of ["darwin", "win32"] as const) {
-    it(`${platform}: the expired closed root reaches exactly main's recursive removal; others remain`, async () => {
+    it(`${platform}: removal requires a verified archive; other candidates remain`, async () => {
       const tempRoot = sandbox();
       const old = fixture(tempRoot, { closedAt: 1 });
       const young = fixture(tempRoot, { closedAt: 30 * HOUR });
       const active = fixture(tempRoot);
       const unknown = fixture(tempRoot, { closedAt: 1 });
       fs.writeFileSync(path.join(unknown, "mine.txt"), "private");
-      const before = shape(tempRoot);
+      const kept = [old, young, active, unknown];
+      const before = kept.map(shape);
       const calls = record();
       override("platform", platform);
       const dry = await sweepScratch({ tempRoot, now: 30 * HOUR + 1, dryRun: true });
@@ -89,8 +103,13 @@ describe("off Linux, scratch keeps main's removal after every candidate recheck 
       const result = await sweepScratch({ tempRoot, now: 30 * HOUR + 1 });
       expect(result).toMatchObject({ eligible: [old], removed: [old] });
       expect(calls).toEqual([{ op: "rm", file: old, options: { recursive: true, force: true } }]);
-      // The recorder executed nothing: every fixture, the removed one included, is byte-for-byte intact.
-      expect(shape(tempRoot)).toEqual(before);
+      // Every original fixture is byte-for-byte intact; successful archival adds only the separate sibling archive.
+      expect(kept.map(shape)).toEqual(before);
+      const archive = path.join(tempRoot, ".fabric-scratch-archive");
+      const receipt = fs.readFileSync(path.join(archive, "MANIFEST.jsonl"), "utf8").trim().split("\n")
+        .map(line => JSON.parse(line)).find(row => row.kind === "tree" && row.from === old);
+      expect(receipt).toBeDefined();
+      expect(fs.readFileSync(path.join(receipt.to, "output.txt"), "utf8")).toBe("data");
       for (const kept of [young, active, unknown]) expect(result.removed).not.toContain(kept);
     });
 

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { parsePiSessionHeader } from "../core/pi-session-header.js";
+import { archiveTraceCopy } from "../storage/trace-archive.js";
 
 /**
  * Activation inference must be empty before Pi starts, not only after its
@@ -36,11 +37,36 @@ export class ActivationSession {
   retain(): void {
     const current = fs.existsSync(this.journal) ? fs.readFileSync(this.journal, "utf8") : "";
     if (current !== this.before) throw new Error(`Actor journal changed during activation; isolated session retained at ${this.file}`);
+    // Semantic journal records can normalize or transform the child (notably compaction/context edits).
+    // Preserve its ORIGINAL bytes, even an empty or malformed child, before parsing or any unlink.
+    const archived = archiveTraceCopy(this.file, path.join(path.dirname(this.journal), "session-archive"),
+      { reason: "activation retention", journal: this.journal });
+    const assertOriginal = (): void => {
+      const same = (stat: fs.Stats): boolean => stat.isFile() && stat.dev === archived.stat.dev &&
+        stat.ino === archived.stat.ino && stat.size === archived.stat.size && stat.mode === archived.stat.mode &&
+        stat.mtimeMs === archived.stat.mtimeMs && stat.ctimeMs === archived.stat.ctimeMs &&
+        stat.uid === archived.stat.uid && stat.gid === archived.stat.gid && stat.nlink === archived.stat.nlink;
+      if (!same(fs.lstatSync(this.file))) throw new Error("Activation source changed after archive; original kept");
+      const raw = fs.readFileSync(this.file);
+      if (raw.length !== archived.bytes || createHash("sha256").update(raw).digest("hex") !== archived.sha256 ||
+          !same(fs.lstatSync(this.file))) throw new Error("Activation source changed after archive; original kept");
+      const copy = fs.lstatSync(archived.to);
+      if (!copy.isFile() || copy.isSymbolicLink()) throw new Error("Activation archive changed; original kept");
+      const retainedBytes = fs.readFileSync(archived.to);
+      const after = fs.lstatSync(archived.to);
+      if (retainedBytes.length !== archived.bytes || createHash("sha256").update(retainedBytes).digest("hex") !== archived.sha256 ||
+          copy.dev !== after.dev || copy.ino !== after.ino || copy.mtimeMs !== after.mtimeMs || copy.ctimeMs !== after.ctimeMs) {
+        throw new Error("Activation archive changed; original kept");
+      }
+      if (!same(fs.lstatSync(this.file))) throw new Error("Activation source changed after archive; original kept");
+    };
+    assertOriginal();
     const prior = current.split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
-    const entries = fs.readFileSync(this.file, "utf8").split("\n").filter(Boolean)
+    const raw = fs.readFileSync(archived.to, "utf8");
+    const header = parsePiSessionHeader(raw.split("\n", 1)[0]!);
+    if (!header) throw new Error("Activation session has no valid native header");
+    const entries = raw.split("\n").filter(Boolean).slice(1)
       .map(line => JSON.parse(line) as Record<string, unknown>);
-    const header = entries.shift();
-    if (header?.type !== "session") throw new Error("Activation session has no native header");
     const ids = new Set(prior.map(entry => entry.id));
     const leaf = prior.filter(entry => entry.type !== "session" && typeof entry.id === "string").at(-1)?.id ?? null;
     const retained = entries.map(entry => {
@@ -60,12 +86,15 @@ export class ActivationSession {
       return durable;
     });
     if (!entries.length) {
+      assertOriginal();
       fs.unlinkSync(this.file);
       return;
     }
     const prefix = current ? (current.endsWith("\n") ? "" : "\n") : JSON.stringify(header) + "\n";
+    assertOriginal();
     fs.mkdirSync(path.dirname(this.journal), { recursive: true, mode: 0o700 });
     fs.appendFileSync(this.journal, prefix + retained.map(entry => JSON.stringify(entry)).join("\n") + "\n", { mode: 0o600 });
+    assertOriginal();
     fs.unlinkSync(this.file);
   }
 }

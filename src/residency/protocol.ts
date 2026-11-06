@@ -15,7 +15,7 @@ import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricModelAliases, FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricActorsConfig, FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
-import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter, FabricActorBatching } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest, FabricActorBindingScope, FabricActorActivationFilter, FabricActorBatching, FabricActorHostEvent } from "../actors/types.js";
 import type { FabricThinking } from "../thinking.js";
 import type { AgentHandleInfo, AgentRunRequest, FabricRunOutcome } from "../agents/types.js";
 import type { FabricKernel, FabricResidentOutcomeReceipt } from "../runtime/kernel.js";
@@ -598,6 +598,8 @@ export type ResidentActorMutation =
   | { operation: "stop"; id: string; dropQueued?: true }
   | { operation: "requeueArchived"; id: string; archive: string }
   | { operation: "setTools"; id: string; tools: string[] }
+  | { operation: "setTopics"; id: string; topics: string[] }
+  | { operation: "setEvents"; id: string; events: FabricActorHostEvent[] }
   | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
   | ({ operation: "setBatching"; id: string } & FabricActorBatching)
@@ -661,7 +663,7 @@ export const residentCommandForOwner = (command: ResidentCommand, owner: Residen
 const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor", "removeActor"] as const;
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "slotStatus", "setInstructions", "setModel",
-  "setThinking", "setTools", "setBatching", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
+  "setThinking", "setTools", "setTopics", "setEvents", "setBatching", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
   "requeueArchived",
 ] as const satisfies readonly ResidentCommand["operation"][];
 

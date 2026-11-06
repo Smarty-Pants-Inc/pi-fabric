@@ -1807,8 +1807,9 @@ export class AgentsProvider implements FabricProvider {
           throw new Error("topics must be an array of strings");
         }
         if (args.scope === "global") return this.globalActors.update(String(args.id), { topics: args.topics });
-        // Like setEvents, live subscription changes require this manager's ownership.
-        return this.actorManager.setTopics(String(args.id), args.topics);
+        const resident = await this.#residentActorOwner(String(args.id), context.signal);
+        if (resident) return this.#setResidentActor(resident, { operation: "setTopics", id: resident.id, topics: args.topics }, context);
+        return this.actorManager.setTopics(String(args.id), args.topics, checkCommit);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)
@@ -1816,7 +1817,9 @@ export class AgentsProvider implements FabricProvider {
               (event): event is FabricActorHostEvent => isFabricActorHostEvent(event),
             )
           : [];
-        return this.actorManager.setEvents(String(args.id), events);
+        const resident = await this.#residentActorOwner(String(args.id), context.signal);
+        if (resident) return this.#setResidentActor(resident, { operation: "setEvents", id: resident.id, events }, context);
+        return this.actorManager.setEvents(String(args.id), events, checkCommit);
       }
       case "setDeliveryPolicy": {
         const delivery = args.delivery as FabricActorDelivery;

@@ -6791,7 +6791,8 @@ export class ActorManager {
             throw new ActorLaneUnresolvedLaunchError(result.error ?? "model exception lane unresolved; no worker started");
           }
           if (workerLaunched || recoveredProof ||
-              !loadedLastCleanedRunWorker(actor.lastCleanedRunWorker, actor.id, actor.lastRunId)) {
+              (!this.agents.actorQueuedRunUnlaunched(result.id, actor.id) &&
+                !loadedLastCleanedRunWorker(actor.lastCleanedRunWorker, actor.id, actor.lastRunId))) {
             actor.lastRunId = result.id;
           }
           if (unstartedRedrive) continue;

@@ -78,7 +78,7 @@ import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
 import { removeTree } from "./rm.js";
-import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, persistRunStopIntent, readRunStopIntent, clearRunStopIntent, readActorRunArchiveCustody, readActorWorkerStopProof, persistActorWorkerStopProof, type ActorWorkerStopProof, type PendingRunArchive } from "./archive-custody.js";
+import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, persistRunStopIntent, readRunStopIntent, readDurableRunStopIntent, clearRunStopIntent, readActorRunArchiveCustody, readActorWorkerStopProof, persistActorWorkerStopProof, type ActorWorkerStopProof, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
 import { LocaltermTransport } from "./transports/localterm-transport.js";
@@ -2403,6 +2403,15 @@ export class AgentManager {
     // pid may already name another process. A handle with no close notification is indeterminate: not open.
     const open = managed.transport.closed !== undefined && !identity.closed && !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
     return { pid: identity.pid, startTime: identity.startTime, open };
+  }
+
+  /** After run returns, prove a local prelaunch settlement from exact live queue custody. */
+  actorQueuedRunUnlaunched(runId: string, actorId: string): boolean {
+    const queued = this.#queued.get(runId);
+    return queued !== undefined && queued.info.id === runId && queued.info.actorId === actorId &&
+      queued.terminal?.id === runId && (queued.terminal.status === "failed" || queued.terminal.status === "stopped") &&
+      !this.#runs.has(runId) && queued.cleanupPending === undefined && queued.heldPermit === undefined &&
+      queued.ownProcess === undefined && queued.resolvedRecovered !== true;
   }
 
   /** Durable exact-host whole-execution proof, including after this manager is replaced. */
@@ -5149,6 +5158,11 @@ export class AgentManager {
   async commitActorArchive(runId: string, actorId: string, sessionFile: string): Promise<void> {
     const directory = this.actorArchiveSources(actorId, sessionFile).get(runId);
     if (!directory) return;
+    // A replacement cannot discharge durable stop custody from primary death alone.
+    if (!this.#runs.has(runId) && readDurableRunStopIntent(directory) !== undefined &&
+        !readActorWorkerStopProof(directory, runId, actorId, sessionFile)) {
+      throw new Error(`Actor run ${runId} native proof transfer pending; source retained`);
+    }
     fs.rmSync(path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE));
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all

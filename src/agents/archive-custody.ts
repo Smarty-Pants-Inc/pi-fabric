@@ -83,6 +83,17 @@ export const persistRunStopIntent = (directory: string, reason: "explicit" | "de
   } }, { durable: true });
 };
 
+/** Direct durable custody only; malformed receipts refuse, never fall back to worker status. */
+export const readDurableRunStopIntent = (directory: string): ArchiveCustodyRecord["stopIntent"] => {
+  const record = read(directory);
+  if (!record || typeof record !== "object" || Array.isArray(record) || record.format !== 1) throw new Error("Unknown archive custody format");
+  const intent = record.stopIntent;
+  if (intent !== undefined && (!intent || typeof intent !== "object" || Array.isArray(intent) ||
+      (intent.reason !== "explicit" && intent.reason !== "deadline") ||
+      typeof intent.requestedAt !== "number" || !Number.isFinite(intent.requestedAt))) throw new Error("Malformed durable run stop intent");
+  return intent;
+};
+
 export const readRunStopIntent = (directory: string, statusRecord?: Record<string, unknown>): ArchiveCustodyRecord["stopIntent"] => {
   const fromReceipt = read(directory).stopIntent;
   if (fromReceipt) return fromReceipt;

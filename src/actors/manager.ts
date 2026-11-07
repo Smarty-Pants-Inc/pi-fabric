@@ -301,6 +301,8 @@ interface ManagedActor extends FabricActorBatching {
   createdAt: number;
   updatedAt: number;
   lastRunId?: string;
+  /** Host launch identity retained only after successful whole-execution cleanup; not death proof. */
+  lastCleanedRunWorker?: { actorId: string; runId: string; pid: number; startTime: string };
   /** Setup/admission is separate from a launched worker (smarty-dev#3167). */
   preparing?: { phase: string; startedAt: number; attempts: number; runId?: string; queuePosition?: number };
   inFlightRun?: { id: string; startedAt: number };
@@ -436,6 +438,17 @@ function loadedActivationFilter(
     return { invalidActivationFilter: { value: structuredClone(value), error: reason } };
   }
 }
+function loadedLastCleanedRunWorker(
+  value: unknown, actorId: string, runId: string | undefined,
+): ManagedActor["lastCleanedRunWorker"] {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !runId) return undefined;
+  const row = value as Record<string, unknown>;
+  if (row.actorId !== actorId || row.runId !== runId || typeof row.pid !== "number" ||
+      !Number.isSafeInteger(row.pid) || row.pid <= 1 || typeof row.startTime !== "string" ||
+      !/^[0-9]+$/.test(row.startTime)) return undefined;
+  return { actorId, runId, pid: row.pid, startTime: row.startTime };
+}
+
 // Old registries have no per-filter telemetry; never infer it from lifetime counters.
 function loadedFilterSkipped(value: unknown): FabricActorInfo["filterSkipped"] {
   const empty = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
@@ -2340,13 +2353,25 @@ export class ActorManager {
 
   /**
    * D3 seat drain (smarty-dev#15310), read-only: the launched worker of this owned actor's last run, from this host's
-   * own launch record (pid and kernel start time read at spawn). null: no run recorded; undefined: no record here.
+   * own launch record (pid and kernel start time read at spawn), retained durably after successful cleanup.
+   * The identity still requires an external worker-exit check. null: no run recorded; undefined: no safe identity.
    */
   drainWorker(id: string): { runId: string; pid: number; startTime: string | undefined } | null | undefined {
     const actor = this.#requireOwnedActor(id);
-    const runId = actor.inFlightRun?.id ?? actor.lastRunId;
+    const running = this.#runningActor(actor.id) ?? actor;
+    const currentRunId = running.inFlightRun?.id ?? actor.inFlightRun?.id ??
+      running.preparing?.runId ?? actor.preparing?.runId;
+    if (currentRunId) {
+      const worker = this.agents.workerIdentity(currentRunId);
+      return worker ? { runId: currentRunId, pid: worker.pid, startTime: worker.startTime } : undefined;
+    }
+    // Preparation can precede a run handle. Never substitute the previous run's identity for that activation.
+    if (running.draining || running.abortController || running.preparing || actor.draining || actor.abortController ||
+        actor.preparing || this.#draining.has(actor.id) || this.#inFlight.has(actor.id)) return undefined;
+    const runId = running.lastRunId ?? actor.lastRunId;
     if (!runId) return null;
-    const worker = this.agents.workerIdentity(runId);
+    const worker = this.agents.workerIdentity(runId) ??
+      loadedLastCleanedRunWorker(actor.lastCleanedRunWorker, actor.id, runId);
     return worker ? { runId, pid: worker.pid, startTime: worker.startTime } : undefined;
   }
 
@@ -6351,7 +6376,7 @@ export class ActorManager {
     }
   }
 
-  async #publishDrainPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+  async #publishDrainPresence(actor: ManagedActor, requireCommit = false, durable = false): Promise<void> {
     if (!this.#canManage(actor.id) || !this.#slotCurrent(actor) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
       if (requireCommit) throw new ActorRegistryOwnershipError();
       return;
@@ -6360,7 +6385,7 @@ export class ActorManager {
     // Preparation is an admission boundary, not a coalescible worker status pulse.
     try {
       await this.#prepare(actor, "registry", () => this.#saveActors(new Set(), { flush: true,
-        ...(requireCommit ? { requiredActor: actor } : {}) }));
+        ...(durable ? { durable: true } : {}), ...(requireCommit ? { requiredActor: actor } : {}) }));
     } catch (error) {
       if (error instanceof ActorPreparationTimeoutError) {
         // Release only process-local serialization. An abandoned acquisition
@@ -6510,6 +6535,9 @@ export class ActorManager {
         actor.abortController = abortController;
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
+        const liveAtAdmission = this.#liveActor(actor);
+        delete actor.lastCleanedRunWorker;
+        delete liveAtAdmission.lastCleanedRunWorker;
         let runCompleted = false;
         let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
         let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
@@ -6526,7 +6554,7 @@ export class ActorManager {
         let runEvidence: readonly string[] | undefined;
         const preparationAbort = new AbortController();
         try {
-          await this.#publishDrainPresence(actor);
+          await this.#publishDrainPresence(actor, false, true);
           this.#assertSlotCurrent(actor);
           const beforeRun = await this.#prepare(actor, "validity", () => this.#validity(actor, item));
           this.#assertSlotCurrent(actor);
@@ -7058,8 +7086,30 @@ export class ActorManager {
               }
             }
             if (runId && runCompleted && archived) {
+              const worker = this.agents.workerIdentity(runId);
               const cleaned = await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
-              if (cleaned.cleaned) this.#slotRunIds.get(actor.id)?.delete(runId);
+              if (cleaned.cleaned) {
+                this.#slotRunIds.get(actor.id)?.delete(runId);
+                const identity = loadedLastCleanedRunWorker({ actorId: actor.id, runId,
+                  pid: worker?.pid, startTime: worker?.startTime }, actor.id, runId);
+                if (identity && actor.lastRunId === runId && actor.abortController === abortController &&
+                    this.#runningActor(actor.id) === actor && this.#canManage(actor.id)) {
+                  const live = this.#liveActor(actor);
+                  if (this.#lineage(live) === this.#lineage(actor)) {
+                    // Reloads may have replaced the row while cleanup joined native/tree exit.
+                    live.lastRunId = runId;
+                    actor.lastCleanedRunWorker = live.lastCleanedRunWorker = identity;
+                    await this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: live })
+                      .catch((error: unknown) => {
+                        for (const instance of new Set([actor, live, this.#liveActor(actor)])) {
+                          if (instance.lastCleanedRunWorker === identity) delete instance.lastCleanedRunWorker;
+                        }
+                        this.#recordPreparationFailure(actor, error);
+                        retryDrain = true;
+                      });
+                  }
+                }
+              }
             }
           } finally {
             delete actor.abortController;
@@ -9666,6 +9716,7 @@ export class ActorManager {
   }
 
   #serializedActor(actor: ManagedActor): Record<string, unknown> {
+    const lastCleanedRunWorker = loadedLastCleanedRunWorker(actor.lastCleanedRunWorker, actor.id, actor.lastRunId);
     return {
       id: actor.id,
       name: actor.name,
@@ -9749,6 +9800,7 @@ export class ActorManager {
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      ...(lastCleanedRunWorker ? { lastCleanedRunWorker } : {}),
       ...(actor.removal ? { removal: actor.removal } : {}),
       ...(actor.presenceError ? { presenceError: actor.presenceError } : {}),
       ...(actor.sessionOrphan ? { sessionOrphan: { ...actor.sessionOrphan }, ...(actor.lastError ? { lastError: actor.lastError } : {}) } : {}),
@@ -10261,6 +10313,7 @@ export class ActorManager {
       } catch {
         continue;
       }
+      const lastCleanedRunWorker = loadedLastCleanedRunWorker(source.lastCleanedRunWorker, record.id, record.lastRunId);
       const actor: ManagedActor = {
         id: record.id,
         name: record.name,
@@ -10405,6 +10458,7 @@ export class ActorManager {
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)
           ? { sessionOrphan: { ...record.sessionOrphan }, ...(typeof record.lastError === "string" ? { lastError: record.lastError } : {}) } : {}),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
+        ...(lastCleanedRunWorker ? { lastCleanedRunWorker } : {}),
         ...(typeof record.removal?.requestedAt === "number"
           ? {
               removal: {
@@ -11896,6 +11950,14 @@ export class ActorManager {
       const live = this.#actors.get(old.id);
       if (!live || live === old) continue;
       live.latestActivationSequence = Math.max(live.latestActivationSequence, old.latestActivationSequence);
+      const running = this.#draining.get(old.id);
+      if (running?.abortController && this.#lineage(running) === this.#lineage(live)) {
+        // Carry this activation's invalidation/result, never resurrect an older registry identity during reload.
+        if (running.lastRunId !== undefined) live.lastRunId = running.lastRunId;
+        else delete live.lastRunId;
+        if (running.lastCleanedRunWorker) live.lastCleanedRunWorker = running.lastCleanedRunWorker;
+        else delete live.lastCleanedRunWorker;
+      }
       // An unread history has no local additions to carry and must stay lazy.
       if (this.#lazyMessages.has(old)) continue;
       if (this.#resetMessages.has(old)) {

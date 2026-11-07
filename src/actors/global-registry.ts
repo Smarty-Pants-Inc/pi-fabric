@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { FabricCapabilityRequirement } from "../components/types.js";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import type { FabricAgentTransport } from "../config.js";
+import type { FabricAgentTransport, FabricPythonRuntime } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { FABRIC_ACTOR_HOST_EVENTS, MAX_ACTOR_BATCH_EVENTS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, parseEventsStartAt, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
@@ -242,6 +242,9 @@ export class GlobalActorRegistry {
           : {}),
       runner: patch.runner ?? existing.runner,
       ...(patch.kernel !== undefined ? { kernel: patch.kernel } : existing.kernel ? { kernel: existing.kernel } : {}),
+      ...(patch.pythonRuntime !== undefined
+        ? { pythonRuntime: patch.pythonRuntime }
+        : existing.pythonRuntime !== undefined ? { pythonRuntime: existing.pythonRuntime } : {}),
       ...(patch.model !== undefined ? { model: patch.model } : existing.model ? { model: existing.model } : {}),
       ...(patch.modelReason !== undefined ? { modelReason: patch.modelReason } : patch.model === undefined && existing.modelReason !== undefined ? { modelReason: existing.modelReason } : {}),
       ...(patch.thinking !== undefined ? { thinking: patch.thinking } : existing.thinking ? { thinking: existing.thinking } : {}),
@@ -345,6 +348,7 @@ export class GlobalActorRegistry {
       ...(def.residency ? { residency: def.residency } : {}),
       runner: def.runner,
       ...(def.kernel ? { kernel: def.kernel } : {}),
+      ...(def.pythonRuntime !== undefined ? { pythonRuntime: def.pythonRuntime } : {}),
       ...(def.model ? { model: def.model } : {}),
       ...(def.modelReason !== undefined ? { modelReason: def.modelReason } : {}),
       ...(def.thinking ? { thinking: def.thinking } : {}),
@@ -406,6 +410,10 @@ export class GlobalActorRegistry {
     if (def.kernel && def.kernel !== "inherit" && ((runner !== "pi" && runner !== "pi-durable") || def.extensions === false)) {
       throw new Error("An explicit Fabric kernel requires a Pi actor with extensions enabled");
     }
+    const pythonRuntime: FabricPythonRuntime | undefined = def.pythonRuntime;
+    if (pythonRuntime !== undefined && pythonRuntime !== "cpython" && pythonRuntime !== "monty") {
+      throw new Error(`Invalid inherited Fabric Python runtime: ${String(pythonRuntime)}`);
+    }
     const model = typeof def.model === "string" && def.model.trim() ? def.model.trim() : undefined;
     const thinking =
       def.thinking !== undefined && isFabricThinking(def.thinking) ? def.thinking : undefined;
@@ -449,6 +457,7 @@ export class GlobalActorRegistry {
       residency,
       runner,
       ...(def.kernel ? { kernel: def.kernel } : {}),
+      ...(pythonRuntime !== undefined ? { pythonRuntime } : {}),
       ...(model ? { model } : {}),
       ...(typeof def.modelReason === "string" ? { modelReason: def.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
@@ -562,6 +571,10 @@ export class GlobalActorRegistry {
       const runner = record.runner === "claude" || record.runner === "pi-durable" ? record.runner : "pi";
       if (record.kernel !== undefined && record.kernel !== "inherit" && record.kernel !== "typescript" && record.kernel !== "python") continue;
       if (record.kernel && record.kernel !== "inherit" && ((runner !== "pi" && runner !== "pi-durable") || record.extensions === false)) continue;
+      const pythonRuntime: FabricPythonRuntime | undefined = record.pythonRuntime;
+      if (pythonRuntime !== undefined && pythonRuntime !== "cpython" && pythonRuntime !== "monty") {
+        throw new Error(`Invalid inherited Fabric Python runtime: ${String(pythonRuntime)}`);
+      }
       const thinking: FabricThinking | undefined = isFabricThinking(record.thinking)
         ? record.thinking
         : undefined;
@@ -607,6 +620,7 @@ export class GlobalActorRegistry {
         residency,
         runner,
         ...(record.kernel ? { kernel: record.kernel } : {}),
+        ...(pythonRuntime !== undefined ? { pythonRuntime } : {}),
         createdAt: record.createdAt,
         updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : record.createdAt,
         ...(typeof record.model === "string" && record.model ? { model: record.model } : {}),

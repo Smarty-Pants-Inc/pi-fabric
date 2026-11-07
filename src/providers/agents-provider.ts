@@ -95,6 +95,7 @@ import {
   DEFAULT_FABRIC_CONFIG,
   type FabricAgentRunner,
   type FabricModelsConfig,
+  type FabricPythonRuntime,
 } from "../config.js";
 import {
   aliasThinking,
@@ -370,6 +371,9 @@ const actorRequest = (
     ...actorInstructionsSource(args),
     runner,
     ...(kernel !== undefined ? { kernel } : {}),
+    ...(args.pythonRuntime !== undefined
+      ? { pythonRuntime: manager.resolvePythonRuntime(args.pythonRuntime as FabricPythonRuntime) }
+      : {}),
     ...(events ? { events } : {}),
     ...(eventsStartAt !== undefined ? { eventsStartAt } : {}),
     ...(topics ? { topics } : {}),
@@ -805,6 +809,10 @@ export class AgentsProvider implements FabricProvider {
     actionName: string,
     args: Record<string, unknown>,
   ): Record<string, unknown> {
+    // Optional-field normalization drops null; reject an explicit invalid runtime first.
+    if ((actionName === "create" || actionName === "createActor") && args.pythonRuntime !== undefined) {
+      this.manager.resolvePythonRuntime(args.pythonRuntime as FabricPythonRuntime);
+    }
     return normalizeAgentsArgs(actionName, args);
   }
 

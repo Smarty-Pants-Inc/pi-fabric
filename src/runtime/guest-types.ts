@@ -811,6 +811,8 @@ interface FabricActorRequestBase extends FabricActorBatching {
   slotClaim?: FabricActorSlotClaim;
   /** Fixed at creation; ask/tell cannot change language. Global templates resolve inheritance on import. */
   kernel?: FabricKernel | "inherit";
+  /** Actor-only backend, fixed at creation; omitted policy is inherited on creation or template import. */
+  pythonRuntime?: "cpython" | "monty";
   scope?: "session" | "project" | "global";
   name: string;
   events?: FabricActorHostEvent[];

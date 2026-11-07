@@ -351,6 +351,41 @@ describe("#3752 participant heartbeat contention", () => {
     expect(mesh.get("sessions/live")!.updatedAt).toBe(Date.now());
   });
 
+  it("an admitted canonical Main renews its file lease while confirmation is held beyond TTL", async () => {
+    const { root, mesh, directory, identity, advance } = await setup(true, 15_000);
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
+    await directory.start();
+    const confirmedAt = directory.confirmedAt();
+    const initial = readHostLeases(root).get(identity.id)!;
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(mesh, "confirmWritable").mockImplementation(async callback => {
+      entered();
+      await blocked;
+      callback?.(Date.now());
+    });
+    advance(5_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await enteredPromise;
+    const firstRenewed = readHostLeases(root).get(identity.id)!;
+    for (let tick = 1; tick < 4; tick += 1) {
+      advance(5_000);
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    try {
+      const renewed = readHostLeases(root).get(identity.id)!;
+      expect(firstRenewed.updatedAt).toBeGreaterThan(initial.updatedAt);
+      expect(renewed.updatedAt).toBeGreaterThan(firstRenewed.updatedAt);
+      expect(renewed.expiresAt).toBe(renewed.updatedAt + 15_000);
+      expect(directory.confirmedAt()).toBe(confirmedAt);
+    } finally {
+      release();
+      await vi.waitFor(() => expect(directory.confirmedAt()).toBeGreaterThan(confirmedAt));
+    }
+  });
+
   it("unchanged participants stay live to directory, lineage, reaper and bridge, then expire", async () => {
     const { directory, mesh, hostKey, participantKey, identity, writes, advance, now } = await setup(true);
     const participant = mesh.get(participantKey)!;

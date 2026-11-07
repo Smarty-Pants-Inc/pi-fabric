@@ -79,7 +79,8 @@ Wait for the original operation **and any pending actor stop** to settle, then r
 operation id and generation**. A stuck mutation needs an **independently verified same-session Main
 restart**, not merely a channel close or extension reload. Verify recovery: a timeout is not proof that work stopped. Explicitly stopped actors are **not automatically restored** by restart. On failed-cutover
 fallback, use the validated ordinary owner recreation path with new actor ids and configuration/live-binding
-readback. `drain-restore` is only for a successful cutover with **both PASS drain and PASS fence receipts**;
+readback. Preserve the saved `kernel` and `pythonRuntime` through ordinary create and verify both fields.
+`drain-restore` is only for a successful cutover with **both PASS drain and PASS fence receipts**;
 it is not a failed-cutover recovery shortcut.
 
 ## Evidence files under RUN (all 0600, O_EXCL, read back)

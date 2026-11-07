@@ -108,8 +108,14 @@ describe("agent kernel public contracts", () => {
     for (const kernel of [null, "", "PYTHON", "ruby", false, 1, {}, []]) {
       expect(Value.Check(schema, { ...required, kernel })).toBe(false);
     }
-    expect(Value.Check(schema, { ...required, kernel: "python", pythonRuntime: "monty" })).toBe(false);
-    expect(Value.Check(schema, { ...required, kernel: "python", pythonRuntime: "monty" })).toBe(false);
+    for (const pythonRuntime of ["cpython", "monty"]) {
+      expect(Value.Check(schema, { ...required, kernel: "python", pythonRuntime })).toBe(name === "create");
+    }
+    if (name === "create") {
+      for (const pythonRuntime of [null, "", "pypy", false, 1, {}, []]) {
+        expect(Value.Check(schema, { ...required, kernel: "python", pythonRuntime })).toBe(false);
+      }
+    }
     expect(Value.Check(schema, { ...required, unknown: true })).toBe(false);
   });
 
@@ -133,6 +139,9 @@ describe("agent kernel public contracts", () => {
       const language: FabricKernel | undefined = run.kernel;
       await agents.spawn({ task: "b", kernel: "inherit" });
       await agents.create({ name: "actor", instructions: "task", kernel: "typescript" });
+      const actor = await agents.create({ name: "python actor", instructions: "task", kernel: "python", pythonRuntime: "cpython" });
+      const runtime: "cpython" | "monty" | undefined = actor.pythonRuntime;
+      await agents.create({ name: "monty actor", instructions: "task", kernel: "python", pythonRuntime: "monty" });
       await agents.handoff({ model: "test/model", kernel: "python" });
       await workflow.agent("task", { kernel: "python" });
       await council.run({ task: "task", roles: ["reviewer"], kernel: "inherit" });
@@ -144,6 +153,7 @@ describe("agent kernel public contracts", () => {
       'return council.run({ task: "a", roles: [], kernell: "python" });',
       'return agents.ask({ id: "a", message: "b", kernel: "python" });',
       'return agents.run({ task: "a", pythonRuntime: "monty" });',
+      'return agents.create({ name: "a", instructions: "task", pythonRuntime: "monty", unknown: true });',
     ]) expect(typeCheckFabricCode(code, guestTypeDeclarations(true)).errors.length).toBeGreaterThan(0);
   });
 });

@@ -459,8 +459,14 @@ describe("Conservative raw-user admission: attempts are never exact origin", () 
     };
     // This double mirrors native 0.87's ignored option, not a forged HOST message.
     // The native replay also submits the forged RPC option against the real host.
-    recording.pi.sendUserMessage(via === "payload" ? JSON.stringify(forged) : "human request",
-      via === "option" ? { provenance: forged } as Parameters<ExtensionAPI["sendUserMessage"]>[1] : undefined);
+    if (via === "payload") {
+      recording.pi.sendUserMessage(JSON.stringify(forged));
+    } else {
+      recording.pi.sendUserMessage(
+        "human request",
+        { provenance: forged } as Parameters<ExtensionAPI["sendUserMessage"]>[1],
+      );
+    }
     const [message] = await recording.consumeNativeUsers();
     expect(message).not.toHaveProperty("provenance");
     expect(recording.fake.appendEntry.mock.calls).toEqual([["pi-fabric.wake-diagnostic", { cause: "unattributed" }]]);

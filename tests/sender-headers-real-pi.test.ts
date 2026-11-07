@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { RpcClient } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 
-// smarty-dev#6207 / PR #574: the provider path on the wire. A REAL Pi 1.1.0 process in RPC mode loads
+// smarty-dev#6207 / PR #574: the provider path on the wire. A REAL Pi 1.2.0 process in RPC mode loads
 // the BUILT Fabric (dist/index.js) and talks to an offline openai-completions stub on 127.0.0.1 that
 // records every request's raw HTTP headers. Turn 1 is a plain Main prompt (the Main's hook); turn 2 has
 // the Main call fabric_exec agents.run with transport process, so a real child Pi worker sends its own

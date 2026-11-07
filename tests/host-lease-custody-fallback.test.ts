@@ -258,7 +258,8 @@ describe.each(["file", "sqlite"] as const)("%s missing-identity custody recovery
   it("resumes target reaping after dead local custody recovery without identity", async () => {
     const s = await reaperFixture(), held = await gate(s.root, s.target.id, deadPid());
     expect(await s.reap()).toBe(1); expect(await s.reap()).toBe(0);
-    expect(readHostLeaseCurrent(s.root, s.target.id)).toBeUndefined(); expect(s.mesh.get(s.key, { fresh: true })).toBeUndefined();
+    expect(readHostLeaseCurrent(s.root, s.target.id)).toBeUndefined();
+    expect(s.mesh.get(s.key, { fresh: true })).toBeUndefined();
     expect(fences(held.domain)).toHaveLength(1); expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(s.lease);
   });
 

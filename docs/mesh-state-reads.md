@@ -112,6 +112,64 @@ write; a returning host/incarnation is retained. Own/recent/malformed records ar
 This path does not touch participants, deliveries, completion claims, result journals,
 residency directories or lineage receipts, and creates no new timer/standalone write.
 
+### Incremental host-lease reads and retirement
+
+Topology readers already have host IDs from validated state records. Directory liveness,
+mirrored control ownership and the committed-owner bridge alarm pass point-read only those
+IDs. Each point read checks current file metadata, including independent atomic renewals and
+synchronous directory replacement; unchanged metadata can reuse the parsed lease. Retained
+file-only orphans therefore add no listing or per-orphan stat work to these heartbeat paths.
+Full lease enumeration remains available for maintenance and a fresh, complete census.
+
+The existing dead-host sweep also handles lease files left after host-record compaction.
+It selects at most 100 target hosts per pass, excluding its own host and leases that expired
+less than or exactly 6 hours ago. Selection is not deletion authority: current state liveness,
+target custody, exact observed versions and a detached-file recheck protect returning hosts.
+Before taking the lease-additions gate, target gates or its own commit fence, the reaper
+asynchronously prepares one durable batch snapshot of the selected expired leases. Its file
+fsync and shared namespace barriers all finish before any of those gates or fences are taken;
+none runs in the synchronous commit outbox. Inside custody, the reaper rechecks both the selected
+version and exact detached bytes before unlinking. A fixed 500-lease backlog drains in five
+successful passes of 100. State/participant dead-record selection uses the same 100-record bound;
+stale bookkeeping still joins the existing commit.
+
+The 100-target cap is intended to leave margin below the directory's 1-second waiting budget. It is not a hard latency guarantee on arbitrary disks;
+archive preparation and total pass time are separate from time under custody. A one-time
+1,325-lease backlog needs 14 successful passes: at a 15-minute cadence with the first pass at
+t=0, the last pass is at 3 hours 15 minutes, assuming no deferred passes or new backlog.
+No new timer, controller or notification protocol is introduced.
+
+A new lease filename needs the additions gate before its per-host gate; existing renewals use
+only their per-host gate. Native creators have a default additions-gate waiting budget of at
+most 2 seconds, shortened by a finite caller budget (including zero). `ParticipantDirectory`
+lease-lock preparation supplies a 1-second budget. If the gate remains busy, the operation
+returns a retryable busy refusal and the caller owns retry policy; it does not bypass custody.
+These are acquisition waiting budgets, not hard wall-time bounds on disk I/O or scheduling.
+
+Batch snapshots live at `host-lease-archive/batches/<UUID>.json`. Their fields are `format: 2`,
+`status: "prepared"`, `removalConfirmed: false`, `preparedAt` and `candidates`. Each candidate
+contains `hostId`, `leaseSha256` and `leaseBase64`, preserving exact bytes, unknown fields and
+original encoding. These immutable snapshots are backups, **not removal receipts**: a lease
+may renew, be replaced or survive a failed unlink after preparation. Readers must never infer
+removal or death from a candidate's presence. Failed preparation permits no lease unlink.
+
+Standalone exact-version removal still uses the content-addressed format-1 receipt at
+`host-lease-archive/<host lease filename>/<SHA-256 of exact bytes>.json`, with fields `format`,
+`hostId`, `archivedAt`, `leaseSha256` and `leaseBase64`. Both paths sync archive data before
+removal on every platform; POSIX also confirms the directory namespace barriers. Windows
+supports removal but cannot confirm directory-entry durability through Node's filesystem API,
+so neither format promises namespace persistence across power loss there. An archive mismatch
+or failure during detached removal restores the canonical lease; if restoration also fails,
+the detached copy is retained, never silently unlinked. No raw session traces are touched.
+
+This reuses established lease-lifecycle and incremental-observation patterns:
+[Kubernetes Leases](https://kubernetes.io/docs/concepts/architecture/leases/) with existing
+[garbage collection](https://kubernetes.io/docs/concepts/architecture/garbage-collection/),
+and [etcd lease revocation and watches](https://etcd.io/docs/v3.7/learning/api/).
+Deploying Kubernetes or etcd would add infrastructure without replacing the existing file
+transport's ownership contract; the existing reaper and fresh by-ID reader provide the needed
+behavior without a second runtime.
+
 ## Diagnosis and measurements
 
 #468 (`ec455d4d`) is an ancestor of RC2 (`e7bc3f24`). It coalesced idle observers, but public

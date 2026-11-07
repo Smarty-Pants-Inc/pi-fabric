@@ -105,7 +105,8 @@ describe.each(["file", "sqlite"] as const)("%s Round 4 target reaping", backend 
       if (String(from) === hostLeasePath(s.root, s.target.id)) expect(held.has(hostLeasePath(s.root, s.target.id))).toBe(true);
       return rename(from, to);
     });
-    expect(await s.reap()).toBe(3); expect(readHostLeaseCurrent(s.root, s.target.id)).toBeUndefined();
+    expect(await s.reap()).toBe(3);
+    expect(readHostLeaseCurrent(s.root, s.target.id)).toBeUndefined();
     expect(readParticipantFiles(s.root)).toEqual([]); expect(s.mesh.get(hostKey(s.target.id), { fresh: true })).toBeUndefined();
     expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(s.lease);
   });

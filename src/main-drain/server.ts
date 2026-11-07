@@ -4,10 +4,12 @@ import path from "node:path";
 import { diagnostics } from "../core/diagnostics.js";
 import { peerCredentials } from "../records/peer.js";
 import type { MainDrainControl, MainDrainPeer } from "./control.js";
+import { drainSlot, pruneDrainSlot } from "./slot.js";
 import { MAIN_DRAIN_MAX_REQUEST_BYTES, mainDrainDirectory, mainDrainSocketName, parseMainDrainRequest, type MainDrainOp } from "./protocol.js";
 
 const MAX_CONNECTIONS = 4;
 const REQUEST_TIMEOUT_MS = 5_000;
+const OPERATION_TIMEOUT_MS = 25_000;
 
 /** Every directory from `/` to `directory` is root- or uid-owned and not group/other-writable unless sticky. */
 const safeChain = (directory: string, uid: number): boolean => {
@@ -100,6 +102,8 @@ export class MainDrainServer {
     platform?: NodeJS.Platform; uid?: number;
     /** Tests only: the SO_PEERCRED reader. */
     peer?: (socket: net.Socket) => Promise<MainDrainPeer | undefined>;
+    /** Tests may shorten the absolute request budget, never extend the production cap. */
+    operationTimeoutMs?: number;
   } = {}) {}
 
   get socketPath(): string | undefined { return this.#pinned?.socket; }
@@ -174,19 +178,59 @@ export class MainDrainServer {
         return;
       }
       handled = true;
+      socket.setTimeout(0);
       const request = newline <= MAIN_DRAIN_MAX_REQUEST_BYTES ? parseMainDrainRequest(buffer.subarray(0, newline).toString("utf8")) : undefined;
       if (!request) { this.#refuse(socket, null, "REQUEST_INVALID"); return; }
-      if (request.sessionId !== this.control.host.sessionId) { this.#refuse(socket, request.op, "SESSION_MISMATCH"); return; }
-      // Every binding needs the caller's kernel identity (SO_PEERCRED): the host lock proof and the pod caller proof.
-      // peerCredentials always runs the fixed /usr/bin/python3, isolated (records/peer.ts).
-      const peer = request.binding ? (this.options.peer ?? peerCredentials)(socket) : Promise.resolve(undefined);
-      // One op at a time, in arrival order: the fence and the actor stops never race.
-      const run = this.#queue.then(async () => this.control.handle(request.op, request.binding, await peer.catch(() => undefined), uid));
-      this.#queue = run.catch(() => undefined);
-      run.then(reply => {
+      const configured = this.options.operationTimeoutMs;
+      const wait = typeof configured === "number" && Number.isFinite(configured) && configured > 0
+        ? Math.min(configured, OPERATION_TIMEOUT_MS) : OPERATION_TIMEOUT_MS;
+      const deadline = Date.now() + wait;
+      let timedOut = false;
+      const expired = (): boolean => timedOut || Date.now() >= deadline;
+      let timer: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<"OPERATION_TIMEOUT">(resolve => {
+        timer = setTimeout(() => { timedOut = true; resolve("OPERATION_TIMEOUT"); }, wait);
+      });
+      // Queue wait shares the same absolute budget. Replies (including timeouts/refusals) stay in arrival order.
+      const run = this.#queue.then(async () => {
+        if (expired()) return "OPERATION_TIMEOUT";
+        if (request.sessionId !== this.control.host.sessionId) return "SESSION_MISMATCH";
+        const slot = request.binding ? drainSlot(this.control.host.rootId) : undefined;
+        if (slot?.pendingOperation) return "OPERATION_PENDING";
+        // Defer ALL work until the process-global slot owns it, including the peer await. A reload/close
+        // can retire this server, but cannot admit a second mutation while this promise remains unsettled.
+        const work = Promise.resolve().then(async () => {
+          if (expired()) return "OPERATION_TIMEOUT";
+          // Every binding needs SO_PEERCRED (the fixed isolated interpreter in records/peer.ts).
+          const peer = request.binding ? await (this.options.peer ?? peerCredentials)(socket).catch(() => undefined) : undefined;
+          if (expired()) return "OPERATION_TIMEOUT"; // A late peer proof must never start effects.
+          return this.control.handle(request.op, request.binding, peer, uid);
+        });
+        if (slot) {
+          slot.pendingOperation = work;
+          const clear = (): void => {
+            if (slot.pendingOperation === work) {
+              delete slot.pendingOperation;
+              pruneDrainSlot(this.control.host.rootId);
+            }
+          };
+          // The timeout only releases the reply queue; it cannot cancel handle's side effects.
+          void work.then(clear, clear);
+        }
+        return Promise.race([work, timeout]);
+      });
+      this.#queue = run.then(reply => {
+        clearTimeout(timer);
+        if (socket.destroyed) return;
+        if (expired()) { this.#refuse(socket, request.op, "OPERATION_TIMEOUT"); return; }
         if (typeof reply === "string") { this.#refuse(socket, request.op, reply); return; }
-        socket.end(`${JSON.stringify(reply)}\n`, () => { if (reply.exiting) this.control.commitExit(); });
-      }, () => this.#refuse(socket, request.op, "INTERNAL"));
+        socket.end(`${JSON.stringify(reply)}\n`, () => {
+          if (reply.exiting && !expired() && !socket.destroyed) this.control.commitExit();
+        });
+      }, () => {
+        clearTimeout(timer);
+        if (!socket.destroyed) this.#refuse(socket, request.op, expired() ? "OPERATION_TIMEOUT" : "INTERNAL");
+      }).catch(() => undefined);
     });
   }
 

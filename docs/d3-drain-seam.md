@@ -61,6 +61,27 @@ Python 3 at `/usr/bin/python3` must be present on the seat host, for two things:
 The Main and the seam always run that fixed interpreter, isolated (`-I`) with a minimal env. A `python3` placed earlier
 in `PATH` is never used.
 
+## Request budgets and timeout recovery
+
+The socket keeps its **5-second idle guard before a complete request line**. After parsing, that guard is
+removed and one absolute **25-second operation budget** covers queue wait, peer verification and the entire
+control call. This leaves **5 seconds** below the normal **30-second client/seam call cap**. Responses and
+refusals remain ordered; a request whose budget expires while queued never starts work. Actor stop retains its
+separate **10-second wait bound** and its pending-stop protection.
+
+`OPERATION_TIMEOUT` bounds asynchronous waiting, not execution: it neither cancels side effects nor preempts a
+blocked event loop. A mutation still running after timeout remains owned by the process-global drain slot,
+including across an extension reload or channel close. Further mutations refuse `OPERATION_PENDING` until the
+original work settles; `status` and `probe` remain available with their own bounded requests. A late
+peer proof cannot start the control call, and late completion cannot send another reply or commit an exit.
+
+Wait for the original operation **and any pending actor stop** to settle, then retry undo with the **same run,
+operation id and generation**. A stuck mutation needs an **independently verified same-session Main
+restart**, not merely a channel close or extension reload. Verify recovery: a timeout is not proof that work stopped. Explicitly stopped actors are **not automatically restored** by restart. On failed-cutover
+fallback, use the validated ordinary owner recreation path with new actor ids and configuration/live-binding
+readback. `drain-restore` is only for a successful cutover with **both PASS drain and PASS fence receipts**;
+it is not a failed-cutover recovery shortcut.
+
 ## Evidence files under RUN (all 0600, O_EXCL, read back)
 
 | file | written |

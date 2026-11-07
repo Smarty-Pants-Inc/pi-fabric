@@ -557,7 +557,10 @@ export const readParticipantFiles = (
     return [];
   }
   const known = cache.get(dir);
+  // Strict reads validate names and leaf metadata: a foreign replacement can leave the parent
+  // stamp unchanged without invalidating this process's cache.
   if (
+    options.maxAgeMs !== 0 &&
     known?.complete && process.platform !== "win32" && known.ino === dirStat.ino && known.mtimeMs === dirStat.mtimeMs &&
     known.scannedAt - known.mtimeMs >= DIR_TICK_MS
   ) return known.entries;

@@ -1,0 +1,12 @@
+# Hostd CHILD SPEC only; never install/enable independently; no [Install].
+# Admission owner must stage this relative path in the reviewed factory release.
+# This leaf has JetStream disabled; all state/event authority is in fabric-r3.
+[Unit]
+Description=Fabric NATS leaf over Tailscale
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/smarty-dev/nats/current/nats-server -c %h/.config/smarty/nats/server.conf
+Restart=always
+RestartSec=5
+TimeoutStopSec=40

@@ -40,6 +40,8 @@ export interface MainDrainSlot {
   stopAttempted?: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
   /** Read-back mapping for ordinary owner re-creations; retained across an extension reload. */
   restored?: Array<{ id: string; restoredId: string }>;
+  /** A timed-out control request still owns its peer await and mutation across server close/reload. */
+  pendingOperation?: Promise<unknown>;
   /** A timed-out stop still owns its completion; undo must not race its late commit. */
   pendingStop?: Promise<unknown>;
   /** A clean exit was accepted (pod binding): it is final, and every later mutating op is refused. */
@@ -61,7 +63,7 @@ export const peekDrainSlot = (rootId: string): MainDrainSlot | undefined => slot
 /** Drop an empty slot (nothing closed, bound, held, or stopped by an operation and not yet restored). */
 export const pruneDrainSlot = (rootId: string): void => {
   const slot = slots().get(rootId);
-  if (slot && !slot.gate && !slot.binding && !slot.fence && !slot.stopped?.length && !slot.stopAttempted?.length && !slot.restored?.length && !slot.pendingStop) slots().delete(rootId);
+  if (slot && !slot.gate && !slot.binding && !slot.fence && !slot.stopped?.length && !slot.stopAttempted?.length && !slot.restored?.length && !slot.pendingOperation && !slot.pendingStop) slots().delete(rootId);
 };
 
 const LEDGER_LIMIT = 1_000;

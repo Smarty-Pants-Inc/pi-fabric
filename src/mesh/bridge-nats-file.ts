@@ -1,3 +1,4 @@
+import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { readParticipantFiles } from "../topology/participant-files.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
@@ -6,7 +7,7 @@ import {
 } from "../transport/types.js";
 import type { BridgeChange } from "./change-notifier.js";
 import {
-  admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
+  admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
 } from "./bridge.js";
 import {
@@ -48,8 +49,6 @@ const RESEND_ATTEMPTS = 3;
 const RESEND_DELAY_MS = 250;
 /** JetStream redelivers an in-hand message after its ack wait; extend well inside the shortest one. */
 const WORKING_INTERVAL_MS = 5_000;
-/** How long an inbound delivery may wait for this link's KV view to show its target (a watch lag), then TERM. */
-const PRESENCE_WAIT_MS = 15_000;
 /** In-hand deliveries this side holds before it stops pulling (backpressure, not loss). */
 const MAX_IN_HAND = 512;
 const PARTICIPANT_PREFIX = "topology/participants/";
@@ -94,7 +93,7 @@ export class NatsCarrierUncertainError extends Error {
 export const natsPresenceEntry = (port: Pick<BridgeNatsPort, "resolve">, id: string): NatsPresenceEntry | undefined => {
   const resolved = port.resolve(id);
   if (!resolved?.route.live || !resolved.route.machine || !resolved.route.ownerIncarnation || resolved.identity.id !== id) return undefined;
-  return { identity: copy(resolved.identity), route: { ...resolved.route, capabilities: [...resolved.route.capabilities] } };
+  return { ...resolved, identity: copy(resolved.identity), route: { ...resolved.route, capabilities: [...resolved.route.capabilities] } };
 };
 
 const copy = (identity: MeshIdentity): MeshIdentity => ({
@@ -204,6 +203,8 @@ const delay = (ms: number): Promise<void> => new Promise(resolve => { setTimeout
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 export interface NatsCarrierSideOptions {
+  /** The link-local cursor; its sender-lapse sidecar uses the same atomic, durable write as MeshBridge. */
+  readonly cursorPath: string;
   /** Lane L1's raw NATS port. */
   readonly port: BridgeNatsPort;
   /** The hub's file side (MeshBridge `local`): native presence for outbound identity and actor mirrors. */
@@ -225,10 +226,23 @@ export interface NatsCarrierSideOptions {
   readonly topicTimeoutMs?: number;
   readonly workingIntervalMs?: number;
   readonly maxInHand?: number;
-  /** Bound on an inbound delivery's wait for its target in this link's KV view (default 15 s). */
+  /** Bound on an inbound target's KV wait (default/shared maximum 30 s from the event's FIRST lapse). */
   readonly presenceWaitMs?: number;
   /** Only these inbound targets (allow.file) may wait for KV visibility; any other is refused at once. */
   readonly waitForTarget?: (targetId: string) => boolean;
+}
+
+interface SenderLeaseLapse {
+  readonly sequence: number;
+  readonly id: string;
+  readonly sourceMachine: string;
+  readonly senderId: string;
+  readonly startedAt: number;
+  readonly budgetMs?: number;
+  readonly reason?: string;
+  readonly detail?: string;
+  /** Written durably before sending the unconfirmed broker TERM. */
+  readonly terminalReason?: string;
 }
 
 interface InHand {
@@ -238,8 +252,11 @@ interface InHand {
   /** The carrier's conversion, cached so a reread presents the same event. */
   event?: MeshEvent;
   settle?: NatsCarrierSettle;
-  /** When a presence wait for this delivery began (this side's clock). */
-  waitingSince?: number;
+  /** Coalesce an unchanged failed predicate while the delivery is held. */
+  senderFailure?: string;
+  /** First observation survives a failed write or a temporarily full journal. */
+  lapse?: SenderLeaseLapse;
+  lapseUnrecorded?: boolean;
 }
 
 export class NatsCarrierSide implements NatsCarrierSideContract {
@@ -260,6 +277,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly #workingIntervalMs: number;
   readonly #maxInHand: number;
   readonly #presenceWaitMs: number;
+  readonly #senderLapsePath: string;
+  #senderLeaseLapses: SenderLeaseLapse[] = [];
+  #senderLapsesDirty = false;
   /** In-hand deliveries in stream order, by stream sequence. */
   readonly #inHand = new Map<number, InHand>();
   /** Highest sequence this side has given out; never below a cursor MeshBridge read from. */
@@ -283,6 +303,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.filePresence = new FileCarrierPresence(options.file, this.#now, options.filePresenceTtlMs);
     const presence: NatsCarrierPresence = {
       nats: id => natsPresenceEntry(this.port, id),
+      natsInbound: id => this.port.resolve(id),
       file: id => this.filePresence.file(id),
     };
     this.carrier = new NatsBridgeCarrier({ link: options.link, machine: options.port.machine, presence, ledger: options.ledger,
@@ -297,7 +318,24 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.#resendDelayMs = Math.max(0, options.resendDelayMs ?? RESEND_DELAY_MS);
     this.#workingIntervalMs = Math.max(1, options.workingIntervalMs ?? WORKING_INTERVAL_MS);
     this.#maxInHand = Math.max(1, options.maxInHand ?? MAX_IN_HAND);
-    this.#presenceWaitMs = Math.max(0, options.presenceWaitMs ?? PRESENCE_WAIT_MS);
+    this.#presenceWaitMs = Math.min(LEASE_LAPSE_DEFER_MS, Math.max(0, options.presenceWaitMs ?? LEASE_LAPSE_DEFER_MS));
+    this.#senderLapsePath = `${options.cursorPath}.sender-lease-lapse`;
+    try {
+      const saved = JSON.parse(readFileRetrying(this.#senderLapsePath)) as { v: number; lapses: SenderLeaseLapse[] };
+      if (saved?.v !== 1 || !Array.isArray(saved.lapses) || saved.lapses.length > this.#maxInHand ||
+          !saved.lapses.every(lapse => lapse && Number.isSafeInteger(lapse.sequence) && lapse.sequence > 0 &&
+            typeof lapse.id === "string" && lapse.id && typeof lapse.sourceMachine === "string" && lapse.sourceMachine &&
+            typeof lapse.senderId === "string" && lapse.senderId && Number.isFinite(lapse.startedAt) &&
+            (lapse.budgetMs === undefined || (Number.isFinite(lapse.budgetMs) && lapse.budgetMs >= 0 && lapse.budgetMs <= LEASE_LAPSE_DEFER_MS)) &&
+            (lapse.reason === undefined || typeof lapse.reason === "string") &&
+            (lapse.detail === undefined || typeof lapse.detail === "string") &&
+            (lapse.terminalReason === undefined || typeof lapse.terminalReason === "string"))) {
+        throw new Error("Invalid NATS sender lease-lapse metadata");
+      }
+      this.#senderLeaseLapses = saved.lapses;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; // Never restart a corrupt window.
+    }
   }
 
   // -------------------------------------------------------------------------------------------
@@ -338,7 +376,11 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     for (const listener of this.#listeners) listener.changed(kind);
   }
 
-  #release(stream: number): void {
+  #release(stream: number, acknowledged = false): void {
+    // Only a broker-confirmed ACK proves completion. A missing process-local handle (including
+    // after restart), or an unconfirmed TERM, must never erase a delivery's original deadline.
+    // Persist this safe reclamation with the next first-lapse write, not on unchanged retries.
+    if (acknowledged) this.#senderLeaseLapses = this.#senderLeaseLapses.filter(lapse => lapse.sequence !== stream);
     this.#inHand.delete(stream);
     if (this.#inHand.size < this.#maxInHand && this.#room) {
       const room = this.#room;
@@ -541,7 +583,10 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       try {
         const event = await this.#inbound(stream, held);
         if (event) events.push(event);
-        else continue; // answered and settled here; its sequence is never shown
+        else {
+          through = Math.max(through, held.sequence ?? after); // A rechecked cached event may now be deliberately refused.
+          continue;
+        }
       } catch (error) {
         // Stop in order before the delivery that failed; it is retried on the next read.
         if (!events.length) throw deferTransient(error);
@@ -554,13 +599,44 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   }
 
   async #inbound(stream: number, held: InHand): Promise<MeshEvent | undefined> {
-    if (held.event) return held.event;
-    await this.filePresence.refresh();
     const delivery = held.delivery;
     const envelopeId = typeof delivery.envelope?.id === "string" ? delivery.envelope.id : `stream:${stream}`;
-    const plan: NatsInbound = await this.carrier.inbound(carrierDeliveryFromPort(delivery));
+    const retained = held.lapse ?? this.#savedLapse(delivery);
+    const now = this.#now();
+    if (retained) this.#saveSenderLapses(); // Retry an uncertain write before ANY admission.
+    // Check BEFORE conversion/ledger claim, independently of recovered source/target health.
+    // A cached event already belongs to MeshBridge's append-fence/cursor deadline path.
+    if (retained && (retained.terminalReason || (!held.event && this.#lapseExpired(retained, now)))) {
+      this.#senderLapseSince(delivery);
+      await this.#termLapse(stream, held, retained);
+      return undefined;
+    }
+    // Even a converted event must re-check LIVE source presence when the bridge retries it.
+    await this.filePresence.refresh();
+    let plan: NatsInbound;
+    try { plan = await this.carrier.inbound(carrierDeliveryFromPort(delivery)); }
+    catch (error) {
+      if ((error as { code?: unknown })?.code !== "FABRIC_DIRECTORY_NOT_READY") throw error;
+      if (held.senderFailure !== "not-ready") {
+        this.#log("toFile: sender-live wait predicate=not-ready remainingAuthorityMs=unknown");
+        held.senderFailure = "not-ready";
+      }
+      // Directory readiness is another lapse, not an unbounded escape around the event's
+      // durable first-lapse deadline. No unverified sender identity belongs in this diagnostic.
+      plan = { kind: "wait", reason: "directory is not ready", senderLeaseLapse: true,
+        senderDiagnostic: { failure: "not-ready" } };
+    }
+    const diagnostic = plan.kind === "wait" || plan.kind === "refused" ? plan.senderDiagnostic : undefined;
+    const detail = diagnostic ? `; predicate=${diagnostic.failure}` +
+      (diagnostic.senderId ? ` sender=${diagnostic.senderId}` : "") +
+      ` remainingAuthorityMs=${diagnostic.remainingAuthorityMs ?? "unknown"}` : "";
+    if (diagnostic && plan.kind === "wait" && held.senderFailure !== diagnostic.failure) {
+      this.#log(`toFile: sender-live defer${detail}`);
+      held.senderFailure = diagnostic.failure;
+    }
     switch (plan.kind) {
       case "event": {
+        if (held.event) return held.event; // Keep its original cursor sequence and conversion.
         // Record the owner's answer BEFORE the file append that hands it to its sender: a same-key resend
         // racing that append must find it recorded (replayAck), never wait for an ACK already consumed.
         // The delivery is acked, and the answer marked forwarded, only after the append is durable.
@@ -574,7 +650,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         await this.#send(plan.envelope);
         this.#log(`toFile: answered ${envelopeId} for the hop: ${plan.reason}`);
         await delivery.ack();
-        this.#release(stream);
+        this.#release(stream, true);
         return undefined;
       case "settled": {
         if (plan.settle) await this.carrier.settle(plan.settle);
@@ -590,23 +666,128 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
           }
         }
         await delivery.ack();
-        this.#release(stream);
+        this.#release(stream, true);
         return undefined;
       }
       case "wait": {
-        const since = held.waitingSince ??= this.#now();
-        if (this.#now() - since < this.#presenceWaitMs) throw new NatsCarrierDeferredError(new Error(plan.reason));
-        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine} after ${this.#presenceWaitMs} ms: ${plan.reason}`);
-        await delivery.term(plan.reason);
-        this.#release(stream);
+        const budget = plan.senderLeaseLapse ? LEASE_LAPSE_DEFER_MS : this.#presenceWaitMs;
+        const startedAt = this.#now(); // Anchor before the optional broker reclamation lookup.
+        const ackFloor = this.#savedLapse(delivery) ? 0 : await this.#senderLapseAckFloor();
+        this.#senderLapseSince(delivery, startedAt, { budgetMs: budget, reason: plan.reason, detail }, ackFloor);
+        const lapse = held.lapse!;
+        if (!this.#lapseExpired(lapse, this.#now())) throw new NatsCarrierDeferredError(new Error(plan.reason));
+        await this.#termLapse(stream, held, lapse);
         return undefined;
       }
       case "refused":
-        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine}: ${plan.reason}`);
+        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine}: ${plan.reason}${detail}`);
         await delivery.term(plan.reason);
         this.#release(stream);
         return undefined;
     }
+  }
+
+  #savedLapse(delivery: BridgeNatsPortDelivery): SenderLeaseLapse | undefined {
+    return this.#senderLeaseLapses.find(lapse => lapse.sequence === delivery.streamSequence && lapse.id === delivery.envelope.id &&
+      lapse.sourceMachine === delivery.sourceMachine && lapse.senderId === delivery.envelope.from.id);
+  }
+
+  #lapseExpired(lapse: SenderLeaseLapse, now: number): boolean {
+    return lapse.startedAt > now || now - lapse.startedAt >= (lapse.budgetMs ?? LEASE_LAPSE_DEFER_MS);
+  }
+
+  #saveSenderLapses(): void {
+    if (!this.#senderLapsesDirty) return;
+    writeJsonAtomic(this.#senderLapsePath, { v: 1, lapses: this.#senderLeaseLapses }, { mode: 0o600, durable: true });
+    this.#senderLapsesDirty = false; // A failed post-rename barrier is NOT a durable receipt.
+  }
+
+  async #termLapse(stream: number, held: InHand, lapse: SenderLeaseLapse): Promise<void> {
+    const reason = lapse.terminalReason ?? lapse.reason ?? "sender lease-lapse deadline expired";
+    if (!lapse.terminalReason) {
+      const terminal = { ...lapse, terminalReason: reason };
+      held.lapse = terminal;
+      const saved = this.#savedLapse(held.delivery);
+      if (saved) {
+        this.#senderLeaseLapses = this.#senderLeaseLapses.map(entry => entry === saved ? terminal : entry);
+        this.#senderLapsesDirty = true;
+      }
+    }
+    this.#saveSenderLapses(); // Durable terminal disposition BEFORE TERM, unless the cap forced memory-only retention.
+    this.#log(`toFile: refused ${held.delivery.envelope.id} from ${held.delivery.sourceMachine} after ` +
+      `${lapse.budgetMs ?? LEASE_LAPSE_DEFER_MS} ms: ${reason}${lapse.detail ?? ""}`);
+    await held.delivery.term(reason);
+    this.#release(stream);
+  }
+
+  async #senderLapseAckFloor(): Promise<number> {
+    if (this.#senderLeaseLapses.length < this.#maxInHand || !this.port.ackFloor) return 0;
+    try {
+      const floor = await this.port.ackFloor();
+      if (Number.isSafeInteger(floor) && floor >= 0) return floor;
+    } catch (error) {
+      // An unavailable floor cannot prove settlement, but must not wedge new deliveries.
+      this.#log(`toFile: sender lapse reclamation unavailable: ${message(error)}`);
+    }
+    return 0;
+  }
+
+  /** Bounded link-local retention metadata, not a spool; never take the mesh state lock.
+   * Reclaim only terminal entries proven complete by the consumer ack floor, NOT by age
+   * or process-local absence. At capacity, keep the new window in hand without wedging.
+   * Recovery without its tombstone checks live presence normally; only a renewed WAIT
+   * uses the immutable broker publish time, so healthy old redeliveries are never aged out. */
+  #senderLapseSince(delivery: BridgeNatsPortDelivery, startedAt = this.#now(),
+    context: Pick<SenderLeaseLapse, "budgetMs" | "reason" | "detail"> = {}, ackFloor = 0): number {
+    const held = this.#inHand.get(delivery.streamSequence)!;
+    const saved = this.#savedLapse(delivery);
+    if (saved) {
+      // Diagnostics may change (sender -> directory gap) without renewing or rewriting
+      // the first timestamp. Persist the latest reason only when marking terminal.
+      held.lapse = { ...saved, ...context };
+      this.#saveSenderLapses();
+      return saved.startedAt;
+    }
+    const now = this.#now();
+    // Only a proven WAIT/append lapse enters here. Never age out the healthy path.
+    // Broker time may shorten, never extend, the local first-seen window. Clamp a
+    // fast broker to local now; absent/invalid metadata uses local first-seen.
+    // After total history loss this bounds the window from local re-observation,
+    // not the unrecoverable original local time. Never trust sender-createdAt.
+    const publishedAt = delivery.publishedAt;
+    const anchor = typeof publishedAt === "number" && Number.isFinite(publishedAt)
+      ? Math.min(publishedAt, now) : now;
+    const lapse = held.lapse ?? { sequence: delivery.streamSequence, id: delivery.envelope.id,
+      sourceMachine: delivery.sourceMachine, senderId: delivery.envelope.from.id,
+      startedAt: Math.min(startedAt, now, anchor), ...context };
+    held.lapse = lapse; // Keep the SAME first timestamp even if the write/barrier/cap fails.
+    const lapses = [...this.#senderLeaseLapses];
+    if (lapses.length >= this.#maxInHand) {
+      const reclaimable = lapses.filter(entry => entry.terminalReason && entry.sequence <= ackFloor)
+        .sort((a, b) => a.startedAt - b.startedAt || a.sequence - b.sequence)[0];
+      if (reclaimable) lapses.splice(lapses.indexOf(reclaimable), 1);
+      else {
+        if (!held.lapseUnrecorded) this.#log("toFile: sender lapse journal full with no broker-confirmed reclamation; " +
+          "retaining this lapse in memory only; restart uses live presence and broker publish time");
+        held.lapseUnrecorded = true;
+        this.#saveSenderLapses();
+        return lapse.startedAt;
+      }
+    }
+    held.lapseUnrecorded = false;
+    this.#senderLeaseLapses = [...lapses, lapse];
+    this.#senderLapsesDirty = true;
+    this.#saveSenderLapses();
+    return lapse.startedAt;
+  }
+
+  /** Share the first-lapse time in either order: carrier -> append fence, or append fence -> carrier.
+   * This is retention metadata only, never authority, and the matching record is not rewritten. */
+  retainLeaseLapse(event: MeshEvent, startedAt?: number): number | undefined {
+    const held = [...this.#inHand.values()].find(held => held.event?.id === event.id && held.sequence === event.sequence);
+    if (!held) return startedAt;
+    if (startedAt !== undefined) return this.#senderLapseSince(held.delivery, startedAt);
+    return (held.lapse ?? this.#savedLapse(held.delivery))?.startedAt;
   }
 
   /** Broker ACK after the durable append: every in-hand delivery whose sequence MeshBridge read past. */
@@ -624,7 +805,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         try { await this.carrier.settle(held.settle, true); }
         catch (error) { this.#log(`toFile: ledger settle for stream sequence ${stream} failed: ${message(error)}`); }
       }
-      this.#release(stream);
+      this.#release(stream, true);
     }
   }
 

@@ -1886,7 +1886,10 @@ export class ActorManager {
       runner,
       extensions: request.extensions ?? true,
     });
-    const pythonRuntime = kernel ? this.agents.resolvePythonRuntime(request.pythonRuntime) : undefined;
+    const resolvedPythonRuntime = kernel || request.pythonRuntime !== undefined
+      ? this.agents.resolveActorPythonRuntime(request.pythonRuntime)
+      : undefined;
+    const pythonRuntime = kernel ? resolvedPythonRuntime : undefined;
     if (request.routeClass !== undefined) {
       if (request.routeClass !== "status-groom" || runner !== "pi" || (request.transport ?? this.agents.config.transport) !== "process") {
         throw new Error("Actor shadow routing requires status-groom and process/Pi");

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic, syncDirectoryChain } from "../core/atomic-write.js";
-import { sealResidentLaunchBinaries } from "./launch-config.js";
+import { findExecutable } from "../agents/transports/process-utils.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import type { ResidentActorCaller, ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 
@@ -118,6 +118,21 @@ function fixedFile(file: string): string {
   }
   return absolute;
 }
+function pinBinary(binary: string, releaseRoot: string, required = false): string {
+  // Sealed absence must be idempotent when reconstructing an already-pinned
+  // specification. A new file here still changes the package JS closure hash.
+  if (!required && path.dirname(binary) === path.join(releaseRoot, "dist/residency") &&
+      /^unavailable-[0-9a-f]{64}\.js$/.test(path.basename(binary))) return binary;
+  const found = path.isAbsolute(binary) ? (fs.existsSync(binary) ? binary : undefined) : findExecutable(binary);
+  if (!found) {
+    if (required) throw new Error(`Resident handover cannot resolve binary: ${binary}`);
+    // Freeze known absence too: a later PATH change/install must not silently
+    // supply a different runner to the A fallback. This missing .js path belongs
+    // to the sealed closure; creating it later invalidates the artifact digest.
+    return path.join(releaseRoot, "dist/residency", `unavailable-${createHash("sha256").update(binary).digest("hex")}.js`);
+  }
+  return fs.realpathSync(found);
+}
 /** Hash the whole package-local JS closure, not only a cheap entrypoint. First use only. */
 function artifactDigest(root: string): string {
   const hash = createHash("sha256");
@@ -142,7 +157,10 @@ export function residentLaunchSpec(config: ResidentHostConfig, entry: string, ru
     throw new Error("Resident launch specification mixes releases");
   }
   fixedFile(config.fabricExtensionPath); fixedFile(config.workerPath);
-  const pinned = Object.assign(structuredClone(config), sealResidentLaunchBinaries(config, releaseRoot));
+  const pinned = structuredClone(config);
+  pinned.piBinary = pinBinary(config.piBinary, releaseRoot, true);
+  pinned.claudeBinary = pinBinary(config.claudeBinary, releaseRoot);
+  pinned.vedaBinary = pinBinary(config.vedaBinary, releaseRoot);
   const value = { abi: RESIDENT_HANDOVER_ABI, releaseRoot, entry: path.resolve(entry),
     runtime: fixedFile(fs.realpathSync(runtime)), artifact: artifactDigest(releaseRoot), config: pinned };
   return { ...value, digest: specDigest(value) };

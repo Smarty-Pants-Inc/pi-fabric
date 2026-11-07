@@ -4,7 +4,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { watchResidentChild } from "../src/residency/child-lifetime.js";
+import { RESIDENT_CHILD_KILL_WAIT_MS, RESIDENT_CHILD_TERM_GRACE_MS, watchResidentChild } from "../src/residency/child-lifetime.js";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 async function until(predicate: () => boolean, ms = 5_000): Promise<void> {
@@ -45,6 +45,27 @@ describe("resident native child receipts (not attempt membership)", () => {
     expect(await lifetime.exit).toEqual({ code: -2, signal: null });
   });
 
+  it("lets slow orderly cleanup finish beyond the old five-second TERM budget", async () => {
+    vi.useFakeTimers();
+    const { child, events, kill } = fakeChild();
+    const lifetime = watchResidentChild(child);
+    const stop = lifetime.stop();
+    let settled = false;
+    void stop.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(kill.mock.calls).toEqual([["SIGTERM"]]);
+    expect(settled).toBe(false);
+    expect(lifetime.exited).toBe(false);
+    events.emit("exit", 0, null);
+    await vi.advanceTimersByTimeAsync(50);
+    await stop;
+    expect(await lifetime.exit).toEqual({ code: 0, signal: null });
+    // A completed stop must not leave a delayed escalation behind.
+    await vi.advanceTimersByTimeAsync(RESIDENT_CHILD_TERM_GRACE_MS);
+    expect(kill.mock.calls).toEqual([["SIGTERM"]]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("single-flights stop, escalates TERM, and waits for native exit after KILL", async () => {
     vi.useFakeTimers();
     const { child, events, kill } = fakeChild();
@@ -54,7 +75,11 @@ describe("resident native child receipts (not attempt membership)", () => {
     let settled = false;
     void stop.then(() => { settled = true; });
     expect(kill.mock.calls).toEqual([["SIGTERM"]]);
-    await vi.advanceTimersByTimeAsync(5_000);
+    expect(RESIDENT_CHILD_TERM_GRACE_MS).toBe(90_000);
+    expect(RESIDENT_CHILD_KILL_WAIT_MS).toBe(5_000);
+    await vi.advanceTimersByTimeAsync(RESIDENT_CHILD_TERM_GRACE_MS - 1);
+    expect(kill.mock.calls).toEqual([["SIGTERM"]]);
+    await vi.advanceTimersByTimeAsync(1);
     expect(kill.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
     expect(settled).toBe(false);
     expect(lifetime.exited).toBe(false);
@@ -73,7 +98,12 @@ describe("resident native child receipts (not attempt membership)", () => {
     const lifetime = watchResidentChild(child);
     const stop = lifetime.stop();
     const rejected = expect(stop).rejects.toThrow("native exit receipt");
-    await vi.advanceTimersByTimeAsync(10_000);
+    let settled = false;
+    void stop.catch(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(RESIDENT_CHILD_TERM_GRACE_MS + RESIDENT_CHILD_KILL_WAIT_MS - 1);
+    expect(lifetime.exited).toBe(false);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
     await rejected;
     expect(lifetime.exited).toBe(false);
     expect(lifetime.stop()).toBe(stop);
@@ -112,7 +142,7 @@ process.on('SIGTERM',()=>{});fs.writeFileSync(${JSON.stringify(ready)},'ready');
       await lifetime.exit;
       fs.rmSync(root, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, RESIDENT_CHILD_TERM_GRACE_MS + RESIDENT_CHILD_KILL_WAIT_MS + 10_000);
 
   it("gets a native receipt for a failed executable spawn", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-native-missing-"));

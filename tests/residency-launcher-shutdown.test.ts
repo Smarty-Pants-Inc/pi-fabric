@@ -4,7 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { watchResidentChild } from "../src/residency/child-lifetime.js";
+import { RESIDENT_CHILD_KILL_WAIT_MS, RESIDENT_CHILD_TERM_GRACE_MS, watchResidentChild } from "../src/residency/child-lifetime.js";
 import { launchLog, same, type Owned } from "./helpers/owned-processes.js";
 
 const launcherPath = path.resolve("dist/residency/launcher.js");
@@ -27,11 +27,12 @@ const live = (owned: Owned): boolean => {
 // Native Windows child receipt tests live in residency-child-lifetime.test.ts.
 // This launcher fault injection specifically exercises Linux /proc uncertainty.
 describe.skipIf(process.platform !== "linux" || !fs.existsSync(launcherPath))("compiled launcher native shutdown", () => {
-  it.each(["unreadable-birth", "observed-helper"] as const)("joins one shutdown pass for %s, even after repeated TERM", async mode => {
+  it.each(["unreadable-birth", "observed-helper", "slow-close"] as const)("joins one shutdown pass for %s, even after repeated TERM", async mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-launcher-stop-"));
     const ownership = launchLog(root);
     const ready = path.join(root, "host-ready.json"), helperReady = path.join(root, "helper-ready.json");
     const signals = path.join(root, "native-signals.jsonl"), denied = path.join(root, "birth-denied");
+    const cleanupComplete = path.join(root, "cleanup-complete");
     const hostPath = path.join(root, "host.mjs"), preload = path.join(root, "launcher-preload.mjs");
     fs.writeFileSync(preload, `import fs from 'node:fs';import {ChildProcess} from 'node:child_process';
 if(process.argv[1]===${JSON.stringify(launcherPath)}) {
@@ -46,7 +47,9 @@ if(process.argv[1]===${JSON.stringify(launcherPath)}) {
 process.on('SIGTERM',()=>{});fs.writeFileSync(${JSON.stringify(helperReady)},JSON.stringify({pid:process.pid}));setInterval(()=>{},1000);`;
     fs.writeFileSync(hostPath, `import fs from 'node:fs';import {spawn} from 'node:child_process';
 ${mode === "observed-helper" ? `const helper=spawn(process.execPath,['--input-type=module','-e',${JSON.stringify(helperCode)}],{detached:true,stdio:'ignore',env:process.env});helper.unref();
-process.on('SIGTERM',()=>process.exit(0));` : "process.on('SIGTERM',()=>{});"}
+process.on('SIGTERM',()=>process.exit(0));` : mode === "slow-close" ? `let closing=false;
+process.on('SIGTERM',()=>{if(closing)return;closing=true;
+setTimeout(()=>{fs.writeFileSync(${JSON.stringify(cleanupComplete)},'complete');process.exit(0);},6000);});` : "process.on('SIGTERM',()=>{});"}
 fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid}));setInterval(()=>{},1000);`);
     const configPath = path.join(root, "config.json");
     fs.writeFileSync(configPath, JSON.stringify({ cwd: root, piBinary: hostPath }));
@@ -72,8 +75,13 @@ fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid}));set
         expect(live(ownership.owned().find(record => record.pid === helperPid)!)).toBe(true);
         expect(lifetime.exited).toBe(false); // Finalizer joins cleanup after native host exit.
       }
-      await until(() => lifetime.exited);
+      // The TERM-resistant fixture must exercise the production service grace,
+      // not reintroduce the old five-second cutoff through the test deadline.
+      await until(() => lifetime.exited, RESIDENT_CHILD_TERM_GRACE_MS + RESIDENT_CHILD_KILL_WAIT_MS + 5_000);
       await lifetime.exit;
+      // A deliberately slow host fixture, not a claim about real Pi/store
+      // cleanup timing: the compiled launcher must not KILL it at five seconds.
+      if (mode === "slow-close") expect(fs.readFileSync(cleanupComplete, "utf8")).toBe("complete");
       expect(ownership.owned().filter(live)).toEqual([]);
       const directSignals = fs.readFileSync(signals, "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(directSignals).toEqual(mode === "unreadable-birth"
@@ -93,5 +101,5 @@ fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid}));set
       await until(() => ownership.owned().filter(live).length === 0);
       fs.rmSync(root, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, RESIDENT_CHILD_TERM_GRACE_MS + RESIDENT_CHILD_KILL_WAIT_MS + 20_000);
 });

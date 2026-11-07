@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
@@ -16,6 +17,8 @@ import { residentHostId, residentRoot } from "../src/residency/protocol.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import type { ResidentChannelOwnerProbe } from "../src/actors-cli.js";
 import type { AttemptLaunchReceipt } from "../src/residency/attempt-containment-contract.js";
+import { residentGenerationExitPath, type ResidentGenerationExit } from "../src/residency/generation-exit.js";
+import { watchResidentChild } from "../src/residency/child-lifetime.js";
 
 // Keep reason: data safety + OS-user/release/process trust boundaries. These
 // fixtures exercise the operator entrypoint but never signal/stop a native child.
@@ -34,6 +37,7 @@ function fixture() {
   fs.mkdirSync(path.join(directory, "requests"), { recursive: true });
   fs.mkdirSync(path.join(directory, "responses"));
   fs.mkdirSync(path.join(directory, "actors"));
+  fs.mkdirSync(path.join(directory, "generations"));
   fs.writeFileSync(path.join(directory, "requests/pending.json"), '{"accepted":"keep"}\n');
   fs.writeFileSync(path.join(directory, "actors/queue.json"), '["keep queued work"]\n');
   fs.writeFileSync(path.join(directory, "watchdog-custody.json"), '{"custody":"keep"}\n');
@@ -168,11 +172,25 @@ function resumedDrain(initial: EndpointDrainReceipt): EndpointDrainReceipt {
     reason: "Checkpoint read back; A resumed. Complete attempt containment unavailable; no A exit or B launch.",
     terminal: true, admissionHeld: false, checkpointReadback: true, at: Date.now(), resumedAt: Date.now() };
 }
-async function negotiatedInvoke(f: NegotiatedFixture, releaseDrain: (intent: ResidentDrainIntent, signal?: AbortSignal) => Promise<ResidentCommandResponse>, timeoutMs = 2_000) {
+function exitedDrain(initial: EndpointDrainReceipt): EndpointDrainReceipt {
+  return { ...initial, phase: "exited", outcome: "exited", code: "DRAIN_EXITED",
+    reason: "Operator exit after checkpoint; target not launched", terminal: true,
+    admissionHeld: true, checkpointReadback: true, at: Date.now() };
+}
+function stoppedRecord(f: NegotiatedFixture, initial: EndpointDrainReceipt): ResidentGenerationExit {
+  return { format: 1, generation: String(f.owner.token), writer: "host", reason: "stopped", pid: initial.owner.pid, at: Date.now() };
+}
+async function negotiatedInvoke(f: NegotiatedFixture, releaseDrain: (intent: ResidentDrainIntent, signal?: AbortSignal) => Promise<ResidentCommandResponse>, timeoutMs = 2_000, exitRequested = false) {
   const stdout: string[] = [];
   const client = vi.fn(() => ({ releaseDrain }));
   const dependencies: ResidentDrainDependencies = { client, timeoutMs };
-  const exit = await main(f.argv, { out: text => stdout.push(text) }, undefined, dependencies);
+  if (exitRequested) {
+    const target = fs.realpathSync(f.argv[f.argv.indexOf("--target-release") + 1]!);
+    Object.assign(f.config, f.previous.config, { fabricExtensionPath: path.join(target, "dist/index.js"), workerPath: path.join(target, "dist/worker.js") }); f.save();
+    f.mainGeneration.releaseRoot = target;
+    fs.writeFileSync(mainGenerationPath(f.directory), JSON.stringify(f.mainGeneration));
+  }
+  const exit = await main([...f.argv, ...(exitRequested ? ["--exit"] : [])], { out: text => stdout.push(text) }, undefined, dependencies);
   expect(stdout).toHaveLength(1);
   expect(stdout[0]).not.toContain("fixture-owner");
   expect(stdout[0]).not.toContain("fixture-launcher");
@@ -184,14 +202,16 @@ function response(drain: EndpointDrainReceipt): ResidentCommandResponse {
   return { format: 1, requestId: "recorded-call", ok: true, completedAt: Date.now(), drain };
 }
 
-// No host startup, process launch, signals or cleanup. The endpoint seam records
-// requests and publishes retained durable receipts on the real fs.watch path.
+// The endpoint seam records requests and publishes retained durable receipts on
+// real fs.watch. Exit success additionally joins one directly owned native child;
+// the separate resident-drain-exit-native suite covers the real host/launch path.
 describe.skipIf(process.platform !== "linux")("fabric-resident-drain negotiated cooperative endpoint", () => {
   it("holds then watches the exact durable terminal receipt, returns nonzero partial delivery, and preserves existing Main identity", async () => {
     const f = negotiatedFixture();
     const mainBefore = fs.readFileSync(mainGenerationPath(f.directory), "utf8");
     const participantBefore = fs.readFileSync(f.participantPath, "utf8");
     const send = vi.fn(async (intent: ResidentDrainIntent) => {
+      expect(intent).not.toHaveProperty("exit");
       expect(intent.main).toEqual(f.mainGeneration);
       expect(intent.caller.identity).toEqual(f.participant.updatedBy);
       expect(intent.expected.configDigest).toBe(f.previous.digest);
@@ -470,6 +490,117 @@ describe.skipIf(process.platform !== "linux")("fabric-resident-drain negotiated 
     expect(receipt.reason).toContain("deadline expired");
   });
 
+  it.each(["withdrawn", "independent-successor"])("--exit proves the stopped host's native exit with %s ownership, never target service", async ownership => {
+    const f = negotiatedFixture();
+    const child = spawn(process.execPath, ["--eval", "process.stdin.resume(); process.stdin.once('end', () => process.exit(0));"],
+      { stdio: ["pipe", "ignore", "ignore"] });
+    const lifetime = watchResidentChild(child);
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      Object.assign(f.owner, { pid: child.pid, processStartTime: processStartTime(child.pid!)!, token: randomUUID() }); f.save();
+      const { exit, receipt } = await negotiatedInvoke(f, async intent => {
+        expect(intent.exit).toBe(true);
+        const initial = initialDrain(f, intent);
+        fs.writeFileSync(residentGenerationExitPath(f.directory, String(f.owner.token)), JSON.stringify(stoppedRecord(f, initial)));
+        child.stdin!.end();
+        expect(await lifetime.exit).toEqual({ code: 0, signal: null });
+        fs.renameSync(path.join(f.directory, "owner.json"), path.join(f.directory, "retained-owner.json"));
+        if (ownership === "independent-successor") fs.writeFileSync(path.join(f.directory, "owner.json"), JSON.stringify({ ...f.owner,
+          token: randomUUID(), pid: process.pid, processStartTime: processStartTime(process.pid), releaseRoot: intent.target.releaseRoot,
+          fabricExtensionPath: intent.target.config.fabricExtensionPath }));
+        fs.writeFileSync(residentDrainReceiptPath(f.directory, initial.id), JSON.stringify(exitedDrain(initial)));
+        return response(initial);
+      }, 2_000, true);
+      expect(exit).toBe(0);
+      expect(receipt).toMatchObject({ ok: true, phase: "exited", outcome: "exited", code: "DRAIN_EXITED", unchanged: false,
+        transitionAttempted: true, drain: { terminal: true, admissionHeld: true, checkpointReadback: true,
+          hostExit: { pid: child.pid, reason: "stopped", processExited: true } },
+        rollback: { status: "not-attempted", reason: "no-target-launch-authorized" } });
+      expect(receipt.reason).toContain("not launched or verified serving");
+      expect(receipt.drain).not.toHaveProperty("resumedAt");
+      expect(fs.readdirSync(path.join(f.directory, "requests"))).toEqual(["pending.json"]);
+    } finally { if (!lifetime.exited) { child.stdin!.end(); await lifetime.stop(); } }
+  });
+
+  it("--exit requires desired config and the active Main to select B before dispatch", async () => {
+    for (const fault of ["config", "active-main", "topology"] as const) {
+      const f = negotiatedFixture(); let called = false;
+      Object.assign(f.config, f.previous.config, { fabricExtensionPath: path.join(f.target, "dist/index.js"), workerPath: path.join(f.target, "dist/worker.js") });
+      f.mainGeneration.releaseRoot = f.target;
+      if (fault === "config") f.config.workerPath = path.join(f.expected, "dist/worker.js");
+      if (fault === "active-main") f.mainGeneration.releaseRoot = f.expected;
+      if (fault === "topology") f.config.actorRoot = path.join(f.directory, "changed-actors");
+      f.save(); fs.writeFileSync(mainGenerationPath(f.directory), JSON.stringify(f.mainGeneration));
+      const before = snapshot(f.root); const output: string[] = [];
+      const exit = await main([...f.argv, "--exit"], { out: text => output.push(text) }, undefined, {
+        client: () => { called = true; throw new Error("must not dispatch"); },
+      });
+      expect(exit, fault).toBe(1); expect(called, fault).toBe(false);
+      expect(JSON.parse(output[0]!)).toMatchObject({ phase: "preflight", outcome: "refused", unchanged: true, transitionAttempted: false,
+        code: fault === "active-main" ? "ACTIVE_RELEASE_MISMATCH" : "CONFIG_RELEASE_MISMATCH" });
+      expect(snapshot(f.root), fault).toEqual(before);
+    }
+  });
+
+  it("never accepts exited evidence for the default reversible operation", async () => {
+    const f = negotiatedFixture();
+    const result = await negotiatedInvoke(f, async intent => {
+      expect(intent).not.toHaveProperty("exit");
+      const initial = initialDrain(f, intent);
+      fs.writeFileSync(residentDrainReceiptPath(f.directory, initial.id), JSON.stringify(exitedDrain(initial)));
+      return response(initial);
+    });
+    expect(result.exit).toBe(1);
+    expect(result.receipt).toMatchObject({ outcome: "needs-operator", code: "DRAIN_OUTCOME_UNKNOWN" });
+  });
+
+  it("--exit refuses incomplete, unrelated, live or substituted host exit evidence", async () => {
+    for (const fault of ["missing-record", "wrong-generation", "wrong-pid", "wrong-writer", "wrong-reason", "stale-record",
+      "future-record", "error-code", "signal", "symlink", "live-process", "owner-replaced", "checkpoint-missing", "not-held", "resumed"] as const) {
+      const f = negotiatedFixture(); f.owner.token = randomUUID(); f.save();
+      const result = await negotiatedInvoke(f, async intent => {
+        expect(intent.exit).toBe(true);
+        const initial = initialDrain(f, intent); const terminal = exitedDrain(initial); const stopped = stoppedRecord(f, initial);
+        if (fault === "wrong-generation") stopped.generation = randomUUID();
+        if (fault === "wrong-pid") stopped.pid++;
+        if (fault === "wrong-writer") stopped.writer = "launcher";
+        if (fault === "wrong-reason") stopped.reason = "idle-exit";
+        if (fault === "stale-record") stopped.at = 1;
+        if (fault === "future-record") stopped.at += 60_000;
+        if (fault === "error-code") stopped.code = 1;
+        if (fault === "signal") stopped.signal = "SIGTERM";
+        if (fault === "checkpoint-missing") terminal.checkpointReadback = false;
+        if (fault === "not-held") terminal.admissionHeld = false;
+        if (fault === "resumed") terminal.resumedAt = Date.now();
+        const recordPath = residentGenerationExitPath(f.directory, String(f.owner.token));
+        if (fault !== "missing-record") fs.writeFileSync(recordPath, JSON.stringify(stopped));
+        if (fault === "symlink") { fs.renameSync(recordPath, `${recordPath}.retained`); fs.symlinkSync(`${recordPath}.retained`, recordPath); }
+        if (fault === "owner-replaced") { f.owner.token = randomUUID(); f.save(); }
+        else fs.renameSync(path.join(f.directory, "owner.json"), path.join(f.directory, "retained-owner.json"));
+        fs.writeFileSync(residentDrainReceiptPath(f.directory, initial.id), JSON.stringify(terminal));
+        return response(initial);
+      }, 1, true);
+      expect(result.exit, fault).toBe(1);
+      expect(result.receipt, fault).toMatchObject({ ok: false, phase: "needs-operator", outcome: "needs-operator",
+        code: "DRAIN_OUTCOME_UNKNOWN", unchanged: false, transitionAttempted: true });
+    }
+  }, 10_000);
+
+  it("--exit keeps endpoint refusal nonzero and the same serving owner", async () => {
+    const f = negotiatedFixture(); const before = fs.readFileSync(path.join(f.directory, "owner.json"), "utf8");
+    const { exit, receipt } = await negotiatedInvoke(f, async intent => {
+      expect(intent.exit).toBe(true);
+      const initial = initialDrain(f, intent);
+      const refused: EndpointDrainReceipt = { ...initial, phase: "refused", outcome: "refused", terminal: true,
+        admissionHeld: false, code: "DRAIN_BUSY", reason: "Accepted request is still in flight" };
+      fs.writeFileSync(residentDrainReceiptPath(f.directory, initial.id), JSON.stringify(refused));
+      return { ...response(refused), ok: false, error: refused.reason };
+    }, 2_000, true);
+    expect(exit).toBe(1);
+    expect(receipt).toMatchObject({ ok: false, phase: "refused", outcome: "refused", code: "DRAIN_BUSY" });
+    expect(fs.readFileSync(path.join(f.directory, "owner.json"), "utf8")).toBe(before);
+  });
+
   it("ResidentActorClient sends negotiated releaseDrain over the existing request/response channel", async () => {
     const f = negotiatedFixture();
     const target = residentLaunchSpec({ ...f.previous.config, fabricExtensionPath: path.join(f.target, "dist/index.js"),
@@ -529,6 +660,8 @@ describe.skipIf(process.platform !== "linux")("fabric-resident-drain read-only p
     expect(receipt).toMatchObject({ ok: true, outcome: "help", code: "HELP", resident: null, expected: null, target: null });
     expect(receipt.help).toContain("setActivationFilter skips/consumes");
     expect(receipt.help).toContain("no actor stop/control");
+    expect(receipt.help).toContain("--exit");
+    expect(receipt.help).toContain("CLI does not launch or verify the target");
     expect(receipt.help).toContain("not that the concurrent\nservice is frozen");
     expect(receipt.observed).toBeUndefined();
     expect((await invoke(["-h"])).exit).toBe(0);
@@ -541,7 +674,7 @@ describe.skipIf(process.platform !== "linux")("fabric-resident-drain read-only p
       const argv = f.argv.filter((_, position) => position !== index && position !== index + 1);
       expect((await invoke(argv)).receipt.code).toBe("INVALID_ARGUMENTS");
     }
-    for (const extra of [["--force"], ["--dry-run"], ["--help"], ["--resident", f.directory]]) {
+    for (const extra of [["--force"], ["--dry-run"], ["--help"], ["--resident", f.directory], ["--exit", "--exit"], ["--exit", "true"]]) {
       await refusal(f, "INVALID_ARGUMENTS", [...f.argv, ...extra]);
     }
   });

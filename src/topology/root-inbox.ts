@@ -6,9 +6,11 @@ import type { NativeRecoveryBinding, NativeRecoveryCustodyReader, NativeRecovery
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
+import { RootInboxDeadLetters, type RootInboxReplayRepair } from "./root-inbox-dead-letter.js";
+export { ROOT_INBOX_MAX_FAILED_OFFERS, type RootInboxDeadLetter, type RootInboxReplayRepair } from "./root-inbox-dead-letter.js";
 import {
   INBOX_HORIZON_MS, ROOT_ID_PREFIX, ROOT_INBOX_ACTION_KINDS, compareRootInboxEvents, crossIdentityReceipts, deliveryIdentity,
-  eventReceipt, eventReceipts, rootInboxBudget, topicWorkReceipt, workKey,
+  eventReceipt, eventReceipts, rootInboxBudget, rootInboxMessage, topicWorkReceipt, workKey,
   type NativeRecoveryInboxHandoff, type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
@@ -27,7 +29,8 @@ export {
  * turn boundary and every settle, from a processing cursor in mesh state.
  *
  * A batch is saved as pending before it is delivered, and the cursor moves past it only once the
- * session's own entries hold its message. Until then every reconcile delivers it again, so work
+ * session's own entries hold its message (or a bounded failed singleton offer parks full replayable
+ * bytes in mesh state, without a delivery receipt). Until then every reconcile offers it again, so work
  * survives a stop between the save and the session's write: delivery is at least once. A work
  * event is skipped when the recipient has a confirmed native/inbox receipt for its sender and
  * work identity, persisted across reloads. Queued messages are not receipts. Addressed shadows
@@ -148,6 +151,9 @@ export class RootInbox {
   readonly #predecessors = new Map<string, RootInbox>();
   readonly #offered = new Map<string, { inbox: RootInbox; event: MeshEvent }>();
   readonly #reads = new Set<Promise<unknown>>();
+  readonly #deadLetters: RootInboxDeadLetters;
+  readonly #failedOffers = new Set<string>();
+  readonly #reporting = new Set<string>();
   #writes = Promise.resolve();
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
   /** An ack is one-shot: its own queue retries a mesh lock timeout instead of dropping it. */
@@ -163,7 +169,25 @@ export class RootInbox {
     /** The ids and names a sender may address this root by (its id first). */
     readonly names: () => readonly string[],
     readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number; wakeCooldownMs?: number; horizonMs?: number } = {},
-  ) {}
+  ) { this.#deadLetters = new RootInboxDeadLetters(mesh, identity, this.key); }
+
+  /** Full original payload remains available after replay and consumption; never expires/trims. */
+  readDeadLetter(id: string): MeshEvent {
+    const inbox = this.#readers().find(reader => reader.#deadLetters.get(id)?.original);
+    if (!inbox) throw new Error("Unknown root inbox dead letter");
+    return inbox.#deadLetters.read(id, true);
+  }
+
+  /** Explicit replay bypasses the scan cursor, not duplicate suppression for ordinary events. */
+  async replayDeadLetter(id: string, repair: RootInboxReplayRepair = {}): Promise<MeshEvent> {
+    this.#refreshNative();
+    return this.#reading(async () => {
+      const inbox = this.#readers().find(reader => reader.#deadLetters.get(id)?.original);
+      if (!inbox) throw new Error("Unknown root inbox dead letter");
+      if (inbox.#nativePending(id)) throw new Error("Root inbox dead letter is in native custody");
+      return inbox.#deadLetters.replay(id, repair, event => inbox.#validateOffer(event));
+    });
+  }
 
   get key(): string {
     return ROOT_INBOX_PREFIX + createHash("sha256").update(this.identity.id).digest("hex").slice(0, 32);
@@ -322,11 +346,17 @@ export class RootInbox {
     finally { this.#reads.delete(work); }
   }
 
-  async #collect(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
+  async #collect(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean, prepared = false): Promise<RootInboxBatch> {
     const events: RootInboxEvent[] = [];
     let through = this.#load().after, skippedStale = 0;
     for (const inbox of this.#readers()) {
-      const batch = await inbox.#next(session, options, priority);
+      const batch = await inbox.#next(session, options, priority, prepared);
+      if (!options.commitOnly) for (const row of inbox.#deadLetters.list()) {
+        if (row.status !== "replaying" || inbox.#failedOffers.has(row.id) || inbox.#nativePending(row.id)) continue;
+        const replay = inbox.#deadLetters.read(row.id);
+        batch.events.push(inbox.#late(replay));
+        if (batch.events.length >= MAX_ACKED_IDS) break;
+      }
       if (inbox === this) through = batch.through;
       skippedStale += batch.skippedStale ?? 0;
       for (const event of batch.events) {
@@ -361,9 +391,71 @@ export class RootInbox {
     return Number.isFinite(this.#dueAt) ? this.#dueAt : undefined;
   }
 
-  async #next(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
+  /** A singleton must actually admit its id: aggregate budget overflow is NOT a failed offer. */
+  #validateOffer(event: MeshEvent): void {
+    if (!rootInboxMessage([this.#late(event)]).details.ids.includes(event.id)) {
+      throw new Error("Singleton event exceeds root inbox admission budget");
+    }
+  }
+
+  async #prepareOffers(session: RootInboxSession, options: RootInboxReconcileOptions): Promise<void> {
     const state = this.#load();
-    let saveImmediately = this.#trimReceipts();
+    this.#failedOffers.clear();
+    await this.#deadLetters.confirmParks();
+    if (!options.commitOnly) {
+      const seen = new Set<string>(), reservations = new Set<string>();
+      const offer = async (event: MeshEvent, replay = false): Promise<void> => {
+        if (seen.has(event.id)) return;
+        seen.add(event.id);
+        // Reserved/received work is held by native, never a failed Main offer. A confirmed
+        // receipt likewise wins before a renderer probe, just as on the ordinary scan path.
+        let receipts: string[] = [], receiptsValid = true;
+        try { receipts = eventReceipts(event); }
+        catch { receiptsValid = false; } // The singleton probe below records this render failure.
+        if (this.#nativePending(event.id, receipts) ||
+            (!replay && (this.#deadLetters.excludes(event.id) || this.#acked(event) || this.#stale(event) ||
+              (receiptsValid && this.#steered(event, session, reservations))))) return;
+        try { this.#validateOffer(event); }
+        catch (error) {
+          this.#failedOffers.add(event.id);
+          await this.#deadLetters.failed(event, error instanceof Error ? error.message : String(error), this.#now());
+        }
+      };
+      for (const row of this.#deadLetters.list()) if (row.status === "replaying") await offer(this.#deadLetters.read(row.id), true);
+      // Pending carriers are already admitted past grace. Probe before #scan/#late can throw,
+      // including legacy pending rows that an older renderer could not shape.
+      if (state.pending) for (const event of this.#reread(state.after, state.pending)) await offer(event);
+      const names = new Set(this.names().filter(name => name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX)));
+      const pageSize = this.options.pageSize ?? 500;
+      // Probe before grace too: an invalid future Date must not pin a nonpriority read
+      // forever. A valid recent/future row succeeds and acquires NO failure count.
+      for (let cursor = state.after; ;) {
+        const page = this.mesh.read({ after: cursor, limit: pageSize });
+        for (const event of page) {
+          cursor = Math.max(cursor, event.sequence);
+          if (!event.topic.startsWith(WORK_TOPIC_PREFIX) || !event.to || !names.has(event.to)) continue;
+          await offer(event);
+        }
+        if (page.length < pageSize) break;
+      }
+    }
+    for (const row of this.#deadLetters.list()) if (row.original && !row.reported && !this.#reporting.has(row.id)) {
+      this.#reporting.add(row.id);
+      // Existing alarm path/queue, independent of the poisoned pending range. Report failure
+      // must not undo durable parking or block cursor progress; keyed publication dedups reloads.
+      void this.#notifications.enqueue(async () => {
+        try { await this.#deadLetters.report(row, ROOT_INBOX_ALARM_TOPIC); }
+        finally { this.#reporting.delete(row.id); }
+      });
+    }
+  }
+
+  async #next(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean, prepared = false): Promise<RootInboxBatch> {
+    const state = this.#load();
+    if (!prepared) await this.#prepareOffers(session, options);
+    // A parked decision is durable progress, not an ordinary cursor-only checkpoint.
+    let saveImmediately = this.#deadLetters.list().some(row => row.original && row.sequence > state.after);
+    saveImmediately = this.#trimReceipts() || saveImmediately;
     saveImmediately = immediateSnapshot(state) !== this.#savedImmediate || saveImmediately;
     // Canonical history without a finite timestamp is exact-replay evidence only; do not
     // renew its ambiguous key/ref claim at read time.
@@ -379,6 +471,9 @@ export class RootInbox {
     // An ack can land while this read awaits the mesh: it may commit this very batch.
     const held = state.pending;
     if (held) {
+      // Parking decides the cursor, NOT delivery. Remove only after the DLQ payload/barrier;
+      // never let holdsBatch/receipt bookkeeping turn these removed ids into delivered outcomes.
+      held.ids = held.ids.filter(id => !this.#deadLetters.excludes(id));
       // Acked ids are never delivered again (smarty-dev#8962); a fully acked batch commits.
       const unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
       const holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
@@ -408,6 +503,7 @@ export class RootInbox {
         }
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
         const events = pending.filter((event) => {
+          if (this.#failedOffers.has(event.id)) { withheld.add(event.id); return false; }
           const status = this.#nativeStatus(event.id, eventReceipts(event));
           const reserved = status === "reserved" || status === "received";
           // Real canonical receipts win even while native still reports the saved holder pending.
@@ -471,6 +567,7 @@ export class RootInbox {
     this.#refreshNative();
     const cooldownEnd = this.#wokeAt + (this.options.wakeCooldownMs ?? wakeCooldownMs());
     const cooling = this.#now() < cooldownEnd;
+    for (const inbox of this.#readers()) await inbox.#prepareOffers(session, {});
     const peeked = this.#readers().flatMap(inbox => inbox.#peek(session));
     const urgent = peeked.some((event) => URGENT_KINDS.has(event.kind));
     // Work addressed to this exact session wakes at once too (smarty-dev#4313), unless delivered late.
@@ -479,7 +576,7 @@ export class RootInbox {
       if (peeked.length) this.#dueAt = Math.min(this.#dueAt, cooldownEnd);
       return undefined;
     }
-    const batch = await this.#collect(session, {}, true);
+    const batch = await this.#collect(session, {}, true, true);
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn; nor does late actionable work.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
@@ -527,6 +624,9 @@ export class RootInbox {
   }
 
   #ack(ids: readonly string[], receipts: readonly string[]): void {
+    const hadIds = ids.length > 0;
+    ids = ids.filter(id => !this.#deadLetters.excludes(id) || this.#deadLetters.get(id)?.status === "replaying");
+    if (hadIds && !ids.length) return;
     const state = this.#load();
     this.#trimReceipts();
     this.#remember([...ids.map(eventReceipt), ...receipts]);
@@ -538,7 +638,11 @@ export class RootInbox {
     // committing the prefix must not erase an out-of-order consumption receipt.
     const consumed = ids.filter((id) => !this.#acks.has(id));
     const through = Math.max(pending?.through ?? state.after, this.mesh.latestSequence());
-    const delivered = consumed.length ? this.#reread(state.after, { ids: consumed, through, since: this.#now() }) : [];
+    const replayed = consumed.flatMap(id => this.#deadLetters.get(id)?.status === "replaying" ? [this.#deadLetters.read(id)] : []);
+    const delivered = [...new Map([
+      ...(consumed.length ? this.#reread(state.after, { ids: consumed, through, since: this.#now() }) : []), ...replayed,
+    ].map(event => [event.id, event])).values()];
+    for (const event of replayed) this.#deadLetters.consume(event.id);
     const sequences = new Map(delivered.map((event) => [event.id, event.sequence]));
     for (const id of ids) {
       if (!this.#acks.has(id)) this.#acks.set(id, sequences.get(id) ?? through);
@@ -569,7 +673,10 @@ export class RootInbox {
     const status = this.#nativeStatus(id);
     if (status === "consumed") return true;
     const inbox = this.#receiptLedger(id, sequence);
-    if (!inbox || !inbox.#state) return false;
+    if (!inbox) return false;
+    const parked = inbox.#deadLetters.acked(id);
+    if (parked !== undefined) return parked;
+    if (!inbox.#state) return false;
     if (status === "received" || status === "reserved") return inbox.#acks.has(id) || inbox.#delivered.has(eventReceipt(id));
     return inbox.#acks.has(id) || (sequence !== undefined && sequence <= inbox.#mark());
   }
@@ -589,8 +696,10 @@ export class RootInbox {
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     const reservations = new Set<string>();
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#acked(event) && !this.#nativePending(event.id, eventReceipts(event)) && !this.#stale(event) && !this.#steered(event, session, reservations)).map((event) => this.#late(event)) : []),
-    ...this.#scan(after, session, false, undefined, true, reservations).events];
+      !this.#deadLetters.excludes(event.id) && !this.#failedOffers.has(event.id) && !this.#acked(event) && !this.#nativePending(event.id, eventReceipts(event)) && !this.#stale(event) && !this.#steered(event, session, reservations)).map((event) => this.#late(event)) : []),
+    ...this.#scan(after, session, false, undefined, true, reservations).events,
+    ...this.#deadLetters.list().filter(row => row.status === "replaying" && !this.#failedOffers.has(row.id) && !this.#nativePending(row.id))
+      .map(row => this.#late(this.#deadLetters.read(row.id)))];
   }
 
   /** Addressed to this session's own id on a work topic (not a name or alias). */
@@ -604,7 +713,9 @@ export class RootInbox {
     return Math.max(state.after, state.ackedThrough ?? Number.NEGATIVE_INFINITY);
   }
 
-  #acked(event: MeshEvent): boolean { return event.sequence <= this.#mark() || this.#acks.has(event.id); }
+  #acked(event: MeshEvent): boolean {
+    return this.#deadLetters.acked(event.id) ?? (event.sequence <= this.#mark() || this.#acks.has(event.id));
+  }
 
   /**
    * Keep the ordinary 20-event/32-KiB durable prefix, plus a ranked tail window that fits the
@@ -722,7 +833,8 @@ export class RootInbox {
       const page = this.mesh.read({ after: cursor, limit: pageSize });
       for (const event of page) {
         cursor = Math.max(cursor, event.sequence);
-        if (event.createdAt > cutoff && this.#exact(event) && !this.#acked(event) && !this.#steered(event, session, priorityReservations)) {
+        if (event.createdAt > cutoff && this.#exact(event) && !this.#deadLetters.excludes(event.id) &&
+            !this.#failedOffers.has(event.id) && !this.#acked(event) && !this.#steered(event, session, priorityReservations)) {
           bypassThrough = event.sequence;
         }
       }
@@ -737,6 +849,12 @@ export class RootInbox {
     for (;;) {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
+        // Dead letters have independent full-payload custody, not a delivered/acked receipt.
+        if (addressed(event) && this.#deadLetters.excludes(event.id)) {
+          through = Math.max(through, event.sequence);
+          continue;
+        }
+        if (addressed(event) && this.#failedOffers.has(event.id)) return result();
         // Native reservation is neither delivery nor expiry, and never advances this ledger.
         if (addressed(event) && !this.#acked(event) && this.#nativePending(event.id, eventReceipts(event)) &&
             !this.#steered(event, session, reservations)) return result();
@@ -990,6 +1108,7 @@ export class RootInbox {
   }
 
   async #saveState(now: boolean): Promise<void> {
+    await this.#deadLetters.flush();
     this.#absorb();
     this.#trimReceipts();
     const text = JSON.stringify(this.#state);

@@ -6535,9 +6535,6 @@ export class ActorManager {
         actor.abortController = abortController;
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
-        const liveAtAdmission = this.#liveActor(actor);
-        delete actor.lastCleanedRunWorker;
-        delete liveAtAdmission.lastCleanedRunWorker;
         let runCompleted = false;
         let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
         let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
@@ -6653,6 +6650,10 @@ export class ActorManager {
             abortController.signal,
             (handle) => {
               this.#noteSlotRun(actor, handle.id);
+              // Only a launched worker supersedes the previous cleanup receipt.
+              const liveAtLaunch = this.#liveActor(actor);
+              delete actor.lastCleanedRunWorker;
+              delete liveAtLaunch.lastCleanedRunWorker;
               // AgentManager can canonicalize a selector after permit admission. Use
               // its actual handle, then piggyback on the existing running publication.
               this.#rememberResolvedBinding(actor, {

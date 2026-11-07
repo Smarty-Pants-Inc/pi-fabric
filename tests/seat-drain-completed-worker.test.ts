@@ -12,6 +12,7 @@ import { procStartTime, procWorkerExited } from "../src/main-drain/binding.js";
 import { MainDrainServer } from "../src/main-drain/server.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { callMainDrain, mainDrainSocket } from "../src/main-drain/client.js";
+import { FABRIC_MAIN_DRAINING } from "../src/main-drain/gate.js";
 import { createSeat, ROOT, SID, type Seat } from "./seat-drain-fixture.js";
 
 const linux = process.platform === "linux" && typeof process.getuid === "function";
@@ -76,6 +77,7 @@ const harness = async (): Promise<Harness> => {
     transport: "process",
     retainRuns: true,
   }, {
+    mainAgentId: ROOT,
     runRoot,
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     preparePiModel: async model => model,
@@ -200,6 +202,24 @@ const completeSupervisorRun = async (harness: Harness, actorId: string): Promise
   expect(harness.agents.workerIdentity(run.id)).toBeUndefined();
   expect(procWorkerExited(worker.pid, worker.startTime)).toBe(true);
   return { id: run.id, worker: { pid: worker.pid, startTime: worker.startTime }, directory };
+};
+
+const treeSnapshot = (directory: string): string => {
+  const entries: string[] = [];
+  const visit = (current: string, relative = ""): void => {
+    for (const name of fs.readdirSync(current).sort()) {
+      const file = path.join(current, name);
+      const entry = relative ? `${relative}/${name}` : name;
+      const stat = fs.lstatSync(file);
+      if (stat.isDirectory()) {
+        entries.push(`d ${entry}`);
+        visit(file, entry);
+      } else if (stat.isSymbolicLink()) entries.push(`l ${entry} ${fs.readlinkSync(file)}`);
+      else entries.push(`f ${entry} ${fs.readFileSync(file).toString("base64")}`);
+    }
+  };
+  visit(directory);
+  return entries.join("\n");
 };
 
 const drainThenStop = async (harness: Harness) => {
@@ -348,37 +368,119 @@ describe.skipIf(!linux)("completed session actor drain proof", () => {
     expect(sameActorSpec(saved, h.actors.drainSpec(restored.id))).toBe(true);
   }, 30_000);
 
-  it("drains and restores the supervisor after a native Main settle arrives during the fence", async () => {
+  it("replaces a completed receipt with the genuinely launched next worker before drain", async () => {
     const h = await harness(); fixtures.push(h);
     const actorId = await createSupervisor(h);
     const completed = await completeSupervisorRun(h, actorId);
-    const socket = mainSocket(h.seat);
-    const drained = await callMainDrain(socket, SID, "drain", bind(h.seat));
-    expect(drained.native.inputsFenced).toBe(true);
+    const oldDirectory = treeSnapshot(completed.directory);
+    expect(h.actors.drainWorker(actorId)).toEqual({
+      runId: completed.id, pid: completed.worker.pid, startTime: completed.worker.startTime,
+    });
 
-    const release = path.join(h.seat.base, "late-worker-release");
-    const dispatched = h.emitMainSettle({ fakeWorkerFinishGate: release });
-    expect(dispatched).toBe(1);
-    // A settle can activate the supervisor during the fence; old completed-run proof must not mask its live worker.
+    const release = path.join(h.seat.base, "next-worker-release");
+    expect(h.emitMainSettle({ fakeWorkerFinishGate: release })).toBe(1);
     await vi.waitFor(() => expect(fs.existsSync(`${release}.entered`)).toBe(true), { timeout: 10_000, interval: 20 });
-    const active = h.agents.list().find(row => row.actorName === "supervisor" && row.status === "running")!;
+    const active = h.agents.list().find(row => row.actorName === "supervisor" && row.status === "running");
+    expect(active).toBeDefined();
+    if (!active) throw new Error("The native supervisor event did not launch the next run");
     expect(active.id).not.toBe(completed.id);
-    const currentWorker = h.agents.workerIdentity(active.id)!;
+    const currentWorker = h.agents.workerIdentity(active.id);
+    expect(currentWorker?.startTime).toBeTypeOf("string");
+    if (!currentWorker?.startTime) throw new Error("The next worker process birth was unavailable");
+    expect(currentWorker.open).toBe(true);
     expect(h.actors.drainWorker(actorId)).toEqual({ runId: active.id, pid: currentWorker.pid, startTime: currentWorker.startTime });
-    expect(h.actors.drainSpec(actorId).lastCleanedRunWorker).toBeUndefined();
+    await vi.waitFor(() => {
+      const registry = JSON.parse(fs.readFileSync(path.join(h.actorRoot, "actors.json"), "utf8")) as {
+        actors: Array<Record<string, unknown>>;
+      };
+      expect(registry.actors.find(row => row.id === actorId)?.lastCleanedRunWorker).toBeUndefined();
+    }, { timeout: 10_000, interval: 20 });
     fs.writeFileSync(release, "release");
-    await vi.waitFor(() => expect(h.actors.status(actorId).lastRunId).toBe(active.id), { timeout: 10_000, interval: 20 });
-    await vi.waitFor(() => expect(h.actors.status(actorId).status).toBe("idle"), { timeout: 10_000, interval: 20 });
-    await vi.waitFor(() => expect(h.agents.hasRunCustody(h.actors.status(actorId).lastRunId!)).toBe(false),
-      { timeout: 10_000, interval: 20 });
+    await vi.waitFor(() => {
+      const status = h.actors.status(actorId);
+      expect(status.status).toBe("idle");
+      expect(status.lastRunId).toBe(active.id);
+      expect(h.agents.hasRunCustody(active.id)).toBe(false);
+      expect(h.actors.drainWorker(actorId)).toEqual({ runId: active.id, pid: currentWorker.pid, startTime: currentWorker.startTime });
+    }, { timeout: 15_000, interval: 20 });
+
+    expect(treeSnapshot(completed.directory)).toBe(oldDirectory);
+    const registry = JSON.parse(fs.readFileSync(path.join(h.actorRoot, "actors.json"), "utf8")) as {
+      actors: Array<Record<string, unknown>>;
+    };
+    expect(registry.actors.find(row => row.id === actorId)?.lastCleanedRunWorker).toEqual({
+      actorId, runId: active.id, pid: currentWorker.pid, startTime: currentWorker.startTime,
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(h.runRoot, active.id, "status.json"), "utf8")).status).toBe("completed");
+
     const saved = h.actors.drainSpec(actorId);
-    const stopped = await callMainDrain(socket, SID, "stop-actors", bind(h.seat));
+    const stopped = await drainThenStop(h);
     expect(stopped.stopRefused).toBeNull();
     expect(stopped.stopped.map(row => row.id)).toContain(actorId);
     const undone = await undo(h);
     expect(undone.undo?.actorsRestored).toBe(true);
     const restored = h.actors.listOwned().find(row => row.name === "supervisor" && row.status !== "stopped")!;
+    expect(restored).toMatchObject({ status: "idle", supervisorFor: ROOT, model: liveModel,
+      modelReason: liveModelReason, thinking: "high" });
     expect(sameActorSpec(saved, h.actors.drainSpec(restored.id))).toBe(true);
     expect(h.agents.hasRunCustody(completed.id)).toBe(false);
+  }, 30_000);
+
+  it("refuses a native settle during the fence without losing the completed receipt", async () => {
+    const h = await harness(); fixtures.push(h);
+    const actorId = await createSupervisor(h);
+    const completed = await completeSupervisorRun(h, actorId);
+    const saved = h.actors.drainSpec(actorId);
+    const registryBefore = JSON.parse(fs.readFileSync(path.join(h.actorRoot, "actors.json"), "utf8")) as {
+      actors: Array<Record<string, unknown>>;
+    };
+    expect(registryBefore.actors.find(row => row.id === actorId)?.lastCleanedRunWorker).toEqual({
+      actorId, runId: completed.id, pid: completed.worker.pid, startTime: completed.worker.startTime,
+    });
+    expect(h.actors.drainWorker(actorId)).toEqual({
+      runId: completed.id, pid: completed.worker.pid, startTime: completed.worker.startTime,
+    });
+    const runSnapshot = treeSnapshot(h.runRoot);
+    const priorRunIds = h.agents.list().map(row => row.id).sort();
+
+    const socket = mainSocket(h.seat);
+    const drained = await callMainDrain(socket, SID, "drain", bind(h.seat));
+    expect(drained.native.inputsFenced).toBe(true);
+    const release = path.join(h.seat.base, "refused-worker-release");
+    expect(h.emitMainSettle({ fakeWorkerFinishGate: release })).toBe(1);
+    await vi.waitFor(() => {
+      const status = h.actors.status(actorId);
+      expect(status.status).toBe("idle");
+      expect(status.queued).toBe(0);
+      expect(status.inFlightRun).toBeUndefined();
+      expect(status.lastError).toContain(FABRIC_MAIN_DRAINING);
+    }, { timeout: 15_000, interval: 20 });
+
+    expect(h.actors.status(actorId).lastRunId).toBe(completed.id);
+    expect(h.agents.list().map(row => row.id).sort()).toEqual(priorRunIds);
+    expect(treeSnapshot(h.runRoot)).toBe(runSnapshot);
+    expect(fs.existsSync(`${release}.entered`)).toBe(false);
+    const workerAfter = h.actors.drainWorker(actorId);
+    const registryAfter = JSON.parse(fs.readFileSync(path.join(h.actorRoot, "actors.json"), "utf8")) as {
+      actors: Array<Record<string, unknown>>;
+    };
+
+    const stopped = await callMainDrain(socket, SID, "stop-actors", bind(h.seat));
+    expect(stopped.ledger.some(row => row.path === "agents.spawn")).toBe(true);
+    expect(stopped.stopRefused).toBeNull();
+    expect(workerAfter).toEqual({
+      runId: completed.id, pid: completed.worker.pid, startTime: completed.worker.startTime,
+    });
+    expect(registryAfter.actors.find(row => row.id === actorId)?.lastCleanedRunWorker).toEqual({
+      actorId, runId: completed.id, pid: completed.worker.pid, startTime: completed.worker.startTime,
+    });
+    expect(stopped.stopped.map(row => row.id)).toContain(actorId);
+    expect(h.actors.status(actorId).status).toBe("stopped");
+    const undone = await undo(h);
+    expect(undone.undo?.actorsRestored).toBe(true);
+    const restored = h.actors.listOwned().find(row => row.name === "supervisor" && row.status !== "stopped")!;
+    expect(restored).toMatchObject({ status: "idle", supervisorFor: ROOT, model: liveModel,
+      modelReason: liveModelReason, thinking: "high" });
+    expect(sameActorSpec(saved, h.actors.drainSpec(restored.id))).toBe(true);
   }, 30_000);
 });

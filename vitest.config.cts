@@ -64,6 +64,7 @@ const realBrokerNatsSuites = [
   "tests/state-backend-nats-publish-dedupe.test.ts",
   "tests/state-backend-nats-pull-recovery.test.ts",
   "tests/nats-auth-server.test.ts",
+  "tests/nats-auth-path-b-native-actor-pod-compat.test.ts",
 ];
 const excludedSuites = [...localRealDeleteSuites,
   ...(process.env.FABRIC_TEST_SKIP_NATS === "1" ? realBrokerNatsSuites : [])];

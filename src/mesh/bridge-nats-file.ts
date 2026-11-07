@@ -274,6 +274,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   #fileRenewal: Promise<void> | undefined;
   #fileRenewalPending = false;
   #fenced = false;
+  #withdrawOnClose = false;
 
   constructor(options: NatsCarrierSideOptions) {
     this.port = options.port;
@@ -467,15 +468,19 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   }
   async withdraw(): Promise<void> {
     await this.fence();
+    if (this.#withdrawOnClose) await this.#pump?.catch(() => undefined);
     await this.port.withdraw();
   }
+
+  /** Keep the port alive through an explicit bridge stop so its exact owned mirrors can be withdrawn. */
+  prepareExplicitStop(): void { this.#withdrawOnClose = true; }
 
   close(_error?: Error): void {
     this.#fenced = true;
     this.#abort.abort();
     clearInterval(this.#working);
     this.#room?.();
-    void this.port.close().catch(() => undefined);
+    if (!this.#withdrawOnClose) void this.port.close().catch(() => undefined);
   }
 
   closeGracefully(error?: Error): void { this.close(error); }

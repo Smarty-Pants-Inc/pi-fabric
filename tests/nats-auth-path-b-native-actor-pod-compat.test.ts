@@ -8,6 +8,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { jetstreamManager, type StreamConfig } from "@nats-io/jetstream";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { startNatsLink, type NatsLinkHandle, type NatsLinkStartConfig } from "../src/mesh/bridge-nats-link.js";
@@ -22,6 +23,8 @@ import { readHostLeaseCurrent } from "../src/topology/host-leases.js";
 import { watchResidentChild } from "../src/residency/child-lifetime.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
+import { INBOX_DUPLICATE_WINDOW_MS, transportStreamConfig } from "../src/transport/nats/provision.js";
+import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { FROZEN_F3393715_COMMIT, FROZEN_F3393715_SHA256 } from "./helpers/frozen-f3393715.js";
 import { createNativeActorOwner, type NativeActorOwner } from "./helpers/native-actor-owner.js";
 import { launchLog, same, stopOwned, type Owned } from "./helpers/owned-processes.js";
@@ -64,13 +67,13 @@ const startOldPod = (owner: NativeActorOwner, broker: PathBHarness, user: PathBU
   sdkDirectory: string, nodeBinary: string) => {
   const root = path.join(owner.root, `old-provider-${label}`);
   fs.mkdirSync(root, { mode: 0o700 });
-  const cwd = path.join(root, "service"), agentDir = path.join(root, "profile"), sessions = path.join(root, "sessions");
+  const cwd = path.join(root, "service"), agentDir = path.join(root, "profile"), sessions = path.join(root, "sessions"), meshRoot = path.join(root, "mesh");
   const sourceDirectory = path.join(root, "frozen-source");
-  for (const directory of [cwd, agentDir, sessions, sourceDirectory]) fs.mkdirSync(directory, { mode: 0o700 });
+  for (const directory of [cwd, agentDir, sessions, sourceDirectory, meshRoot]) fs.mkdirSync(directory, { mode: 0o700 });
   save(path.join(agentDir, "settings.json"), { modelPolicy: { allow: [] }, packages: [], extensions: [],
     enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false } });
   const pinsFile = path.join(root, "pod-pins.json");
-  save(pinsFile, { cwd, agentDir, sourceDirectory, sdkDirectory, nodeBinary, repoRoot: repo, actorId: owner.binding.actorId,
+  save(pinsFile, { cwd, agentDir, sourceDirectory, meshRoot, sdkDirectory, nodeBinary, repoRoot: repo, actorId: owner.binding.actorId,
     sessionFile: path.join(sessions, "pod.jsonl"), sessionPin: path.join(root, "session-pin.json"),
     nativeOwnerEntry: owner.nativeOwnerEntry, nativeOwnerEntrySha256: sha256(owner.nativeOwnerEntry),
     policyEnv: broker.policyEnv, nats: { ...broker.runtimeOptions(user), operatorMachine: "fabric-ops" } });
@@ -80,7 +83,7 @@ const startOldPod = (owner: NativeActorOwner, broker: PathBHarness, user: PathBU
   Object.assign(env, owned.env, broker.policyEnv, { PI_OFFLINE: "1", HOME: path.resolve(owner.root, "../home"), USERPROFILE: path.resolve(owner.root, "../home"),
     TMPDIR: root, TMP: root, TEMP: root, PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: sessions,
     XDG_CONFIG_HOME: path.join(root, "config"), XDG_CACHE_HOME: path.join(root, "cache"), XDG_DATA_HOME: path.join(root, "data"),
-    XDG_STATE_HOME: path.join(root, "state"), PI_FABRIC_MESH_ROOT: path.join(root, "mesh"), PI_FABRIC_PROJECT_ROOT: cwd,
+    XDG_STATE_HOME: path.join(root, "state"), PI_FABRIC_MESH_ROOT: meshRoot, PI_FABRIC_PROJECT_ROOT: cwd,
     PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"), PI_FABRIC_LOCK_STATS: "0",
     FABRIC_NATIVE_OLD_POD_PINS: pinsFile });
   // No current provider, makeMain(), fake-worker, NatsWire prototype patch, or
@@ -146,6 +149,21 @@ const startOldPod = (owner: NativeActorOwner, broker: PathBHarness, user: PathBU
 };
 type OldPod = ReturnType<typeof startOldPod>;
 
+const provisionLegacyInboxes = async (broker: PathBHarness): Promise<void> => {
+  const connection = await broker.connect(broker.users.bootstrap);
+  try {
+    const manager = await jetstreamManager(connection);
+    for (const machine of broker.permissionPolicy.pathBMachines) {
+      // f339 clients require the pre-retention-policy max_age:0 inboxes. Seed
+      // the actual legacy state before current provisioning, which must accept
+      // it without updating it (docs/configuration.md:1102-1108).
+      const config = transportStreamConfig({ name: transportInboxStream(machine),
+        subjects: [transportInboxStreamSubject(machine)], maxBytes: 1_073_741_824, maxAgeMs: 0,
+        maxMessageBytes: 1_048_576, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1 });
+      await manager.streams.add(config as StreamConfig & { name: string });
+    }
+  } finally { await broker.closeConnections(); }
+};
 const provision = async (broker: PathBHarness): Promise<void> => {
   const env = broker.adminEnv(broker.users.bootstrap);
   const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
@@ -270,6 +288,7 @@ describe.skipIf(process.platform !== "linux")("N8 bounded TEST topology: indepen
       expect(broker.policyEnv.PI_FABRIC_NATS_MACHINES).toBe(INVENTORY.join(","));
       expect(PATH_B_PERMISSION_POLICY.pathBMachines).toEqual(["machine-a", "machine-b"]);
       expect(PATH_B_POLICY_ENV.PI_FABRIC_NATS_MACHINES).toBe("machine-a,machine-b");
+      await provisionLegacyInboxes(broker);
       await provision(broker);
       const hubUser = broker.additionalRuntimeUsers.find(user => user.machine === HUB);
       const unauthorizedUser = broker.additionalRuntimeUsers.find(user => user.machine === UNAUTHORIZED);
@@ -382,9 +401,8 @@ describe.skipIf(process.platform !== "linux")("N8 bounded TEST topology: indepen
       for (const row of discovery) {
         expect(row).toMatchObject({ id: ACTOR, kind: "actor", rootId: owner.pin.rootId, ownerHostId: residentHostId(owner.pin.rootId), machine: HUB });
         expect(row.capabilities).toContain("ask");
-        // Actual old parser discovery proves optional runner compatibility. It
-        // must NOT advertise native runner/model bindings on the old wire.
-        expect(row.runner).toBeUndefined(); expect(row.capabilities).not.toContain("actor-bindings");
+        // The old parser accepts the native runner token; model/binding details remain absent.
+        expect(row.runner).toBe("native"); expect(row.capabilities).not.toContain("actor-bindings");
       }
       save(path.join(owner.root, "n8-discovery.json"), discovery);
       const callbacks = (): Callback[] => owner.callbacks() as unknown as Callback[];

@@ -133,10 +133,10 @@ const send = value => new Promise((resolve, reject) => {
   process.send(value, error => error ? reject(error) : resolve());
 });
 const discover = (id, milliseconds = 60_000) => new Promise((resolve, reject) => {
-  let watcher, timer, finished = false;
+  let watcher, timer, poll, finished = false;
   const finish = (error, value) => {
     if (finished) return;
-    finished = true; clearTimeout(timer); watcher?.close();
+    finished = true; clearTimeout(timer); clearInterval(poll); watcher?.close();
     if (error) reject(error); else resolve(value);
   };
   const check = () => {
@@ -145,11 +145,17 @@ const discover = (id, milliseconds = 60_000) => new Promise((resolve, reject) =>
       if (row) finish(undefined, row);
     } catch (error) { finish(error); }
   };
-  // Normal source: the real NATS projection's committed files. No discovery
-  // polling/retry loop and no injected participant. Deadline only bounds failure.
-  watcher = fs.watch(root, { recursive: true, persistent: false }, check);
+  // Primary signal is the real local NATS projection commit; bounded polling of
+  // the same public read recovers missed/coalesced filesystem notifications.
+  watcher = fs.watch(pins.meshRoot, { recursive: true, persistent: false }, check);
   watcher.on("error", error => finish(error));
-  timer = setTimeout(() => finish(new Error("N8 BLOCKED: frozen public actor discovery deadline")), milliseconds);
+  timer = setTimeout(() => {
+    let observed;
+    try { observed = runtime.participantInfos({ fresh: true, includeStale: true }).map(row => ({ id: row.id, kind: row.kind, runner: row.runner, status: row.status, stale: row.stale })); }
+    catch (error) { observed = String(error); }
+    finish(new Error(`N8 BLOCKED: frozen public actor discovery deadline; observed=${JSON.stringify(observed)}`));
+  }, milliseconds);
+  poll = setInterval(check, 500);
   check();
 });
 try {

@@ -91,6 +91,7 @@ export interface NatsLinkStartOptions {
 export interface NatsLinkHandle {
   /** Settles when the link has stopped: resolves after stop() or an abort, rejects when the link failed. */
   readonly closed: Promise<void>;
+  /** Explicit shutdown drains the bridge and withdraws this link's exact NATS-owned mirrors. */
   stop(): Promise<void>;
 }
 
@@ -289,12 +290,18 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     log(`linked ${config.name} <-> ${config.link} (NATS machine ${port.machine})`);
     let stopping: Promise<void> | undefined;
     const openedLedger = opened;
-    const stop = (): Promise<void> => stopping ??= (async () => {
-      await bridge.stop().catch(() => undefined);
-      await openedPort.close().catch(() => undefined);
-      await openedLedger.close().catch(() => undefined);
-      store.closeState();
-    })();
+    const stop = (explicit = false): Promise<void> => {
+      if (stopping) return stopping;
+      if (explicit) remote!.prepareExplicitStop();
+      stopping = (async () => {
+        await bridge.stop().catch(() => undefined);
+        if (explicit) await remote!.withdraw().catch(error => log(`explicit NATS mirror withdrawal failed: ${natsBridgeErrorSummary(error)}`));
+        await openedPort.close().catch(() => undefined);
+        await openedLedger.close().catch(() => undefined);
+        store.closeState();
+      })();
+      return stopping;
+    };
     const onAbort = (): void => { void stop(); };
     signal.addEventListener("abort", onAbort, { once: true });
     const closed = bridge.run().then(
@@ -305,7 +312,7 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
         if (!signal.aborted) throw error;
       });
     void closed.catch(() => undefined);
-    return { closed, stop };
+    return { closed, stop: () => stop(true) };
   } catch (error) {
     await port?.close().catch(() => undefined);
     await opened?.close().catch(() => undefined);

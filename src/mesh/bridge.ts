@@ -461,6 +461,8 @@ export interface BridgeSide {
   presence(): Promise<BridgePresence>;
   /** Hub-local only: live direct mirrors owned by other links, never re-exported mirrors. */
   relayPresence?(): Promise<Pick<BridgePresence, "hosts" | "participants">>;
+  /** Hub-local only: current native actor ids keyed by their live resident host. */
+  nativeActorRecipients?(): Promise<ReadonlyMap<string, ReadonlySet<string>>>;
   /** Direct origin of a held root on another link, for captured control destinations. */
   relayOrigin?(id: string): string | undefined;
   /** Hub-local only: a structurally attributable projection whose authority is stale; never routing authority. */
@@ -1033,6 +1035,42 @@ export class StoreBridgeSide implements BridgeSide {
 
   async presence(): Promise<BridgePresence> {
     return this.#presenceSnapshot();
+  }
+
+  async nativeActorRecipients(): Promise<ReadonlyMap<string, ReadonlySet<string>>> {
+    const presence = this.#presenceSnapshot();
+    const nativeHosts = new Map(presence.hosts.filter(({ record }) => isNativeNonRootHost(record))
+      .map(({ record }) => [record.id, record]));
+    const actors = new Map<string, { record?: FabricParticipantRecord; writer?: string; mirrored?: string | undefined; ambiguous: boolean }>();
+    for (const entry of this.#participantEntries()) {
+      if (!isObject(entry.value) || entry.value.kind !== "actor" || typeof entry.value.id !== "string") continue;
+      const participant = participantOf(entry.key, entry.value);
+      const previous = actors.get(entry.value.id);
+      if (!participant) {
+        actors.set(entry.value.id, { ambiguous: true });
+        continue;
+      }
+      const mirrored = remoteHostOf(participant) ?? participant.bridgeVia;
+      if (previous) {
+        const sameNativeRecord = previous.record !== undefined && previous.writer === entry.updatedBy.id &&
+          previous.mirrored === mirrored && previous.record.rootId === participant.rootId &&
+          previous.record.ownerHostId === participant.ownerHostId && previous.record.ownerIdentityId === participant.ownerIdentityId &&
+          previous.record.name === participant.name && previous.record.sessionId === participant.sessionId;
+        actors.set(participant.id, sameNativeRecord ? previous : { ambiguous: true });
+      } else actors.set(participant.id, { record: participant, writer: entry.updatedBy.id, mirrored, ambiguous: false });
+    }
+    const routes = new Map<string, Set<string>>();
+    for (const [id, candidate] of actors) {
+      const actor = candidate.record;
+      if (candidate.ambiguous || !actor || candidate.writer !== actor.ownerIdentityId || candidate.mirrored !== undefined ||
+          actor.retiredAt !== undefined || actor.id === actor.rootId || !isNonRootHostId(actor.ownerHostId, actor.rootId)) continue;
+      const owner = nativeHosts.get(actor.ownerHostId);
+      if (!owner || owner.id !== actor.ownerHostId || owner.identity.id !== actor.ownerIdentityId || owner.rootId !== actor.rootId) continue;
+      const recipients = routes.get(owner.id) ?? new Set<string>();
+      recipients.add(id);
+      routes.set(owner.id, recipients);
+    }
+    return routes;
   }
 
   #relayProjection(id: string): FabricHostRecord | undefined {
@@ -3559,6 +3597,8 @@ interface BridgeRules {
   recipients: Set<string>;
   /** Inbound only: other links' canonical addresses (remoteAddresses(relays)); routable through the hub, never hub-local. */
   relayRecipients?: Set<string>;
+  /** Inbound only: a command may target a uniquely owned, live native actor at its resident host. */
+  nativeActorRecipients?: ReadonlyMap<string, ReadonlySet<string>>;
   senders?: Set<string>;
   /** Inbound only: each admitted sender's canonical identity (senderIdentities). */
   identities?: Map<string, MeshIdentity>;
@@ -4507,7 +4547,9 @@ export class MeshBridge {
           const { local, remote } = await this.#authority(refreshIfStale, direction);
           // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
           const relays = await this.options.local.relayPresence?.();
+          const nativeActorRecipients = await this.options.local.nativeActorRecipients?.();
           return { recipients: addresses(local), relayRecipients: remoteAddresses(relays ?? { hosts: [], participants: [] }),
+            ...(nativeActorRecipients ? { nativeActorRecipients } : {}),
             senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved),
             relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
         } finally { end(); }
@@ -5323,8 +5365,11 @@ export class MeshBridge {
     // The hub factory reads by topic: addressed work/owner wakes and unaddressed WAIT/ETA issue
     // records cross within its rate bound. The latter gain `to: factory` only on the hub copy
     // (smarty-dev#9349); no other broadcast does, and never hub to remote.
+    const nativeActorRecipient = direction === "toLocal" && event.topic === "fabric.control.command" &&
+      typeof event.to === "string" && isObject(event.data) && typeof event.data.targetId === "string" &&
+      rules.nativeActorRecipients?.get(event.to)?.has(event.data.targetId) === true;
     if (!((typeof event.to === "string" && (rules.recipients.has(event.to) || rules.relayRecipients?.has(event.to))) ||
-      (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
+      nativeActorRecipient || (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
       return "not addressed across";
     }
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";

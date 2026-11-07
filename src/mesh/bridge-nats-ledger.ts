@@ -384,7 +384,16 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
       // Never leave a torn line in front of later ones (load would refuse it as corruption). After a
       // failed fsync the page state is unknown, so stop appending either way: a restart reloads the file.
       this.#failed = error;
-      try { fs.ftruncateSync(fd, this.#size); fs.fsyncSync(fd); } catch { /* the reload cuts an unfinished tail */ }
+      // On Windows the append-only descriptor may lack the access needed to truncate.
+      // Open a separate read/write handle under the custody lock so rollback uses the
+      // same explicit durable-prefix boundary on every platform.
+      let rollbackFd: number | undefined;
+      try {
+        rollbackFd = fs.openSync(this.#file, "r+");
+        fs.ftruncateSync(rollbackFd, this.#size);
+        fs.fsyncSync(rollbackFd);
+      } catch { /* the reload cuts an unfinished tail */ }
+      finally { if (rollbackFd !== undefined) { try { fs.closeSync(rollbackFd); } catch { /* rollback is best effort */ } } }
       throw error;
     }
     this.#size += bytes.length;

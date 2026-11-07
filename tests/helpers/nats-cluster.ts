@@ -166,6 +166,13 @@ const ACCOUNT_LIMITS = {
   streams: 64,
   consumer: 256,
 };
+const TEST_STREAM_MAX_BYTES = 1_073_741_824;
+/** One 1-GiB inbox stream per added runtime machine, in addition to the default
+ * two inboxes, shared advisory stream and existing 1-GiB safety reserve. */
+const accountLimitsForMachines = (machines: readonly string[]) => ({
+  ...ACCOUNT_LIMITS,
+  disk_storage: ACCOUNT_LIMITS.disk_storage + (machines.length - PATH_B_MACHINES.length) * TEST_STREAM_MAX_BYTES,
+});
 const SYSTEM_LIMITS = {
   conn: -1,
   leaf: -1,
@@ -414,7 +421,7 @@ export class PathBHarness {
           },
         ];
         const appAccountJwt = encodeAccountJwt(
-          { name: "path-b-app", subject: appAccount, signingKeys: scopedKeys, limits: ACCOUNT_LIMITS },
+          { name: "path-b-app", subject: appAccount, signingKeys: scopedKeys, limits: accountLimitsForMachines(machines) },
           signerOf(operatorSigning),
           clock,
         );

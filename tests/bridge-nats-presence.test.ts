@@ -109,6 +109,13 @@ describe("NATS presence -> file mirror snapshot", () => {
     expect(presence.participants[0]).not.toHaveProperty("remoteHost");
   });
 
+  it("preserves the native runner tag needed for old-release actor discovery", () => {
+    const actor = natsRoot("34200000000000000000000000000008", "native-inc-1", {
+      kind: "actor", rootId: NATS_ROOT, runner: "native", capabilities: ["stop", "ask"],
+    });
+    expect(projectNatsMirrorRecord(actor)).toMatchObject({ runner: "native", capabilities: ["stop", "ask"] });
+  });
+
   it("never returns this link's own machine rows (no echo of mirrored file roots)", async () => {
     const w = world();
     const { side, clock } = bridge(w);

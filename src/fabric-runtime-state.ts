@@ -1084,7 +1084,6 @@ export class FabricRuntimeState {
         await initializeMeshActivation();
       },
       // Reuse committed heartbeat maintenance, never another timer/background import.
-      presencePassMs: 25_000,
       terminalActor: entry => (transport ? directoryActors : this.#actors)?.validateSessionActorTombstone(entry),
       presencePass: async () => {
         // Commit notifications are primary; reuse maintenance without delaying lease renewal on a backlog.

@@ -12,6 +12,17 @@ export interface ResidentChildLifetime {
   stop(): Promise<void>;
 }
 
+/** Orderly TERM joins ResidentHost.close(), not just signal delivery. Even idle
+ * actor scopes can retry their final registry save for 30s (in parallel, not
+ * once per actor). Use the conventional systemd service stop grace of 90s;
+ * the session-store extension's 2s deadline starts at TERM, so its expiry is
+ * not a measurement or upper bound of the host's teardown. I/O can still hang:
+ * retain bounded SIGKILL escalation and require a native exit receipt.
+ * Prior art: https://www.freedesktop.org/software/systemd/man/259/systemd.service.html
+ */
+export const RESIDENT_CHILD_TERM_GRACE_MS = 90_000;
+export const RESIDENT_CHILD_KILL_WAIT_MS = 5_000;
+
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Native exit is independent of Linux birth observation and inherited stdio.
@@ -33,10 +44,10 @@ export function watchResidentChild(child: ChildProcess): ResidentChildLifetime {
     child.once("close", record);
   });
   const stop = async (): Promise<void> => {
-    for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    for (const [signal, graceMs] of [["SIGTERM", RESIDENT_CHILD_TERM_GRACE_MS], ["SIGKILL", RESIDENT_CHILD_KILL_WAIT_MS]] as const) {
       if (exited) return;
       child.kill(signal);
-      const deadline = Date.now() + 5_000;
+      const deadline = Date.now() + graceMs;
       while (!exited && Date.now() < deadline) await delay(50);
       if (exited) return;
     }

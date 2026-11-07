@@ -2,11 +2,12 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { currentBinding } from "../src/main-drain/binding.js";
 import { assertMainInboxOpen, mainInboxDrainGate } from "../src/main-drain/gate.js";
 import { drainSlot } from "../src/main-drain/slot.js";
 import { main } from "../src/seat-drain/seam.js";
+import { resolveSeatMeshRoot } from "../src/seat-drain/run.js";
 import { createSeat, installedSeam, ROOT, runSeam, SID, type Seat } from "./seat-drain-fixture.js";
 
 // D3 drain seam (smarty-dev#15310 prep item 13): DRAIN-RESULT.md "Tests to write", challenge r1/r2 (N1-N9) and
@@ -96,6 +97,91 @@ describe.skipIf(!linux)("fabric-seat-drain, the real installed artifact run as A
     expect(result.status).toBe(2);
     expect(result.stderr).toBe("GAP: seam-not-installed [owner: fabric-v2]\n");
   }, 60_000);
+});
+
+// Regression: the sealed Pi source was 157 MB; only its first line supplies the cwd, not its body.
+// Keep reason: the real size-cap incident plus the journal ownership/no-follow trust boundary.
+describe.skipIf(!linux)("source journal header (bounded independently of session size)", () => {
+  const source = (target: Seat): string => JSON.parse(fs.readFileSync(path.join(target.runDir, "seat-run.json"), "utf8")).source.journal;
+
+  for (const bytes of [157_000_000, 314_000_000]) {
+    it(`drain accepts a sparse ${bytes}-byte source journal, not inventory-incomplete`, async () => {
+      const target = await seat();
+      fs.truncateSync(source(target), bytes);
+      expect((await inProcess(target, "drain"))).toMatchObject({ code: 0, stderr: "", receipt: { result: "pass" } });
+    });
+
+    it(`drain-recheck accepts a sparse ${bytes}-byte source journal`, async () => {
+      const target = await seat();
+      expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+      storeReceipt(target, "fence", fenceReceipt(target));
+      fs.truncateSync(source(target), bytes);
+      expect((await inProcess(target, "drain-recheck"))).toMatchObject({ code: 0, stderr: "", receipt: { result: "pass" } });
+    });
+
+    it(`drain-undo accepts a sparse ${bytes}-byte source journal and reopens admission`, async () => {
+      const target = await seat();
+      const passed = await inProcess(target, "drain");
+      expect(passed.receipt?.result).toBe("pass");
+      const digest = storeReceipt(target, "drain", passed.stdout);
+      fs.truncateSync(source(target), bytes);
+      expect((await inProcess(target, "drain-undo", undoInputs(1, digest)))).toMatchObject({ code: 0, stderr: "",
+        receipt: { result: "pass", observed: { inputsFenced: false, admissionRestored: true } } });
+      expect(target.native.state.fenced).toBe(false);
+    });
+  }
+
+  it("resume-drain gets past a large source header to the existing kube packet check", async () => {
+    const target = await seat();
+    fs.truncateSync(source(target), 157_000_000);
+    expect(await inProcess(target, "resume-drain", { pod: { name: "raw", uid: "00000000-0000-4000-8000-0000000000bb" } }))
+      .toMatchObject({ code: 2, stdout: "", stderr: "GAP: kube-unpinned [owner: fabric-v2]\n" });
+  });
+
+  it("requires a complete first line inside 64 KiB, even when its JSON fits before EOF", async () => {
+    const target = await seat();
+    const journal = source(target);
+    const header = fs.readFileSync(journal, "utf8").trimEnd();
+    for (const text of [header, `${header}${" ".repeat(65536 - Buffer.byteLength(header))}\n`,
+      `${header.slice(0, -1)},\"padding\":\"${"x".repeat(65536)}\"}\n`]) {
+      fs.writeFileSync(journal, text);
+      expect(() => resolveSeatMeshRoot(journal, SID, process.getuid!())).toThrow("source-journal-header-invalid");
+    }
+    // The last byte in the window CAN be the newline (the body need not fit).
+    fs.writeFileSync(journal, `${header}${" ".repeat(65535 - Buffer.byteLength(header))}\n`);
+    fs.truncateSync(journal, 157_000_000);
+    expect(resolveSeatMeshRoot(journal, SID, process.getuid!())).toBe(target.meshRoot);
+  });
+
+  it("loops over short reads but reads no more than the 64 KiB head window", async () => {
+    const target = await seat();
+    const journal = source(target);
+    fs.truncateSync(journal, 157_000_000);
+    const read = fs.readSync;
+    let total = 0;
+    const spy = vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, offset: number, length: number, position: number) => {
+      const count = read(fd, buffer, offset, Math.min(length, 997), position);
+      total += count;
+      return count;
+    }) as typeof fs.readSync);
+    try {
+      expect(resolveSeatMeshRoot(journal, SID, process.getuid!())).toBe(target.meshRoot);
+      expect(total).toBe(65536);
+      expect(spy.mock.calls.length).toBeGreaterThan(1);
+    } finally { spy.mockRestore(); }
+  });
+
+  it("still refuses a source journal with the wrong owner or a symlink", async () => {
+    const target = await seat();
+    const journal = source(target);
+    expect(() => resolveSeatMeshRoot(journal, SID, process.getuid!() + 1)).toThrow("source-journal-unreadable");
+    const moved = path.join(target.base, "source-moved.jsonl");
+    fs.renameSync(journal, moved);
+    fs.symlinkSync(moved, journal);
+    expect(() => resolveSeatMeshRoot(journal, SID, process.getuid!())).toThrow("source-journal-unreadable");
+    expect((await inProcess(target, "drain")).receipt).toMatchObject({ result: "refused", observed: { reason: "inventory-incomplete" } });
+    expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stdout: "", stderr: "GAP: source-journal-unreadable [owner: fabric-v2]\n" });
+  });
 });
 
 describe.skipIf(!linux)("drain counts (in-process seam, real lock and channel)", () => {

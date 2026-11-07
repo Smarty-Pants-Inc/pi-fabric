@@ -10,7 +10,7 @@ import { callMainDrain, mainDrainSocket, MainDrainClientError } from "../main-dr
 import { MAIN_DRAIN_INGRESS } from "../main-drain/control.js";
 import { mainDrainSocketPath, type MainDrainReply } from "../main-drain/protocol.js";
 import { evaluateDrain, scanCompletions, type DrainEvaluation } from "./evaluate.js";
-import { fixedKubectl, kubectl, POD_FABRIC_CLI, readPod, verifyKubeconfig, type KubeAccess } from "./kube.js";
+import { fixedKubectl, kubectl, verifyKubeconfig, type KubeAccess, type PodView } from "./kube.js";
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
   socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "./run.js";
 
@@ -69,15 +69,16 @@ export interface SeamDeps {
   python?: string;
   procRoot?: string;
   uid?: number;
-  /** Tests only: the kubectl client (production uses the fixed root-owned one) and the in-image CLI path (null: unconfirmed). */
+  /** Tests only: the kubectl client (production uses the fixed root-owned one). */
   kubectl?: string;
-  podCli?: string | null;
   /** Tests only: see the error behind a fixed GAP code. */
   onError?: (error: unknown) => void;
 }
 interface Context {
   runDir: string; request: SeamRequest; meshRoot: string; lockFd: number; uid: number; io: SeamIo; deps: SeamDeps;
   now: () => number; sleep: (ms: number) => Promise<void>; deadline: number; started: number; requestSha256: string;
+  /** Presence selects ON even when the pinned seam's owner is malformed. */
+  fencePinned?: boolean;
   /** The sealed run's `seams.fence.owner`: the owner a fence receipt must name (never a constant here). */
   fenceOwner?: string;
 }
@@ -139,7 +140,7 @@ export const main = async (argv: string[], io: SeamIo, deps: SeamDeps = {}): Pro
     const seams = sealed.run.seams as Record<string, { owner?: unknown } | undefined> | undefined;
     const fenceOwner = typeof seams?.fence?.owner === "string" && seams.fence.owner ? seams.fence.owner : undefined;
     const context: Context = { runDir, request, meshRoot: meshRoot ?? "", lockFd, uid, io, deps, now, sleep, deadline, started,
-      requestSha256: sha256(stdin), ...(fenceOwner ? { fenceOwner } : {}) };
+      requestSha256: sha256(stdin), fencePinned: Object.prototype.hasOwnProperty.call(seams, "fence"), ...(fenceOwner ? { fenceOwner } : {}) };
     if (phase === "drain") {
       if (Object.keys(request.inputs).join(",") !== "operationId") throw new SeamGap("inputs-invalid");
       if (meshRoot === undefined) return refuse(context, "inventory-incomplete", false);
@@ -488,8 +489,8 @@ const stopIntents = (context: Context): Array<{ id: string; registryRow: unknown
 
 /**
  * A's stored `drain` receipt, byte-exact under RUN/receipts/, hashing to the given value: this run, phase
- * drain, owner fabric-v2, this session. A `pass` is accepted only while RUN/receipts/fence.json is absent
- * (contract rev 4 §2, N6 iii: A rejected the pass, or died before `fence`).
+ * drain, owner fabric-v2, this session. A `pass` is accepted only before either an ON fence receipt or
+ * any journaled OFF fence stop (contract rev 4 §2, N6 iii: A rejected the pass, or died before `fence`).
  */
 const verifyDrainReceipt = (context: Context, expected: string): "pass" | "refused" => {
   const bytes = readOwned(path.join(context.runDir, "receipts", "drain.json"), context.uid, 1024 * 1024, undefined, "drain-receipt-unreadable");
@@ -499,8 +500,56 @@ const verifyDrainReceipt = (context: Context, expected: string): "pass" | "refus
   const observed = value.observed as Record<string, unknown> | undefined;
   if (value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "drain" || value.owner !== OWNER ||
     (value.result !== "refused" && value.result !== "pass") || observed?.sessionId !== context.request.sessionId) throw new SeamGap("drain-receipt-invalid");
-  if (value.result === "pass" && present(path.join(context.runDir, "receipts", "fence.json"))) throw new SeamGap("drain-pass-after-fence");
+  if (value.result === "pass" && (present(path.join(context.runDir, "receipts", "fence.json")) ||
+    readFenceJournal(context).some(offFenceDone))) throw new SeamGap("drain-pass-after-fence");
   return value.result;
+};
+
+/** A's append-only journal, with the same ownership, no-follow and size checks as the sealed-run read. */
+const readFenceJournal = (context: Context): Array<Record<string, unknown>> => {
+  const lines = readOwned(path.join(context.runDir, "seat-journal.jsonl"), context.uid, 64 * 1024 * 1024, undefined,
+    "seat-journal-unreadable").toString("utf8").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines.map(line => {
+    let row: Record<string, unknown>;
+    try {
+      const value: unknown = JSON.parse(line);
+      if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+      row = value as Record<string, unknown>;
+    } catch { throw new SeamGap("fence-off-observation-invalid"); }
+    return row;
+  });
+};
+
+/** Historical OFF stops also bar undo: a later drain completion cannot erase a stopped writer. */
+const offFenceDone = (row: Record<string, unknown>): boolean =>
+  row.event === "done" && row.step === "fence" && (row.observed as Record<string, unknown> | undefined)?.mode === "off";
+
+/** ON requires its pinned receipt; OFF requires the last fence completion after the latest completed drain. */
+const verifyFence = (context: Context): void => {
+  const journal = readFenceJournal(context);
+  if (context.fencePinned) {
+    if (journal.some(offFenceDone)) throw new SeamGap("fence-off-observation-invalid");
+    verifyFenceReceipt(context);
+    return;
+  }
+  let lastDrain = -1;
+  let lastFence = -1;
+  let lastFenceActivity = -1;
+  for (const [index, row] of journal.entries()) {
+    if (row.event === "done" && row.step === "drain") lastDrain = index;
+    if (row.event === "done" && row.step === "fence") lastFence = index;
+    if (row.step === "fence" || row.phase === "fence" || row.seam === "fence") {
+      lastFenceActivity = index;
+    }
+  }
+  if (lastFence === -1) throw new SeamGap("fence-off-observation-missing");
+  const observed = journal[lastFence]!.observed as Record<string, unknown> | undefined;
+  if (lastDrain === -1 || lastFence < lastDrain || lastFenceActivity !== lastFence || observed?.mode !== "off" ||
+    observed.writerGone !== true || typeof observed.tombstoneSha256 !== "string" || !HEX64.test(observed.tombstoneSha256) ||
+    typeof observed.stoppedUnit !== "string" || observed.stoppedUnit.length === 0) {
+    throw new SeamGap("fence-off-observation-invalid");
+  }
 };
 
 /** A's stored `fence` receipt: this run, phase fence, the sealed run's fence owner, a pass (re-review finding 3). */
@@ -650,10 +699,10 @@ const drainRestore = async (context: Context): Promise<number> => {
 
 /** drain-recheck (after `fence`, v1 terminal): the session-pending inventory, filesystem only. */
 const recheck = (context: Context): number => {
-  // Lineage (stage 1 review finding 5): this operation's drain intent, its PASSING outcome and A's fence receipt.
+  // Lineage (stage 1 review finding 5): this operation's drain intent, its PASSING outcome and A's ON/OFF fence evidence.
   if (!readIntent(context)) throw new SeamGap("intent-missing");
   if (drainOutcome(context)?.result !== "pass") throw new SeamGap("drain-not-passed");
-  verifyFenceReceipt(context);
+  verifyFence(context);
   const intentSha256 = evidence(context, "fabric-v2-drain-recheck-intent.json", { schema: "fabric-v2-drain-recheck-intent-v1",
     measured: { meshRoot: context.meshRoot, startedAt: new Date().toISOString() } });
   // The in-process `pi-fabric session pending`: exit 0 is complete; exit 1 is complete:false; a throw is any other exit.
@@ -681,17 +730,153 @@ const recheck = (context: Context): number => {
   return 0;
 };
 
-// POD_FABRIC_CLI (kube.ts): /opt/pi-fabric/dist/cli/index.js (mode 0555), with /usr/local/bin/pi-fabric pointing to
-// it (DRAIN-DESIGN.r2 Q5). The seam still checks `test -x` on it inside the Pod first: cut 2 builds a new base and must
-// re-confirm it. Tests inject SeamDeps.podCli (null: unconfirmed).
+/**
+ * P GAP 6: the pinned image has NO `pi-fabric session` command. One isolated Python exec discovers the
+ * single uid-1000 `pi`, hashes the exact --session file against A's accepted resume witness and, ONLY
+ * on equality, sends SIGTERM. No shell, cmdline inference, newest-file search or second signal exec.
+ * This is a pre-signal observation, NOT a native admission-fence API or a post-exit byte read.
+ */
+export const RESUME_DRAIN_SCRIPT = String.raw`import datetime, hashlib, json, os, signal, stat, sys
+result = dict(format=1, op='resume-drain', inputsFenced=False, signalled=False,
+              journalSha256=None, journalBytes=None, piPid=None, piStartTime=None,
+              signalAt=None, reason=None, errorClass=None, errorMessage=None)
+def refuse(reason):
+    result['reason'] = reason
+    result['errorClass'] = 'ResumeDrainRefused'
+    result['errorMessage'] = reason
+    raise ValueError(reason)
+def process_identity(pid):
+    root = '/proc/' + str(pid)
+    with open(root + '/comm') as stream:
+        comm = stream.read().rstrip('\n')
+    with open(root + '/stat') as stream:
+        start = stream.read().rsplit(') ', 1)[1].split()[19]
+    return comm, os.stat(root).st_uid, start
+def identity(value):
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+try:
+    file, expected_bytes, expected_sha = sys.argv[1:]
+    expected_bytes = int(expected_bytes)
+    matches = []
+    for name in os.listdir('/proc'):
+        if not name.isdecimal():
+            continue
+        try:
+            comm, uid, start = process_identity(int(name))
+        except FileNotFoundError:
+            continue
+        if comm == 'pi' and uid == 1000:
+            matches.append((int(name), start))
+    if len(matches) != 1:
+        refuse('pi-process-count')
+    pid, start = matches[0]
+    result.update(piPid=pid, piStartTime=start)
+    if os.path.realpath(file) != file:
+        refuse('journal-unsafe')
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        result['journalBytes'] = before.st_size
+        if not stat.S_ISREG(before.st_mode):
+            refuse('journal-unsafe')
+        if before.st_size != expected_bytes:
+            refuse('journal-changed')
+        digest = hashlib.sha256()
+        total = 0
+        while total < expected_bytes:
+            chunk = os.read(fd, min(1048576, expected_bytes - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+        result['journalSha256'] = digest.hexdigest()
+        if total != expected_bytes or digest.hexdigest() != expected_sha:
+            refuse('journal-changed')
+        if process_identity(pid) != ('pi', 1000, start):
+            refuse('pi-process-changed')
+        if identity(before) != identity(os.fstat(fd)) or identity(before) != identity(os.stat(file, follow_symlinks=False)):
+            refuse('journal-read-unstable')
+        # Same process, immediately after the final file check. A's route hold is still required:
+        # this is not an atomic kernel transaction with another process's possible journal write.
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        os.kill(pid, signal.SIGTERM)
+        result.update(inputsFenced=True, signalled=True, signalAt=stamp)
+    finally:
+        os.close(fd)
+except Exception as error:
+    if result['reason'] is None:
+        result.update(reason='check-signal-failed', errorClass=type(error).__name__[:100], errorMessage='check-signal-failed')
+print(json.dumps(result, separators=(',', ':')), flush=True)
+sys.exit(0 if result['signalled'] else 1)
+`;
 const POD_NAME = /^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/;
 const POD_UID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Local extension of the API view; kube.ts's exports are shared with the bridge and stay unchanged. */
+interface ResumePod extends Omit<PodView, "piArgs" | "natsMachine"> { journalPath: string | null; containerId: string | null; restartCount: number | null; restartPolicy: unknown }
+const readResumePod = async (access: KubeAccess, name: string, timeout: number): Promise<ResumePod | undefined> => {
+  const reply = await kubectl(access, ["-n", access.namespace, "get", "pod", name, "-o", "json"], timeout);
+  let pod: unknown;
+  try { pod = JSON.parse(reply.stdout); } catch { return undefined; }
+  if (reply.code !== 0 || !object(pod) || !object(pod.metadata) || typeof pod.metadata.uid !== "string" || !object(pod.spec)) return undefined;
+  const containers = Array.isArray(pod.spec.containers) ? pod.spec.containers.filter(object).filter(row => row.name === "pi") : [];
+  const args: unknown[] = containers.length === 1 && Array.isArray(containers[0]!.args) ? containers[0]!.args : [];
+  const index = args.indexOf("--session");
+  const file = index >= 0 && args.filter(arg => arg === "--session").length === 1 ? args[index + 1] : undefined;
+  const journalPath = typeof file === "string" && path.posix.isAbsolute(file) && path.posix.normalize(file) === file && file !== "/" && !file.includes("\0") ? file : null;
+  const statuses = object(pod.status) && Array.isArray(pod.status.containerStatuses) ? pod.status.containerStatuses.filter(object).filter(row => row.name === "pi") : [];
+  const status = statuses.length === 1 ? statuses[0] : undefined;
+  const state = object(status?.state) ? status.state : {};
+  const terminated = object(state.terminated) && Number.isSafeInteger(state.terminated.exitCode) ? { exitCode: state.terminated.exitCode as number } : null;
+  return { uid: pod.metadata.uid, nodeName: typeof pod.spec.nodeName === "string" ? pod.spec.nodeName : null,
+    piRunning: object(state.running), piTerminated: terminated, meshRoot: null, journalPath,
+    containerId: typeof status?.containerID === "string" && status.containerID ? status.containerID : null,
+    restartCount: Number.isSafeInteger(status?.restartCount) ? status!.restartCount as number : null, restartPolicy: pod.spec.restartPolicy };
+};
+
 /**
- * resume-drain (DRAIN-DESIGN.r1 §1.13, challenge r1 M9): drain the raw v2 Pod's Main through `kubectl exec`
- * of the in-image `pi-fabric session drain --exit`, bound to the pod UID. The same zero and children checks
- * run inside the Pod; a not-drained Main undoes itself there. `exited` is the pi container's own terminated
- * exitCode 0, and the pod UID must match the input pin before and after. Truthful: pass only with all three.
+ * A's O_EXCL receipts/resume.json, authenticated by its append-only seam row. Its closed observed set has
+ * journalSha256 but NO size; the same bridge's write-once outcome has measured.journal.journalBytes.
+ * Bind that size to the accepted receipt's run/session/Pod/path/hash, never to today's source journal size.
+ */
+const resumeWitness = (context: Context, journalPath: string, podUid: string): { journalSha256: string; journalBytes: number; receiptSha256: string } => {
+  const code = "resume-witness-invalid";
+  const bytes = readOwned(path.join(context.runDir, "receipts", "resume.json"), context.uid, 8 * 1024 * 1024, { mode: 0o600 }, "resume-witness-unreadable");
+  const digest = sha256(bytes);
+  const rows = readFenceJournal(context);
+  const accepted = rows.filter(row => row.event === "seam" && row.phase === "resume");
+  if (accepted.length !== 1 || accepted[0]!.seam !== "bridge" || accepted[0]!.sha256 !== digest ||
+    !rows.some(row => row.event === "done" && row.step === "resume")) throw new SeamGap(code);
+  let value: unknown, outcome: unknown;
+  try {
+    value = JSON.parse(bytes.toString("utf8"));
+    outcome = JSON.parse(readOwned(path.join(context.runDir, "fabric-v2-bridge-resume-outcome.json"), context.uid,
+      8 * 1024 * 1024, { mode: 0o600 }, "resume-outcome-unreadable").toString("utf8"));
+  } catch { throw new SeamGap(code); }
+  if (!object(value) || Object.keys(value).sort().join(",") !== "observed,owner,phase,result,run,schema" ||
+    value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "resume" || value.owner !== OWNER ||
+    value.result !== "pass" || !object(value.observed)) throw new SeamGap(code);
+  const seen = value.observed;
+  if (Object.keys(seen).sort().join(",") !== "appendedSinceSeal,journal,journalSha256,leafId,podUid,sessionId,suffixBase64" ||
+    seen.sessionId !== context.request.sessionId || seen.podUid !== podUid || seen.journal !== journalPath ||
+    typeof seen.journalSha256 !== "string" || !HEX64.test(seen.journalSha256)) throw new SeamGap(code);
+  if (!object(outcome) || outcome.schema !== "fabric-v2-bridge-resume-outcome-v1" || outcome.owner !== OWNER || outcome.run !== context.request.run ||
+    outcome.phase !== "resume" || outcome.sessionId !== context.request.sessionId || outcome.result !== "pass" || !object(outcome.observed) ||
+    !object(outcome.measured) || !object(outcome.measured.journal)) throw new SeamGap(code);
+  for (const key of ["sessionId", "podUid", "journal", "journalSha256", "leafId", "suffixBase64"]) {
+    if (outcome.observed[key] !== seen[key]) throw new SeamGap(code);
+  }
+  const journal = outcome.measured.journal;
+  if (journal.journalSha256 !== seen.journalSha256 || !Number.isSafeInteger(journal.journalBytes) || (journal.journalBytes as number) <= 0) throw new SeamGap(code);
+  return { journalSha256: seen.journalSha256, journalBytes: journal.journalBytes as number, receiptSha256: digest };
+};
+
+/**
+ * CLI-free resume-drain: unchanged bytes BEFORE SIGTERM, then the same Pod/container observed terminal,
+ * exit code 0 (EOF) or 143 (pi's caught SIGTERM). No new reader Pod and no claim of a post-exit hash.
+ * A still receives EXACTLY {podUid, inputsFenced, exited}; richer measurements stay in RUN's outcome.
  */
 const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number> => {
   const { request } = context;
@@ -706,7 +891,7 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
     namespace: sealed.run.namespace as string, server: kube.server, caSha256: kube.caSha256, home: sealed.seat.home };
   const remaining = (): number => Math.max(0, context.deadline - context.now());
   await verifyKubeconfig(access, Math.min(30_000, remaining()));
-  const before = await readPod(access, pod.name, Math.min(30_000, remaining()));
+  const before = await readResumePod(access, pod.name, Math.min(30_000, remaining()));
   if (before && before.uid !== pod.uid) throw new SeamGap("pod-uid-mismatch");
   // The sealed run's target node (re-review finding 4): the raw Pod A created there, nowhere else.
   const target = sealed.run.target as Record<string, unknown> | undefined;
@@ -716,53 +901,69 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
   const intentSha256 = evidence(context, "fabric-v2-resume-drain-intent.json", { schema: "fabric-v2-resume-drain-intent-v1", generation,
     podUid: pod.uid, requestSha256: context.requestSha256, measured: { kubectl: access.kubectl, server: access.server, before: before ?? null,
       interpreter: interpreterIdentity(), startedAt: new Date().toISOString() } });
-  const cli = context.deps.podCli !== undefined ? context.deps.podCli : POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null;
   let reason: string | null = null;
+  let errorClass: string | null = null, errorMessage: string | null = null;
   let exec: Record<string, unknown> | undefined;
-  let execAttempted = false;
+  let execAttempted = false, signalled = false, inputsFenced = false, exited = false;
   let execCode: number | null = null;
-  // The CLI's last stdout line, bounded, kept even when it is a refusal ({format, error}) for triage.
-  let podLine: string | null = null;
-  if (!before) reason = "pod-unreadable";
-  else if (!cli) reason = "pod-cli-unconfirmed";
-  else if (!before.piRunning || !before.meshRoot) reason = before.piRunning ? "pod-mesh-root-unknown" : "pod-not-running";
-  else if ((await kubectl(access, ["-n", access.namespace, "exec", pod.name, "-c", "pi", "--", "test", "-x", cli],
-    Math.min(30_000, remaining()))).code !== 0) reason = "pod-cli-missing";
-  else {
-    const deadlineS = Math.max(1, Math.min(540, Math.floor(remaining() / 1000) - 30));
-    execAttempted = true;
-    const result = await kubectl(access, ["-n", access.namespace, "exec", pod.name, "-c", "pi", "--", cli, "session", "drain", request.sessionId,
-      "--mesh", before.meshRoot, "--exit", "--pod-uid", pod.uid, "--run", request.run, "--run-sha256", request.runSha256,
-      "--operation-id", request.operationId, "--generation", generation, "--deadline-s", String(deadlineS)], remaining());
-    execCode = result.code;
-    const line = result.stdout.trim().split("\n").at(-1) ?? "";
-    podLine = line.slice(0, 4096);
-    try { exec = JSON.parse(line) as Record<string, unknown>; } catch { exec = undefined; }
-    if (!exec || exec.format !== 1 || exec.sessionId !== request.sessionId || exec.op !== "exit") { reason = "pod-drain-unreadable"; exec = undefined; }
-    // The complete exit response, with a zero kubectl exit (re-review finding 5).
-    else if (result.code !== 0 || exec.drained !== true || exec.exiting !== true || exec.inputsFenced !== true) {
-      reason = exec.exiting === true ? "pod-exit-incomplete" : "pod-not-drained";
-    }
-  }
-  // After ANY attempted exec, re-read the Pod: the pi container's own exit status, polled until it terminates or the
-  // bound ends (only when it said it is exiting); the UID must not change.
   let after = before;
-  if (execAttempted) {
-    for (;;) {
-      after = await readPod(access, pod.name, Math.min(30_000, Math.max(1_000, remaining())));
-      if (!after || after.piTerminated || exec?.exiting !== true || remaining() <= 2_000) break;
-      await context.sleep(2_000);
+  let witness: ReturnType<typeof resumeWitness> | undefined;
+  try {
+    if (!before) reason = "pod-unreadable";
+    else if (!before.piRunning || before.piTerminated) reason = "pod-not-running";
+    else if (!before.journalPath) reason = "pod-session-arg-unknown";
+    else if (before.restartPolicy !== "Never" || before.restartCount !== 0 || !before.containerId) reason = "pod-container-unpinned";
+    else {
+      witness = resumeWitness(context, before.journalPath, pod.uid);
+      if (remaining() < 1_000) throw new SeamGap("phase-deadline");
+      execAttempted = true;
+      const result = await kubectl(access, ["-n", access.namespace, "exec", pod.name, "-c", "pi", "--", "/usr/bin/python3", "-I", "-c",
+        RESUME_DRAIN_SCRIPT, before.journalPath, String(witness.journalBytes), witness.journalSha256], remaining());
+      execCode = result.code;
+      // Exactly one bounded JSON line; ignore neither garbage prefixes nor a truncated response.
+      if (result.stdout.length <= 4096 && /^[^\r\n]+\n?$/.test(result.stdout)) {
+        try { const value: unknown = JSON.parse(result.stdout); if (object(value)) exec = value; } catch { /* refused below */ }
+      }
+      const valid = exec?.format === 1 && exec.op === "resume-drain" && typeof exec.inputsFenced === "boolean" && typeof exec.signalled === "boolean";
+      inputsFenced = valid && exec!.inputsFenced === true && exec!.journalSha256 === witness.journalSha256 && exec!.journalBytes === witness.journalBytes;
+      signalled = result.code === 0 && inputsFenced && exec!.signalled === true && Number.isSafeInteger(exec!.piPid) && (exec!.piPid as number) > 0 &&
+        typeof exec!.piStartTime === "string" && /^[0-9]+$/.test(exec!.piStartTime) && typeof exec!.signalAt === "string" &&
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(exec!.signalAt) && exec!.reason === null;
+      if (!signalled) reason = valid && typeof exec!.reason === "string" && /^[a-z][a-z0-9-]{0,99}$/.test(exec!.reason)
+        ? exec!.reason : result.code !== 0 ? "pod-exec-failed" : "pod-check-signal-unreadable";
+      // Existing bounded terminal observation, not a new watcher: API container state is the event source;
+      // 1 s polling is the safety net, clipped by the original phase deadline. Never signal again.
+      for (;;) {
+        if (remaining() <= 1_000) { reason ??= "phase-deadline"; break; }
+        after = await readResumePod(access, pod.name, Math.min(30_000, remaining()));
+        if (remaining() <= 0) { reason ??= "phase-deadline"; break; }
+        if (!after) { reason = "pod-unreadable"; break; }
+        if (after.uid !== pod.uid) { reason = "pod-uid-changed"; break; }
+        if (after.nodeName !== target.node) { reason = "pod-node-mismatch"; break; }
+        if (after.containerId !== before.containerId || after.restartCount !== before.restartCount) { reason = "pod-container-changed"; break; }
+        if (after.piTerminated) {
+          exited = signalled && [0, 143].includes(after.piTerminated.exitCode);
+          if (!exited) reason ??= "pod-exit-code-unaccepted";
+          break;
+        }
+        if (!signalled) break;
+        await context.sleep(Math.min(POLL_MS, Math.max(0, remaining() - 1_000)));
+      }
+      if (!exited) reason ??= "pod-exit-unconfirmed";
     }
+  } catch (error) {
+    reason = error instanceof SeamGap ? error.code : "resume-drain-internal";
+    errorClass = error instanceof SeamGap ? "SeamGap" : "ResumeDrainError";
+    errorMessage = reason; // Fixed code, never a stack, file content or an unsanitized child error.
   }
-  const exited = execAttempted && after?.uid === pod.uid && after.piTerminated?.exitCode === 0;
-  // Fence state is the CLI's own report; when an attempted exec gave no complete report it is unknown, so fenced.
-  const inputsFenced = execAttempted ? exec === undefined || exec.inputsFenced !== false : false;
-  if (!reason && !exited) reason = after?.uid === pod.uid ? "pod-exit-unconfirmed" : "pod-uid-changed";
-  if (execAttempted && after && after.uid !== pod.uid) reason = "pod-uid-changed";
   const observed = { podUid: pod.uid, inputsFenced, exited };
   const passed = reason === null && inputsFenced && exited;
+  if (!passed) { errorClass ??= "ResumeDrainRefused"; errorMessage ??= reason ?? "resume-drain-incomplete"; }
   evidence(context, "fabric-v2-resume-drain-outcome.json", { schema: "fabric-v2-resume-drain-outcome-v1", result: passed ? "pass" : "refused",
-    reason, intentSha256, observed, measured: { before: before ?? null, after: after ?? null, execCode }, asserted: { podDrain: exec ?? null, podLine } });
+    reason, errorClass, errorMessage, intentSha256, observed, measured: { before: before ?? null, after: after ?? null, execAttempted, execCode,
+      witness: witness ?? null, journalSha256: exec?.journalSha256 ?? null, journalBytes: exec?.journalBytes ?? null,
+      piPid: exec?.piPid ?? null, piStartTime: exec?.piStartTime ?? null, signalAt: exec?.signalAt ?? null,
+      exitCode: after?.piTerminated?.exitCode ?? null, journalAfterExitChecked: false, reason }, asserted: { checkSignal: exec ?? null } });
   context.io.stdout(receipt(request, passed ? "pass" : "refused", observed));
   return 0;
 };

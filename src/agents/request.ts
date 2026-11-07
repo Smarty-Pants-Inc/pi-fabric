@@ -1,4 +1,5 @@
 import type { AgentRunRequest } from "./types.js";
+import { normalizeAgentAskId } from "./ask-id.js";
 import { normalizeAgentRequires } from "./input-validation.js";
 import { normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 import { isFabricThinking, normalizeThinkingBounds } from "../thinking.js";
@@ -80,6 +81,7 @@ export const normalizeAgentRunRequest = (
   if (args.sessionImport !== undefined && (transport !== "sandbox" || args.profile !== undefined && args.profile !== "lead" && args.profile !== "lane" || typeof args.branch !== "string" || !args.branch)) {
     throw new Error("Sandbox sessionImport requires sandbox transport, a lead/lane profile, and branch");
   }
+  const askId = normalizeAgentAskId(args.askId);
   const requires = normalizeAgentRequires(args.requires);
   const needs = normalizeAgentCapabilityTokens(args.needs);
   // Preserve explicit bounds, including ignored tiny values, for the manager's
@@ -100,6 +102,7 @@ export const normalizeAgentRunRequest = (
   }
   return {
     task: String(args.task),
+    ...(askId !== undefined ? { askId } : {}),
     ...(args.complexity !== undefined ? { complexity: args.complexity as NonNullable<AgentRunRequest["complexity"]> } : {}),
     ...(args.profile !== undefined ? { profile: args.profile as NonNullable<AgentRunRequest["profile"]> } : {}),
     ...(args.branch !== undefined ? { branch: args.branch as string } : {}),

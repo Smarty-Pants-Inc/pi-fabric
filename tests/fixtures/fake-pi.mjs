@@ -348,6 +348,7 @@ switch (behavior) {
         role: "assistant",
         content: JSON.stringify({
           lineage: process.env.PI_FABRIC_LINEAGE ?? null,
+          askId: process.env.PI_FABRIC_ASK_ID ?? null,
           writePolicy: process.env.PI_FABRIC_WRITE_POLICY ?? null,
           scope: process.env.PI_FABRIC_SCOPE ?? null,
           scopeFile: process.env.PI_FABRIC_SCOPE_FILE ?? null,

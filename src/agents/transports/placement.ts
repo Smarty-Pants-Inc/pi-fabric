@@ -67,7 +67,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     id: request.id, cwd: request.cwd, task, minutes: String(Math.max(1, Math.ceil(timeoutMs / 60_000))),
     model: args.get("--model") ?? "", thinking: args.get("--thinking") ?? "high",
   };
-  let environment = taskAgentEnvironment();
+  let environment: NodeJS.ProcessEnv = { ...taskAgentEnvironment(), PI_FABRIC_ASK_ID: args.get("--ask-id") };
   // The launcher binds its inbox notification to the Pi caller, not this child.
   environment.PI_SESSION_ID = args.get("--fabric-session-id") ?? environment.PI_SESSION_ID;
   const prepared = await preflightFleetPlacement(request, config, config.command.map(entry => render(entry, values)), task, environment, preflightDeadline, selectedHost);
@@ -93,6 +93,8 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   const audit = (type: string, data: Record<string, unknown>) => fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id: request.id, ...data }) + "\n", { mode: 0o600 });
   const base: AgentRunRecord = {
     id: request.id, name: request.name, task, runner: "pi", transport: "process", cwd: request.cwd,
+    ...(args.has("--ask-id-state") ? { askId: args.get("--ask-id") ?? null,
+      askIdState: args.get("--ask-id-state") as NonNullable<AgentRunRecord["askIdState"]> } : {}),
     status: "running", startedAt, updatedAt: startedAt, turns: 0, toolCalls: 0, text: "",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     ...(values.model ? { model: values.model } : {}),

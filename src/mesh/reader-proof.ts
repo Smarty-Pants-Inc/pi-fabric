@@ -218,7 +218,7 @@ export const scanStateDbHolders = (root: string, scan: ProcScanOptions = {}): { 
     try { fds = readFdDir(fdDir); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; // exited
       // ponytail: known limit, an accepted security gap (smarty-dev#7936,
-      // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187):
+      // REFERENCES.md#reader-proof-7936):
       // an unreadable fd dir whose process holds state.db open WITHOUT any SQLite lock (not a WAL
       // connection) is not detected HERE; WAL connections always hold a lock on -shm, which /proc/locks shows.
       // The write-lease probe (probeStateDbLeases) catches such a holder when it opened before the probe;

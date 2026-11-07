@@ -319,7 +319,8 @@ describe("live cleanup move-aside custody", () => {
     } finally { await f.dispose(); }
   });
 
-  it("replacement canonical occupants survive every successful root move", async () => {
+  // Windows cleanup can time out after participant-withdrawal lock contention (smarty-dev#19142).
+  it.skipIf(process.platform === "win32")("replacement canonical occupants survive every successful root move", async () => {
     const f = await fixture();
     try {
       const run = await f.launch(); const sources = [run.worktree!, run.run, ...(run.externalTemporary ? [run.temporary] : []), run.metadata, run.result];

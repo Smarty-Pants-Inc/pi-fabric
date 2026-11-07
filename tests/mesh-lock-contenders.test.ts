@@ -51,6 +51,20 @@ type Claim = { key: string; writer: string; payload: string };
 type Report = { pid: number; claimed: Claim[]; published: { key: string; id: string }[];
   conflicts: string[]; waits: number[]; timeout: null | { phase: string; key: string; code: string; name: string } };
 
+function childResultSucceeded(code: number | null, stderr: string): boolean {
+  return code === 0 && stderr.replace(/^\[pi-fabric\] FABRIC_MESH_STATE_ACL_ADVISORY: [^\r\n]*(?:\r?\n|$)/gm, "") === "";
+}
+
+it("child result gate ignores only mesh ACL advisory lines", () => {
+  const advisory = "[pi-fabric] FABRIC_MESH_STATE_ACL_ADVISORY: ";
+  expect(childResultSucceeded(0, advisory + "read-only state\n")).toBe(true);
+  expect(childResultSucceeded(0, advisory + "one\r\n" + advisory + "two")).toBe(true);
+  expect(childResultSucceeded(0, advisory + "read-only state\nother diagnostic")).toBe(false);
+  expect(childResultSucceeded(0, advisory + "read-only state\n \t\n")).toBe(false);
+  expect(childResultSucceeded(0, "other " + advisory + "read-only state")).toBe(false);
+  expect(childResultSucceeded(1, advisory + "read-only state\n")).toBe(false);
+});
+
 it.each(["file", "sqlite"] as const)("16 real %s-state contenders preserve CAS claims and FILE publications", async stateBackend => {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-contenders-"));
   const root = path.join(scratch, "mesh");
@@ -80,7 +94,7 @@ it.each(["file", "sqlite"] as const)("16 real %s-state contenders preserve CAS c
       exits.push(new Promise(resolve => child.once("close", () => resolve())));
       return new Promise<Report>((resolve, reject) => {
         child.once("error", reject);
-        child.once("close", code => code === 0 && !stderr ? resolve(JSON.parse(stdout.trim().split("\n").at(-1)!))
+        child.once("close", code => childResultSucceeded(code, stderr) ? resolve(JSON.parse(stdout.trim().split("\n").at(-1)!))
           : reject(new Error("child " + index + " exit " + code + ": " + stderr)));
       });
     });

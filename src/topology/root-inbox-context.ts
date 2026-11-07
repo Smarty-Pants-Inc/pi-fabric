@@ -1,5 +1,9 @@
 import { ROOT_INBOX_CUSTOM_TYPE, type RootInboxReceiptVerifier } from "./root-inbox-shared.js";
 
+// Reuse this stable lazy entry for actual delivery as well as inbox-context projection.
+export { deliverRootInbox } from "./root-inbox-delivery.js";
+export { rootInboxMessage } from "./root-inbox-shared.js";
+
 /**
  * The model sees each root inbox event once (smarty-dev#8962). The inbox acks an event as soon as
  * its message enters a turn, but copies Pi had already queued before that ack (a second followUp

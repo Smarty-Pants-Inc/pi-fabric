@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshEvent } from "../mesh/store.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, fabricWakeMessage } from "../fabric-provenance.js";
-import { rootInboxBudget, rootInboxMessage, type RootInboxEvent } from "./root-inbox-shared.js";
+import { rootInboxBudget, rootInboxMessage, rootInboxDrains, type RootInboxEvent } from "./root-inbox-shared.js";
+export { pendingRootInboxCarriers, type RootInboxCarrier, type RootInboxCarrierOptions } from "./root-inbox-shared.js";
 
 /** Retained/mixed-version events need positive, recorded admission evidence. */
 const eventProvenance = (event: MeshEvent) => event.verification === "mesh" || event.verification === "bridge"
@@ -48,7 +49,10 @@ export const deliverRootInbox = (
     const issued = fabricWakeMessage(pi, message, delivery, wakeCauses);
     // Wake stamping can replace details; register after stamping, before native ingestion.
     if (issued.details && typeof issued.details === "object") onIssued?.(issued.details, issued.content);
-    pi.sendMessage(issued, provenance ? fabricProvenanceOptions(pi, delivery, provenance) : delivery);
+    const nativeOptions = provenance ? fabricProvenanceOptions(pi, delivery, provenance) : delivery;
+    const drain = rootInboxDrains.get(pi);
+    if (drain) drain.send(issued, nativeOptions, first.from);
+    else pi.sendMessage(issued, nativeOptions);
     start = end;
   }
   return events.map((event) => event.id);

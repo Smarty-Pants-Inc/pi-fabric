@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../core/session-receipts.js";
 import type { MeshEvent } from "../mesh/store.js";
 
@@ -16,6 +17,16 @@ import type { MeshEvent } from "../mesh/store.js";
  */
 export const ROOT_ID_PREFIX = "session:";
 export const ROOT_INBOX_CUSTOM_TYPE = "pi-fabric-inbox";
+
+export type RootInboxCarrier = Parameters<ExtensionAPI["sendMessage"]>[0];
+export type RootInboxCarrierOptions = Parameters<ExtensionAPI["sendMessage"]>[1];
+// Bridge only: the existing Main followUp FIFO owns transient carriers; RootInbox keeps
+// durable custody. Co-locate with already-shared metadata, not the delivery renderer.
+export const rootInboxDrains = new WeakMap<ExtensionAPI, {
+  send(message: RootInboxCarrier, options: RootInboxCarrierOptions, from: MeshEvent["from"]): void;
+  pending(): readonly RootInboxCarrier[];
+}>();
+export const pendingRootInboxCarriers = (pi: ExtensionAPI): readonly RootInboxCarrier[] => rootInboxDrains.get(pi)?.pending() ?? [];
 /** The custom type Main gives a delivered steer or follow-up (src/main-agent.ts deliverAgent). */
 const AGENT_MESSAGE_CUSTOM_TYPE = "pi-fabric-agent-message";
 /** Expire addressed work on first drain, including cursors saved by older runtimes. */

@@ -37,6 +37,7 @@ const stable = [
   "cli/index.js",
 ];
 const lazy = [
+  "actors/registry-payloads.js",
   "actors/slot-authority.js",
   "commands/slot-import.js",
   "config.js",

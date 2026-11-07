@@ -63,6 +63,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_PROJECT_AGENT_AMBIGUOUS: "FabricProjectAgentAmbiguousError",
   FABRIC_PROJECT_LEAD_INVALID: "FabricProjectLeadInvalidError",
   FABRIC_AGENT_SPAWN_FORBIDDEN: "AgentSpawnForbiddenError",
+  FABRIC_PYTHON_RUNTIME_POLICY: "FabricPythonRuntimePolicyError",
 });
 const guestFabricErrorMetadata = (error: unknown): Record<string, string | boolean> | undefined => {
   if (!(error instanceof Error)) return undefined;

@@ -372,7 +372,7 @@ const actorRequest = (
     runner,
     ...(kernel !== undefined ? { kernel } : {}),
     ...(args.pythonRuntime !== undefined
-      ? { pythonRuntime: manager.resolvePythonRuntime(args.pythonRuntime as FabricPythonRuntime) }
+      ? { pythonRuntime: manager.resolveActorPythonRuntime(args.pythonRuntime as FabricPythonRuntime) }
       : {}),
     ...(events ? { events } : {}),
     ...(eventsStartAt !== undefined ? { eventsStartAt } : {}),
@@ -811,7 +811,7 @@ export class AgentsProvider implements FabricProvider {
   ): Record<string, unknown> {
     // Optional-field normalization drops null; reject an explicit invalid runtime first.
     if ((actionName === "create" || actionName === "createActor") && args.pythonRuntime !== undefined) {
-      this.manager.resolvePythonRuntime(args.pythonRuntime as FabricPythonRuntime);
+      this.manager.resolveActorPythonRuntime(args.pythonRuntime as FabricPythonRuntime);
     }
     return normalizeAgentsArgs(actionName, args);
   }
@@ -2134,7 +2134,7 @@ export class AgentsProvider implements FabricProvider {
       ...baseRequest,
       runner: request.runner ?? this.manager.config.runner,
       extensions,
-      ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
+      ...(kernel ? { kernel, pythonRuntime: this.manager.resolveActorPythonRuntime(request.pythonRuntime) } : {}),
       ...(principalScope ? { principalScope } : {}),
     };
     if (routerAdmission) this.#creationAdmissions.set(request, routerAdmission);

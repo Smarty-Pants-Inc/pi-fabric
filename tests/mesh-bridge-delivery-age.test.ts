@@ -75,6 +75,19 @@ describe("bridge per-direction delivery age", () => {
     expect(lines[0]).toContain("toLocal count=0");
   });
 
+  it("does not count a durable event refusal as a delivered event or recover an existing delivery outage", async () => {
+    vi.useFakeTimers({ now: 1_800_000_000_000 });
+    const alarms: BridgeDeliveryAgeAlarm[] = [], lines: string[] = [];
+    const monitor = new BridgeDeliveryAgeMonitor({ host: "hub", peer: "far", thresholdMs: 30,
+      clock: Date.now, monotonic: Date.now, alarm: alarm => { alarms.push(alarm); }, log: line => lines.push(line) });
+    monitor.begin("toRemote", baseEvent(Date.now() - 100))!.complete(Date.now());
+    expect(alarms).toHaveLength(1);
+    await monitor.track("toRemote", baseEvent(Date.now()), async () => ({ kind: "refused" as const, sequence: 0 }));
+    expect(alarms).toHaveLength(1); // no false recovery from a refused event
+    monitor.close();
+    expect(lines[0]).toContain("toRemote count=1"); // only the real delivery, not the refusal
+  });
+
   it("alarms on delayed durable receipt even when the destination append itself is fast", async () => {
     vi.useFakeTimers({ now: 1_800_000_000_000 });
     const start = Date.now();

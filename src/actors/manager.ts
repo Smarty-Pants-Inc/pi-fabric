@@ -959,7 +959,7 @@ export class ActorManager {
   readonly #draining = new Map<string, ManagedActor>();
   /** A fallback resumes only the exact drain generation that launched this run. */
   readonly #runReconciliations = new Map<string, {
-    runId: string; settle: (result: AgentRunResult) => void; pending?: Promise<void>; retryAt?: number;
+    runId: string; settle?: (result: AgentRunResult) => void; pending?: Promise<void>; retryAt?: number;
   }>();
   /**
    * smarty-dev#6337: the open stuck-preparing episode per actor, notified at most once. Preparation
@@ -1097,6 +1097,8 @@ export class ActorManager {
   /** A failed close barrier keeps custody and pending memory, but never rearms settlement. */
   #settledClosePending = false;
   #closing = false;
+  /** Owned drains may settle during close, but never after its handoff completes. */
+  #closeCompleted = false;
   #closePromise: Promise<void> | undefined;
   #releasePaused = false;
   #releaseStrict = false;
@@ -5437,7 +5439,10 @@ export class ActorManager {
           actor.lastError ?? `${actor.name} (${actor.id}) pending checkpoint failed`).join("; ")}`));
       }
       this.#closing = true;
-      this.#closePromise = this.#close().finally(() => this.#registry.releaseReadCache());
+      this.#closePromise = this.#close().finally(() => {
+        this.#closeCompleted = true;
+        this.#registry.releaseReadCache();
+      });
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
       // a worker while shutdown waits for a deferred maintenance slice. Cache the
@@ -5532,7 +5537,7 @@ export class ActorManager {
       for (const actor of owned) {
         const pending = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
           ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
-        for (const runId of pending) await this.#retainRunLog(actor, runId).catch(() => undefined);
+        for (const runId of pending) await this.#retainRunLog(actor, runId, false, undefined, true).catch(() => undefined);
       }
       for (const actor of owned) {
         if (actor.status !== "stopped" && actor.status !== "dormant") actor.status = "idle";
@@ -6548,6 +6553,8 @@ export class ActorManager {
         let committedRefs: string[] | undefined;
         let preLaunch = true;
         let workerLaunched = false;
+        let launchedWorker: ReturnType<AgentManager["workerIdentity"]>;
+        let recoveredNativeRun = false;
         let runEvidence: readonly string[] | undefined;
         const preparationAbort = new AbortController();
         try {
@@ -6649,9 +6656,19 @@ export class ActorManager {
               ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
             (handle) => {
+              // Bind the real worker before cancellation/ownership handling can
+              // bypass result assignment. A queued handle is not launch evidence.
+              runId = handle.id;
+              workerLaunched = true;
+              launchedWorker = this.agents.workerIdentity(handle.id);
               this.#noteSlotRun(actor, handle.id);
+              if (this.#closing || actor.abortController !== abortController || this.#runningActor(actor.id) !== actor ||
+                  !this.#canManage(actor.id) || !this.#slotCurrent(actor)) return;
+              const liveAtLaunch = this.#actors.get(actor.id);
+              if (!liveAtLaunch || this.#lineage(liveAtLaunch) !== this.#lineage(actor) ||
+                  liveAtLaunch.sessionFile !== actor.sessionFile) return;
+              actor.lastRunId = liveAtLaunch.lastRunId = handle.id;
               // Only a launched worker supersedes the previous cleanup receipt.
-              const liveAtLaunch = this.#liveActor(actor);
               delete actor.lastCleanedRunWorker;
               delete liveAtLaunch.lastCleanedRunWorker;
               // AgentManager can canonicalize a selector after permit admission. Use
@@ -6661,7 +6678,6 @@ export class ActorManager {
                 ...(launchBinding.modelReason !== undefined ? { modelReason: launchBinding.modelReason } : {}),
                 ...(handle.thinking ? { thinking: handle.thinking } : {}),
               });
-              workerLaunched = true;
               const events = this.#batchItems(actor.id, item);
               for (const event of events) {
                 event.launchEvidenceVersion = 1;
@@ -6708,6 +6724,9 @@ export class ActorManager {
               return !this.#persistent || this.#persistQueue(actor.id, true, false, undefined, false, true);
             },
           ), reconciled]);
+          // A completed close may have handed this durable batch to a replacement
+          // manager. Until then, its owned drain still owes normal settlement.
+          if (this.#closeCompleted) continue;
           runId = result.id;
           runLost = this.agents.actorRunLost(result.id);
           this.#noteSlotRun(actor, result.id);
@@ -6720,6 +6739,20 @@ export class ActorManager {
           runCompleted = result.status === "completed";
           enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped" || isRecoveredDurableStop(result);
+          const recoveredProof = !workerLaunched
+            ? this.agents.actorWorkerStopProof(result.id, actor.id, actor.sessionFile) : undefined;
+          if (recoveredProof && actor.abortController === abortController && this.#runningActor(actor.id) === actor &&
+              this.#canManage(actor.id) && this.#slotCurrent(actor)) {
+            const live = this.#actors.get(actor.id);
+            if (live && this.#lineage(live) === this.#lineage(actor) && live.sessionFile === actor.sessionFile) {
+              // A durable native proof is a real prior launch, unlike a synthetic
+              // recovery receipt. Never resurrect R0 merely because no callback ran here.
+              recoveredNativeRun = true;
+              actor.lastRunId = live.lastRunId = result.id;
+              delete actor.lastCleanedRunWorker;
+              delete live.lastCleanedRunWorker;
+            }
+          }
           const retryIdentity = this.#unstartedReplayId(item);
           const explicitlyCancelled = this.#batchItems(actor.id, item).some(event =>
             this.#cancelledInFlight.get(actor.id)?.has(event.id));
@@ -6757,7 +6790,10 @@ export class ActorManager {
           if (!workerLaunched && result.status === "failed" && result.launchDenial === "lane-unresolved") {
             throw new ActorLaneUnresolvedLaunchError(result.error ?? "model exception lane unresolved; no worker started");
           }
-          actor.lastRunId = result.id;
+          if (workerLaunched || recoveredProof ||
+              !loadedLastCleanedRunWorker(actor.lastCleanedRunWorker, actor.id, actor.lastRunId)) {
+            actor.lastRunId = result.id;
+          }
           if (unstartedRedrive) continue;
           if (result.contextUsage) {
             const live = this.#liveActor(actor);
@@ -6863,7 +6899,7 @@ export class ActorManager {
           }
           actor.updatedAt = Date.now();
           const beforeDelivery = await this.#deliveryValidity(actor, item);
-          if (!this.#canManage(actor.id) || !this.#slotCurrent(actor)) {
+          if (this.#closeCompleted || !this.#canManage(actor.id) || !this.#slotCurrent(actor)) {
             throw new Error(`Fabric actor ownership or slot admission moved before delivery: ${actor.id}`);
           }
           if (!beforeDelivery.valid) {
@@ -6886,6 +6922,7 @@ export class ActorManager {
               const reason = `Fabric actor ${actor.name} (${actor.id}): its recovered answer's delivery receipt could not be written`;
               diagnostics.warn("src/actors/manager.ts", `[pi-fabric] ${reason} (smarty-dev#8935)`);
               await new Promise(resolve => setTimeout(resolve, ENODEV_RECEIPT_RETRY_MS));
+              if (this.#closeCompleted) continue;
               this.#park(actor, [item], reason);
               this.#scheduleRestoreParked();
               continue;
@@ -6904,6 +6941,7 @@ export class ActorManager {
               ...(message.data !== undefined ? { data: message.data } : {}),
             }, actor)
             .catch(() => undefined);
+          if (this.#closeCompleted) continue;
           // pi-fabric#912 round 6: a replay still hands the answer to the host. The mesh event stays exactly once
           // (dedupeKey); the host hand-off is at least once, never lost (a save may persist the record before this).
           if (
@@ -6914,6 +6952,7 @@ export class ActorManager {
             const delivery = actor.delivery;
             try {
               await this.#withSlotPublication(actor, () => {
+                if (this.#closeCompleted) return;
                 this.onDeliver({
                   actor: this.#publicInfo(actor),
                   message: structuredClone(message),
@@ -6923,6 +6962,7 @@ export class ActorManager {
               });
             } catch { /* skip non-cloneable or undeliverable message */ }
           }
+          if (this.#closeCompleted) continue;
           item.resolve?.(structuredClone(message));
           if (message.action === "stop") {
             this.#clearSettledWindows(actor.id);
@@ -6938,6 +6978,7 @@ export class ActorManager {
             );
           }
         } catch (error) {
+          if (this.#closeCompleted) continue;
           const message = error instanceof Error ? error.message : String(error);
           const preparationKind = preparationFailureKind(error);
           if ((error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched") ||
@@ -7061,6 +7102,21 @@ export class ActorManager {
               .catch((error: unknown) => this.#recordPreparationFailure(actor, error));
             else await capabilityLease.release().catch(() => undefined);
           }
+          if (this.#closeCompleted) {
+            // Release only this incarnation's local join. In particular, do not
+            // ack, archive-commit or rewrite the replacement's restored batch.
+            delete actor.abortController;
+            delete actor.preparing;
+            delete actor.inFlightRun;
+            this.#endPreparationClock(actor.id, item.id);
+            this.#runReconciliations.delete(actor.id);
+            // Only local retry bookkeeping is retired here. The durable source
+            // marker remains for the replacement's proof/archive transfer.
+            this.#pendingRunArchives.delete(actor.id);
+            if (this.#inFlight.get(actor.id) === item) this.#inFlight.delete(actor.id);
+            this.#inFlightBatches.delete(actor.id);
+            continue;
+          }
           // Retain a durable copy of the run's event log + status in the
           // actor's directory so agents.log / /fabric log can inspect what the
           // actor sent to and received from its model, even after a successful
@@ -7071,7 +7127,10 @@ export class ActorManager {
           try {
             let archived = false;
             if (runId) {
-              archived = await this.#retainRunLog(actor, runId).then(result => result.archived, () => false);
+              // Non-completed runs transfer identity before the archive source
+              // commit, without consuming their retained debugging handle.
+              archived = await this.#retainRunLog(actor, runId, recoveredNativeRun, launchedWorker)
+                .then(result => result.archived, () => false);
             }
             // Release the in-memory handle and tmp run dir for completed runs;
             // failed runs are retained for agents.status(actor.lastRunId).
@@ -7119,6 +7178,11 @@ export class ActorManager {
             delete actor.inFlightRun;
             this.#runReconciliations.delete(actor.id);
           }
+          if (this.#closeCompleted) {
+            if (this.#inFlight.get(actor.id) === item) this.#inFlight.delete(actor.id);
+            this.#inFlightBatches.delete(actor.id);
+            continue;
+          }
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
@@ -7156,7 +7220,7 @@ export class ActorManager {
       const resetAtExit = this.#pendingResets.has(actor.id) || verifiedOverflowBlock(resetLive.activationBlocked, resetLive.lastRunId);
       // A reset caller can enqueue another reset from its resolved promise while
       // the boundary presence write is settling. Consume it before releasing admission.
-      while (this.#pendingResets.has(actor.id) && !this.#inFlight.has(actor.id) && !actor.abortController) {
+      while (!this.#closing && this.#pendingResets.has(actor.id) && !this.#inFlight.has(actor.id) && !actor.abortController) {
         await this.#resetAtBoundary(actor)?.catch(() => undefined);
       }
       // No backlog is needed to repair routing after a terminal overflow. The failed activation
@@ -8955,15 +9019,118 @@ export class ActorManager {
     for (const id of ids.slice(-DELIVERED_EVENT_MEMORY / 2)) this.#delivered.add(`${actor.id}\0${id}`);
   }
 
-  async #retainRunLog(actor: ManagedActor, runId: string): Promise<ActorRunArchiveResult> {
+  /** Transfer exact host-owned whole-execution proof without consuming the debugging handle. */
+  async #saveActorWorkerStopProof(actor: ManagedActor, runId: string, controller?: AbortController,
+    launchedWorker?: ReturnType<AgentManager["workerIdentity"]>, completedRecovery = false): Promise<boolean> {
+    const lineage = this.#lineage(actor);
+    const current = (): boolean => {
+      if (this.#closeCompleted || this.#releaseStrict || !this.#canManage(actor.id)) return false;
+      const live = this.#actors.get(actor.id);
+      return !!live && !live.removal && live.sessionFile === actor.sessionFile &&
+        this.#lineage(live) === lineage && this.#lineage(actor) === lineage &&
+        actor.lastRunId === runId && live.lastRunId === runId && this.#slotCurrent(live) &&
+        (controller ? this.#runningActor(actor.id) === actor && actor.abortController === controller
+          : !this.#draining.has(actor.id) && !live.abortController);
+    };
+    if (!current()) return false;
+    // Reconcile joins the existing native/tree owner; a primary exit or terminal
+    // status alone is never enough. A restarted manager may have only the marker.
+    await this.agents.reconcileActorRun(runId, actor.id);
+    if (!current()) return false;
+    const proof = this.agents.actorWorkerStopProof(runId, actor.id, actor.sessionFile);
+    if (!proof || (proof.status === "completed" && !completedRecovery) ||
+        (launchedWorker && (launchedWorker.pid !== proof.pid || launchedWorker.startTime !== proof.startTime))) return false;
+    const identity = loadedLastCleanedRunWorker({ actorId: actor.id, runId,
+      pid: proof.pid, startTime: proof.startTime }, actor.id, runId);
+    if (!identity) return false;
+    const live = this.#actors.get(actor.id)!;
+    const previous = new Map([...new Set([actor, live])].map(instance => [instance, instance.lastCleanedRunWorker]));
+    const assertHeld = (): void => {
+      const native = this.agents.actorWorkerStopProof(runId, actor.id, actor.sessionFile);
+      if (!current() || !native || native.pid !== identity.pid || native.startTime !== identity.startTime ||
+          native.status !== proof.status) throw new ActorRegistryOwnershipError();
+    };
+    actor.lastCleanedRunWorker = live.lastCleanedRunWorker = identity;
+    try {
+      await this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: live, assertHeld });
+      assertHeld();
+      return true;
+    } catch (error) {
+      // An unsaved staged value cannot discharge source custody. Do not erase a
+      // prior receipt or a newer launch's identity while undoing this attempt.
+      for (const instance of new Set([actor, live, this.#liveActor(actor)])) {
+        if (instance.lastCleanedRunWorker !== identity) continue;
+        const prior = previous.has(instance) ? previous.get(instance) : previous.get(live);
+        if (prior) instance.lastCleanedRunWorker = prior;
+        else delete instance.lastCleanedRunWorker;
+      }
+      throw error;
+    }
+  }
+
+  #nonCompletedActorWorker(actor: ManagedActor, runId: string): boolean {
+    const proof = this.agents.actorWorkerStopProof(runId, actor.id, actor.sessionFile);
+    if (proof) return proof.status !== "completed";
+    const worker = this.agents.workerIdentity(runId);
+    if (!worker?.startTime) return false; // Unknown/no-birth history keeps its existing archive behavior.
+    try {
+      const status = this.agents.status(runId).status;
+      return status === "failed" || status === "timed_out" || status === "stopped";
+    } catch { return false; }
+  }
+
+  async #retainRunLog(actor: ManagedActor, runId: string, completedRecovery = false,
+    launchedWorker?: ReturnType<AgentManager["workerIdentity"]>, closingRetry = false): Promise<ActorRunArchiveResult> {
     let pending = this.#pendingRunArchives.get(actor.id);
     if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
     pending.add(runId);
+    const lineage = this.#lineage(actor);
+    const executing = this.#runningActor(actor.id) ?? actor;
+    const controller = executing.abortController;
+    const lastRunId = executing.lastRunId;
+    const current = (): boolean => {
+      // An owned finalizer still settles during close. Its separate archive retry
+      // must not consume a held drain's source before that drain receives its result.
+      if (this.#closeCompleted || (this.#closing && closingRetry && this.#draining.has(actor.id)) ||
+          this.#releaseStrict || !this.#canManage(actor.id)) return false;
+      const live = this.#actors.get(actor.id);
+      const running = this.#runningActor(actor.id);
+      return !!live && live.sessionFile === actor.sessionFile && this.#lineage(live) === lineage && this.#slotCurrent(live) &&
+        running?.lastRunId === lastRunId && live.lastRunId === lastRunId &&
+        (controller ? running === executing && running.abortController === controller
+          : !this.#draining.has(actor.id) && !live.abortController);
+    };
     try {
+      if (!current()) throw new ActorRegistryOwnershipError();
+      const running = this.#runningActor(actor.id) ?? actor;
+      const nonCompletedWorker = this.#nonCompletedActorWorker(actor, runId);
+      if (nonCompletedWorker && running.lastRunId !== runId &&
+          !loadedLastCleanedRunWorker(running.lastCleanedRunWorker, actor.id, runId) &&
+          (!running.lastRunId || (!this.agents.workerIdentity(running.lastRunId) &&
+            !this.agents.actorWorkerStopProof(running.lastRunId, actor.id, actor.sessionFile)))) {
+        // An unlaunched result may have replaced a lastRunId whose receipt save
+        // failed. It is not a newer native launch and cannot consume that proof.
+        throw new Error(`Actor run ${runId} native identity still held; source retained`);
+      }
+      if (running.lastRunId === runId && (completedRecovery || nonCompletedWorker)) {
+        const sources = this.agents.actorArchiveSources(actor.id, actor.sessionFile);
+        // A previously committed transfer may already have removed the marker;
+        // a staged value never suffices while that source veto is still present.
+        if (sources.has(runId) ||
+            !loadedLastCleanedRunWorker(running.lastCleanedRunWorker, actor.id, runId)) {
+          if (!await this.#saveActorWorkerStopProof(running, runId, running.abortController, launchedWorker, completedRecovery)) {
+            throw new Error(`Actor run ${runId} native proof transfer pending; source retained`);
+          }
+        }
+      }
+      if (!current()) throw new ActorRegistryOwnershipError();
       const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
       const result = await this.#logs.retainRun(actor, runId, source);
-      // Only a verified copy discharges the durable source veto, including on close/restarted-owner retries.
+      if (!current()) throw new ActorRegistryOwnershipError();
+      // A verified copy and (for the last non-completed worker) a durable
+      // identity transfer must precede discharge of the sole native source.
       if (result.archived) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);
+      if (!current()) throw new ActorRegistryOwnershipError();
       // A previously archived/cleaned prior run may have no source. That is not an archive receipt or cleanup authority.
       pending.delete(runId);
       if (!pending.size) this.#pendingRunArchives.delete(actor.id);
@@ -9137,6 +9304,28 @@ export class ActorManager {
    */
   #reconcileActorRun(actor: ManagedActor, now: number): void {
     const run = actor.inFlightRun;
+    // The same mesh wake / 5s maintenance pass retries a late native close or
+    // failed receipt save after settlement, even with an empty actor queue.
+    if (!run) {
+      const runId = actor.lastRunId;
+      if (!runId || this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false ||
+          this.#draining.has(actor.id) || actor.abortController || !this.#canManage(actor.id) || !this.#slotCurrent(actor) ||
+          !this.agents.actorArchiveSources(actor.id, actor.sessionFile).has(runId) ||
+          !this.#nonCompletedActorWorker(actor, runId)) return;
+      let recovery = this.#runReconciliations.get(actor.id);
+      if (!recovery || recovery.runId !== runId) {
+        recovery = { runId };
+        this.#runReconciliations.set(actor.id, recovery);
+      }
+      if (recovery.pending || now < (recovery.retryAt ?? 0)) return;
+      const state = recovery;
+      const pending = this.#retainRunLog(actor, runId).then(() => undefined).catch(() => undefined).finally(() => {
+        if (state.pending === pending) delete state.pending;
+        state.retryAt = Date.now() + TRANSPORT_HOST_LEASE_RENEW_MS;
+      });
+      state.pending = pending;
+      return;
+    }
     const recovery = this.#runReconciliations.get(actor.id);
     if (!run || !recovery || recovery.runId !== run.id || recovery.pending || now < (recovery.retryAt ?? 0) ||
         now - run.startedAt < ACTOR_DEAD_WORKER_RECONCILE_AFTER_MS || this.#closing || this.#releaseStrict ||
@@ -9160,7 +9349,7 @@ export class ActorManager {
       // Never clear an in-flight marker or start a second drain here. Hand the
       // manager-validated result back through the original serial finalizer.
       if (result && current() && this.#runningActor(actor.id)?.inFlightRun === run &&
-          this.#runReconciliations.get(actor.id) === recovery) recovery.settle(result);
+          this.#runReconciliations.get(actor.id) === recovery) recovery.settle?.(result);
     }).catch(() => undefined).finally(() => {
       if (recovery.pending === pending) delete recovery.pending;
       recovery.retryAt = Date.now() + TRANSPORT_HOST_LEASE_RENEW_MS;

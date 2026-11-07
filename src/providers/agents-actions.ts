@@ -9,6 +9,7 @@ import {
 } from "../compaction/instructions.js";
 import { FABRIC_LIFECYCLE_EVENTS } from "../lifecycle/types.js";
 import type { FabricActionDescriptor } from "../protocol.js";
+import type { FabricPythonRuntime } from "../config.js";
 
 // RUNNER_ID_PATTERN (src/agents/runner-registry.ts) as source text; kept in sync by a test.
 const RUNNER_ID_SOURCE = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
@@ -597,6 +598,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         slotClaim: actorSlotClaimSchema,
         runner: runProperties.runner,
         kernel: runProperties.kernel,
+        pythonRuntime: {
+          type: "string",
+          enum: ["cpython", "monty"] satisfies FabricPythonRuntime[],
+          description: "Actor Python backend, fixed at creation. Omit to inherit configured policy; global templates inherit on import. CPython is native execution.",
+        },
         model: strictModelProperty,
         modelReason: runProperties.modelReason,
         opusReason: runProperties.opusReason,

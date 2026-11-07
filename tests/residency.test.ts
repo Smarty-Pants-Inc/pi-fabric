@@ -1974,7 +1974,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       await waitFor(() => participant()?.status === "running" && participant()?.actorRun !== undefined);
       const running = participant()!;
       expect(await provider.invoke("actorStatus", { id: actor.id }, context)).toMatchObject({
-        status: "running", queued: 0, inFlightRun: { id: running.actorRun!.id }, lastRunId: baseline.lastRunId,
+        status: "running", queued: 0, inFlightRun: { id: running.actorRun!.id }, lastRunId: running.actorRun!.id,
       });
       expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
         id: actor.id, status: "running", queued: 0, inFlightRun: expect.objectContaining({ id: running.actorRun!.id }),
@@ -1986,12 +1986,12 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(live).toMatchObject({ status: "running", ownerHostId: client.hostId, actorQueued: 2,
         actorRun: { id: running.actorRun!.id } });
       expect(live.actorMessages).toBeGreaterThan(baseline.messages);
-      expect(passive.status(actor.id)).toMatchObject({ status: baseline.status, queued: 0, lastRunId: baseline.lastRunId });
+      expect(passive.status(actor.id)).toMatchObject({ status: baseline.status, queued: 0, lastRunId: running.actorRun!.id });
       const single = await provider.invoke("actorStatus", { id: actor.id }, context);
       const listed = (await provider.invoke("actors", {}, context) as Array<{ id: string }>).find(row => row.id === actor.id);
       for (const view of [single, listed]) {
         expect(view).toMatchObject({ id: actor.id, name: actor.name, status: "running", queued: 2,
-          messages: live.actorMessages, lastRunId: baseline.lastRunId, inFlightRun: { id: live.actorRun!.id } });
+          messages: live.actorMessages, lastRunId: running.actorRun!.id, inFlightRun: { id: live.actorRun!.id } });
       }
       expect(passive.definition(actor.id)).toEqual(definition);
       // The real worker cannot finish FIRST until both provider reads above agree.

@@ -5166,7 +5166,8 @@ export class ActorManager {
         await this.mesh.delete({ key: cleanup.presenceKey });
       }
       for (const kind of ACTOR_ALARM_KINDS) await this.mesh.delete({ key: actorAlarmKey(cleanup.id, kind) }).catch(() => undefined);
-      if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
+      // Removal preserves deliberately retained debugging handles; explicit agents.cleanup still consumes them.
+      if (cleanup.lastRunId && !this.agents.config.retainRuns) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
       // #joinStoppedRun plus durable registry revocation precede retirement. The
       // cleanup marker remains until the permanent tombstone's own sync succeeds.
       if (cleanup.slotTopics) await this.#registry.withLock(() =>
@@ -9025,7 +9026,7 @@ export class ActorManager {
     launchedWorker?: ReturnType<AgentManager["workerIdentity"]>, completedRecovery = false): Promise<boolean> {
     const lineage = this.#lineage(actor);
     const current = (): boolean => {
-      if (this.#closeCompleted || this.#releaseStrict || !this.#canManage(actor.id)) return false;
+      if (this.#closeCompleted || !this.#canManage(actor.id)) return false;
       const live = this.#actors.get(actor.id);
       return !!live && !live.removal && live.sessionFile === actor.sessionFile &&
         this.#lineage(live) === lineage && this.#lineage(actor) === lineage &&
@@ -9093,7 +9094,7 @@ export class ActorManager {
       // An owned finalizer still settles during close. Its separate archive retry
       // must not consume a held drain's source before that drain receives its result.
       if (this.#closeCompleted || (this.#closing && closingRetry && this.#draining.has(actor.id)) ||
-          this.#releaseStrict || !this.#canManage(actor.id)) return false;
+          !this.#canManage(actor.id)) return false;
       const live = this.#actors.get(actor.id);
       const running = this.#runningActor(actor.id);
       return !!live && live.sessionFile === actor.sessionFile && this.#lineage(live) === lineage && this.#slotCurrent(live) &&

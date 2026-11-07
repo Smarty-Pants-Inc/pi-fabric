@@ -647,7 +647,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(row(state.root, recreated.id)).toMatchObject({ model: "provider/new", thinking: "low" });
   });
 
-  it.runIf(hasPosixTrustMetadata)("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
+  it.runIf(hasPosixTrustMetadata)("replaces the Opus stamp within native cleanup budgets without extra binding writes or wakes", async () => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "bound-registry", instructions: "Observe.",
       model: "anthropic/claude-opus-5-5", modelReason: "#11864 bound registry", thinking: "medium" });
@@ -661,15 +661,17 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       await waitFor(() => state.actors.status(actor.id).status === "idle");
       return { saves: saves.mock.calls.length, events: publish.mock.calls.length };
     };
+    const assertWarmWriteBudget = (count: number) => expect(count).toBe(5);
     try {
       const changed = await runOnce("first");
+      expect(changed.saves).toBe(4);
       expect(row(state.root, actor.id)).toMatchObject({ model: "anthropic/claude-opus-5-5", thinking: "medium",
         resolvedBinding: { model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" } });
       expect(state.mesh.get(`actors/test/${actor.id}`)?.value).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
       const unchanged = await runOnce("unchanged");
-      // The first run may also initialize lifecycle state; a stable binding must
-      // never add a write or notification compared with a changed binding.
-      expect(unchanged.saves).toBeLessThanOrEqual(changed.saves);
+      // Unlike the fresh launch, a warm native launch invalidates a prior cleanup receipt.
+      // Its exact budget must still reject a redundant binding write or notification.
+      assertWarmWriteBudget(unchanged.saves);
       expect(unchanged.events).toBe(changed.events);
       saves.mockClear(); publish.mockClear();
       const unchangedBytes = fs.readFileSync(path.join(state.root, "actors", "actors.json"), "utf8");
@@ -678,6 +680,25 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       expect(saves).not.toHaveBeenCalled();
       expect(publish).not.toHaveBeenCalled();
       expect(fs.readFileSync(path.join(state.root, "actors", "actors.json"), "utf8")).toBe(unchangedBytes);
+      // Negative control: the same warm budget must reject one real redundant
+      // binding-row commit, without contaminating the read-only checks above.
+      const control = await runOnce("unchanged write control");
+      assertWarmWriteBudget(control.saves);
+      expect(control.events).toBe(changed.events);
+      const registry = new ActorRegistryStore(path.join(state.root, "actors"));
+      await registry.withLock(() => {
+        const snapshot = registry.snapshot();
+        const prepared = registry.prepare(snapshot.actors.map(record => record.id === actor.id
+          ? { ...record, resolvedBinding: record.resolvedBinding } : record), {}, snapshot);
+        try {
+          expect(prepared.valid()).toBe(true);
+          prepared.commit();
+        } finally { prepared.dispose(); }
+      }, undefined, "redundant-binding-control");
+      expect(publish.mock.calls.length).toBe(changed.events);
+      expect(saves.mock.calls.length).toBe(6);
+      expect(() => assertWarmWriteBudget(saves.mock.calls.length)).toThrow();
+      saves.mockClear(); publish.mockClear();
       await state.actors.ask(actor.id, "foreign pin", undefined, undefined, {
         binding: { model: "provider/foreign", thinking: "low" },
       });

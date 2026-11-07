@@ -36,6 +36,7 @@ queue_rules:
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
+      - check-success = judge-pass
       - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = check (ubuntu-latest)
       # fork-sync labels every upstream sync needs-security-pass, so sync/upstream-* heads pushed to THIS repository
@@ -52,7 +53,7 @@ queue_rules:
       # Label and title opt-outs added after queueing stop the merge.
       # Review statuses here only refuse a FAILED review: an in-place or batch update
       # makes a new head with no review statuses (smarty-dev#455).
-      # queue_conditions require the reviews on the reviewed head.
+      # queue_conditions require review statuses, including judge-pass success, on the exact reviewed head for admission—not on queue-draft heads.
       - -check-failure = review/astra
       - -label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$
       - -label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$

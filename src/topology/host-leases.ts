@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
-import { isMeshLockTimeout, readFileRetrying, requireNamespaceBarrier, writeJsonAtomic, type PhysicalHostIdentity } from "../core/atomic-write.js";
+import { isMeshLockTimeout, readFileRetrying, syncPathNamespaceAsync, writeJsonAtomic, writeJsonAtomicAsync,
+  type PhysicalHostIdentity } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
@@ -495,12 +496,72 @@ export const writeHostLeaseVersionIf = (meshRoot: string, expected: FabricHostLe
 export const hostLeaseArchivePath = (meshRoot: string, hostId: string, leaseSha256: string): string =>
   path.join(meshRoot, "host-lease-archive", fileName(hostId), `${leaseSha256}.json`);
 
-/** Reaper compare-and-delete. Caller holds the TARGET's leaseCustody gate, as renew/claim do.
- * Archive the exact detached bytes durably BEFORE unlinking; an archive/barrier failure restores
- * the lease. A retry of the same body re-confirms the barriers at the same receipt address. */
-export const removeHostLeaseVersionUnderCustody = (meshRoot: string, expected: FabricHostLease, archivedAt = Date.now()): boolean =>
+/** A successfully synced, immutable candidate snapshot, NOT evidence of removal.
+ * Only preparation creates this handle; matching is read-only and does no archive I/O. */
+export interface PreparedHostLeaseArchiveBatch {
+  readonly meshRoot: string;
+  readonly file: string;
+  matches(hostId: string, bytes: Buffer): boolean;
+}
+
+/** Prepare BEFORE additions/target/own custody. One unique format-2 batch contains
+ * { status: "prepared", removalConfirmed: false, preparedAt, candidates: [
+ *   { hostId, leaseSha256, leaseBase64 }
+ * ] }. It is never rewritten/promoted: a race, failed unlink or crash must not make a
+ * candidate snapshot claim removal. There is no production archive reader; unlike the
+ * standalone format-1 receipts, these are explicitly unconfirmed historical bytes.
+ * Atomic publication is followed by awaited file + complete namespace confirmation,
+ * as in the completion journal. No cleanup is authorized until BOTH barriers succeed.
+ * Windows still executes atomic rename + file fsync, without POSIX namespace durability. */
+export const prepareHostLeaseArchiveBatch = async (meshRoot: string, expected: readonly FabricHostLease[],
+  preparedAt = Date.now()): Promise<PreparedHostLeaseArchiveBatch> => {
+  const snapshots = new Map<string, { hostId: string; leaseSha256: string; leaseBase64: string }>();
+  for (const lease of expected) {
+    const bytes = await fs.promises.readFile(hostLeasePath(meshRoot, lease.id));
+    if (!sameHostLeaseVersion(leaseOf(bytes.toString("utf8"), fileName(lease.id)), lease)) {
+      throw new Error("Host lease changed during archive preparation");
+    }
+    snapshots.set(lease.id, { hostId: lease.id, leaseSha256: createHash("sha256").update(bytes).digest("hex"),
+      leaseBase64: bytes.toString("base64") });
+  }
+  const receipt = { format: 2, status: "prepared", removalConfirmed: false, preparedAt,
+    candidates: [...snapshots.values()] };
+  const serialized = JSON.stringify(receipt);
+  const file = path.join(meshRoot, "host-lease-archive", "batches", `${randomUUID()}.json`);
+  await writeJsonAtomicAsync(file, receipt);
+  // FlushFileBuffers on Windows requires a write-capable handle. Bind confirmation
+  // to the exact published bytes and inode, including Windows' 64-bit file IDs.
+  const handle = await fs.promises.open(file, process.platform === "win32" ? "r+" : "r");
+  try {
+    const stat = await handle.stat({ bigint: true });
+    if (!stat.isFile() || await handle.readFile("utf8") !== serialized) {
+      throw new Error("Host lease archive batch changed before confirmation");
+    }
+    await handle.sync();
+    await syncPathNamespaceAsync(file, stat);
+  } finally { await handle.close(); }
+  return Object.freeze({ meshRoot, file, matches: (hostId: string, bytes: Buffer): boolean => {
+    const snapshot = snapshots.get(hostId);
+    return snapshot !== undefined && bytes.toString("base64") === snapshot.leaseBase64 &&
+      createHash("sha256").update(bytes).digest("hex") === snapshot.leaseSha256;
+  } });
+};
+
+/** Compare-and-delete. Caller holds the TARGET's leaseCustody gate, as renew/claim do.
+ * With a prepared batch, only exact detached-byte/version verification and unlink run
+ * here: all archive barriers have ALREADY completed outside custody. Without a batch,
+ * preserve the standalone format-1 receipt behavior: file fsync + atomic rename on every
+ * platform, plus POSIX namespace barriers. Any archive/mismatch failure restores the lease.
+ * Windows cannot confirm power-loss durability of the names. */
+export const removeHostLeaseVersionUnderCustody = (meshRoot: string, expected: FabricHostLease, archivedAt = Date.now(),
+  prepared?: PreparedHostLeaseArchiveBatch): boolean =>
   removeHostLeaseIf(meshRoot, expected.id, current => sameHostLeaseVersion(current, expected), bytes => {
-    requireNamespaceBarrier(platform => new Error(`Host lease archive namespace is not durable on ${platform}`));
+    if (prepared) {
+      if (prepared.meshRoot !== meshRoot || !prepared.matches(expected.id, bytes)) {
+        throw new Error("Detached host lease differs from its prepared archive");
+      }
+      return;
+    }
     const leaseSha256 = createHash("sha256").update(bytes).digest("hex");
     writeJsonAtomic(hostLeaseArchivePath(meshRoot, expected.id, leaseSha256), {
       format: 1, hostId: expected.id, archivedAt, leaseSha256, leaseBase64: bytes.toString("base64"),

@@ -9,7 +9,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { rootPresenceAlarms } from "../src/topology/stall-alarms.js";
 import { hostLeaseAdditionsGatePath } from "../src/topology/host-lease-lock.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
-import { hostLeaseArchivePath, hostLeasePath, readHostLeaseCurrent, readHostLeases, renewHostLease, writeHostLease,
+import { hostLeasePath, readHostLeaseCurrent, readHostLeases, renewHostLease, writeHostLease,
   type FabricHostLease } from "../src/topology/host-leases.js";
 
 const HOUR = 60 * 60 * 1_000;
@@ -105,8 +105,7 @@ const meshFixture = (prefix: string): { root: string; mesh: MeshStore } => {
 };
 
 describe("host lease GC and heartbeat scaling (#18579)", () => {
-  // The production archive requires namespace fsync barriers unavailable on Windows.
-  it.skipIf(process.platform === "win32")("keeps real directory and committed alarm reads proportional to live hosts before and after orphan GC", async () => {
+  it("keeps real directory and committed alarm reads proportional to live hosts before and after orphan GC", async () => {
     const { mesh } = meshFixture("host-lease-gc-heartbeat-");
     const now = Date.now();
     const self = newMainIdentity("observer");
@@ -132,12 +131,11 @@ describe("host lease GC and heartbeat scaling (#18579)", () => {
     const staleLeases = Array.from({ length: STALE_LEASES }, (_, index) => seedExpiredOrphanLease(mesh, index, now));
     const stalePaths = new Set(staleLeases.map(lease => path.resolve(hostLeasePath(mesh.root, lease.id))));
     expect(staleLeases.every(lease => !mesh.get(stateHostKey(lease.id), { fresh: true }))).toBe(true);
-    const expectedReceipts = staleLeases.map(lease => {
+    const expectedCandidates = new Map(staleLeases.map(lease => {
       const bytes = fs.readFileSync(hostLeasePath(mesh.root, lease.id));
       const leaseSha256 = createHash("sha256").update(bytes).digest("hex");
-      return { hostId: lease.id, bytes, leaseSha256,
-        file: path.resolve(hostLeaseArchivePath(mesh.root, lease.id, leaseSha256)) };
-    });
+      return [lease.id, { hostId: lease.id, bytes, leaseSha256 }] as const;
+    }));
     const livePaths = new Set(liveIds.map(id => path.resolve(hostLeasePath(mesh.root, id))));
 
     const alarmIdentityAvailable = readPhysicalHostIdentity() !== undefined;
@@ -163,35 +161,55 @@ describe("host lease GC and heartbeat scaling (#18579)", () => {
     const liveBeforeReap = new Map(liveIds.map(id => [id, readHostLeaseCurrent(mesh.root, id)!]));
     const reap = () => reapDeadHostRecords(mesh, self, { ownHostId: self.id, now });
     let passes = 0;
+    const passSizes: number[] = [];
     while (passes < MAX_REAP_PASSES && staleLeases.some(lease => fs.existsSync(hostLeasePath(mesh.root, lease.id)))) {
-      await reap();
+      const remaining = staleLeases.filter(lease => fs.existsSync(hostLeasePath(mesh.root, lease.id))).length;
+      const reaped = await reap();
+      expect(reaped).toBe(Math.min(100, remaining));
+      passSizes.push(reaped);
       passes++;
     }
-    expect(passes).toBeGreaterThan(0);
-    expect(passes).toBeLessThanOrEqual(MAX_REAP_PASSES);
+    expect(passes).toBe(20);
+    expect(passSizes).toEqual(Array<number>(20).fill(100));
     expect(staleLeases.filter(lease => fs.existsSync(hostLeasePath(mesh.root, lease.id)))).toEqual([]);
     for (const lease of staleLeases) expect(readHostLeaseCurrent(mesh.root, lease.id)).toBeUndefined();
 
-    const archiveRoot = path.dirname(path.dirname(expectedReceipts[0]!.file));
-    const archiveFiles = (): string[] => fs.readdirSync(archiveRoot).flatMap(hostDirectory =>
-      fs.readdirSync(path.join(archiveRoot, hostDirectory)).map(name => path.join(archiveRoot, hostDirectory, name)));
-    expect(archiveFiles()).toHaveLength(STALE_LEASES);
-    expect(new Set(expectedReceipts.map(receipt => receipt.file)).size).toBe(STALE_LEASES);
-    for (const expected of expectedReceipts) {
-      const receipt = JSON.parse(fs.readFileSync(expected.file, "utf8")) as Record<string, unknown>;
-      expect(receipt).toEqual({ format: 1, hostId: expected.hostId, archivedAt: now,
-        leaseSha256: expected.leaseSha256, leaseBase64: expected.bytes.toString("base64") });
-      expect(createHash("sha256").update(Buffer.from(receipt.leaseBase64 as string, "base64")).digest("hex"))
-        .toBe(expected.leaseSha256);
+    const archiveDirectory = path.join(mesh.root, "host-lease-archive", "batches");
+    expect(fs.readdirSync(path.dirname(archiveDirectory))).toEqual(["batches"]);
+    const archiveFiles = (): string[] => fs.readdirSync(archiveDirectory).map(name => path.join(archiveDirectory, name));
+    const snapshots = new Map(archiveFiles().map(file => [file, fs.readFileSync(file)]));
+    expect(snapshots.size).toBe(20);
+    expect(expectedCandidates.size).toBe(STALE_LEASES);
+    const archivedIds = new Set<string>(), archivedBatchSizes: number[] = [];
+    for (const bytes of snapshots.values()) {
+      const receipt = JSON.parse(bytes.toString("utf8")) as {
+        candidates: { hostId: string; leaseSha256: string; leaseBase64: string }[];
+      };
+      expect(receipt).toEqual({ format: 2, status: "prepared", removalConfirmed: false, preparedAt: now,
+        candidates: expect.any(Array) });
+      archivedBatchSizes.push(receipt.candidates.length);
+      for (const candidate of receipt.candidates) {
+        const expected = expectedCandidates.get(candidate.hostId);
+        expect(expected).toBeDefined();
+        expect(archivedIds.has(candidate.hostId)).toBe(false);
+        expect(candidate).toEqual({ hostId: expected!.hostId, leaseSha256: expected!.leaseSha256,
+          leaseBase64: expected!.bytes.toString("base64") });
+        const archived = Buffer.from(candidate.leaseBase64, "base64");
+        expect(archived).toEqual(expected!.bytes);
+        expect(createHash("sha256").update(archived).digest("hex")).toBe(expected!.leaseSha256);
+        archivedIds.add(candidate.hostId);
+      }
     }
+    expect(archivedBatchSizes.sort((left, right) => right - left)).toEqual(passSizes);
+    expect([...archivedIds].sort()).toEqual([...expectedCandidates.keys()].sort());
 
-    // A second real pass cannot write another receipt or replace an existing one.
-    const receiptWrites = vi.spyOn(fs, "renameSync");
+    // An empty real pass cannot publish another snapshot or rewrite an existing one as removed.
+    const receiptWrites = vi.spyOn(fs.promises, "rename");
     expect(await reap()).toBe(0);
-    expect(receiptWrites.mock.calls.filter(([, target]) => expectedReceipts.some(receipt =>
-      path.resolve(String(target)) === receipt.file))).toEqual([]);
+    expect(receiptWrites.mock.calls.filter(([, target]) => path.dirname(String(target)) === archiveDirectory)).toEqual([]);
     receiptWrites.mockRestore();
-    expect(archiveFiles()).toHaveLength(STALE_LEASES);
+    expect(archiveFiles().sort()).toEqual([...snapshots.keys()].sort());
+    for (const [file, bytes] of snapshots) expect(fs.readFileSync(file)).toEqual(bytes);
     expect([...readHostLeases(mesh.root).keys()].sort()).toEqual([...liveIds].sort());
     for (const id of liveIds) {
       const before = liveBeforeReap.get(id)!;
@@ -217,6 +235,7 @@ describe("host lease GC and heartbeat scaling (#18579)", () => {
       incarnationToken: randomUUID(),
     };
     writeHostLease(mesh.root, old);
+    const oldBytes = fs.readFileSync(hostLeasePath(mesh.root, old.id));
     await mesh.put({ key: stateHostKey(target.id), identity: target, value: {
       format: 1, ...old, identity: target,
     } });
@@ -237,5 +256,14 @@ describe("host lease GC and heartbeat scaling (#18579)", () => {
     expect(renewalCommitted).toBe(true);
     expect(readHostLeaseCurrent(mesh.root, target.id)).toEqual(renewed);
     expect(mesh.get(stateHostKey(target.id), { fresh: true })).toBeDefined();
+    const archiveDirectory = path.join(mesh.root, "host-lease-archive", "batches");
+    expect(fs.readdirSync(path.dirname(archiveDirectory))).toEqual(["batches"]);
+    const files = fs.readdirSync(archiveDirectory);
+    expect(files).toHaveLength(1);
+    const receipt = JSON.parse(fs.readFileSync(path.join(archiveDirectory, files[0]!), "utf8"));
+    expect(receipt).toEqual({ format: 2, status: "prepared", removalConfirmed: false, preparedAt: now,
+      candidates: [{ hostId: old.id, leaseSha256: createHash("sha256").update(oldBytes).digest("hex"),
+        leaseBase64: oldBytes.toString("base64") }] });
+    expect(Buffer.from(receipt.candidates[0].leaseBase64, "base64")).toEqual(oldBytes);
   });
 });

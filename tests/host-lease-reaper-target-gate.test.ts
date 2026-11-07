@@ -106,7 +106,7 @@ describe.each(["file", "sqlite"] as const)("%s Round 4 target reaping", backend 
       return rename(from, to);
     });
     expect(await s.reap()).toBe(3);
-    expect(readHostLeaseCurrent(s.root, s.target.id)).toEqual(process.platform === "win32" ? s.target : undefined);
+    expect(readHostLeaseCurrent(s.root, s.target.id)).toBeUndefined();
     expect(readParticipantFiles(s.root)).toEqual([]); expect(s.mesh.get(hostKey(s.target.id), { fresh: true })).toBeUndefined();
     expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(s.lease);
   });

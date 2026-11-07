@@ -366,8 +366,7 @@ describe("records of dead hosts", () => {
     expect(keys(deadHostRecords(mesh, { ownHostId: "own", now }))).toEqual([hostKey("dead")]);   // ... file lease fresh
     expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
     expect(mesh.get(hostKey("filed"))).toBeDefined();
-    // Unsupported namespace durability retains the lease instead of deleting without an archive.
-    expect([...readHostLeases(mesh.root).keys()].sort()).toEqual(process.platform === "win32" ? ["dead", "filed"] : ["filed"]);
+    expect([...readHostLeases(mesh.root).keys()].sort()).toEqual(["filed"]);
   });
 
   it("deletes in one batch fenced to the versions it saw, and writes nothing when none are dead", async () => {

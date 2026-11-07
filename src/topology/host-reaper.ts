@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
-import { type FabricHostLease, hostEntryLiveness, hostLeasePath, hostLeasePredecessor,
-  readHostLeases, removeHostLeaseVersionUnderCustody, sameHostLeaseVersion, withHostLeaseDirectoryCustody } from "./host-leases.js";
+import { type FabricHostLease, type PreparedHostLeaseArchiveBatch, hostEntryLiveness, hostLeasePath, hostLeasePredecessor,
+  prepareHostLeaseArchiveBatch, readHostLeases, removeHostLeaseVersionUnderCustody,
+  sameHostLeaseVersion, withHostLeaseDirectoryCustody } from "./host-leases.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
@@ -12,8 +14,8 @@ import type { FabricParticipantRecord } from "./types.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
-/** Bound dead host/participant cleanup; stale bookkeeping joins the same commit below. */
-const MAX_REAP_BATCH = 500;
+/** Limit additions-gate work for creators' short wait budget. */
+const MAX_REAP_BATCH = 100;
 
 const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
@@ -225,8 +227,24 @@ export const reapDeadHostRecords = async (
   const targets = [...selectedTargets, ...expiredLeases.map(lease => lease.id)].sort();
   const changed = new Error("Reaper target lease renewed or replaced");
   const root = mesh.root;
+  let archive: PreparedHostLeaseArchiveBatch | undefined;
+  if (typeof root === "string" && mesh.leaseCustody) {
+    const candidates = targets.map(hostId => selectedLeases.get(hostId))
+      .filter((lease): lease is FabricHostLease => lease !== undefined && effectiveLiveness(undefined, lease).expiresAt < cutoff);
+    if (candidates.length > 0) {
+      // One async file/namespace confirmation for the whole pass, before ANY lease
+      // gate or the caller's own commit fence. A failed preparation defers ALL deletes.
+      try { archive = await prepareHostLeaseArchiveBatch(root, candidates, now); }
+      catch { return 0; }
+    }
+  }
   const assertTarget = (hostId: string, expected: FabricHostLease | undefined): void => {
-    if (typeof root === "string" && !sameHostLeaseVersion(hostLeasePredecessor(root, hostId), expected)) throw changed;
+    if (typeof root !== "string") return;
+    if (!sameHostLeaseVersion(hostLeasePredecessor(root, hostId), expected)) throw changed;
+    // Parsed equality omits unknown fields and normalizes invalid UTF-8. Revalidate
+    // candidate bytes too, both on gate entry and at the final state commit fence.
+    if (archive && expected && effectiveLiveness(undefined, expected).expiresAt < cutoff &&
+      !archive.matches(hostId, fs.readFileSync(hostLeasePath(root, hostId)))) throw changed;
   };
   const targetGate = <T>(hostId: string, operation: () => T | Promise<T>): Promise<T> =>
     typeof root === "string" && mesh.leaseCustody
@@ -275,11 +293,11 @@ export const reapDeadHostRecords = async (
       // Still inside every target's gate. Renew/claim cannot cross the state COMMIT
       // and exact-version lease removal. Never re-read/adopt a later renewal as a victim.
       commitOutbox: () => {
-        if (typeof root !== "string" || !mesh.leaseCustody) return;
+        if (typeof root !== "string" || !mesh.leaseCustody || !archive) return;
         for (const hostId of reapable) {
           const expected = selectedLeases.get(hostId);
-          if (expected && effectiveLiveness(undefined, expected).expiresAt < cutoff &&
-            removeHostLeaseVersionUnderCustody(root, expected, now)) retired.add(hostId);
+          if (!expected || !(effectiveLiveness(undefined, expected).expiresAt < cutoff)) continue;
+          if (removeHostLeaseVersionUnderCustody(root, expected, now, archive)) retired.add(hostId);
         }
       },
     })));

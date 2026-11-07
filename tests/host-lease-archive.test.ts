@@ -27,13 +27,37 @@ const archive = (root: string, id: string, bytes: Buffer) => {
   const digest = createHash("sha256").update(bytes).digest("hex");
   return { file: hostLeaseArchivePath(root, id, digest), digest };
 };
+const preparedArchive = (root: string, preparedAt: number, snapshots: readonly { hostId: string; bytes: Buffer }[]) => {
+  const directory = path.join(root, "host-lease-archive", "batches");
+  expect(fs.readdirSync(path.dirname(directory))).toEqual(["batches"]);
+  const names = fs.readdirSync(directory);
+  expect(names).toHaveLength(1);
+  const file = path.join(directory, names[0]!);
+  const bytes = fs.readFileSync(file);
+  const receipt = JSON.parse(bytes.toString("utf8"));
+  expect(receipt).toEqual({ format: 2, status: "prepared", removalConfirmed: false, preparedAt,
+    candidates: expect.arrayContaining(snapshots.map(snapshot => ({ hostId: snapshot.hostId,
+      leaseSha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+      leaseBase64: snapshot.bytes.toString("base64") }))) });
+  expect(receipt.candidates).toHaveLength(snapshots.length);
+  for (const snapshot of snapshots) {
+    const candidate = receipt.candidates.find((value: { hostId: string }) => value.hostId === snapshot.hostId);
+    const archived = Buffer.from(candidate.leaseBase64, "base64");
+    expect(archived).toEqual(snapshot.bytes);
+    expect(createHash("sha256").update(archived).digest("hex")).toBe(candidate.leaseSha256);
+  }
+  return { file, bytes };
+};
+const ARCHIVE_FSYNC_BARRIERS = process.platform === "win32"
+  ? ["file"] as const
+  : ["file", "directory"] as const;
 afterEach(() => {
   vi.restoreAllMocks();
   for (const mesh of stores.splice(0)) mesh.closeState();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === "win32")("expired host lease archive", () => {
+describe("expired host lease archive", () => {
   it("reaps an already-compacted orphan once, preserving the exact detached bytes", async () => {
     const { root, mesh, now, lease } = setup();
     const old = lease("orphan"); writeHostLease(root, old);
@@ -43,15 +67,12 @@ describe.skipIf(process.platform === "win32")("expired host lease archive", () =
     fs.writeFileSync(hostLeasePath(root, old.id), bytes);
     expect(await reapDeadHostRecords(mesh, identity, { ownHostId: identity.id, now })).toBe(1);
     expect(fs.existsSync(hostLeasePath(root, old.id))).toBe(false);
-    const { file, digest } = archive(root, old.id, bytes);
-    const receipt = JSON.parse(fs.readFileSync(file, "utf8"));
-    expect(receipt).toEqual({ format: 1, hostId: old.id, archivedAt: now,
-      leaseSha256: digest, leaseBase64: bytes.toString("base64") });
-    expect(Buffer.from(receipt.leaseBase64, "base64")).toEqual(bytes);
-    const writes = vi.spyOn(fs, "renameSync");
+    const batch = preparedArchive(root, now, [{ hostId: old.id, bytes }]);
+    const writes = vi.spyOn(fs.promises, "rename");
     expect(await reapDeadHostRecords(mesh, identity, { ownHostId: identity.id, now })).toBe(0);
-    expect(writes.mock.calls.filter(([, to]) => String(to) === file)).toEqual([]);
-    expect(fs.readdirSync(path.dirname(file))).toEqual([path.basename(file)]);
+    expect(writes.mock.calls.filter(([, to]) => path.dirname(String(to)) === path.dirname(batch.file))).toEqual([]);
+    expect(fs.readdirSync(path.dirname(batch.file))).toEqual([path.basename(batch.file)]);
+    expect(fs.readFileSync(batch.file)).toEqual(batch.bytes);
   });
 
   it("retains own/live/boundary leases and an expired file protected by a live state row", async () => {
@@ -62,16 +83,19 @@ describe.skipIf(process.platform === "win32")("expired host lease archive", () =
     const row: MeshStateEntry = { key: hostKey(value.id), version: 1, updatedAt: now, updatedBy: identity,
       value: { format: 1, ...value, identity: { ...identity, id: value.identityId }, expiresAt: now + 15_000 } };
     fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({ format: 1, entries: { [row.key]: row } }));
+    const snapshots = ["old", "state-live"].map(hostId => ({ hostId, bytes: fs.readFileSync(hostLeasePath(root, hostId)) }));
     expect(await reapDeadHostRecords(mesh, identity, { ownHostId: identity.id, now })).toBe(1);
     expect(readHostLeaseCurrent(root, "old")).toBeUndefined();
     for (const id of [identity.id, "boundary", "live", "state-live"]) expect(readHostLeaseCurrent(root, id)).toBeDefined();
     expect(mesh.get(row.key, { fresh: true })).toBeDefined();
-    expect(fs.readdirSync(path.join(root, "host-lease-archive"))).toHaveLength(1);
+    // Preparation records candidates, not removal: even the state-protected lease can appear.
+    preparedArchive(root, now, snapshots);
   });
 
-  it("keeps a lease renewed after candidate selection, without archiving the replacement", async () => {
+  it("keeps a lease renewed after selection and leaves only its unconfirmed old snapshot", async () => {
     const { root, mesh, now, lease } = setup();
     const old = lease("returning"); writeHostLease(root, old);
+    const bytes = fs.readFileSync(hostLeasePath(root, old.id));
     const renewed = { ...old, updatedAt: now, expiresAt: now + 15_000 };
     const original = mesh.writeBatch.bind(mesh);
     vi.spyOn(mesh, "writeBatch").mockImplementationOnce(input => {
@@ -82,7 +106,7 @@ describe.skipIf(process.platform === "win32")("expired host lease archive", () =
     });
     expect(await reapDeadHostRecords(mesh, identity, { ownHostId: identity.id, now })).toBe(0);
     expect(readHostLeaseCurrent(root, old.id)).toEqual(renewed);
-    expect(fs.existsSync(path.join(root, "host-lease-archive"))).toBe(false);
+    preparedArchive(root, now, [{ hostId: old.id, bytes }]);
   });
 
   it("rechecks the detached file, not a matching incarnation read before its rename", async () => {
@@ -109,7 +133,17 @@ describe.skipIf(process.platform === "win32")("expired host lease archive", () =
     expect(fs.existsSync(path.join(root, "host-lease-archive"))).toBe(false);
   });
 
-  it.each(["file", "directory"] as const)("restores the exact lease when the archive %s fsync fails", async barrier => {
+  it("archives a small orphan backlog in one batch and one sweep", async () => {
+    const { root, mesh, now, lease } = setup();
+    const stale = Array.from({ length: 5 }, (_, index) => lease(`backlog:${index}`));
+    for (const value of stale) writeHostLease(root, value);
+    const snapshots = stale.map(value => ({ hostId: value.id, bytes: fs.readFileSync(hostLeasePath(root, value.id)) }));
+    expect(await reapDeadHostRecords(mesh, identity, { ownHostId: identity.id, now })).toBe(stale.length);
+    expect(stale.filter(value => fs.existsSync(hostLeasePath(root, value.id)))).toEqual([]);
+    preparedArchive(root, now, snapshots);
+  });
+
+  it.each(ARCHIVE_FSYNC_BARRIERS)("restores the exact lease when the archive %s fsync fails", async barrier => {
     const { root, mesh, now, lease } = setup();
     const old = lease(`failure:${barrier}`); writeHostLease(root, old);
     const bytes = fs.readFileSync(hostLeasePath(root, old.id));
@@ -146,12 +180,27 @@ describe.skipIf(process.platform === "win32")("expired host lease archive", () =
   });
 });
 
-it.skipIf(process.platform !== "win32")("retains a lease when namespace durability is unsupported", async () => {
+it("standalone removal keeps format-1 receipts and platform namespace barriers", async () => {
   const { root, mesh, now, lease } = setup();
-  const old = lease("unsupported"); writeHostLease(root, old);
+  const old = lease("windows-archive"); writeHostLease(root, old);
+  const bytes = fs.readFileSync(hostLeasePath(root, old.id));
   const expected = readHostLeaseCurrent(root, old.id)!;
-  const detach = vi.spyOn(fs, "renameSync");
-  expect(await mesh.leaseCustody(hostLeasePath(root, old.id), () => removeHostLeaseVersionUnderCustody(root, expected, now))).toBe(false);
-  expect(detach.mock.calls.some(([from]) => String(from) === hostLeasePath(root, old.id))).toBe(true);
-  expect(readHostLeaseCurrent(root, old.id)).toEqual(old);
+  const syncedDirectories: boolean[] = [];
+  const sync = fs.fsyncSync;
+  await mesh.leaseCustody(hostLeasePath(root, old.id), () => {
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      syncedDirectories.push(fs.fstatSync(fd).isDirectory());
+      sync(fd);
+    });
+    expect(removeHostLeaseVersionUnderCustody(root, expected, now)).toBe(true);
+    vi.mocked(fs.fsyncSync).mockRestore();
+  });
+  expect(syncedDirectories).toContain(false);
+  if (process.platform === "win32") expect(syncedDirectories).not.toContain(true);
+  else expect(syncedDirectories).toContain(true);
+  expect(readHostLeaseCurrent(root, old.id)).toBeUndefined();
+  const { file, digest } = archive(root, old.id, bytes);
+  const receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+  expect(receipt).toEqual({ format: 1, hostId: old.id, archivedAt: now,
+    leaseSha256: digest, leaseBase64: bytes.toString("base64") });
 });

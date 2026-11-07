@@ -10,8 +10,8 @@ import path from "node:path";
 import readline from "node:readline";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { AsyncLocalStorage } from "node:async_hooks";
-import { DatabaseSync } from "node:sqlite";
+import { createMainBatchObserver, databaseIdentity, aggregateSites } from "./main-batch-observer.mjs";
+export { databaseIdentity, captureTransactions, aggregateSites } from "./main-batch-observer.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const self = fileURLToPath(import.meta.url);
@@ -43,136 +43,29 @@ export function prepareOutput(out) {
   return files;
 }
 
-export function databaseIdentity(file) {
-  const canonical = fs.realpathSync(file), stat = fs.statSync(canonical, { bigint: true });
-  assert(stat.isFile(), "SQLite main database must be a regular file");
-  return { file: canonical, device: String(stat.dev), inode: String(stat.ino) };
-}
 const sameDatabase = (a, b) => a.file === b.file && a.device === b.device && a.inode === b.inode;
-
-// openNodeSqlite may receive a descriptor-pinned path for the native driver.
-// Ask that actual connection for its main file; resolve the pin, then bind the
-// canonical path AND inode to the mesh file also verified by store diagnostics.
-export function captureTransactions(meshDatabase, stamp, record) {
-  const connections = new WeakMap();
-  let sequence = 0;
-  const exec = DatabaseSync.prototype.exec;
-  DatabaseSync.prototype.exec = function (sql, ...rest) {
-    const verb = typeof sql === "string" && /^(BEGIN IMMEDIATE|COMMIT|ROLLBACK)$/.exec(sql)?.[1];
-    if (!verb) return exec.call(this, sql, ...rest);
-    let database = connections.get(this);
-    if (!database) {
-      database = { connectionId: ++sequence, openedFile: null, scope: "unknown-sqlite" };
-      try {
-        const main = this.prepare("PRAGMA database_list").all().find(row => row.name === "main");
-        database.openedFile = main?.file ?? null;
-        Object.assign(database, databaseIdentity(main.file));
-        database.scope = sameDatabase(database, meshDatabase) ? "mesh-state" : "other-sqlite";
-      } catch (error) { database.identityError = String(error); }
-      connections.set(this, database);
-    }
-    const row = { ...stamp(), database, verb, succeeded: false }, began = performance.now();
-    try { const result = exec.call(this, sql, ...rest); row.succeeded = true; return result; }
-    finally { row.elapsedMs = performance.now() - began; record(row); }
-  };
-  return () => { DatabaseSync.prototype.exec = exec; };
-}
 const meshBegin = tx => tx.database.scope === "mesh-state" && tx.verb === "BEGIN IMMEDIATE" && tx.succeeded;
-
-export function aggregateSites(capture) {
-  const sites = new Map();
-  for (const row of capture.calls.filter(row => row.phase === "idle")) {
-    const frame = row.stack[0].replace(/^at\s+/, "");
-    const callSite = frame.endsWith(")") ? frame.slice(frame.lastIndexOf("(") + 1, -1) : frame.replace(/^async\s+/, "");
-    assert(/:\d+:\d+$/.test(callSite), "immediate caller must have a source location");
-    if (!sites.has(callSite)) sites.set(callSite, { callSite, stacks: [], count: 0, inputOps: 0, preparedOps: 0, resultOps: 0,
-      appliedOps: 0, failures: 0, hooks: {}, keys: {}, transactions: 0, lockAcquisitions: 0 });
-    const site = sites.get(callSite);
-    let variant = site.stacks.find(item => item.stack.join("\n") === row.stack.join("\n"));
-    if (!variant) { variant = { stack: row.stack, count: 0 }; site.stacks.push(variant); }
-    variant.count++; site.count++; site.inputOps += row.ops.length;
-    site.preparedOps += row.prepared.flat().length; site.resultOps += row.results?.length ?? 0;
-    site.appliedOps += row.results?.filter(result => result.applied).length ?? 0;
-    if (!row.succeeded) site.failures++;
-    for (const hook of row.hookRuns) site.hooks[hook.name] = (site.hooks[hook.name] ?? 0) + 1;
-    for (const op of [...row.ops, ...row.prepared.flat()]) site.keys[`${op.kind} ${op.key}`] = (site.keys[`${op.kind} ${op.key}`] ?? 0) + 1;
-    site.transactions += capture.transactions.filter(tx => tx.batchId === row.id && meshBegin(tx)).length;
-    site.lockAcquisitions += capture.locks.filter(lock => lock.batchId === row.id && lock.method === "acquired").length;
-  }
-  return [...sites.values()].sort((a, b) => b.count - a.count);
-}
 
 // Loaded as an ordinary Pi extension in the owned RPC child. The real production
 // extension registers all its own hooks; this wrapper does not compose substitutes.
 export default async function probeExtension(pi) {
   const spec = JSON.parse(process.env.IDLE_MAIN_BATCH_SPEC);
-  const als = new AsyncLocalStorage();
-  const calls = [], locks = [], transactions = [], stores = new Set();
-  let phase = "startup", sequence = 0, windowStart, windowEnd;
-  let dropped = 0;
-  const bounded = (list, row) => { if (list.length < 100000) list.push(row); else dropped++; };
-  const stamp = () => ({ at: Date.now(), monotonicMs: performance.now(), phase, batchId: als.getStore()?.id ?? null });
-  const normalize = text => text.replaceAll(spec.candidate, "<candidate>").replaceAll(spec.root, "<scratch>")
-    .replaceAll(path.dirname(self), "<harness-dir>");
-  const describe = ops => ops.map(op => ({ kind: op.kind, key: op.key, valueKind: typeof op.value,
-    ...(op.ifVersion === undefined ? {} : { ifVersion: op.ifVersion }),
-    ...(op.onConflict === undefined ? {} : { onConflict: typeof op.onConflict === "function" ? "function" : op.onConflict }),
-    condition: typeof op.condition === "function" }));
-
-  const meshDatabase = databaseIdentity(path.join(spec.mesh, "state.db"));
-  captureTransactions(meshDatabase, stamp, row => bounded(transactions, row));
-  const { MeshStore } = await import(pathToFileURL(path.join(spec.candidate, "dist/mesh.js")).href);
+  const observer = await createMainBatchObserver({ ...spec, role: "measuredMain", label: "M00" });
+  const { stores } = observer;
   const registry = globalThis[Symbol.for("pi-fabric.mesh.lock-stats")];
-  assert(registry?.stats, "existing lock recorder unavailable");
-  for (const method of ["acquired", "failed", "phase"]) {
-    const original = registry.stats[method];
-    registry.stats[method] = function (...args) {
-      const result = original.apply(this, args);
-      if (args[0] === spec.mesh) bounded(locks, { ...stamp(), method, args: args.slice(1) });
-      return result;
-    };
-  }
-  const batch = MeshStore.prototype.writeBatch;
-  MeshStore.prototype.writeBatch = function (input) {
-    assert.equal(this.root, spec.mesh, "probe must not write another mesh");
-    stores.add(this);
-    const stack = normalize(new Error().stack ?? "").split("\n").slice(2).map(line => line.trim());
-    const row = { ...stamp(), id: ++sequence, stack, ops: describe(input.ops), hooks: {},
-      lockClass: input.lockClass ?? "writeBatch", lockTiming: input.lockTiming ?? null,
-      sqliteHoldTag: input.sqliteHoldTag ?? null, prepared: [], hookRuns: [] };
-    bounded(calls, row);
-    const wrapped = { ...input };
-    for (const name of ["prepare", "beforeCommit", "afterCommit", "commitOutbox"]) {
-      row.hooks[name] = typeof input[name] === "function";
-      if (!row.hooks[name]) continue;
-      wrapped[name] = function (...args) {
-        const run = { name, ...stamp(), succeeded: false }, began = performance.now();
-        row.hookRuns.push(run);
-        try {
-          const result = input[name].apply(this, args);
-          if (name === "prepare") row.prepared.push(describe(result ?? []));
-          run.succeeded = true;
-          return result;
-        } finally { run.elapsedMs = performance.now() - began; }
-      };
-    }
-    return als.run(row, async () => {
-      const began = performance.now();
-      try {
-        const results = await batch.call(this, wrapped);
-        row.results = results.map(({ key, applied, version }) => ({ key, applied, version }));
-        row.succeeded = true;
-        return results;
-      } catch (error) { row.succeeded = false; row.error = normalize(String(error)); throw error; }
-      finally { row.elapsedMs = performance.now() - began; row.endedAt = Date.now(); }
-    });
-  };
-  const production = await import(pathToFileURL(path.join(spec.candidate, "dist/index.js")).href);
-  await production.default(pi);
-  const snapshots = () => [...stores].map(store => {
+  const meshDatabase = databaseIdentity(path.join(spec.mesh, "state.db"));
+  let phase = "startup", windowStart, windowEnd;
+  try {
+    const production = await import(pathToFileURL(path.join(spec.candidate, "dist/index.js")).href);
+    await production.default(pi);
+  } catch (error) { observer.restore(); throw error; }
+  // Preserve this SQLite-only CLI's original shared-store snapshots. The shared observer
+  // also inventories legitimate auxiliary stores, which need not use this backend.
+  const snapshots = () => [...stores].filter(store => fs.realpathSync(store.root) === fs.realpathSync(spec.mesh)).map(store => {
     const diagnostics = store.stateDiagnostics();
-    assert(sameDatabase(databaseIdentity(diagnostics.database), meshDatabase), "store diagnostics must name the captured mesh database");
-    return { backend: store.stateBackend, diagnostics, databaseIdentity: meshDatabase,
+    const identity = databaseIdentity(diagnostics.database);
+    assert(sameDatabase(identity, meshDatabase), "store diagnostics must name the captured mesh database");
+    return { backend: store.stateBackend, diagnostics, databaseIdentity: identity,
       entries: store.listAll("", { fresh: true }).map(({ key, version }) => ({ key, version })) };
   });
   let native;
@@ -180,7 +73,9 @@ export default async function probeExtension(pi) {
     native = { mode: ctx.mode, trusted: ctx.isProjectTrusted(), sessionId: ctx.sessionManager.getSessionId(),
       sessionFile: ctx.sessionManager.getSessionFile(), hasUI: ctx.hasUI };
   });
+  pi.on("session_shutdown", () => observer.restore());
   pi.registerCommand("idle-main-probe", { description: "Private idle transaction measurement", handler: async (args, ctx) => {
+    try {
     assert.equal(ctx.mode, "rpc");
     assert(ctx.isIdle(), "Main must be idle");
     if (args.trim() === "start") {
@@ -191,16 +86,24 @@ export default async function probeExtension(pi) {
       const id = `session:${native.sessionId}`;
       assert([...stores].some(store => store.listAll("topology/participants/").some(entry => entry.value.id === id)),
         "normal runtime did not publish this native Main");
+      const { calls, transactions } = observer.getCapture();
       assert(transactions.some(tx => meshBegin(tx) && calls.some(call => call.id === tx.batchId && call.succeeded)),
         "startup batch must reach the measured mesh SQLite connection");
       save(spec.ready, { native, stores: state });
-      phase = "idle"; windowStart = { at: Date.now(), monotonicMs: performance.now() };
+      phase = "idle"; windowStart = observer.setPhase("idle");
     } else if (args.trim() === "finish") {
       assert.equal(phase, "idle");
-      windowEnd = { at: Date.now(), monotonicMs: performance.now() }; phase = "post-window";
-      registry.flush();
-      save(spec.capture, { native, windowStart, windowEnd, stores: snapshots(), calls, locks, transactions, dropped });
+      windowEnd = observer.setPhase("post-window"); phase = "post-window";
+      try {
+        const drained = await observer.drain(5000);
+        assert(!drained.timedOut && drained.liveBatches === 0, "live batches exceeded the finite drain");
+        registry.flush();
+        const state = snapshots();
+        const raw = observer.getCapture();
+        save(spec.capture, { ...raw, storeInventory: raw.stores, native, windowStart, windowEnd, stores: state });
+      } finally { observer.restore(); }
     } else throw new Error("expected start or finish");
+    } catch (error) { observer.restore(); throw error; }
   } });
 }
 
@@ -299,6 +202,7 @@ async function main() {
     assert.equal(events.filter(event => ["agent_start", "message_start", "tool_execution_start"].includes(event.type)).length, 0,
       "probe must not trigger an agent turn, tool or inference");
     assert.equal(capture.dropped, 0);
+    assert.equal(capture.observerErrorCount, 0, "observer failures invalidate the capture");
     assert(capture.windowEnd.monotonicMs - capture.windowStart.monotonicMs >= options.seconds * 1000);
   } catch (error) { failure = error; }
   finally {

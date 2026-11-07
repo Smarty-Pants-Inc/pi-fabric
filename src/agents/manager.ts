@@ -516,6 +516,15 @@ export class AgentLaunchPreparationTimeoutError extends Error {
   }
 }
 
+/** Creation-time refusal; frozen actor launches retain their admitted backend. */
+export class FabricPythonRuntimePolicyError extends Error {
+  readonly code = "FABRIC_PYTHON_RUNTIME_POLICY";
+  constructor() {
+    super('Actor pythonRuntime: "cpython" requests native execution, which configured executor.pythonRuntime: "monty" does not allow. Choose "monty" or explicitly configure executor.pythonRuntime: "cpython".');
+    this.name = "FabricPythonRuntimePolicyError";
+  }
+}
+
 interface AgentParticipantGuidanceRequest {
   model?: string;
   runner: FabricAgentRunner;
@@ -2298,6 +2307,16 @@ export class AgentManager {
       throw new Error(`Invalid inherited Fabric Python runtime: ${String(runtime)}`);
     }
     return runtime;
+  }
+
+  /** Admit a new actor's selector without changing internal frozen-launch resolution. */
+  resolveActorPythonRuntime(requested?: FabricPythonRuntime): FabricPythonRuntime {
+    const runtime = requested === undefined ? undefined : this.resolvePythonRuntime(requested);
+    const configured = this.resolvePythonRuntime();
+    if (runtime === "cpython" && configured !== "cpython") {
+      throw new FabricPythonRuntimePolicyError();
+    }
+    return runtime ?? configured;
   }
 
   async #recordSpawnRouterStart(request: AgentRunRequest, agentId: string, model: string | undefined, thinking: AgentRunRequest["thinking"], sessionFile?: string, managed?: ManagedAgent, admission?: SpawnRouterAdmission): Promise<void> {

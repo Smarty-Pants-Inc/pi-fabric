@@ -29,13 +29,14 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-// Keep reason: data safety at the persisted template/import boundary.
+// Keep reason: data safety at the persisted template/import boundary and the
+// recorded PR #1873 catch. Registry storage is not execution authorization;
+// public create/import policy is exercised in actor-create-python-runtime.test.
 // All registry I/O and runtime policy resolution are real; no actor is activated.
 describe("global actor Python runtime preservation", () => {
-  it.each(["cpython", "monty"] as const)("preserves explicit %s instead of the opposite default through create, resolve, disk and import request", (pythonRuntime) => {
-    const inherited = pythonRuntime === "cpython" ? "monty" : "cpython";
-    const { root, manager, registry, file } = setup(inherited);
-    expect(manager.resolvePythonRuntime()).toBe(inherited);
+  it.each(["cpython", "monty"] as const)("preserves explicit %s under CPython policy through create, resolve, disk and import request", (pythonRuntime) => {
+    const { root, manager, registry, file } = setup("cpython");
+    expect(manager.resolvePythonRuntime()).toBe("cpython");
     const created = registry.create({ ...request, pythonRuntime });
     expect(created.pythonRuntime).toBe(pythonRuntime);
     expect(registry.resolve(created.id)?.pythonRuntime).toBe(pythonRuntime);
@@ -48,7 +49,7 @@ describe("global actor Python runtime preservation", () => {
   });
 
   it.each(["cpython", "monty"] as const)("retains %s on omitted update and persists an explicit override", (pythonRuntime) => {
-    const { root, registry } = setup();
+    const { root, registry } = setup("cpython");
     const created = registry.create({ ...request, pythonRuntime });
     expect(registry.update(created.id, { instructions: "Still idle." }).pythonRuntime).toBe(pythonRuntime);
     const override = pythonRuntime === "cpython" ? "monty" : "cpython";
@@ -72,7 +73,7 @@ describe("global actor Python runtime preservation", () => {
   });
 
   it.each(["pypy", "", null, false, 1, {}, []].map(value => [value]))("rejects supplied invalid runtime %j on create and update without changing stored bytes", (invalid) => {
-    const { registry, file } = setup();
+    const { registry, file } = setup("cpython");
     const created = registry.create({ ...request, pythonRuntime: "cpython" });
     const before = fs.readFileSync(file, "utf8");
     const pythonRuntime = invalid as FabricPythonRuntime;

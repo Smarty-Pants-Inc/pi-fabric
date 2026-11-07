@@ -601,7 +601,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         pythonRuntime: {
           type: "string",
           enum: ["cpython", "monty"] satisfies FabricPythonRuntime[],
-          description: "Actor Python backend, fixed at creation. Omit to inherit configured policy; global templates inherit on import. CPython is native execution.",
+          description: "Actor Python backend, fixed at creation and constrained by configured executor.pythonRuntime. CPython is native execution and requires configured cpython; configured cpython also permits sandboxed monty. Omit to inherit configured policy; global templates inherit and recheck policy on import.",
         },
         model: strictModelProperty,
         modelReason: runProperties.modelReason,

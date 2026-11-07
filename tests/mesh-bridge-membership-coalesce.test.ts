@@ -261,6 +261,11 @@ describe("real-store bridge membership refresh coalescing", () => {
     }
     const membershipSize = (await f.remote.presence()).hosts.length;
     expect(membershipSize).toBe(64);
+    let localNotice!: (kind: BridgeChange) => void;
+    // Isolate workload wakes: independent startup/self-mirror presence notices can
+    // arrive after a quiet window and legitimately contaminate the sync/sample counts.
+    f.local.subscribeChanges = changed => { localNotice = changed; return () => undefined; };
+    f.remote.subscribeChanges = () => () => undefined;
     const run = await startNotifyingBridge(f);
     await quiet(() => run.syncs.mock.calls.length);
     expect((await f.local.presence()).reserved).toContain(knownOther.id);
@@ -286,6 +291,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     const samplesBefore = actualSamples.mock.calls.length;
     const started = performance.now();
     const published = await Promise.all(workload.map(item => work(f.hub, hubLead, item.to, item.text)));
+    localNotice("events");
     const originals = published.map((event, index) => ({ event, addressed: workload[index]!.addressed }))
       .sort((left, right) => left.event.sequence - right.event.sequence);
     const lastEvent = originals.at(-1)!;

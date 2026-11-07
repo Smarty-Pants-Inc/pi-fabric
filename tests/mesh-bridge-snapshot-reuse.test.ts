@@ -59,12 +59,15 @@ const cleanup: Array<() => void> = [];
 afterEach(() => {
   vi.restoreAllMocks();
   for (const close of cleanup.splice(0).reverse()) close();
+  vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   observation.notify.clear();
   observation.inputs.length = 0;
   vi.mocked(readHostLeases).mockClear();
 });
-const turn = () => new Promise<void>(resolve => setTimeout(resolve, 120));
+// Notification delivery is the event source; advance exactly the fixed coalescing window.
+// Retry tests advance their one pending backoff separately, never sleep past multiple ticks.
+const turn = () => vi.advanceTimersByTimeAsync(100);
 const claimed = (name: string): BridgePresence => {
   const id = `session:${name}-00000000`;
   const identity = { id, name, kind: "main" as const, sessionId: `${name}-00000000` };
@@ -103,6 +106,7 @@ const fixture = async () => {
   const side = new StoreBridgeSide(store, "far", () => NOW);
   await side.mirror(direct);
   await new StoreBridgeSide(store, "other", () => NOW).mirror(relay);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   const changes: BridgeChange[] = [], failures: Error[] = [];
   const subscribe = (log?: (message: string) => void) => {
     const unsubscribe = side.subscribeChanges(kind => changes.push(kind), error => failures.push(error), log);
@@ -126,23 +130,29 @@ const frames = () => {
 };
 const clearInputs = () => { observation.inputs.length = 0; vi.mocked(readHostLeases).mockClear(); };
 const measure = (f: Fixture) => {
-  let fenced = false;
-  const reads: Array<{ prefix: string; fresh: boolean; fenced: boolean }> = [];
-  const leaseReads: boolean[] = [];
+  let fenced = false, inReadSnapshot = false;
+  const reads: Array<{ prefix: string; fresh: boolean; fenced: boolean; snapshot: boolean }> = [];
+  const leaseReads: boolean[] = [], leaseSnapshots: boolean[] = [];
   const readLeases = vi.mocked(readHostLeases).getMockImplementation()!;
   vi.mocked(readHostLeases).mockImplementation((...args) => {
     leaseReads.push(fenced);
+    leaseSnapshots.push(inReadSnapshot);
     return readLeases(...args);
   });
   const original = SqliteStateBackend.prototype.listAll;
   vi.spyOn(SqliteStateBackend.prototype, "listAll").mockImplementation(function (this: InstanceType<typeof SqliteStateBackend>, prefix = "", options = {}) {
-    if (this.root === f.root) reads.push({ prefix, fresh: options.fresh === true, fenced });
+    if (this.root === f.root) reads.push({ prefix, fresh: options.fresh === true, fenced, snapshot: inReadSnapshot });
     return original.call(this, prefix, options);
   });
   // listAllShared can materialize a complete SQLite snapshot instead of the three ranges.
   const shared = vi.spyOn(SqliteStateBackend.prototype, "listAllShared");
-  const fence = f.store.withStateWriteFence.bind(f.store);
-  const fences = vi.spyOn(f.store, "withStateWriteFence").mockImplementation(operation => fence(() => {
+  const readSnapshot = f.store.withStateReadSnapshot.bind(f.store);
+  const snapshots = vi.spyOn(f.store, "withStateReadSnapshot").mockImplementation(operation => readSnapshot(() => {
+    inReadSnapshot = true;
+    try { return operation(); } finally { inReadSnapshot = false; }
+  }));
+  const writeFence = f.store.withStateWriteFence.bind(f.store);
+  const writers = vi.spyOn(f.store, "withStateWriteFence").mockImplementation(operation => writeFence(() => {
     fenced = true;
     try { return operation(); } finally { fenced = false; }
   }));
@@ -152,18 +162,19 @@ const measure = (f: Fixture) => {
     expect(shared).not.toHaveBeenCalled();
     expect(reads).toHaveLength(inside.length * PREFIXES.length);
     for (const prefix of PREFIXES) expect(reads.filter(read => read.prefix === prefix)).toEqual(
-      inside.map(inFence => ({ prefix, fresh: true, fenced: inFence })),
+      inside.map(snapshot => ({ prefix, fresh: true, fenced: false, snapshot })),
     );
     expect(vi.mocked(readHostLeases).mock.calls).toEqual(inside.map(() => [f.root]));
-    expect(leaseReads).toEqual(inside);
+    expect(leaseReads).toEqual(inside.map(() => false));
+    expect(leaseSnapshots).toEqual(inside);
     expect(frames()).toHaveLength(inside.length);
   };
-  return { fences, revisions, proofs, reads, leaseReads, expectAttempts };
+  return { snapshots, writers, revisions, proofs, reads, leaseReads, expectAttempts };
 };
 
 // Keep: trust-boundary/freshness fences, and the recorded snapshot CPU/read amplification
 // incident. Gate mechanisms/counts, not noisy elapsed-time thresholds.
-describe("SQLite bridge snapshot reuse is capture-local", () => {
+describe("SQLite bridge snapshots reuse only proven unchanged observations", () => {
   it("reads each fresh backend prefix and scans leases once for all three projections", async () => {
     const f = await fixture();
     clearInputs();
@@ -176,20 +187,23 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     expect(JSON.parse(initial.content).mirrored).toHaveLength(2);
     expect(JSON.parse(initial.content).relays).toHaveLength(2);
     expect(f.changes).toEqual([]);
-    m.expectAttempts([false]);
-    expect(m.fences).toHaveBeenCalledTimes(1);
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([true]);
+    m.expectAttempts([true]);
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    expect(m.writers).toHaveBeenCalledTimes(1);
+    expect(m.proofs).not.toHaveBeenCalled();
     expect(m.revisions).toHaveBeenCalledTimes(1);
   });
 
-  it("re-reads on later captures, retaining unchanged/lease/presence classification", async () => {
+  it("skips unchanged captures and retains lease/presence classification on invalidation", async () => {
     const f = await fixture();
     f.subscribe();
     const initial = frames().at(-1)!;
     clearInputs();
     const m = measure(f);
     await f.fire();
-    expect(frames()[0]).toEqual(initial);
+    expect(frames()).toEqual([]);
+    expect(m.snapshots).not.toHaveBeenCalled();
+    expect(m.writers).not.toHaveBeenCalled();
     expect(f.changes).toEqual([]);
     // A new SQLite version with reordered JSON properties is semantically unchanged.
     await f.store.put({ key: key("participants", f.participant.id), identity: f.identity,
@@ -228,14 +242,13 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       expect.objectContaining({ value: expect.objectContaining({ id: relayParticipant.id, status: "running" }) }),
     ]));
     expect(f.changes.splice(0)).toEqual(["presence"]);
-    m.expectAttempts(Array<boolean>(7).fill(false));
+    m.expectAttempts(Array<boolean>(6).fill(true));
   });
 
   it("debounces renewMirroredLeases without hiding native lease changes or leaving retries", async () => {
     const f = await fixture();
     const unsubscribe = f.subscribe();
     clearInputs();
-    vi.useFakeTimers();
     try {
       const notify = observation.notify.get(f.root)!;
       const source = f.direct.hosts[0]!;
@@ -263,8 +276,10 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       await vi.advanceTimersByTimeAsync(40);
       expect(frames()).toHaveLength(1);
       expect(f.changes).toEqual([]); // Mirror-only renewal fields are not presence changes.
-      m.expectAttempts([false]); // Three fresh prefixes and one lease scan, all outside the fence.
-      expect(m.reads.every(read => !read.fenced)).toBe(true);
+      m.expectAttempts([true]); // Three fresh prefixes and one lease scan in a read transaction, NEVER writer custody.
+      expect(m.snapshots).toHaveBeenCalledTimes(1);
+      expect(m.writers).not.toHaveBeenCalled();
+      expect(m.reads.every(read => !read.fenced && read.snapshot)).toBe(true);
       expect(m.leaseReads).toEqual([false]);
       expect(vi.getTimerCount()).toBe(0);
 
@@ -277,7 +292,9 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       expect(frames()).toHaveLength(2);
       expect(JSON.parse(frames().at(-1)!.content).native.hosts[0].expiresAt).toBe(NOW + 90_000);
       expect(f.changes.splice(0)).toEqual(["lease"]);
-      m.expectAttempts([false, false]);
+      m.expectAttempts([true, true]);
+      expect(m.snapshots).toHaveBeenCalledTimes(2);
+      expect(m.writers).not.toHaveBeenCalled();
 
       // Unsubscribe cancels a newly queued notification; it cannot turn into retries or scans.
       const settledFrames = frames();
@@ -290,66 +307,131 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       expect(frames()).toEqual(settledFrames);
       expect(f.changes).toEqual([]);
       expect(f.failures).toEqual([]);
-      m.expectAttempts([false, false]);
+      m.expectAttempts([true, true]);
+      expect(m.snapshots).toHaveBeenCalledTimes(2);
+      expect(m.writers).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      unsubscribe();
-      vi.useRealTimers();
-    }
+    } finally { unsubscribe(); }
   });
 
-  it("rejects obsolete SQLite captures and accepts a third only after an out-of-fence resnapshot", async () => {
+  it("settles once before taking the current consistent read snapshot outside writer custody", async () => {
     const f = await fixture();
     f.subscribe();
     const baseline = frames().at(-1)!;
-    // A second real SQLite connection commits exactly between observation and validation.
-    // Its lower-level put has no MeshStore async-open yield before the synchronous transaction.
     const writer = await SqliteStateStore.open(f.root, 64 * 1024, 100);
+    cleanup.push(() => writer.close());
+    await writer.put({ key: key("participants", f.participant.id), identity: f.identity,
+      value: { ...f.participant, status: "obsolete" } });
+    clearInputs();
+    const m = measure(f);
+    const fence = m.writers.getMockImplementation()!;
+    const pending: Array<Promise<unknown>> = [];
+    m.writers.mockImplementation(operation => {
+      pending.push(writer.put({ key: key("participants", f.participant.id), identity: f.identity,
+        value: f.participant }));
+      expect(writer.get(key("participants", f.participant.id), { fresh: true })!.value).toEqual(f.participant);
+      return fence(operation);
+    });
+    await f.fire();
+    await Promise.all(pending);
+    expect(frames()).toEqual([baseline]);
+    expect(f.changes).toEqual([]);
+    expect(m.writers).toHaveBeenCalledTimes(1);
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    expect(m.revisions).toHaveBeenCalledTimes(1);
+    m.expectAttempts([true]);
+  });
+
+  it("rejects obsolete SQLite read captures and accepts a third only on a later retry tick", async () => {
+    const f = await fixture();
+    f.subscribe();
+    const baseline = frames().at(-1)!;
+    const writer = await SqliteStateStore.open(f.root, 64 * 1024, 100, { lockTimeoutMs: 0, busyTimeoutMs: 0 });
     cleanup.push(() => writer.close());
     const pending: Array<Promise<unknown>> = [];
     const setStatus = (status: string) => {
       pending.push(writer.put({ key: key("participants", f.participant.id), identity: f.identity,
         value: { ...f.participant, status } }));
-      // Writes are uncontended and commit synchronously before returning their promise.
       expect(writer.get(key("participants", f.participant.id), { fresh: true })!.value).toMatchObject({ status });
     };
     setStatus("obsolete-0");
     clearInputs();
     const m = measure(f);
-    const fence = m.fences.getMockImplementation()!;
+    const snapshot = m.snapshots.getMockImplementation()!;
     let entered = 0;
-    m.fences.mockImplementation(operation => {
+    m.snapshots.mockImplementation(operation => snapshot(() => {
+      const value = operation();
+      // A real WAL writer commits while this read transaction is still pinned. That is
+      // legal for observation, impossible under writer custody, and invalidates this capture.
       entered += 1;
       if (entered <= 2) setStatus(entered === 1 ? "obsolete-1" : "idle");
-      return fence(operation);
-    });
+      return value;
+    }));
     await f.fire();
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    expect(m.writers).toHaveBeenCalledTimes(1);
+    expect(f.changes).toEqual([]);
+    expect(vi.getTimerCount()).toBe(1);
+    await turn(); // first retry: the second capture is also invalidated
+    expect(m.snapshots).toHaveBeenCalledTimes(2);
+    expect(m.writers).toHaveBeenCalledTimes(2);
+    expect(f.changes).toEqual([]);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(199);
+    expect(m.snapshots).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1); // second retry has the doubled 200 ms backoff
     await Promise.all(pending);
     expect(frames().map(frame => JSON.parse(frame.content).native.participants[0].status))
       .toEqual(["obsolete-0", "obsolete-1", "idle"]);
     expect(frames().at(-1)).toEqual(baseline);
-    expect(f.changes).toEqual([]); // Discarded captures cannot become the subscriber's baseline.
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([false, false, true]);
+    expect(f.changes).toEqual([]); // Invalidated reads never replace the subscriber's baseline.
     expect(m.revisions).toHaveBeenCalledTimes(3);
-    expect(m.fences).toHaveBeenCalledTimes(3);
-    m.expectAttempts([false, false, false]);
+    expect(m.snapshots).toHaveBeenCalledTimes(3);
+    expect(m.writers).toHaveBeenCalledTimes(3);
+    m.expectAttempts([true, true, true]);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounds repeated SQLite churn without ever taking a full snapshot inside the fence", async () => {
+  it("bounds repeated SQLite read invalidation to one capture per tick, never a final writer scan", async () => {
     const f = await fixture();
-    f.subscribe();
+    const unsubscribe = f.subscribe();
+    const writer = await SqliteStateStore.open(f.root, 64 * 1024, 100, { lockTimeoutMs: 0, busyTimeoutMs: 0 });
+    cleanup.push(() => writer.close());
+    await writer.put({ key: key("participants", f.participant.id), identity: f.identity,
+      value: { ...f.participant, status: "obsolete" } });
     clearInputs();
     const m = measure(f);
-    m.proofs.mockReturnValue(false);
+    const snapshot = m.snapshots.getMockImplementation()!;
+    const pending: Array<Promise<unknown>> = [];
+    let version = 0;
+    m.snapshots.mockImplementation(operation => snapshot(() => {
+      const value = operation();
+      const status = `churn-${++version}`;
+      pending.push(writer.put({ key: key("participants", f.participant.id), identity: f.identity,
+        value: { ...f.participant, status } }));
+      expect(writer.get(key("participants", f.participant.id), { fresh: true })!.value).toMatchObject({ status });
+      return value;
+    }));
     await f.fire();
-    expect(m.revisions).toHaveBeenCalledTimes(3);
-    expect(m.fences).toHaveBeenCalledTimes(3);
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual(Array(3).fill(false));
-    m.expectAttempts(Array(3).fill(false));
+    expect(m.revisions).toHaveBeenCalledTimes(1);
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    expect(m.writers).toHaveBeenCalledTimes(1);
+    m.expectAttempts([true]);
+    expect(f.changes).toEqual([]);
     expect(f.failures).toEqual([]);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    unsubscribe();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.all(pending);
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    expect(m.writers).toHaveBeenCalledTimes(1);
+    m.expectAttempts([true]);
   });
 
-  it.each(["participants", "host-leases"] as const)("rejects directory-only %s churn even when the state revision still proves unchanged", async directory => {
+  it.each(["participants", "host-leases"] as const)("retries directory-only %s churn on the next tick, without repeated writer custody", async directory => {
     const f = await fixture();
     let fileEntry: MeshStateEntry | undefined;
     if (directory === "participants") {
@@ -362,92 +444,136 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     const revision = f.store.stateRevision();
     const mutate = (step: number) => {
       if (fileEntry) writeParticipantFile(f.root, { ...fileEntry,
-        value: { ...f.participant, status: step < 2 ? `obsolete-${step}` : "idle" } });
+        value: { ...f.participant, status: step === 0 ? "obsolete-0" : "idle" } });
       else f.renew(NOW + 70_000 + step * 10_000);
     };
     mutate(0);
     clearInputs();
     const m = measure(f);
-    const fence = m.fences.getMockImplementation()!;
+    const snapshot = m.snapshots.getMockImplementation()!;
     let entered = 0;
-    m.fences.mockImplementation(operation => {
-      entered += 1;
-      if (entered <= 2) {
+    m.snapshots.mockImplementation(operation => {
+      const value = snapshot(operation);
+      if (entered++ === 0) {
         const stamp = meshDirectoryStamp(f.root, directory);
-        mutate(entered);
+        mutate(1);
         expect(meshDirectoryStamp(f.root, directory)).not.toBe(stamp);
       }
-      return fence(operation);
+      return value;
     });
     await f.fire();
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    expect(m.writers).not.toHaveBeenCalled();
+    expect(f.changes).toEqual([]);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(m.snapshots).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); // Invalidated files retry without another notification.
     expect(f.store.stateRevision()).toBe(revision);
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([true, true, true]);
-    expect(m.fences).toHaveBeenCalledTimes(3);
+    expect(m.proofs.mock.results.map(result => result.value)).toEqual([true, true]);
+    expect(m.snapshots).toHaveBeenCalledTimes(2);
+    expect(m.writers).not.toHaveBeenCalled();
     if (fileEntry) {
       expect(frames().map(frame => JSON.parse(frame.content).native.participants[0].status))
-        .toEqual(["obsolete-0", "obsolete-1", "idle"]);
+        .toEqual(["obsolete-0", "idle"]);
       expect(frames().at(-1)).toEqual(baseline);
       expect(f.changes).toEqual([]);
     } else {
       expect(frames().map(frame => JSON.parse(frame.content).native.hosts[0].expiresAt))
-        .toEqual([NOW + 70_000, NOW + 80_000, NOW + 90_000]);
+        .toEqual([NOW + 70_000, NOW + 80_000]);
       expect(frames().at(-1)!.topology).toBe(baseline.topology);
       expect(f.changes).toEqual(["lease"]);
     }
-    m.expectAttempts([false, false, false]);
+    m.expectAttempts([true, true]);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("retries a deferred capture to convergence and resets its backoff after success", async () => {
+  it("retries an invalidated read capture to convergence and resets its backoff after success", async () => {
     const f = await fixture();
     const logs: string[] = [];
-    f.subscribe(line => logs.push(line));
+    const unsubscribe = f.subscribe(line => logs.push(line));
+    clearInputs();
     const m = measure(f);
-    m.proofs.mockReturnValue(false);
-    vi.useFakeTimers();
+    const snapshot = m.snapshots.getMockImplementation()!;
+    let invalidate = true, version = 0;
+    m.snapshots.mockImplementation(operation => {
+      const value = snapshot(operation);
+      if (invalidate) f.renew(NOW + 70_001 + ++version);
+      return value;
+    });
     try {
-      observation.notify.get(f.root)!("presence");
-      await vi.advanceTimersByTimeAsync(100); // notification scan; three failed proofs, then 100 ms retry
-      expect(m.proofs).toHaveBeenCalledTimes(3);
+      f.renew(NOW + 70_000); // A real changed file requires a read, then changes again during capture.
+      await f.fire();
+      expect(m.snapshots).toHaveBeenCalledTimes(1);
+      expect(m.writers).not.toHaveBeenCalled();
+      expect(f.changes).toEqual([]);
       expect(vi.getTimerCount()).toBe(1);
       await f.store.put({ key: key("participants", f.participant.id), identity: f.identity,
         value: { ...f.participant, status: "running" } });
-      m.proofs.mockReturnValue(true);
-      await vi.advanceTimersByTimeAsync(100);
-      expect(f.changes).toEqual(["presence"]);
+      invalidate = false;
+      await turn(); // Retry succeeds with current SQLite rows and current files.
+      expect(m.snapshots).toHaveBeenCalledTimes(2);
+      expect(m.writers).toHaveBeenCalledTimes(1);
+      expect(f.changes.splice(0)).toEqual(["presence"]);
       expect(JSON.parse(frames().at(-1)!.content).native.participants[0].status).toBe("running");
       expect(logs).toEqual([]);
-      // A fresh failure after success must again use the minimum 100 ms retry.
-      m.proofs.mockReturnValue(false);
-      observation.notify.get(f.root)!("presence");
-      await vi.advanceTimersByTimeAsync(100);
+      expect(vi.getTimerCount()).toBe(0);
+      // A fresh invalidation after success must again use the minimum 100 ms retry.
+      invalidate = true;
+      f.renew(NOW + 80_000);
+      await f.fire();
+      expect(m.snapshots).toHaveBeenCalledTimes(3);
       expect(vi.getTimerCount()).toBe(1);
-      expect(m.proofs).toHaveBeenCalledTimes(7);
-      await vi.advanceTimersByTimeAsync(100);
-      expect(m.proofs).toHaveBeenCalledTimes(10);
-    } finally { vi.useRealTimers(); }
+      await vi.advanceTimersByTimeAsync(99);
+      expect(m.snapshots).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(m.snapshots).toHaveBeenCalledTimes(4);
+      expect(m.writers).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(f.changes).toEqual([]);
+      expect(f.failures).toEqual([]);
+      m.expectAttempts([true, true, true, true]);
+    } finally { unsubscribe(); }
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("counts deferred captures in one minute diagnostic windows and emits no line without deferrals", async () => {
+  it("counts invalidated read captures in one minute diagnostic windows and is silent without deferrals", async () => {
     const f = await fixture();
     const logs: string[] = [];
-    f.subscribe(line => logs.push(line));
+    const unsubscribe = f.subscribe(line => logs.push(line));
+    clearInputs();
     const m = measure(f);
-    vi.useFakeTimers();
+    const snapshot = m.snapshots.getMockImplementation()!;
+    let invalidate = false, version = 0;
+    m.snapshots.mockImplementation(operation => {
+      const value = snapshot(operation);
+      if (invalidate) f.renew(NOW + 70_001 + ++version);
+      return value;
+    });
     try {
-      const notifyAndScan = async () => {
-        observation.notify.get(f.root)!("presence");
-        await vi.advanceTimersByTimeAsync(100);
-      };
-      await notifyAndScan(); // zero deferrals: the healthy capture is silent
+      await f.fire(); // A healthy reusable observation is silent and leaves no timer.
       expect(logs).toEqual([]);
-      m.proofs.mockReturnValue(false);
-      await notifyAndScan();
-      await vi.advanceTimersByTimeAsync(100); // retry is another deferred capture
+      expect(vi.getTimerCount()).toBe(0);
+      invalidate = true;
+      f.renew(NOW + 70_000);
+      await f.fire();
+      expect(m.snapshots).toHaveBeenCalledTimes(1);
+      await turn(); // A second invalidated capture, not three old-style writer proofs.
+      expect(m.snapshots).toHaveBeenCalledTimes(2);
       expect(logs).toEqual([]);
       vi.setSystemTime(Date.now() + 60_000);
-      await vi.advanceTimersByTimeAsync(200); // next retry closes the minute window
+      await vi.advanceTimersByTimeAsync(199);
+      expect(m.snapshots).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1); // Third deferral closes the minute window.
       expect(logs).toEqual(["bridge far: capture deferred: 3 in last 60s (retry 400ms)"]);
-    } finally { vi.useRealTimers(); }
+      expect(m.snapshots).toHaveBeenCalledTimes(3);
+      expect(m.writers).not.toHaveBeenCalled();
+      expect(f.changes).toEqual([]);
+      expect(f.failures).toEqual([]);
+      m.expectAttempts([true, true, true]);
+      expect(vi.getTimerCount()).toBe(1);
+    } finally { unsubscribe(); }
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it.each(["hosts", "participants", "lease"] as const)("detects externally removed mirror %s and repairs real held authority", async removed => {

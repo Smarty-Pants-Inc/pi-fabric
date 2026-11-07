@@ -92,7 +92,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
-const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "disconnect" | "controls" | "queue-modes" | "held-follow-up" | "delayed-follow-up", retry?: Record<string, unknown>) => {
+const setup = async (mode: "burst" | "forever" | "resume" | "resume-thinking-stop" | "400" | "429" | "disconnect" | "controls" | "queue-modes" | "held-follow-up" | "delayed-follow-up", retry?: Record<string, unknown>) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-overload-")); roots.push(dir);
   let firstRequestAt = 0;
   let releaseOverload!: () => void;
@@ -108,7 +108,8 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
       if (mode === "disconnect" && requests.length === 1) { response.destroy(); return; }
       const overloaded = mode === "forever" || (mode === "queue-modes" && requests.length <= 5) ||
         (mode === "burst" && Date.now() - firstRequestAt < 90_000 * SCALE) ||
-        ((mode === "resume" || mode === "controls" || mode === "held-follow-up") && requests.length === 1);
+        ((mode === "resume" || mode === "controls" || mode === "held-follow-up") && requests.length === 1) ||
+        (mode === "resume-thinking-stop" && requests.length <= 2);
       if (overloaded || mode === "400" || (mode === "429" && requests.length === 1)) {
         response.writeHead(mode === "400" ? 400 : mode === "429" ? 429 : 503, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ error: { message: mode === "400" ? "invalid_request_error: invalid input" : "server_is_overloaded", type: mode === "400" ? "invalid_request_error" : "server_is_overloaded" } }));
@@ -119,12 +120,14 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
         id: "offline", object: "chat.completion.chunk", created: 1, model: "offline",
         choices: [{ index: 0, delta, finish_reason }],
       })}\n\n`);
-      const finish = () => {
-        chunk({ role: "assistant", content: "survived overload" }); chunk({}, "stop");
+      const finish = (thinkingOnly = false) => {
+        chunk(thinkingOnly ? { role: "assistant", reasoning_content: "synthetic reasoning without an answer" } : { role: "assistant", content: "survived overload" });
+        chunk({}, "stop");
         response.end("data: [DONE]\n\n");
       };
       // Keep the resumed turn streaming while native steering/follow-up arrive.
-      if ((mode === "controls" || mode === "held-follow-up") && requests.length === 2) setTimeout(finish, 700);
+      if (mode === "resume-thinking-stop") finish(true);
+      else if ((mode === "controls" || mode === "held-follow-up") && requests.length === 2) setTimeout(finish, 700);
       else finish();
     });
   });
@@ -134,7 +137,7 @@ const setup = async (mode: "burst" | "forever" | "resume" | "400" | "429" | "dis
   const agentDir = path.join(dir, "agent"); fs.mkdirSync(agentDir);
   fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: {
     "overload-test": { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "offline-only", api: "openai-completions", models: [{
-      id: "offline", name: "offline", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1024,
+      id: "offline", name: "offline", reasoning: mode === "resume-thinking-stop", input: ["text"], contextWindow: 128000, maxTokens: 1024,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     }] },
   } }));
@@ -325,6 +328,32 @@ describe("real Pi process provider recovery (offline localhost)", () => {
     expect(fs.existsSync(path.join(path.dirname(result.logFile!), "session.jsonl"))).toBe(true);
     expect(events(result).filter(event => event.type === "fabric_provider_resume" && event.phase === "starting").length).toBeLessThanOrEqual(3);
     expect(events(result).filter(event => event.type === "auto_retry_start").some(event => event.delayMs === 8000)).toBe(true);
+  }, 120_000);
+
+  it("fails NO_FINAL_TEXT after two retryable same-session recoveries when the final turn is thinking-only", async () => {
+    const s = await setup("resume-thinking-stop", { maxRetries: 0 });
+    const ownedStart = ownedProcesses.length;
+    const handle = await s.spawn();
+    const result = await s.manager.wait(handle.id); evidence("resume-thinking-stop", result);
+    expect(result, explain(result)).toMatchObject({ status: "failed", errorCode: "NO_FINAL_TEXT" });
+    expect(result.finalAnswerReceipt).toBeUndefined();
+    expect(s.requests).toHaveLength(3);
+    expect(result.runnerSessionIds).toHaveLength(1);
+    const log = events(result);
+    const resumes = log.filter(event => event.type === "fabric_provider_resume" && event.phase === "starting");
+    expect(resumes.map(event => event.attempt)).toEqual([1, 2]);
+    expect(new Set(resumes.map(event => event.sessionFile)).size).toBe(1);
+    const sessionFile = resumes[0]!.sessionFile as string;
+    expect(fs.existsSync(sessionFile)).toBe(true);
+    expect(s.requests.slice(1).filter(request => JSON.stringify(request).includes("Continue the task from the existing session. Do not repeat completed work."))).toHaveLength(2);
+    const run = path.dirname(result.logFile!);
+    expect(fs.existsSync(path.join(run, "final-answer.json"))).toBe(false);
+    const recoveryPrompts = entries(path.join(run, "session.jsonl")).filter(entry => entry.type === "message" &&
+      entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("Continue the task from the existing session. Do not repeat completed work."));
+    expect(recoveryPrompts).toHaveLength(2);
+    const owned = ownedProcesses.slice(ownedStart);
+    expect(owned.length).toBeGreaterThan(0);
+    expect(owned.every(child => child.didClose())).toBe(true);
   }, 120_000);
 
   it("resumes an exhausted retryable Pi child on the exact same file and records the lifecycle", async () => {

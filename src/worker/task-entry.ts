@@ -133,7 +133,7 @@ if (process.env.PI_FABRIC_TERMINAL_TASK === "1") {
     // Do not write around native RPC's serialized stdout queue: a large answer
     // may still be flushing. IPC preserves this receipt frame independently.
     const assistant = message?.role === "assistant" ? { usage: message.usage, model: message.model,
-      provider: message.provider, timestamp: message.timestamp } : undefined;
+      provider: message.provider, timestamp: message.timestamp, ...receipt.assistant } : undefined;
     process.send?.({ type: "fabric_final_answer", runId, receiptId: receipt.id, assistant,
       totals: { ...totals, turns: totals.turns + 1 } });
   }, process.env.PI_FABRIC_REPLY_FILE, process.env.PI_FABRIC_TASK_RESUMING === "1");

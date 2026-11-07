@@ -33,7 +33,11 @@ input.on("line", (line) => {
     record(command);
     send({
       type: "message_end",
-      message: { role: "assistant", content: [{ type: "text", text: `answer ${JSON.stringify(command)}` }] },
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: `answer ${JSON.stringify(command)}` }],
+        stopReason: "stop",
+      },
     });
     setTimeout(() => send({ type: "agent_settled" }), 50);
   }

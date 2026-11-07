@@ -39,10 +39,10 @@ const ownedRootCleanup = (directory: string, stillOwned: () => boolean = () => t
 const jobTempMarker = "PI_TEST_TEMP_JOB_DIR";
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// A fresh Windows run directory is protected before its marker is exported. Set-Acl is
-// used instead of icacls so no PATH-resolved tool or localized text is involved; the
-// existing builder pins the child to Windows PowerShell 5.1 and its system modules.
-const freshDirectorySecurity = String.raw`
+// Protect the persistent Windows job directory and its fresh run child before exporting
+// the run marker. Set-Acl avoids PATH-resolved tools and localized text; the existing
+// builder pins the child to Windows PowerShell 5.1 and its system modules.
+const windowsDirectorySecurity = String.raw`
 $directory = $env:PI_FABRIC_TEST_TEMP_DIRECTORY
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $acl = [System.Security.AccessControl.DirectorySecurity]::new()
@@ -60,21 +60,21 @@ foreach ($sid in @($user.Value, 'S-1-5-18')) {
 }
 Set-Acl -LiteralPath $directory -AclObject $acl
 $read = Get-Acl -LiteralPath $directory
-if (-not $read.AreAccessRulesProtected) { throw 'fresh Windows test temp DACL is inheritable' }
-if ($read.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $user.Value) { throw 'fresh Windows test temp owner read-back mismatch' }
+if (-not $read.AreAccessRulesProtected) { throw 'Windows test temp DACL is inheritable' }
+if ($read.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $user.Value) { throw 'Windows test temp owner read-back mismatch' }
 $actual = [System.Security.AccessControl.RawSecurityDescriptor]::new($read.GetSecurityDescriptorBinaryForm(), 0)
 $expected = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
-if ($null -eq $actual.DiscretionaryAcl) { throw 'fresh Windows test temp DACL read-back is null' }
+if ($null -eq $actual.DiscretionaryAcl) { throw 'Windows test temp DACL read-back is null' }
 $actualBytes = [byte[]]::new($actual.DiscretionaryAcl.BinaryLength)
 $expectedBytes = [byte[]]::new($expected.DiscretionaryAcl.BinaryLength)
 $actual.DiscretionaryAcl.GetBinaryForm($actualBytes, 0)
 $expected.DiscretionaryAcl.GetBinaryForm($expectedBytes, 0)
-if ([Convert]::ToBase64String($actualBytes) -cne [Convert]::ToBase64String($expectedBytes)) { throw 'fresh Windows test temp DACL read-back mismatch' }
+if ([Convert]::ToBase64String($actualBytes) -cne [Convert]::ToBase64String($expectedBytes)) { throw 'Windows test temp DACL read-back mismatch' }
 `;
 
-const protectFreshWindowsRunDirectory = (directory: string): void => {
+const protectWindowsTestDirectory = (directory: string): void => {
   try {
-    const command = windowsSecurityPowerShell(freshDirectorySecurity, {
+    const command = windowsSecurityPowerShell(windowsDirectorySecurity, {
       ...process.env,
       PI_FABRIC_TEST_TEMP_DIRECTORY: directory,
     });
@@ -127,8 +127,9 @@ const stableRoot = (prefix: string): string | undefined => {
   if (!lstatSync(jobRoot).isDirectory()) {
     throw new Error(`Windows job temp must be a real directory inside RUNNER_TEMP on the runner's checkout volume: ${jobRoot}`);
   }
+  protectWindowsTestDirectory(jobRoot);
   const directory = mkdtempSync(join(jobRoot, `${prefix}run-`));
-  protectFreshWindowsRunDirectory(directory);
+  protectWindowsTestDirectory(directory);
   process.env[jobTempMarker] = directory;
   return directory;
 };

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { emitMeshJournalAlarm, processIncarnation, readPhysicalHostIdentity, validProcessIncarnation } from "../core/atomic-write.js";
 import { meshAlarmRecipient, type MeshIdentity, type MeshStore } from "../mesh/store.js";
-import { hostMirrorLease, MIRROR_FRESH_MS, readHostLeases, type BridgeLeaseProcess } from "./host-leases.js";
+import { hostMirrorLease, MIRROR_FRESH_MS, readHostLease, type BridgeLeaseProcess } from "./host-leases.js";
 
 /** Mirror observations already renew before their 15 s cap, even without event traffic.
  * Three missed freshness intervals are a stalled link; no new timer or probe traffic. */
@@ -19,7 +19,6 @@ const episodes = new WeakMap<MeshStore, Map<string, Episode>>();
 export const bridgeLeaseAlarms = async (mesh: MeshStore, identity: MeshIdentity, now = Date.now()): Promise<void> => {
   const physical = readPhysicalHostIdentity();
   if (!physical) return; // Unverified locality must not turn a foreign pid into a local bridge.
-  const leases = readHostLeases(mesh.root);
   const links = new Map<string, Observation>();
   for (const entry of mesh.listAll("topology/hosts/", { fresh: true })) {
     const host = entry.value;
@@ -29,7 +28,11 @@ export const bridgeLeaseAlarms = async (mesh: MeshStore, identity: MeshIdentity,
       typeof host.remoteHost !== "string" || !NAME.test(host.remoteHost) ||
       typeof host.startedAt !== "number" || typeof host.expiresAt !== "number" ||
       (host.incarnationToken !== undefined && typeof host.incarnationToken !== "string")) continue;
-    const mirror = hostMirrorLease(leases, {
+    // Only validated mirrored roots can contribute an alarm. Never enumerate retained native
+    // or orphan lease files on the committed heartbeat; metadata-gated point reads stay fresh.
+    const lease = readHostLease(mesh.root, host.id);
+    if (!lease) continue;
+    const mirror = hostMirrorLease(new Map([[host.id, lease]]), {
       id: host.id, rootId: host.id, identity: { id: host.id }, startedAt: host.startedAt,
       expiresAt: host.expiresAt, remoteHost: host.remoteHost,
       ...(typeof host.incarnationToken === "string" ? { incarnationToken: host.incarnationToken } : {}),
@@ -45,7 +48,7 @@ export const bridgeLeaseAlarms = async (mesh: MeshStore, identity: MeshIdentity,
     const previous = links.get(key);
     if (!previous || mirror.observedAt > previous.observedAt) links.set(key, {
       process: writer, observedAt: mirror.observedAt,
-      expiresAt: Math.min(leases.get(host.id)!.expiresAt, mirror.observedAt + MIRROR_FRESH_MS),
+      expiresAt: Math.min(lease.expiresAt, mirror.observedAt + MIRROR_FRESH_MS),
     });
   }
   let active = episodes.get(mesh);

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { MeshBatchOperation, MeshStateEntry } from "../mesh/store.js";
-import { hostEntryLiveness, readHostLease } from "./host-leases.js";
+import { hostEntryLiveness, hostLeasePredecessor, type FabricHostLease } from "./host-leases.js";
 
 /** Native Mains and resident brokers both advertise topology host records. Never expire their
  * participants, deliveries, completion claims, result journals or explicit lineage receipts here. */
@@ -17,9 +17,11 @@ const expired = (entry: MeshStateEntry, root: string, ownHostId: string, cutoff:
     typeof host.rootId !== "string" || typeof host.startedAt !== "number" || !Number.isFinite(host.startedAt) ||
     typeof host.expiresAt !== "number" || !Number.isFinite(host.expiresAt) ||
     !Number.isFinite(entry.updatedAt) || entry.updatedAt > cutoff) return false;
-  // readHostLease is an exact, fresh metadata-gated file read. Incarnation/root/identity checks
-  // in hostEntryLiveness prevent an unrelated file from extending or shortening this record.
-  const lease = readHostLease(root, host.id);
+  // Destructive authority never uses a cached last answer on unreadable renewed bytes.
+  // Only ENOENT proves absence; invalid/unreadable current leases retain the state row.
+  // Incarnation/root/identity checks still reject an unrelated file's liveness.
+  let lease: FabricHostLease | undefined;
+  try { lease = hostLeasePredecessor(root, host.id); } catch { return false; }
   return hostEntryLiveness(entry, lease ? new Map([[host.id, lease]]) : new Map()).expiresAt < cutoff;
 };
 

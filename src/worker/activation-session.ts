@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parsePiSessionHeader } from "../core/pi-session-header.js";
+import { archiveSessionTrace, SESSION_ARCHIVE_DIR } from "../storage/session-archive.js";
 
 /**
  * Activation inference must be empty before Pi starts, not only after its
@@ -60,12 +61,16 @@ export class ActivationSession {
       return durable;
     });
     if (!entries.length) {
-      fs.unlinkSync(this.file);
+      archiveSessionTrace(this.file, path.join(path.dirname(this.journal), SESSION_ARCHIVE_DIR), {
+        reason: "activation session", deleter: "ActivationSession.retain",
+      });
       return;
     }
     const prefix = current ? (current.endsWith("\n") ? "" : "\n") : JSON.stringify(header) + "\n";
     fs.mkdirSync(path.dirname(this.journal), { recursive: true, mode: 0o700 });
     fs.appendFileSync(this.journal, prefix + retained.map(entry => JSON.stringify(entry)).join("\n") + "\n", { mode: 0o600 });
-    fs.unlinkSync(this.file);
+    archiveSessionTrace(this.file, path.join(path.dirname(this.journal), SESSION_ARCHIVE_DIR), {
+      reason: "activation session", deleter: "ActivationSession.retain",
+    });
   }
 }

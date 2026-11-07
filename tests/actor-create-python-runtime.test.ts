@@ -93,24 +93,27 @@ const fixture = (inheritedRuntime: FabricPythonRuntime = "monty") => {
   config.fullCodeMode = false;
   config.executor.kernel = "typescript";
   config.executor.runtime = "quickjs";
+  config.executor.pythonRuntime = inheritedRuntime;
   config.approvals.agent = "allow";
   const service = new FabricExecutionService(registry, config);
-  const executeAction = (ref: string, args: object) => service.execute({
-    // Generic tools.call deliberately reaches authoritative registry validation
-    // rather than stopping at the guest's typed agents facade.
-    code: `return tools.call({ ref: ${JSON.stringify(ref)}, args: ${JSON.stringify(args)} });`,
-    signal: undefined, parentToolCallId: "create-python-runtime",
+  const executeCode = (code: string) => service.execute({
+    code, signal: undefined, parentToolCallId: "create-python-runtime",
     context: { cwd: root, hasUI: false } as ExtensionContext, onPartial() {},
   });
+  // Generic tools.call deliberately reaches authoritative registry validation
+  // rather than stopping at the guest's typed agents facade.
+  const executeAction = (ref: string, args: object) => executeCode(
+    `return tools.call({ ref: ${JSON.stringify(ref)}, args: ${JSON.stringify(args)} });`,
+  );
   const executeCreate = (args: object) => executeAction("agents.create", args);
-  return { root, actorRoot, actors, globalRegistry, run, spawn, refresh, invoke, create, executeAction, executeCreate };
+  return { root, actorRoot, actors, globalRegistry, run, spawn, refresh, invoke, create, executeCode, executeAction, executeCreate };
 };
 
 describe("public agents.create Python runtime", () => {
   it.each(["monty", "cpython"] as const)("restores and persists %s through tools.call and the real actor registry without activation", async (pythonRuntime) => {
-    // Opposite live defaults prove that both explicit selectors survive public
-    // argument validation and provider projection, rather than being re-inherited.
-    const { actorRoot, actors, run, spawn, create, executeCreate } = fixture(pythonRuntime === "monty" ? "cpython" : "monty");
+    // Native execution is explicitly authorized. Monty remains a permitted,
+    // more restrictive selector and must survive the opposite CPython default.
+    const { actorRoot, actors, run, spawn, create, executeCreate } = fixture("cpython");
     const request = actorRestoreRequest({
       id: "a".repeat(32), rootId: "session:old-main", status: "stopped",
       name: `restored-${pythonRuntime}`, instructions: "Idle actor; do not execute Python.",
@@ -139,7 +142,7 @@ describe("public agents.create Python runtime", () => {
   });
 
   it.each(["cpython", "monty"] as const)("roundtrips global %s templates through public create and import without activation", async (pythonRuntime) => {
-    const { root, actorRoot, actors, globalRegistry, run, spawn, create, executeAction, executeCreate } = fixture(pythonRuntime === "monty" ? "cpython" : "monty");
+    const { root, actorRoot, actors, globalRegistry, run, spawn, create, executeAction, executeCreate } = fixture("cpython");
     const name = `global-${pythonRuntime}`;
     const result = await executeCreate({
       name, instructions: "Idle global template; do not execute Python.", scope: "global",
@@ -153,7 +156,7 @@ describe("public agents.create Python runtime", () => {
     expect(create).not.toHaveBeenCalled();
 
     // A new registry instance must recover the selector from the temporary disk,
-    // and its real import projection must preserve it against the opposite default.
+    // and its real import projection must preserve it under CPython policy.
     const reloaded = new GlobalActorRegistry(root, 64 * 1024);
     const persisted = reloaded.resolve(template.id)!;
     expect(persisted).toMatchObject({ id: template.id, kernel: "python", pythonRuntime });
@@ -176,6 +179,103 @@ describe("public agents.create Python runtime", () => {
     const savedActor = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8"));
     expect(savedActor.actors).toEqual([expect.objectContaining({ id: actor.id, kernel: "python", pythonRuntime })]);
     expect(create).toHaveBeenCalledTimes(1);
+    expect(run).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  // Keep reason: the public caller/configured-sandbox trust boundary and the
+  // recorded post-merge catch in PR #1873. Refusal must precede persistence.
+  it.each([
+    ["agents.create", "session"],
+    ["agents.create", "global"],
+    ["agents.createActor", "session"],
+    ["agents.createActor", "global"],
+  ])("refuses CPython under Monty policy through %s (%s) without persisted effects", async (ref, scope) => {
+    const { root, actors, globalRegistry, run, spawn, refresh, create, executeAction } = fixture("monty");
+    const before = treeSnapshot(root);
+    const result = await executeAction(ref!, {
+      name: "policy-rejected", instructions: "Must not be created.", scope,
+      kernel: "python", pythonRuntime: "cpython",
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/cpython/i);
+    expect(result.error).toMatch(/monty/i);
+    expect(actors.list()).toEqual([]);
+    expect(globalRegistry.resolve("policy-rejected")).toBeUndefined();
+    expect(create).not.toHaveBeenCalled();
+    expect(treeSnapshot(root)).toEqual(before);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(["session", "global"] as const)("lets a public %s caller catch the stable runtime-policy error without persisted effects", async scope => {
+    const { root, actors, run, spawn, refresh, executeCode } = fixture("monty");
+    const before = treeSnapshot(root);
+    const args = { name: "typed-policy-refusal", instructions: "Must not be created.", scope, kernel: "python", pythonRuntime: "cpython" };
+    const result = await executeCode(`
+      try {
+        await tools.call({ ref: "agents.create", args: ${JSON.stringify(args)} });
+        return { admitted: true };
+      } catch (error) {
+        return { name: error.name, code: error.code, message: error.message };
+      }
+    `);
+    expect(result.success, result.error).toBe(true); // The guest caught a host refusal.
+    expect(result.value).toMatchObject({ name: "FabricPythonRuntimePolicyError", code: "FABRIC_PYTHON_RUNTIME_POLICY" });
+    expect(actors.list()).toEqual([]);
+    expect(treeSnapshot(root)).toEqual(before);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(["cpython", "monty"] as const)("admits %s through the same public guest catch path under CPython policy", async pythonRuntime => {
+    const { actors, executeCode } = fixture("cpython");
+    const args = { name: "typed-policy-allowed", instructions: "Authorized idle actor.", kernel: "python", pythonRuntime };
+    const result = await executeCode(`
+      try {
+        const actor = await tools.call({ ref: "agents.create", args: ${JSON.stringify(args)} });
+        return { admitted: true, actor };
+      } catch (error) {
+        return { name: error.name, code: error.code };
+      }
+    `);
+    expect(result.success, result.error).toBe(true);
+    expect(result.value).toMatchObject({ admitted: true, actor: { kernel: "python", pythonRuntime } });
+    expect(actors.list()).toHaveLength(1);
+  });
+
+  it("enforces Monty policy at the direct local actor boundary before any persisted effects", async () => {
+    const { root, actors, run, spawn, refresh } = fixture("monty");
+    const before = treeSnapshot(root);
+    await expect(actors.create({
+      name: "direct-policy-rejected", instructions: "Must not be created.",
+      kernel: "python", pythonRuntime: "cpython",
+    })).rejects.toMatchObject({ code: "FABRIC_PYTHON_RUNTIME_POLICY" });
+    expect(actors.list()).toEqual([]);
+    expect(treeSnapshot(root)).toEqual(before);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("refuses import of a native template under Monty policy without changing the template or session", async () => {
+    const { root, actors, globalRegistry, run, spawn, refresh, executeAction } = fixture("monty");
+    // Stored templates are data, not native-execution authorization. The
+    // importing caller's policy must be checked before materializing an actor.
+    const template = globalRegistry.create({
+      name: "native-template", instructions: "Native actor from an authorized host.",
+      kernel: "python", pythonRuntime: "cpython", residency: "session",
+    });
+    const before = treeSnapshot(root);
+    const result = await executeAction("agents.import", { id: template.id, as: "blocked-import" });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/cpython/i);
+    expect(result.error).toMatch(/monty/i);
+    expect(actors.list()).toEqual([]);
+    expect(treeSnapshot(root)).toEqual(before);
+    expect(refresh).not.toHaveBeenCalled();
     expect(run).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
   });

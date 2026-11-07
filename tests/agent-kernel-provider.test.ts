@@ -6,7 +6,7 @@ import { Value } from "typebox/value";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentHandleInfo, AgentRunRequest, AgentRunResult, AgentSessionSeed } from "../src/agents/types.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, type FabricPythonRuntime } from "../src/config.js";
 import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
@@ -36,7 +36,7 @@ const completed: AgentRunResult = {
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 };
 type ProviderArgs = ConstructorParameters<typeof AgentsProvider>;
-const setup = () => {
+const setup = (pythonRuntime: FabricPythonRuntime = "monty") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-agent-kernel-provider-"));
   roots.push(root);
   const boundRootRecord = Object.freeze({ cwd: root });
@@ -49,7 +49,7 @@ const setup = () => {
   }, {
     rootSessionCwd: () => boundRootRecord.cwd,
     claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
-    runRoot: root, kernel: () => "python", pythonRuntime: () => "monty",
+    runRoot: root, kernel: () => "python", pythonRuntime: () => pythonRuntime,
   });
   managers.push(manager);
   const spawn = vi.spyOn(manager, "spawn").mockResolvedValue(handle);
@@ -159,6 +159,46 @@ describe("agent kernel public contracts", () => {
 });
 
 describe("provider kernel forwarding", () => {
+  // Keep reason: configured-sandbox trust boundary; PR #1873's recorded catch.
+  it.each([
+    ["create", "session", "session"],
+    ["create", "session", "durable"],
+    ["create", "global", "session"],
+    ["createActor", "session", "session"],
+    ["createActor", "session", "durable"],
+    ["createActor", "global", "session"],
+  ])("refuses native runtime before routing %s scope=%s residency=%s under Monty policy", async (action, scope, residency) => {
+    const { provider, actors, templates, residency: resident, spawn } = setup("monty");
+    await expect(provider.invoke(action!, {
+      name: "policy-rejected", instructions: "Must not be created.", scope, residency,
+      kernel: "python", pythonRuntime: "cpython",
+    }, context)).rejects.toMatchObject({ code: "FABRIC_PYTHON_RUNTIME_POLICY" });
+    expect(actors.create).not.toHaveBeenCalled();
+    expect(templates.create).not.toHaveBeenCalled();
+    expect(resident.createActor).not.toHaveBeenCalled();
+    expect(resident.ensureHost).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(["cpython", "monty"] as const)("permits explicit %s under CPython policy and preserves its selector", async pythonRuntime => {
+    const { provider, actors } = setup("cpython");
+    await provider.invoke("create", {
+      name: "authorized-runtime", instructions: "Explicit native policy.", kernel: "python", pythonRuntime,
+    }, context);
+    expect(actors.create).toHaveBeenCalledWith(expect.objectContaining({ kernel: "python", pythonRuntime }),
+      expect.objectContaining({ beforeCommit: expect.any(Function), checkActive: expect.any(Function) }));
+  });
+
+  it("keeps the internal launch resolver able to use a previously frozen CPython selection", () => {
+    const { manager } = setup("monty");
+    // New public creates must obey the current policy, but this resolver also
+    // carries already-frozen handoffs/actor activations. Do not turn it into a
+    // create-only admission check or silently replace their selected backend.
+    expect(manager.resolvePythonRuntime()).toBe("monty");
+    expect(manager.resolvePythonRuntime("cpython")).toBe("cpython");
+    expect(manager.resolvePythonRuntime("monty")).toBe("monty");
+  });
+
   it.each(["typescript", "python", "inherit"] as const)("copies %s into local run requests", async (kernel) => {
     const { provider, spawn } = setup();
     await provider.invoke("run", { task: "task", kernel }, context);

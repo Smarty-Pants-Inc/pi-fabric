@@ -54,6 +54,9 @@ if (simulatedWindows) {
         "$read = Get-Acl -LiteralPath $directory",
         "[Convert]::ToBase64String($actualBytes) -cne [Convert]::ToBase64String($expectedBytes)",
       ]) assert(source.includes(required), required);
+      const modulePathEntries = Object.entries(options.env).filter(([key]) => key.toLowerCase() === "psmodulepath");
+      assert.deepEqual(modulePathEntries, [["PSModulePath", path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules")]],
+        "ACL subprocess must use only the pinned Windows PowerShell system module path");
       const command = windowsSecurityPowerShell(source, { ...process.env, PI_FABRIC_TEST_TEMP_DIRECTORY: target });
       assert.equal(file, command.file);
       assert.deepEqual(args, command.args);

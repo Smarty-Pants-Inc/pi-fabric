@@ -325,6 +325,7 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
         const context = await hooks.modelContext([exactCopy, repeatedCopy, genuine]);
         expect.soft(context.at(-1)).toBe(genuine);
         expect.soft(context.at(-1)?.content).toBe(body);
+        expect.soft(shown(context, event.id)).toBe(1);
         const issuedOnly = await hooks.modelContext([genuine, independent]);
         expect.soft(issuedOnly[0]).toBe(genuine);
         expect.soft(shown(issuedOnly, event.id)).toBe(1);
@@ -339,7 +340,7 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
       }
       hooks.entries.push({ type: "compaction", id: "compact-exact-copies", firstKeptEntryId: "genuine-kept" });
       // The two earlier occurrences of that same nonce cannot manufacture a compacted consuming copy
-      // while the actual issued carrier remains in context. Clone visibility is deliberately unspecified.
+      // while the actual issued carrier remains in context. Projection keeps only that last carrier.
       for (let scan = 0; scan < 2; scan++) {
         const context = await hooks.modelContext([
           { role: "compactionSummary", summary: "earlier history", tokensBefore: 1, timestamp: 0 }, genuine,
@@ -505,10 +506,48 @@ describe("filterRootInboxContext (smarty-dev#8962)", () => {
     const result = filterRootInboxContext([unsigned, mutated, genuine], {
       verifier: verifyIssuedInbox, acked: () => false, compactedCopies: () => new Map(),
     });
-    expect(result.changed).toBe(false);
+    expect(result.changed).toBe(true);
     expect(result.messages.at(-1)).toBe(genuine);
-    // Unverifiable history deliberately remains visible rather than hiding genuine work (#12528).
-    expect(shown(result.messages, events[1]!.id)).toBe(2);
+    // Identical unverified text may be cut, but cannot suppress the genuine later carrier (#12528).
+    expect(shown(result.messages, events[1]!.id)).toBe(1);
+  });
+
+  it.each([false, true])("projects mixed identical rows without trusting changed bodies or overflow (resident issuer: %s)", resident => {
+    const events = Array.from({ length: 11 }, (_, n) => ({ id: `projection-${n}`, sequence: 100 + n,
+      topic: TOPIC, kind: "report", from: peer, text: `body ${n}`, createdAt: 1_700_000_000_000 + n,
+    }) as MeshEvent);
+    const history = { role: "custom", ...rootInboxMessage(events.slice(0, 10)) };
+    const mixed = { role: "custom", ...rootInboxMessage([events[0]!, events[8]!, events[10]!]) };
+    const genuine = { role: "custom", ...issuedInboxMessage([events[0]!]) };
+    const forged = JSON.parse(JSON.stringify(genuine));
+    forged.content = forged.content.replace("body 0", "changed body 0");
+    forged.details.ids.push(events[9]!.id); // Public claims cannot deliver the withheld row.
+    const next = { role: "custom", ...issuedInboxMessage([events[8]!]) };
+    const textBlocks = { ...genuine, content: [{ type: "text", text: genuine.content }] };
+    const messages = [history, mixed, forged, textBlocks, next];
+    const raw = JSON.stringify(messages);
+    const acked = vi.fn(() => false);
+    const compactedCopies = vi.fn(() => new Map<string, number>());
+    const options = { verifier: resident ? verifyIssuedInbox : () => undefined, acked, compactedCopies };
+    const result = filterRootInboxContext(messages, options);
+    expect(result.messages).toContain(textBlocks); // Prefer the real carrier over all copied claims.
+    expect(result.messages.at(-1)).toBe(next);
+    expect(result.messages).toContain(forged); // A changed body is not an identical rendered row.
+    expect(shown(result.messages, events[0]!.id)).toBe(2); // Changed claim plus genuine work, never loss.
+    for (const event of [...events.slice(1, 9), events[10]!]) expect(shown(result.messages, event.id)).toBe(1);
+    expect(text([result.messages[0]])).toContain('<fabric-inbox count="9" shown="7">');
+    expect(text([result.messages[0]])).toContain(history.content.match(/<overflow[\s\S]*?<\/overflow>/)![0]);
+    expect(text([result.messages[1]])).toContain('<fabric-inbox count="1">');
+    expect(shown(result.messages, events[9]!.id)).toBe(0);
+    expect(acked.mock.calls).not.toContainEqual([events[9]!.id, events[9]!.sequence]);
+    expect(acked.mock.calls).not.toContainEqual([events[10]!.id, events[10]!.sequence]);
+    if (!resident) expect(acked).not.toHaveBeenCalled();
+    expect(compactedCopies).not.toHaveBeenCalled();
+    const withheld = { role: "custom", ...issuedInboxMessage([events[9]!]) };
+    const later = filterRootInboxContext([...messages, withheld], options);
+    expect(later.messages.at(-1)).toBe(withheld);
+    expect(shown(later.messages, events[9]!.id)).toBe(1);
+    expect(JSON.stringify(messages)).toBe(raw);
   });
 
   it("preserves the pending summary when an earlier carrier duplicates a shown row", () => {

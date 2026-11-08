@@ -5,8 +5,9 @@ import { ROOT_INBOX_CUSTOM_TYPE, type RootInboxReceiptVerifier } from "./root-in
  * its message enters a turn, but copies Pi had already queued before that ack (a second followUp
  * after a lease expiry, a nextTurn plus a followUp, a stale writer's read) are still injected and
  * kept in the session. Only the request changes here; the session keeps every message.
- * - The first issued copy with a shown row is kept; later issued copies are dropped. Unverifiable
- *   history cannot suppress work: possible redelivery is safer than loss (smarty-dev#12528).
+ * - The first issuance with a shown row is kept; repeated occurrences of its nonce retain the last
+ *   authentic carrier. Unverifiable history only collapses identical rendered rows, never ids:
+ *   genuine issued rows take precedence, and changed bodies cannot hide work (smarty-dev#12528).
  * - An acked event (acked id, or at or below the high-water mark) is dropped from every copy when the
  *   context no longer holds the copy that consumed it: compaction summarized a copy of it away.
  * - A mixed batch keeps its other events: only the dropped events are cut from it.
@@ -14,7 +15,7 @@ import { ROOT_INBOX_CUSTOM_TYPE, type RootInboxReceiptVerifier } from "./root-in
  *   short line takes its place, so the request still ends on the user's side.
  */
 export interface RootInboxContextOptions {
-  /** Only the private issuer's shown-only snapshot may suppress another carrier. */
+  /** Only the private issuer's shown-only snapshot may suppress another carrier by event id. */
   verifier: RootInboxReceiptVerifier;
   /** The root inbox acked this event: its id is in the acked set or its sequence at or below the mark. */
   acked: (id: string, sequence?: number) => boolean;
@@ -33,11 +34,16 @@ const NOTHING_NEW = `<fabric-inbox count="0">Nothing new: this delivery repeated
 const record = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === "object" ? value as Record<string, unknown> : undefined;
 
+const inboxFields = (message: unknown): Record<string, unknown> | undefined => {
+  const fields = record(message);
+  return (fields?.role === "custom" || fields?.type === "custom_message") && fields.customType === ROOT_INBOX_CUSTOM_TYPE
+    ? fields : undefined;
+};
+
 /** Unissued history and ids without a shown row cannot hide genuine work (smarty-dev#12356). */
 const inboxIds = (message: unknown, verifier: RootInboxReceiptVerifier, accepted: Set<string>): string[] | undefined => {
-  const fields = record(message);
-  if (fields?.role !== "custom" && fields?.type !== "custom_message") return undefined;
-  if (fields.customType !== ROOT_INBOX_CUSTOM_TYPE) return undefined;
+  const fields = inboxFields(message);
+  if (!fields) return undefined;
   const ids = verifier(fields.details, fields, accepted)?.ids;
   if (!ids?.length) return undefined;
   const shown = eventSequences(fields.content).shown;
@@ -94,8 +100,10 @@ export const rootInboxCompactedCopies = (
   return rootInboxCopies(branch.slice(0, cut), verifier, scan);
 };
 
-const cutEvents = (text: string, drop: ReadonlySet<string>, shown: number, overflow: number): string => {
-  let next = text.replace(EVENT, (element, id: string) => drop.has(id) ? "" : element);
+const renderedRow = (element: string): string => element.replace(/^\n/, "");
+
+const cutEvents = (text: string, drop: ReadonlySet<string>, repeated: ReadonlySet<string>, shown: number, overflow: number): string => {
+  let next = text.replace(EVENT, (element, id: string) => drop.has(id) || repeated.has(renderedRow(element)) ? "" : element);
   // Removing shown duplicates cannot deliver or reduce the original pending summary.
   if (overflow === 0) next = next.replace(OVERFLOW, "");
   return next.replace(HEADER, `<fabric-inbox count="${shown + overflow}"${overflow ? ` shown="${shown}"` : ""}>`);
@@ -108,6 +116,23 @@ export const filterRootInboxContext = <Message>(
   let compacted: ReadonlyMap<string, number> | undefined;
   // Compaction evidence inherits these accepted nonces without spending later context rows.
   const accepted = new Set<string>();
+  const issued = new Map<number, string[]>();
+  const rows = new Map<number, RegExpMatchArray[]>();
+  const retainedRows = new Map<string, number>();
+  // Resolve each nonce once, retained-last, before any id suppression. Identical row projection
+  // has no receipt authority: it never seeds seen, ack or compaction, and cannot outrank a verified row.
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const fields = inboxFields(messages[index]);
+    if (!fields) continue;
+    const ids = inboxIds(fields, options.verifier, accepted);
+    if (ids?.length) issued.set(index, ids);
+    const elements = texts(fields.content).flatMap(text => [...text.matchAll(EVENT)]);
+    rows.set(index, elements);
+    for (const element of elements) {
+      const row = renderedRow(element[0]);
+      if (!retainedRows.has(row) || ids?.includes(element[1]!)) retainedRows.set(row, index);
+    }
+  }
   // Acked, and the copy that consumed it was compacted away: the model saw it before this context.
   const consumedEarlier = (id: string, sequence: number | undefined): boolean => {
     if (!options.acked(id, sequence)) return false;
@@ -119,31 +144,34 @@ export const filterRootInboxContext = <Message>(
   let changed = false;
   let droppedLast: Message | undefined;
   messages.forEach((message, index) => {
-    const ids = inboxIds(message, options.verifier, accepted);
-    if (!ids?.length) {
+    const elements = rows.get(index);
+    if (!elements) {
       filtered.push(message);
       return;
     }
+    const ids = issued.get(index) ?? [];
     const fields = message as Record<string, unknown>;
     const sequences = eventSequences(fields.content);
+    const repeated = new Set(elements.filter(element => !ids.includes(element[1]!) &&
+      retainedRows.get(renderedRow(element[0])) !== index).map(element => renderedRow(element[0])));
     const drop = new Set<string>();
     for (const id of ids) {
       if (seen.has(id) || consumedEarlier(id, sequences.shown.get(id) ?? sequences.overflowSequence)) drop.add(id);
       else seen.add(id);
     }
-    if (!drop.size) {
+    if (!drop.size && !repeated.size) {
       filtered.push(message);
       return;
     }
     changed = true;
-    if (drop.size === ids.length && sequences.overflowCount === 0) {
+    const shown = elements.filter(element => !drop.has(element[1]!) && !repeated.has(renderedRow(element[0]))).length;
+    if (shown === 0 && sequences.overflowCount === 0) {
       if (index === messages.length - 1) droppedLast = message;
       return;
     }
     const kept = ids.filter((id) => !drop.has(id));
-    const shown = kept.filter((id) => sequences.shown.has(id)).length;
     const overflow = sequences.overflowCount;
-    const edit = (text: string) => cutEvents(text, drop, shown, overflow);
+    const edit = (text: string) => cutEvents(text, drop, repeated, shown, overflow);
     const content = typeof fields.content === "string" ? edit(fields.content)
       : Array.isArray(fields.content) ? fields.content.map((part) => {
         const text = record(part)?.type === "text" ? record(part)!.text : undefined;

@@ -38,7 +38,7 @@ const fixture = async () => {
   };
   const handlers = new Map<string, Array<(event: any, context: ExtensionContext) => unknown>>();
   const fake = {
-    hostCapabilities: { turnProvenance: 1 },
+    hostCapabilities: { turnProvenance: 1, triggeredMessageQueuesBehindPreflight: true, promptPendingVisible: true },
     sendMessage: vi.fn((message: any, _options: any) => queued.push(message)),
     sendUserMessage: vi.fn(),
     events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
@@ -62,7 +62,8 @@ const fixture = async () => {
   const maybeCommit = vi.fn(async () => {});
   vi.spyOn(FabricState.prototype, "compact", "get").mockReturnValue({ maybeCommit } as any);
   const lifecycle = vi.spyOn(FabricState.prototype, "publishHostLifecycle").mockResolvedValue(undefined);
-  const reconcile = vi.spyOn(FabricState.prototype, "nextRootInbox").mockImplementation((session, _idle, options) => inbox.next(session, options));
+  const reconcile = vi.spyOn(FabricState.prototype, "nextRootInbox").mockImplementation((session, idle, options) =>
+    idle ? inbox.wake(session, idle) : inbox.next(session, options));
   vi.spyOn(FabricState.prototype, "nextRecordsInboxMessage").mockResolvedValue(undefined);
   const consumed = vi.spyOn(FabricState.prototype, "consumeRootInbox").mockImplementation((ids, receipts) => inbox.consume(ids, receipts));
   await piFabric(fake as unknown as ExtensionAPI);
@@ -89,11 +90,76 @@ const fixture = async () => {
   const injectUnconfirmed = async () => {
     for (const message of queued.splice(0)) await emit("message_end", { message: { role: "custom", ...message } });
   };
+  const bindIdleWake = async () => {
+    // The host can defer a triggered followUp without exposing it in hasPendingMessages().
+    Object.assign(context, { isIdle: () => true, hasPendingMessages: () => false });
+    let wake: (() => Promise<void>) | undefined;
+    const boundary = new Error("idle test reached wake registration boundary");
+    const bootstrap = vi.spyOn(FabricState.prototype, "bootstrap").mockResolvedValue(undefined);
+    const registration = vi.spyOn(FabricState.prototype, "setRootInboxWake").mockImplementation(callback => {
+      if (!callback) return;
+      wake = callback;
+      throw boundary; // No optional engines/watchers: this fixture owns the real durable inbox.
+    });
+    try { await expect(emit("session_start", { reason: "startup" })).rejects.toBe(boundary); }
+    finally { bootstrap.mockRestore(); registration.mockRestore(); }
+    cleanups.push(() => emit("session_shutdown", { reason: "exit" }));
+    if (!wake) throw new Error("expected the registered idle inbox callback");
+    return wake;
+  };
   return { mesh, inbox, context, entries, fake, queued, emit, consume, injectUnconfirmed, consumed, work, cursor, ids, turn, reconcile,
-    maybeCommit, lifecycle, advance: (ms: number) => { now += ms; } };
+    bindIdleWake, maybeCommit, lifecycle, advance: (ms: number) => { now += ms; } };
 };
 
 describe("index root inbox turn/settle reconciliation (#4313)", () => {
+  // Keep reason: repeated idle notifications can issue many native carriers for one retained,
+  // still-unreceived event; a visible host queue or canonical receipt masks this failure path.
+  it("queues one retained event across 160 eligible idle wakes until native consumption, then admits a fresh id", async () => {
+    const h = await fixture();
+    const wake = await h.bindIdleWake();
+    const retained = await h.work("retained while the native followUp is deferred");
+    for (let notification = 0; notification < 160; notification++) await wake();
+    expect(h.context.isIdle()).toBe(true);
+    expect(h.context.hasPendingMessages()).toBe(false);
+    expect(h.ids()).toEqual([]); // No canonical receipt can hide the idle queueing bug.
+    expect(h.inbox.acked(retained.id, retained.sequence)).toBe(false);
+    expect(h.cursor().pending.ids).toEqual([retained.id]);
+    expect(h.queued.flatMap(message => message.details.ids)).toEqual([retained.id]);
+    expect(h.fake.sendMessage.mock.calls[0]?.[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+
+    await h.injectUnconfirmed(); // Registered message_end consumes the actual issued carrier.
+    expect(h.inbox.acked(retained.id, retained.sequence)).toBe(true);
+    expect(h.cursor().pending).toBeUndefined();
+    expect(h.ids()).toEqual([]);
+    await wake();
+    expect(h.queued).toEqual([]);
+    const fresh = await h.work("different id must still wake Main");
+    await wake();
+    expect(h.queued.flatMap(message => message.details.ids)).toEqual([fresh.id]);
+    await h.injectUnconfirmed();
+    expect(h.inbox.acked(fresh.id, fresh.sequence)).toBe(true);
+    await wake();
+    expect(h.queued).toEqual([]);
+  });
+
+  it("releases an unreceived idle carrier at cancellation so the next prompt can receive it", async () => {
+    const h = await fixture();
+    const wake = await h.bindIdleWake();
+    const retained = await h.work("cancelled before native consumption");
+    await wake();
+    expect(h.queued.flatMap(message => message.details.ids)).toEqual([retained.id]);
+    h.queued.splice(0); // Host cancellation, not a native injection or canonical receipt.
+    await h.turn("aborted"); // The registered commit-only reconciliation invalidates the lease.
+    expect(h.queued).toEqual([]);
+    expect(h.inbox.acked(retained.id, retained.sequence)).toBe(false);
+    expect(h.cursor().pending.ids).toEqual([retained.id]);
+    await h.emit("before_agent_start");
+    expect(h.queued.flatMap(message => message.details.ids)).toEqual([retained.id]);
+    await h.injectUnconfirmed();
+    expect(h.inbox.acked(retained.id, retained.sequence)).toBe(true);
+    expect(h.cursor().pending).toBeUndefined();
+  });
+
   it("commits held work and receives later events over 50 steer-driven turns without a completed settle", async () => {
     const h = await fixture();
     const first = await h.work("initial batch");

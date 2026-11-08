@@ -184,6 +184,64 @@ describe("resident root inbox issuer custody", () => {
 });
 
 describe("native root inbox receipt isolation", () => {
+  it("projects 160 retained copies once after session_tree, same-manager reload and a cold issuer/runtime restart", async () => {
+    const { first, start } = await setup();
+    await first.bind("startup");
+    const consume = vi.spyOn(first.runtime, "consumeRootInbox");
+    const event = await first.publish("one retained event, not 160 new deliveries");
+    const issued = await first.oneIssued();
+    await first.callback(clone(issued));
+    expect(consume.mock.calls).toEqual([[[event.id], issued.details.receipts]]);
+    expect(first.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+    const copies = Array.from({ length: 160 }, () => clone(issued));
+    first.entries.push(...copies.map((message, index) => ({ type: "custom_message", id: `retained-${index}`,
+      timestamp: new Date().toISOString(), ...clone(message) })));
+    const retained = JSON.stringify(first.entries);
+    const file = first.context.sessionManager.getSessionFile()!;
+    fs.writeFileSync(file, [{ type: "session", id: sessionId }, ...first.entries].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    const canonical = fs.readFileSync(file, "utf8");
+    const checkProjection = async (generation: typeof first, phase: string) => {
+      for (let scan = 0; scan < 2; scan++) {
+        const projected = await generation.modelContext(copies);
+        expect.soft(shown(projected, event.id), `${phase}, context scan ${scan}`).toBe(1);
+        expect.soft(projected.at(-1)?.content, `${phase}: retain the last exact carrier`).toBe(issued.content);
+      }
+      expect(generation.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
+      expect(await generation.issue()).toEqual([]);
+      expect(JSON.stringify(generation.context.sessionManager.getBranch())).toBe(retained);
+      expect(fs.readFileSync(file, "utf8")).toBe(canonical);
+    };
+    await first.emit("session_tree");
+    await checkProjection(first, "session_tree");
+
+    const manager = first.context.sessionManager;
+    await first.emit("session_shutdown", { reason: "reload" });
+    await first.stop();
+    const reloaded = await start(manager);
+    await reloaded.bind("reload");
+    expect(reloaded.context.sessionManager).toBe(manager);
+    // The reused manager still closes over first.entries, not reloaded.entries.
+    expect(reloaded.context.sessionManager.getBranch()).toBe(first.entries);
+    const reloadConsume = vi.spyOn(reloaded.runtime, "consumeRootInbox");
+    await reloaded.callback(clone(issued));
+    expect(reloadConsume).not.toHaveBeenCalled();
+    await checkProjection(reloaded, "same-manager reload");
+
+    await reloaded.emit("session_shutdown", { reason: "quit" });
+    await reloaded.stop();
+    // A fresh manager and runtime lose private issuer custody. This models cold issuer loss;
+    // it is not a separate OS process or a native SDK transcript-rebuild proof.
+    const cold = await start();
+    await cold.bind("startup");
+    expect(cold.context.sessionManager).not.toBe(manager);
+    cold.entries.push(...clone(first.entries));
+    const coldConsume = vi.spyOn(cold.runtime, "consumeRootInbox");
+    await cold.callback(clone(issued));
+    expect(coldConsume).not.toHaveBeenCalled();
+    await checkProjection(cold, "cold issuer/runtime restart");
+    expect(consume).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
   it("restores a queued carrier through the registered same-manager session_start reload handler", async () => {
     const { first, start } = await setup();
     await first.bind("startup");

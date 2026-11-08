@@ -934,8 +934,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), idle);
       await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
-      if (inbox?.events.length && idle()) {
-        for (const id of deliverRootInbox(pi, inbox.events, undefined, registerIssuedInbox)) inboxIssuer.queued.set(id, inboxIssuer.turn);
+      const events = inbox ? inboxEventsToQueue(inbox) : [];
+      if (events.length && idle()) {
+        for (const id of deliverRootInbox(pi, events, undefined, registerIssuedInbox)) inboxIssuer.queued.set(id, inboxIssuer.turn);
         return undefined;
       }
       // Records: the same gate, re-checked after the read (F21).

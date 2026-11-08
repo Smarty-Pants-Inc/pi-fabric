@@ -193,6 +193,102 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     } finally { mesh.closeState(); }
   }, 60_000);
 
+  it("projects 160 retained same-nonce inbox copies once after native tree navigation and same-manager reload", async () => {
+    const { session, faux, missedWork, inboxMessages } = await start(100_000, false, { persisted: true });
+    session.setAutoCompactionEnabled(false);
+    session.setAutoRetryEnabled(false);
+    const manager = session.sessionManager;
+    const away = manager.getLeafId()!;
+    expect(manager.getEntry(away)).toMatchObject({ type: "message", message: { role: "assistant" } });
+    const old = missedWork("one genuine delivery retained in many native entries");
+    faux.setResponses([fauxAssistantMessage("received the original delivery")]);
+    await session.prompt("receive the missed work");
+    expect(inboxMessages()).toHaveLength(1);
+    const issued = inboxMessages()[0] as unknown as {
+      customType: string; content: string; display: boolean;
+      details: { nonce: string; ids: string[] };
+    };
+    expect(issued.details.ids).toEqual([old]);
+    expect(issued.details.nonce).toEqual(expect.any(String));
+    const N = 160;
+    // One original plus N-1 exact retained copies, not N newly published work events.
+    const calls = faux.state.callCount;
+    for (let index = 1; index < N; index++) {
+      await session.sendCustomMessage(structuredClone({
+        customType: issued.customType, content: issued.content, display: issued.display, details: issued.details,
+      }), { triggerTurn: false });
+    }
+    expect(faux.state.callCount).toBe(calls);
+    const inboxEntries = (source = manager) => source.getEntries().flatMap(entry =>
+      entry.type === "custom_message" && entry.customType === "pi-fabric-inbox" ? [entry] : []);
+    const retained = inboxEntries();
+    expect(retained).toHaveLength(N);
+    const assertHistory = (fresh: string[]) => {
+      // Read both native canonical history and its persisted file: projection must never delete traces.
+      for (const source of [manager, SessionManager.open(manager.getSessionFile()!)]) {
+        const entries = inboxEntries(source);
+        const copies = entries.filter(entry => (entry.details as { ids: string[] }).ids.includes(old));
+        expect(copies.map(entry => entry.id)).toEqual(retained.map(entry => entry.id));
+        expect(copies).toHaveLength(N);
+        for (const copy of copies) {
+          expect(copy.content).toBe(issued.content);
+          expect(copy.details).toEqual(issued.details);
+        }
+        // Any runtime reissuance, even with a fresh nonce, creates an extra canonical entry/ID.
+        expect(entries.flatMap(entry => (entry.details as { ids: string[] }).ids))
+          .toEqual([...Array.from({ length: N }, () => old), ...fresh]);
+      }
+    };
+    assertHistory([]);
+    faux.setResponses([fauxAssistantMessage("assistant leaf after every retained copy")]);
+    await session.prompt("anchor all retained copies");
+    const back = manager.getLeafId()!;
+    // Selecting a custom_message rewinds to its parent. Select an assistant AFTER all copies instead.
+    expect(manager.getEntry(back)).toMatchObject({ type: "message", message: { role: "assistant" } });
+    expect((await session.navigateTree(away, { summarize: false })).cancelled).toBe(false);
+    expect(manager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-inbox"))
+      .toHaveLength(0);
+    expect((await session.navigateTree(back, { summarize: false })).cancelled).toBe(false);
+    expect(manager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-inbox"))
+      .toHaveLength(N);
+    const infer = async (prompt: string, activate = false) => {
+      const requests: string[][] = [];
+      const respond = (context: { messages: readonly unknown[] }) => {
+        const texts = context.messages.flatMap(message => {
+          const content = (message as { content?: unknown }).content;
+          return typeof content === "string" ? [content] : Array.isArray(content)
+            ? content.flatMap(part => part?.type === "text" && typeof part.text === "string" ? [part.text] : []) : [];
+        });
+        // Count shown XML rows, not IDs in receipt metadata or the pre-projection session.messages.
+        requests.push([...texts.join("\n").matchAll(/<event id="([^"]+)"/g)].map(match => match[1]!));
+        return fauxAssistantMessage(activate && requests.length === 1
+          ? fauxToolCall("fabric_exec", { code: "return 1" }) : "observed the projected inbox");
+      };
+      const before = faux.state.callCount;
+      faux.setResponses(activate ? [respond, respond] : [respond]);
+      await session.prompt(prompt);
+      expect.soft(faux.state.callCount - before).toBe(activate ? 2 : 1);
+      expect.soft(requests).toHaveLength(activate ? 2 : 1);
+      // Soft assertions keep the real reload reachable on a broken bundle (expected: N rows).
+      for (const rows of requests) expect.soft(rows.filter(id => id === old), prompt).toHaveLength(1);
+      return requests;
+    };
+    const fresh = missedWork("unrelated work after native tree navigation");
+    const treeRequests = await infer("inspect retained inbox after native tree navigation");
+    expect.soft(treeRequests.at(-1)?.filter(id => id === fresh)).toHaveLength(1);
+    assertHistory([fresh]);
+    await session.reload(); // Real SDK shutdown/reload/session_start, retaining the same manager.
+    expect(session.sessionManager).toBe(manager);
+    session.setAutoCompactionEnabled(false);
+    session.setAutoRetryEnabled(false);
+    await infer("reactivate Fabric after same-manager reload", true);
+    assertHistory([fresh]);
+    const newer = missedWork("unrelated work after same-manager reload");
+    const reloadRequests = await infer("inspect retained inbox and fresh work after reload");
+    expect.soft(reloadRequests.at(-1)?.filter(id => id === newer)).toHaveLength(1);
+    assertHistory([fresh, newer]);
+  }, 60_000);
+
   it("does not cache a failed native session append before its shadow, then delivers once after reload (F5)", async () => {
     const h = await start(1_000, false, { persisted: true });
     const { session, faux, root, meshRoot, loader, modelRuntime } = h;

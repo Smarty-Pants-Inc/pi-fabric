@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync, execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { compareFileParity } from "../scripts/ci-test-counts.mjs";
 
@@ -168,5 +168,107 @@ describe("affected selector shard forwarding (dry run only)", () => {
     expect(JSON.parse(fs.readFileSync(path.join(reports, "selection.json"), "utf8")).phases).toEqual(["related", "direct"]);
     // No Vitest report means --dry-run did not run the suite.
     expect(fs.existsSync(path.join(reports, "direct.json"))).toBe(false);
+  });
+});
+
+describe("affected selector shard execution", () => {
+  it("records an empty direct shard without running Vitest, but invokes Vitest for a nonempty shard", () => {
+    const root = temp();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
+    fs.mkdirSync(path.join(root, "src"));
+    fs.mkdirSync(path.join(root, "tests"));
+    fs.writeFileSync(path.join(root, "src/example.ts"), "export const value = 1;\n");
+    git("init");
+    git("add", ".");
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "fixture");
+
+    const preload = path.join(root, "record-bunx.mjs");
+    const callsFile = path.join(root, "bunx-calls.jsonl");
+    fs.writeFileSync(preload, `import fs from "node:fs";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalExecFileSync = childProcess.execFileSync;
+childProcess.execFileSync = function (file, args, options) {
+  if (file === "bunx") {
+    fs.appendFileSync(process.env.CI_TEST_BUNX_CALLS, JSON.stringify({ file, args }) + "\\n");
+    return Buffer.alloc(0);
+  }
+  return originalExecFileSync.call(this, file, args, options);
+};
+syncBuiltinESMExports();
+`);
+    const runShard = (reports: string) => {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PI_TEST_REPORT_DIR: reports,
+        CI_TEST_BUNX_CALLS: callsFile,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${pathToFileURL(preload).href}`].filter(Boolean).join(" "),
+      };
+      delete env.PI_TEST_BASE;
+      return spawnSync(process.execPath, [affectedScript, "--shard=7/10"], {
+        cwd: root, env, encoding: "utf8",
+      });
+    };
+
+    const directFiles = Array.from({ length: 10 }, (_, index) => `tests/direct-${index + 1}.test.ts`);
+    fs.writeFileSync(path.join(root, directFiles[0]!), "// selected direct test\n");
+    const skippedReports = path.join(root, "skipped-reports");
+    const skipped = runShard(skippedReports);
+    expect(skipped.status, skipped.stderr).toBe(0);
+    expect(skipped.stdout).toContain("shard 7/10: no selected tests");
+    expect(fs.existsSync(callsFile)).toBe(false);
+    const skippedSelection = JSON.parse(fs.readFileSync(path.join(skippedReports, "selection.json"), "utf8"));
+    expect(skippedSelection.phases).toEqual(["direct"]);
+    expect(skippedSelection.direct).toEqual([directFiles[0]]);
+    const skippedReport = JSON.parse(fs.readFileSync(path.join(skippedReports, "direct.json"), "utf8"));
+    expect(skippedReport).toMatchObject({
+      success: true,
+      numTotalTests: 0,
+      numPassedTests: 0,
+      numFailedTests: 0,
+      numPendingTests: 0,
+      numTodoTests: 0,
+      testResults: [],
+    });
+
+    const platform = process.platform === "win32" ? "windows-latest" : "ubuntu-latest";
+    const shardRoot = path.join(root, "aggregate-shards");
+    const unshardedSelection = path.join(root, "unsharded-selection.json");
+    json(unshardedSelection, { related: [], direct: [directFiles[0]] });
+    for (let index = 1; index <= 10; index++) {
+      const directory = path.join(shardRoot, `affected-${platform}-${index}`);
+      fs.mkdirSync(directory, { recursive: true });
+      if (index === 7) {
+        fs.copyFileSync(path.join(skippedReports, "selection.json"), path.join(directory, "selection.json"));
+        fs.copyFileSync(path.join(skippedReports, "direct.json"), path.join(directory, "direct.json"));
+      } else {
+        json(path.join(directory, "selection.json"), { ...skippedSelection, shard: `${index}/10` });
+        json(path.join(directory, "direct.json"), index === 1 ? {
+          success: true,
+          numTotalTests: 1,
+          numPassedTests: 1,
+          numFailedTests: 0,
+          numPendingTests: 0,
+          numTodoTests: 0,
+          testResults: [{ name: `/fixture/${directFiles[0]}` }],
+        } : skippedReport);
+      }
+    }
+    const counts = spawnSync(process.execPath, [countsScript, shardRoot, platform, "10", unshardedSelection], {
+      encoding: "utf8", env: { ...process.env, GITHUB_STEP_SUMMARY: path.join(root, "aggregate-summary.md") },
+    });
+    expect(counts.status, counts.stderr).toBe(0);
+    expect(counts.stdout).toContain("**direct: PASS** — expected 1 files; shard union 1 files.");
+
+    for (const file of directFiles.slice(1)) fs.writeFileSync(path.join(root, file), "// selected direct test\n");
+    const nonemptyReports = path.join(root, "nonempty-reports");
+    const nonempty = runShard(nonemptyReports);
+    expect(nonempty.status, nonempty.stderr).toBe(0);
+    const invocations = fs.readFileSync(callsFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0].file).toBe("bunx");
+    expect(invocations[0].args).toContain("vitest");
+    expect(invocations[0].args).toContain("--shard=7/10");
+    expect(invocations[0].args.filter((arg: string) => directFiles.includes(arg))).toHaveLength(10);
   });
 });

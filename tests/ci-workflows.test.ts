@@ -1,10 +1,15 @@
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 type Step = {
   name?: string;
+  id?: string;
   uses?: string;
   run?: string;
   if?: string;
@@ -40,6 +45,7 @@ type ActionConfig = {
   inputs?: Record<string, { default?: string }>;
   runs?: { steps?: Step[] };
 };
+type ExpandedStep = { step: Step; localActions: string[] };
 
 const root = new URL("../", import.meta.url);
 const manifest = JSON.parse(fs.readFileSync(new URL("package.json", root), "utf8"));
@@ -52,11 +58,20 @@ const workflowInventory = () => Object.fromEntries(workflows.map((file) => [
   parse(fs.readFileSync(new URL(`.github/workflows/${file}`, root), "utf8")) as Workflow,
 ]));
 const action = (name: string) => parse(fs.readFileSync(new URL(`.github/actions/${name}/action.yml`, root), "utf8")) as ActionConfig;
-const expandedSteps = ({ steps = [] }: Job): Step[] => steps.flatMap((step) =>
-  step.uses?.startsWith("./.github/actions/")
-    ? expandedSteps({ steps: parse(fs.readFileSync(new URL(`${step.uses}/action.yml`, root), "utf8")).runs.steps })
-    : [step]);
+const setupBunAction = "./.github/actions/setup-bun";
+function expandedStepsWithOrigins({ steps = [] }: Job, localActions: string[] = []): ExpandedStep[] {
+  return steps.flatMap((step) => {
+    if (!step.uses?.startsWith("./.github/actions/")) return [{ step, localActions }];
+    const nested = parse(fs.readFileSync(new URL(`${step.uses}/action.yml`, root), "utf8")) as ActionConfig;
+    return expandedStepsWithOrigins({ steps: nested.runs?.steps ?? [] }, [...localActions, step.uses]);
+  });
+}
+const expandedSteps = (job: Job): Step[] => expandedStepsWithOrigins(job).map(({ step }) => step);
 const acceptance = (os: string) => workflow().jobs[`${os}-acceptance`] as Job;
+
+function curlsGitHubReleaseDownload(source: string): boolean {
+  return /\bcurl\b/i.test(source) && /github\.com\/[^\s"'`]*\/releases\/download(?:\/|\b)/i.test(source);
+}
 
 const i9JobId = "windows-i9";
 const i9WorkflowFile = "windows-i9.yml";
@@ -276,13 +291,34 @@ describe("CI Node runtime prerequisites", () => {
     const gate = steps.find((step) => step.name === "Session-channel real-broker acceptance");
     expect(install?.if).toBe("runner.os == 'Linux'");
     expect(install?.run).toBe("bash scripts/install-pinned-nats-server.sh");
+    expect(install?.env?.GH_TOKEN).toBe("${{ github.token }}");
     const installer = fs.readFileSync(new URL("scripts/install-pinned-nats-server.sh", root), "utf8");
     expect(installer).toContain("version=2.14.7");
     expect(installer).toContain("e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2");
-    expect(installer).toContain("https://github.com/nats-io/nats-server/releases/download/v${version}");
+    expect(installer).toContain("gh release download");
     expect(gate?.if).toBe("runner.os == 'Linux'");
     expect(gate?.env).toEqual({ PI_FABRIC_REQUIRE_NATS: "1", NATS_EXPECTED_SERVER_VERSION: "2.14.7" });
     expect(gate?.run).toBe("bunx vitest run --retry=0 tests/nats-session-channel.test.ts");
+  });
+
+  it("uses authenticated gh for GitHub release assets and never curls a release URL", () => {
+    const steps = Object.entries(workflowInventory()).flatMap(([file, config]) =>
+      Object.entries(config.jobs).flatMap(([job, definition]) => expandedStepsWithOrigins(definition).map(({ step }) => ({
+        location: `${file}:${job}:${step.name ?? step.uses ?? "unnamed"}`,
+        step,
+      }))),
+    );
+    const releaseDownloads = steps.filter(({ step }) => /\bgh\s+release\s+download\b/i.test(step.run ?? ""));
+    expect(releaseDownloads.length).toBeGreaterThan(0);
+    for (const { location, step } of releaseDownloads) {
+      expect(step.env?.GH_TOKEN, `${location} must pass the GitHub token`).toBe("${{ github.token }}");
+    }
+
+    const curlDownloads = steps.filter(({ step }) => curlsGitHubReleaseDownload(step.run ?? "")).map(({ location }) => location);
+    const installer = fs.readFileSync(new URL("scripts/install-pinned-nats-server.sh", root), "utf8");
+    if (curlsGitHubReleaseDownload(installer)) curlDownloads.push("scripts/install-pinned-nats-server.sh");
+    expect(curlDownloads).toEqual([]);
+    expect(installer).toMatch(/\bgh\s+release\s+download\b/i);
   });
 
   // Deliberately pinned jobs retain their own Node versions.
@@ -290,8 +326,12 @@ describe("CI Node runtime prerequisites", () => {
   it.each(workflows)("%s configures the declared Node runtime before install and execution", (file) => {
     const config = parse(fs.readFileSync(new URL(`.github/workflows/${file}`, root), "utf8")) as { jobs: Record<string, Job> };
     for (const [job, definition] of Object.entries(config.jobs)) {
-      const steps = expandedSteps(definition);
-      const executions = steps.flatMap((step, index) => /\b(?:node|bun|bunx)\s/.test(step.run ?? "") ? [index] : []);
+      const expanded = expandedStepsWithOrigins(definition);
+      const steps = expanded.map(({ step }) => step);
+      // Bun's local installer invokes its freshly unpacked binary for the pinned version check.
+      // That bootstrap is not application runtime; all later workflow/composite Bun commands remain covered.
+      const executions = expanded.flatMap(({ step, localActions }, index) =>
+        /\b(?:node|bun|bunx)\s/.test(step.run ?? "") && !localActions.includes(setupBunAction) ? [index] : []);
       if (executions.length === 0) continue;
       const setup = steps.findIndex((step) => step.uses?.startsWith("actions/setup-node@"));
       expect(setup, `${file}:${job} must set up Node`).toBeGreaterThanOrEqual(0);
@@ -309,6 +349,199 @@ describe("CI Node runtime prerequisites", () => {
       for (const index of executions) expect(setup).toBeLessThan(index);
     }
   });
+});
+
+describe("pinned local Bun setup contract", () => {
+  it("uses the local Bun action after checkout at every direct workflow setup site", () => {
+    const inventory = workflowInventory();
+    const consumers = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs).flatMap(([job, definition]) =>
+      (definition.steps ?? []).flatMap((step, index) => step.uses === setupBunAction ? [{ file, job, definition, index }] : [])));
+    const externalConsumers = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs).flatMap(([job, definition]) =>
+      (definition.steps ?? []).filter((step) => step.uses?.startsWith("oven-sh/setup-bun@")).map(() => `${file}:${job}`)));
+
+    expect(externalConsumers).toEqual([]);
+    expect(consumers).toHaveLength(5);
+    expect(consumers.filter(({ file }) => file === "test.yml")).toHaveLength(4);
+    expect(consumers.filter(({ file }) => file === "entropy.yml")).toHaveLength(1);
+    for (const { file, job, definition, index } of consumers) {
+      const checkout = (definition.steps ?? []).findIndex((step) => step.uses?.startsWith("actions/checkout@"));
+      expect(checkout, `${file}:${job} must check out before local Bun setup`).toBeGreaterThanOrEqual(0);
+      expect(checkout).toBeLessThan(index);
+    }
+
+    const sharedSetup = action("check-setup").runs?.steps ?? [];
+    expect(sharedSetup.some((step) => step.uses === setupBunAction)).toBe(true);
+    expect(sharedSetup.some((step) => step.uses?.startsWith("oven-sh/setup-bun@"))).toBe(false);
+    const sharedConsumers = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs).flatMap(([job, definition]) =>
+      (definition.steps ?? []).flatMap((step, index) => step.uses === "./.github/actions/check-setup"
+        ? [{ file, job, definition, index }]
+        : [])));
+    expect(sharedConsumers.length).toBeGreaterThan(0);
+    for (const { file, job, definition, index } of sharedConsumers) {
+      const checkout = (definition.steps ?? []).findIndex((step) => step.uses?.startsWith("actions/checkout@"));
+      expect(checkout, `${file}:${job} must check out before shared Bun setup`).toBeGreaterThanOrEqual(0);
+      expect(checkout).toBeLessThan(index);
+    }
+  });
+
+  it("restores and explicitly saves the exact SHA-keyed archive cache with download-scoped token", () => {
+    const steps = action("setup-bun").runs?.steps ?? [];
+    const cacheActions = steps.filter((step) => step.uses?.startsWith("actions/cache"));
+    expect(cacheActions.map((step) => step.uses)).toEqual([
+      "actions/cache/restore@v4",
+      "actions/cache/save@v4",
+    ]);
+    const restore = cacheActions[0]!;
+    const save = cacheActions[1]!;
+    const expectedCache = {
+      path: "${{ steps.pin.outputs.cache_dir }}/${{ steps.pin.outputs.asset }}",
+      key: "bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}",
+    };
+    expect(restore.id).toBe("restore");
+    expect(restore.with).toEqual(expectedCache);
+    expect(save.with).toEqual(expectedCache);
+    expect(save.if).toBe("steps.restore.outputs.cache-hit != 'true'");
+
+    const pinIndex = steps.findIndex((step) => step.id === "pin");
+    const restoreIndex = steps.indexOf(restore);
+    const downloadIndex = steps.findIndex((step) => step.name === "Download missing Bun archive");
+    const saveIndex = steps.indexOf(save);
+    const verifyIndex = steps.findIndex((step) => step.name === "Verify and install Bun");
+    expect(pinIndex).toBeGreaterThanOrEqual(0);
+    expect(downloadIndex).toBeGreaterThanOrEqual(0);
+    expect(verifyIndex).toBeGreaterThanOrEqual(0);
+    expect(pinIndex).toBeLessThan(restoreIndex);
+    expect(restoreIndex).toBeLessThan(downloadIndex);
+    expect(saveIndex).toBe(downloadIndex + 1);
+    expect(saveIndex).toBeLessThan(verifyIndex);
+
+    const authenticated = steps.filter((step) => step.env?.GH_TOKEN !== undefined);
+    expect(authenticated).toHaveLength(1);
+    expect(authenticated[0]?.env).toEqual({
+      GH_TOKEN: "${{ github.token }}",
+      BUN_ASSET: "${{ steps.pin.outputs.asset }}",
+      BUN_CACHE_DIR: "${{ steps.pin.outputs.cache_dir }}",
+    });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "runs the extracted bunx before publishing PATH (POSIX fixture; Windows uses the native action in CI)",
+    () => {
+      const fixtureDir = fs.mkdtempSync(join(tmpdir(), "setup-bun-bunx-"));
+      try {
+        const runnerTemp = join(fixtureDir, "runner-temp");
+        const cacheDir = join(fixtureDir, "cache");
+        const toolsDir = join(fixtureDir, "tools");
+        fs.mkdirSync(runnerTemp);
+        fs.mkdirSync(cacheDir);
+        fs.mkdirSync(toolsDir);
+
+        const runnerOs = process.platform === "darwin" ? "macOS" : "Linux";
+        const asset = runnerOs === "macOS" ? "bun-darwin-x64.zip" : "bun-linux-x64.zip";
+        const archivePath = join(cacheDir, asset);
+        const archive = Buffer.from("fixture archive; extraction is controlled by the unzip stub");
+        fs.writeFileSync(archivePath, archive);
+        const archiveSha = createHash("sha256").update(archive).digest("hex");
+        const githubPath = join(fixtureDir, "github-path");
+        const invocationPathLog = join(fixtureDir, "invocation-paths");
+        const publicationLog = join(fixtureDir, "publication-states");
+        const fixtureBun = join(fixtureDir, "fixture-bun");
+        fs.writeFileSync(fixtureBun, [
+          "#!/bin/sh",
+          "set -eu",
+          'printf \'%s\\n\' "$PATH" >> "$BUN_FIXTURE_PATH_LOG"',
+          'if [ -s "$GITHUB_PATH" ]; then printf \'published\\n\' >> "$BUN_FIXTURE_PUBLICATION_LOG"; else printf \'not-published\\n\' >> "$BUN_FIXTURE_PUBLICATION_LOG"; fi',
+          'case "${0##*/}" in bunx|bunx.exe) version="$BUN_FIXTURE_BUNX_VERSION" ;; *) version=1.4.4 ;; esac',
+          'printf \'%s\\n\' "$version"',
+          "",
+        ].join("\n"));
+
+        const unzipStub = join(toolsDir, "unzip");
+        fs.writeFileSync(unzipStub, [
+          "#!/bin/sh",
+          "set -eu",
+          '[ "$1" = "-q" ] && [ "$3" = "-d" ]',
+          'asset=${2##*/}',
+          'unpacked=${asset%.zip}',
+          'mkdir -p "$4/$unpacked"',
+          'cp "$BUN_FIXTURE_BUN" "$4/$unpacked/bun"',
+          "",
+        ].join("\n"));
+        fs.chmodSync(unzipStub, 0o755);
+
+        const installStep = action("setup-bun").runs?.steps?.find((step) => step.name === "Verify and install Bun");
+        expect(installStep?.run).toBeTruthy();
+        const installerEnv = {
+          ...process.env,
+          PATH: `${toolsDir}${delimiter}${process.env.PATH ?? ""}`,
+          RUNNER_OS: runnerOs,
+          RUNNER_ARCH: "X64",
+          RUNNER_TEMP: runnerTemp,
+          BUN_ASSET: asset,
+          BUN_SHA: archiveSha,
+          BUN_CACHE_DIR: cacheDir,
+          GITHUB_PATH: githubPath,
+          BUN_FIXTURE_BUN: fixtureBun,
+          BUN_FIXTURE_PATH_LOG: invocationPathLog,
+          BUN_FIXTURE_PUBLICATION_LOG: publicationLog,
+          BUN_FIXTURE_BUNX_VERSION: "1.4.4",
+        };
+        const runInstaller = () => spawnSync("/bin/bash", ["-c", installStep!.run!], {
+          cwd: cacheDir,
+          env: installerEnv,
+          encoding: "utf8",
+        });
+
+        const installed = runInstaller();
+        expect(installed.status).toBe(0);
+        expect(installed.stderr).toBe("");
+        const publishedEntries = fs.readFileSync(githubPath, "utf8").trim().split(/\r?\n/);
+        expect(publishedEntries).toHaveLength(1);
+        const binDir = publishedEntries[0]!;
+        expect(basename(binDir)).toBe(asset.slice(0, -".zip".length));
+        expect(fs.readdirSync(binDir).sort()).toEqual(["bun", "bunx"]);
+
+        const bunx = join(binDir, "bunx");
+        expect(fs.lstatSync(bunx).isSymbolicLink()).toBe(true);
+        expect(fs.readlinkSync(bunx)).toBe("bun");
+        fs.accessSync(bunx, fs.constants.X_OK);
+        const bunxRun = spawnSync(bunx, ["--version"], {
+          env: {
+            PATH: binDir,
+            GITHUB_PATH: githubPath,
+            BUN_FIXTURE_PATH_LOG: invocationPathLog,
+            BUN_FIXTURE_PUBLICATION_LOG: publicationLog,
+            BUN_FIXTURE_BUNX_VERSION: "1.4.4",
+          },
+          encoding: "utf8",
+        });
+        expect(bunxRun.status).toBe(0);
+        expect(bunxRun.stdout.trim()).toBe("1.4.4");
+        expect(fs.readFileSync(invocationPathLog, "utf8").trim().split(/\r?\n/).at(-1)).toBe(binDir);
+        expect(fs.readFileSync(publicationLog, "utf8").trim().split(/\r?\n/)).toEqual([
+          "not-published",
+          "not-published",
+          "published",
+        ]);
+
+        fs.writeFileSync(githubPath, "");
+        installerEnv.BUN_FIXTURE_BUNX_VERSION = "1.4.5";
+        const rejected = runInstaller();
+        expect(rejected.status).not.toBe(0);
+        expect(rejected.stderr).toContain("Expected bunx 1.4.4, got: 1.4.5");
+        expect(fs.readFileSync(githubPath, "utf8")).toBe("");
+        expect(fs.readFileSync(publicationLog, "utf8").trim().split(/\r?\n/)).toEqual([
+          "not-published",
+          "not-published",
+          "published",
+          "not-published",
+          "not-published",
+        ]);
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("Windows i9 test observation contract", () => {

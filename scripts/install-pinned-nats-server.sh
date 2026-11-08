@@ -3,11 +3,9 @@ set -euo pipefail
 
 version=2.14.7
 archive="nats-server-v${version}-linux-amd64.tar.gz"
-release="https://github.com/nats-io/nats-server/releases/download/v${version}"
 stage="${RUNNER_TEMP:?RUNNER_TEMP must be set}/nats-session-channel"
 mkdir -p "$stage"
-curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/SHA256SUMS" "$release/SHA256SUMS"
-curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$archive" "$release/$archive"
+gh release download -R nats-io/nats-server "v${version}" -p SHA256SUMS -p "$archive" -D "$stage"
 (
   cd "$stage"
   awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -

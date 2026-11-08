@@ -40,6 +40,7 @@ type ActionConfig = {
   inputs?: Record<string, { default?: string }>;
   runs?: { steps?: Step[] };
 };
+type ExpandedStep = { step: Step; localActions: string[] };
 
 const root = new URL("../", import.meta.url);
 const manifest = JSON.parse(fs.readFileSync(new URL("package.json", root), "utf8"));
@@ -52,10 +53,15 @@ const workflowInventory = () => Object.fromEntries(workflows.map((file) => [
   parse(fs.readFileSync(new URL(`.github/workflows/${file}`, root), "utf8")) as Workflow,
 ]));
 const action = (name: string) => parse(fs.readFileSync(new URL(`.github/actions/${name}/action.yml`, root), "utf8")) as ActionConfig;
-const expandedSteps = ({ steps = [] }: Job): Step[] => steps.flatMap((step) =>
-  step.uses?.startsWith("./.github/actions/")
-    ? expandedSteps({ steps: parse(fs.readFileSync(new URL(`${step.uses}/action.yml`, root), "utf8")).runs.steps })
-    : [step]);
+const setupBunAction = "./.github/actions/setup-bun";
+function expandedStepsWithOrigins({ steps = [] }: Job, localActions: string[] = []): ExpandedStep[] {
+  return steps.flatMap((step) => {
+    if (!step.uses?.startsWith("./.github/actions/")) return [{ step, localActions }];
+    const nested = parse(fs.readFileSync(new URL(`${step.uses}/action.yml`, root), "utf8")) as ActionConfig;
+    return expandedStepsWithOrigins({ steps: nested.runs?.steps ?? [] }, [...localActions, step.uses]);
+  });
+}
+const expandedSteps = (job: Job): Step[] => expandedStepsWithOrigins(job).map(({ step }) => step);
 const acceptance = (os: string) => workflow().jobs[`${os}-acceptance`] as Job;
 
 const i9JobId = "windows-i9";
@@ -290,8 +296,12 @@ describe("CI Node runtime prerequisites", () => {
   it.each(workflows)("%s configures the declared Node runtime before install and execution", (file) => {
     const config = parse(fs.readFileSync(new URL(`.github/workflows/${file}`, root), "utf8")) as { jobs: Record<string, Job> };
     for (const [job, definition] of Object.entries(config.jobs)) {
-      const steps = expandedSteps(definition);
-      const executions = steps.flatMap((step, index) => /\b(?:node|bun|bunx)\s/.test(step.run ?? "") ? [index] : []);
+      const expanded = expandedStepsWithOrigins(definition);
+      const steps = expanded.map(({ step }) => step);
+      // Bun's local installer invokes its freshly unpacked binary for the pinned version check.
+      // That bootstrap is not application runtime; all later workflow/composite Bun commands remain covered.
+      const executions = expanded.flatMap(({ step, localActions }, index) =>
+        /\b(?:node|bun|bunx)\s/.test(step.run ?? "") && !localActions.includes(setupBunAction) ? [index] : []);
       if (executions.length === 0) continue;
       const setup = steps.findIndex((step) => step.uses?.startsWith("actions/setup-node@"));
       expect(setup, `${file}:${job} must set up Node`).toBeGreaterThanOrEqual(0);
@@ -308,6 +318,56 @@ describe("CI Node runtime prerequisites", () => {
       expect(steps[setup]!.if).toBeUndefined();
       for (const index of executions) expect(setup).toBeLessThan(index);
     }
+  });
+});
+
+describe("pinned local Bun setup contract", () => {
+  it("uses the local Bun action after checkout at every direct workflow setup site", () => {
+    const inventory = workflowInventory();
+    const consumers = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs).flatMap(([job, definition]) =>
+      (definition.steps ?? []).flatMap((step, index) => step.uses === setupBunAction ? [{ file, job, definition, index }] : [])));
+    const externalConsumers = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs).flatMap(([job, definition]) =>
+      (definition.steps ?? []).filter((step) => step.uses?.startsWith("oven-sh/setup-bun@")).map(() => `${file}:${job}`)));
+
+    expect(externalConsumers).toEqual([]);
+    expect(consumers).toHaveLength(5);
+    expect(consumers.filter(({ file }) => file === "test.yml")).toHaveLength(4);
+    expect(consumers.filter(({ file }) => file === "entropy.yml")).toHaveLength(1);
+    for (const { file, job, definition, index } of consumers) {
+      const checkout = (definition.steps ?? []).findIndex((step) => step.uses?.startsWith("actions/checkout@"));
+      expect(checkout, `${file}:${job} must check out before local Bun setup`).toBeGreaterThanOrEqual(0);
+      expect(checkout).toBeLessThan(index);
+    }
+
+    const sharedSetup = action("check-setup").runs?.steps ?? [];
+    expect(sharedSetup.some((step) => step.uses === setupBunAction)).toBe(true);
+    expect(sharedSetup.some((step) => step.uses?.startsWith("oven-sh/setup-bun@"))).toBe(false);
+    const sharedConsumers = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs).flatMap(([job, definition]) =>
+      (definition.steps ?? []).flatMap((step, index) => step.uses === "./.github/actions/check-setup"
+        ? [{ file, job, definition, index }]
+        : [])));
+    expect(sharedConsumers.length).toBeGreaterThan(0);
+    for (const { file, job, definition, index } of sharedConsumers) {
+      const checkout = (definition.steps ?? []).findIndex((step) => step.uses?.startsWith("actions/checkout@"));
+      expect(checkout, `${file}:${job} must check out before shared Bun setup`).toBeGreaterThanOrEqual(0);
+      expect(checkout).toBeLessThan(index);
+    }
+  });
+
+  it("keys the exact archive cache by SHA and scopes the GitHub token to the download step", () => {
+    const steps = action("setup-bun").runs?.steps ?? [];
+    const cache = steps.find((step) => step.uses === "actions/cache@v4");
+    expect(cache?.with).toEqual({
+      path: "${{ steps.pin.outputs.cache_dir }}/${{ steps.pin.outputs.asset }}",
+      key: "bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}",
+    });
+    const authenticated = steps.filter((step) => step.env?.GH_TOKEN !== undefined);
+    expect(authenticated).toHaveLength(1);
+    expect(authenticated[0]?.env).toEqual({
+      GH_TOKEN: "${{ github.token }}",
+      BUN_ASSET: "${{ steps.pin.outputs.asset }}",
+      BUN_CACHE_DIR: "${{ steps.pin.outputs.cache_dir }}",
+    });
   });
 });
 

@@ -359,7 +359,7 @@ jobs:
         profile: [single, cluster]
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
       - uses: actions/setup-node@v4
         with:
           node-version-file: package.json
@@ -465,7 +465,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
       # The benchmark runs dist/ (built for node24) in node worker processes.
       - uses: actions/setup-node@v4
         with:
@@ -501,7 +501,7 @@ jobs:
       IDLE_WAKE_ENFORCE: '0'
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
       - uses: actions/setup-node@v4
         with:
           node-version-file: package.json
@@ -544,7 +544,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
       - uses: actions/setup-node@v4
         with:
           node-version-file: package.json

@@ -346,6 +346,47 @@ describe("project identity", () => {
     expect(resolveProjectAgent([other, lead], P("/moved/lane"), { repository, leadId: lead.id }).id).toBe(lead.id);
   });
 
+  // Keep reason: #19315's exact-return-address and eligibility trust boundary; this pure
+  // resolver must attribute uncertainty without waiting, publishing or electing a successor.
+  it("throws attributed retryable uncertainty only for an eligible recorded bridge-stale mirror", () => {
+    const project = P("/p/repo");
+    const lead = { id: "session:lead", startedAt: 1, remoteHost: "forge", bridgeStale: true,
+      interactive: true, capabilities: ["steer", "followUp"] };
+    const successor = root("session:successor", { role: "project-agent", project, startedAt: 99 });
+    expect(() => resolveProjectAgent([lead, successor], project, { leadId: lead.id })).toThrow(expect.objectContaining({
+      name: "FabricProjectAgentBridgeStaleError", code: "FABRIC_PROJECT_AGENT_BRIDGE_STALE", retryable: true,
+      targetId: lead.id, remoteHost: "forge", message: expect.stringContaining("no message was published by this lookup"),
+    }));
+    expect(resolveProjectAgent([{ ...lead, bridgeStale: false }, successor], project, { leadId: lead.id }).id).toBe(lead.id);
+    expect(resolveProjectAgent([lead, successor], project)).toBe(successor); // The mirror cannot be elected.
+  });
+
+  it.each([undefined, "", "invalid host", "-forge", "f".repeat(64)])(
+    "does not attribute temporary bridge failure to invalid remoteHost %j", remoteHost => {
+      const lead = { id: "session:lead", startedAt: 1, bridgeStale: true,
+        ...(remoteHost !== undefined ? { remoteHost } : {}) };
+      expect(() => resolveProjectAgent([lead], P("/p/repo"), { leadId: lead.id })).toThrow(expect.objectContaining({
+        code: "FABRIC_PROJECT_AGENT_UNRESOLVED",
+      }));
+    },
+  );
+
+  it.each([
+    { interactive: false }, { capabilities: ["fabric"] }, { capabilities: ["steer"] }, { capabilities: ["followUp"] },
+  ])("checks eligibility before bridge uncertainty: %j", patch => {
+    const lead = { id: "session:lead", startedAt: 1, remoteHost: "forge", bridgeStale: true, ...patch };
+    expect(() => resolveProjectAgent([lead], P("/p/repo"), { leadId: lead.id })).toThrow(expect.objectContaining({
+      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("is non-interactive or lacks steer/followUp"),
+    }));
+  });
+
+  it("keeps an ordinarily stale recorded root unresolved even with bridge attribution", () => {
+    const lead = { id: "session:lead", startedAt: 1, remoteHost: "forge", stale: true, bridgeStale: true };
+    expect(() => resolveProjectAgent([lead], P("/p/repo"), { leadId: lead.id })).toThrow(expect.objectContaining({
+      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("is absent or stale"),
+    }));
+  });
+
   it("fails by name on ambiguous project agents instead of selecting the newest", () => {
     const all = [root("session:a", { role: "project-agent", project: P("/p/repo") }),
       root("session:b", { role: "project-agent", project: P("/p/repo"), startedAt: 2 })];

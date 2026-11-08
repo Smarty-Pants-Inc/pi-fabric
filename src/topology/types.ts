@@ -196,6 +196,8 @@ export interface FabricPeerInfo {
   local: false;
   /** The remote host of a peer mirrored by the mesh bridge (smarty-dev#2004). */
   host?: string;
+  /** Retained remote routing attribution when the bridge observation is stale. */
+  bridgeStale?: true;
 }
 
 /** Local-only operational health; one entry per source, never raw error/payload text. */

@@ -9,6 +9,8 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { ActionRegistry } from "../src/core/action-registry.js";
+import { FabricExecutionService } from "../src/execution-service.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -16,6 +18,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { MIRROR_FRESH_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { FabricProjectAgentBridgeStaleError } from "../src/topology/project-identity.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 // Keep reason: smarty-dev#16723's recorded cross-repository return address and the
@@ -24,10 +27,12 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 describe("#16723 projectAgent launch binding", () => {
   const roots: string[] = [];
   const directories: ParticipantDirectory[] = [];
+  const stores: MeshStore[] = [];
   const providers: AgentsProvider[] = [];
   afterEach(async () => {
     await Promise.all(providers.splice(0).map(provider => provider.close()));
     await Promise.all(directories.splice(0).map(directory => directory.close()));
+    for (const store of stores.splice(0)) store.closeState();
     vi.unstubAllEnvs();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
@@ -49,6 +54,7 @@ describe("#16723 projectAgent launch binding", () => {
       fs.writeFileSync(path.join(lane, ".local", "lead"), `${leadId}\n`);
     }
     const mesh = new MeshStore(path.join(lane, "mesh"), 64 * 1024, 1_000);
+    stores.push(mesh);
     const identity: MeshIdentity = { id: "session:observer", name: "main", kind: "main" };
     const directory = new ParticipantDirectory(mesh, {
       enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
@@ -97,7 +103,7 @@ describe("#16723 projectAgent launch binding", () => {
       if (mirrored) mirror(now);
     };
     await publish(otherId); // A valid native fallback must never replace a failed recorded id.
-    return { mesh, directory, call, publish, mirror };
+    return { mesh, directory, provider, context, lane, call, publish, mirror };
   };
   const unavailable = {
     code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("is absent or stale"),
@@ -142,20 +148,104 @@ describe("#16723 projectAgent launch binding", () => {
     await expect(f.call()).resolves.toMatchObject({ id: otherId });
   });
 
-  it.each(["bridge", "source-lease"] as const)("accepts a cross-repo recorded mirror only while its %s is fresh", async kind => {
+  it.each(["marker", "env"] as const)("attributes retryable bridge uncertainty to the exact recorded mirror via %s, then recovers", async binding => {
+    const f = await fixture(binding, true);
+    await f.publish(leadId, { repository: "code.example/team/control" });
+    const before = f.mesh.read();
+    await expect(f.call()).resolves.toMatchObject({ id: leadId, remoteHost: "remote" });
+    f.mirror(Date.now() - MIRROR_FRESH_MS - 1);
+    expect(f.directory.sessions().find(root => root.id === leadId)).toMatchObject({ bridgeStale: true });
+    const lookup = f.call();
+    await expect(lookup).rejects.toBeInstanceOf(FabricProjectAgentBridgeStaleError);
+    await expect(lookup).rejects.toMatchObject({
+      name: "FabricProjectAgentBridgeStaleError", code: "FABRIC_PROJECT_AGENT_BRIDGE_STALE", retryable: true,
+      targetId: leadId, remoteHost: "remote",
+      message: expect.stringContaining("no message was published by this lookup"),
+    });
+    await expect(lookup).rejects.toThrow("this lookup does not establish the outcome of any earlier send");
+    expect(f.mesh.read()).toEqual(before); // Lookup never publishes a command, including on uncertainty.
+    f.mirror(Date.now());
+    await expect(f.call()).resolves.toMatchObject({ id: leadId, remoteHost: "remote" });
+    expect(f.directory.sessions().find(root => root.id === leadId)).not.toHaveProperty("bridgeStale");
+    expect(f.mesh.read()).toEqual(before);
+  });
+
+  it("preserves recorded bridge-stale lead actionability through TypeScript and QuickJS, then renews the same owner", async () => {
+    const f = await fixture("marker", true);
+    await f.publish(leadId, { repository: "code.example/team/control", ownerIncarnation: "fixture:owner" });
+    fs.writeFileSync(path.join(f.lane, ".local", "lead"), `${otherId}\n`); // Never re-elect from a later marker.
+    f.mirror(Date.now() - MIRROR_FRESH_MS - 1);
+    const before = f.mesh.read();
+    const registry = new ActionRegistry();
+    registry.register(f.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.kernel = "typescript";
+    config.executor.runtime = "quickjs";
+    const service = new FabricExecutionService(registry, config);
+    const execute = (code: string) => service.execute({ code,
+      context: { ...f.context.extensionContext, cwd: f.context.cwd, mode: "rpc" } as ExtensionContext,
+      signal: undefined, parentToolCallId: "guest-launch-lead-contract", onPartial() {},
+    });
+    try {
+      const stale = await execute(`try { await agents.projectAgent(); return { unexpected: true }; }
+        catch (error) { const failure = error as Error & { code?: string; retryable?: boolean; targetId?: string; remoteHost?: string };
+          return { isError: error instanceof Error, name: failure.name, code: failure.code, retryable: failure.retryable,
+            targetId: failure.targetId, remoteHost: failure.remoteHost, message: failure.message }; }`);
+      expect(stale.success, stale.error).toBe(true);
+      expect(stale.value).toEqual({ isError: true, name: "FabricProjectAgentBridgeStaleError",
+        code: "FABRIC_PROJECT_AGENT_BRIDGE_STALE", retryable: true, targetId: leadId, remoteHost: "remote",
+        message: expect.stringContaining("no message was published by this lookup") });
+      expect(stale.value).toHaveProperty("message", expect.stringContaining("this lookup does not establish the outcome of any earlier send"));
+      expect(f.mesh.read()).toEqual(before);
+      f.mirror(Date.now());
+      const renewed = await execute("const lead = await agents.projectAgent(); return { id: lead.id, ownerIncarnation: lead.ownerIncarnation, remoteHost: lead.remoteHost };");
+      expect(renewed.success, renewed.error).toBe(true);
+      expect(renewed.value).toEqual({ id: leadId, ownerIncarnation: "fixture:owner", remoteHost: "remote" });
+      expect(f.mesh.read()).toEqual(before);
+    } finally {
+      await registry.close();
+    }
+  });
+
+  it("keeps a fresh source-expired recorded mirror unresolved, then recovers the same lead", async () => {
     const f = await fixture("marker", true);
     await f.publish(leadId, { repository: "code.example/team/control" });
     await expect(f.call()).resolves.toMatchObject({ id: leadId, remoteHost: "remote" });
-    if (kind === "bridge") f.mirror(Date.now() - MIRROR_FRESH_MS - 1);
-    else f.mirror(Date.now(), Date.now() - 1);
-    if (kind === "bridge") expect(f.directory.sessions().find(root => root.id === leadId)).toMatchObject({ bridgeStale: true });
-    else expect(f.directory.sessions().find(root => root.id === leadId)).toBeUndefined();
+    f.mirror(Date.now(), Date.now() - 1);
+    expect(f.directory.sessions().find(root => root.id === leadId)).toBeUndefined();
+    const before = f.mesh.read();
+    await expect(f.call()).rejects.toMatchObject(unavailable);
+    expect(f.mesh.read()).toEqual(before);
+    f.mirror(Date.now());
+    await expect(f.call()).resolves.toMatchObject({ id: leadId, remoteHost: "remote" });
+  });
+
+  it.each<Partial<FabricParticipantRecord>>([
+    { interactive: false }, { capabilities: ["fabric"] }, { capabilities: ["followUp"] }, { capabilities: ["steer"] },
+  ])("does not misdiagnose an ineligible recorded mirror as a bridge failure: %j", async patch => {
+    const f = await fixture("marker", true);
+    await f.publish(leadId, patch);
+    f.mirror(Date.now() - MIRROR_FRESH_MS - 1);
+    expect(f.directory.sessions().find(root => root.id === leadId)).toMatchObject({ bridgeStale: true });
+    await expect(f.call()).rejects.toMatchObject({
+      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("is non-interactive or lacks steer/followUp"),
+    });
+  });
+
+  it.each<Partial<FabricParticipantRecord>>([
+    { ownerIdentityId: otherId }, { remoteHost: "invalid host" },
+  ])("keeps a malformed or wrong-owner stale mirror unresolved: %j", async patch => {
+    const f = await fixture("marker", true);
+    await f.publish(leadId, patch);
+    f.mirror(Date.now() - MIRROR_FRESH_MS - 1);
+    expect(f.directory.sessions().map(root => root.id)).toEqual([otherId]);
     await expect(f.call()).rejects.toMatchObject(unavailable);
   });
 
-  it("refuses a colliding recorded mirror instead of electing a native root", async () => {
+  it.each(["fresh", "bridge-stale"] as const)("refuses a colliding %s recorded mirror instead of electing a native root", async kind => {
     const f = await fixture("marker", true);
     await f.publish(leadId, { repository: "code.example/team/control" });
+    if (kind === "bridge-stale") f.mirror(Date.now() - MIRROR_FRESH_MS - 1);
     const identity: MeshIdentity = { id: "session:native-owner", name: "main", kind: "main" };
     await f.mesh.put({ key: key("topology/hosts/", identity.id), identity, value: {
       format: 1, id: identity.id, rootId: leadId, identity, startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() + 120_000,

@@ -5,10 +5,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // pi-fabric#1554 P2-2 (smarty-dev#15878): resident run retention (ResidentRequestRetention's V2 sweep and its
-// off-Linux main sweep, src/residency/retention.ts) deletes a resident run tree directly. A resident actor run gets a
-// short TMPDIR outside that tree too (the host's AgentManager spawn path), so it must leave with the run. On fd533e62
-// both sweeps removed the run and leaked its `r.<hex>` directory.
-// The platform gate is toggled, never process.platform, so both sweeps run on this host.
+// off-Linux main sweep, src/residency/retention.ts) archives a resident run tree whole. A resident actor run gets a
+// short TMPDIR outside that tree too (the host's AgentManager spawn path), so it must enter the same trace-archive
+// custody root. The platform gate is toggled, never process.platform, so both sweeps run on this host.
 const platform = vi.hoisted(() => ({ v2: true }));
 vi.mock("../src/storage/retention-platform.js", () => ({ retentionV2Enabled: () => platform.v2 }));
 const { ResidentRequestRetention } = await import("../src/residency/retention.js");
@@ -47,22 +46,51 @@ const sweep = (residencyRoot: string, now: number): void => {
   const collector = new ResidentRequestRetention(residencyRoot, [], { retainRuns: false, residentRunMs: DAY });
   try { collector.sweep(now, new Set(), 10_000); } finally { collector.close(); }
 };
+const byteSnapshot = (directory: string): unknown => fs.readdirSync(directory).sort().map(name => {
+  const file = path.join(directory, name), stat = fs.lstatSync(file);
+  if (stat.isDirectory()) return [name, "directory", byteSnapshot(file)];
+  if (stat.isFile()) return [name, "file", fs.readFileSync(file).toString("base64")];
+  throw new Error(`Unexpected fixture entry type: ${file}`);
+});
+const custodyTrees = (archiveRoot: string): Map<string, string> => {
+  const trees = new Map<string, string>();
+  for (const name of fs.readdirSync(archiveRoot)) {
+    const container = path.join(archiveRoot, name);
+    const receipt = JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8")) as {
+      source?: string; destination?: string; state?: string;
+    };
+    expect(receipt.state).toBe("moved");
+    expect(receipt.destination).toBe(path.join(container, "tree"));
+    if (receipt.source && receipt.destination) trees.set(receipt.source, receipt.destination);
+  }
+  return trees;
+};
 
-describe.skipIf(process.platform === "win32")("resident run retention removes a run's short TMPDIR (pi-fabric#1554 P2-2)", () => {
-  it.each([["V2", true], ["main", false]] as const)("the %s sweep removes an expired resident run and then its short TMPDIR", (_name, v2) => {
+describe.skipIf(process.platform === "win32")("resident run retention archives a run's short TMPDIR (pi-fabric#1554 P2-2)", () => {
+  it.each([["V2", true], ["main", false]] as const)("the %s sweep archives an expired resident run and its short TMPDIR", (_name, v2) => {
     platform.v2 = v2;
     const { residencyRoot, run, temporary, now } = fixture(10);
+    const runBytes = byteSnapshot(run), temporaryBytes = byteSnapshot(temporary);
+    const archiveRoot = `${path.join(residencyRoot, "runs")}.trace-archive`;
     sweep(residencyRoot, now);
     expect(fs.existsSync(run)).toBe(false);
     expect(fs.existsSync(temporary)).toBe(false);
+    expect(fs.existsSync(archiveRoot)).toBe(true);
+    const archived = custodyTrees(archiveRoot);
+    const archivedRun = archived.get(run), archivedTemporary = archived.get(temporary);
+    expect(archivedRun).toBeDefined();
+    expect(archivedTemporary).toBeDefined();
+    expect(byteSnapshot(archivedRun!)).toEqual(runBytes);
+    expect(byteSnapshot(archivedTemporary!)).toEqual(temporaryBytes);
   });
 
   it.each([["V2", true], ["main", false]] as const)("the %s sweep keeps the run and its short TMPDIR when the scratch is unsafe", (_name, v2) => {
     platform.v2 = v2;
     const { residencyRoot, run, temporary, now } = fixture(65);
     sweep(residencyRoot, now);
-    // Custody unchanged: more than 64 entries vetoes the run, exactly as an in-tree tmp/ did.
+    // More than 64 scratch entries veto archival, exactly as an in-tree tmp/ would.
     expect(fs.existsSync(path.join(run, "status.json"))).toBe(true);
     expect(fs.readdirSync(temporary)).toHaveLength(65);
+    expect(fs.existsSync(`${path.join(residencyRoot, "runs")}.trace-archive`)).toBe(false);
   });
 });

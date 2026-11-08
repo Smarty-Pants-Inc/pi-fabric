@@ -3,11 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-// Recorded-call proof (fv2-11107). verifiedRemove is replaced by a recorder:
-// it captures the target and never delegates to the real removal or to the
-// non-Linux fallback. All selection logic (age, references, tree/exit and
-// saved-result fences) is the real product source.
+// Recorded-call proof (fv2-11107). verifiedRemove keeps its metadata recorder,
+// while retainCleanupRoot records run-tree archive attempts; neither seam mutates
+// fixtures. All selection logic (age, references, tree/exit and saved-result
+// fences) is the real product source.
 const recorded = vi.hoisted(() => [] as Array<{ target: string; deleter: string; dryRun: boolean }>);
+const archives = vi.hoisted(() => [] as Array<{ source: string; archive: string; id: string; reason: string }>);
 vi.mock("../src/storage/verified-remove.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/storage/verified-remove.js")>();
   return {
@@ -18,6 +19,13 @@ vi.mock("../src/storage/verified-remove.js", async (importOriginal) => {
     },
   };
 });
+vi.mock("../src/agents/worktree-manager.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/agents/worktree-manager.js")>(),
+  retainCleanupRoot: (source: string, archive: string, id: string, reason = "agent cleanup whole-root custody") => {
+    archives.push({ source, archive, id, reason });
+    return undefined; // Recorded-only: never create custody containers or move fixture trees.
+  },
+}));
 
 const { RESIDENT_RUN_RETENTION_MS, ResidentRequestRetention, sweepResidentRuns } = await import("../src/residency/retention.js");
 
@@ -28,6 +36,7 @@ const roots: string[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
   recorded.length = 0;
+  archives.length = 0;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -60,7 +69,7 @@ const fixture = (now: number) => {
     nonterminal: make("nonterminal", { status: "running", transport: "process", sessionId: EXITED_PID }),
     missingResult: make("missing-result", exited),
   };
-  // Resident metadata exists but no saved result: deletion would lose the outcome.
+  // Resident metadata exists but no saved result: retention must not retire its only outcome.
   writeJson(path.join(dir, "agents", "missing-result.json"), { format: 1, id: "missing-result" });
   // Explicit age: this fixture tests selection, not the disabled default.
   const aged = now - POLICY_MS - DAY;
@@ -70,8 +79,8 @@ const fixture = (now: number) => {
   return { dir, runs, actorRoot, run, aged, snapshot };
 };
 
-describe.skipIf(process.platform === "win32")("resident run age pruning (no real deletion)", () => {
-  it("RESIDENT_RUN_RETENTION_MS disables deletion by default", () => {
+describe.skipIf(process.platform === "win32")("resident run age pruning (no real mutation)", () => {
+  it("RESIDENT_RUN_RETENTION_MS disables resident-run retention by default", () => {
     expect(RESIDENT_RUN_RETENTION_MS).toBeUndefined();
   });
 
@@ -81,11 +90,12 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
     const before = snapshot();
     const rm = vi.spyOn(fs, "rmSync"), rename = vi.spyOn(fs, "renameSync");
     expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], retentionMs: POLICY_MS, dryRun: true })).toEqual([run.old]);
-    expect(recorded).toEqual([{ target: run.old, deleter: "sweepResidentRuns", dryRun: true }]);
+    expect(recorded).toEqual([]);
+    expect(archives).toEqual([]);
     expect(rm).not.toHaveBeenCalled(); expect(rename).not.toHaveBeenCalled();
     expect(snapshot()).toEqual(before);
 
-    // retainRuns is an explicit policy: no run is selected for deletion.
+    // retainRuns is an explicit policy: no run is selected for archival.
     recorded.length = 0;
     expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], retentionMs: POLICY_MS, dryRun: true, retainRuns: true })).toEqual([]);
     expect(recorded).toEqual([]);
@@ -98,18 +108,19 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
     expect(snapshot()).toEqual(before);
   });
 
-  it("the streaming ResidentRequestRetention selects the same old run (recorded verifiedRemove, no fallback)", () => {
+  it("the streaming ResidentRequestRetention records whole-run archival without moving the fixture", () => {
     const now = Date.now();
-    const { dir, actorRoot, run, snapshot } = fixture(now);
+    const { dir, runs, actorRoot, run, snapshot } = fixture(now);
     const before = snapshot();
     const rm = vi.spyOn(fs, "rmSync");
     const collector = new ResidentRequestRetention(dir, [actorRoot], { retainRuns: false, residentRunMs: POLICY_MS });
     try {
       for (let slice = 0; slice < 50 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000);
     } finally { collector.close(); }
-    expect(recorded.filter(call => call.deleter === "residentRunRetention")).toEqual([
-      { target: run.old, deleter: "residentRunRetention", dryRun: false },
-    ]);
+    expect(recorded.filter(call => call.deleter === "residentRunRetention")).toEqual([]);
+    expect(archives).toEqual([{
+      source: run.old, archive: `${runs}.trace-archive`, id: "old", reason: "resident run retention whole-root custody",
+    }]);
     // Only atomic-write temp files of the collector's own health/expiry records.
     expect(rm.mock.calls.filter(([target]) => String(target).startsWith(path.join(dir, "runs")))).toEqual([]);
     expect(snapshot()).toEqual(before);
@@ -124,6 +135,7 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
         for (let slice = 0; slice < 50 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000);
       } finally { collector.close(); }
       expect(recorded.filter(call => call.deleter === "residentRunRetention")).toEqual([]);
+      expect(archives).toEqual([]);
     }
   });
 
@@ -151,6 +163,7 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
         for (let slice = 0; slice < 50 && collector.due(now); slice++) collector.sweep(now, new Set(change === "live set" ? ["old"] : []), 10_000);
       } finally { collector.close(); }
       expect(recorded.filter(call => call.deleter === "residentRunRetention")).toEqual([]);
+      expect(archives).toEqual([]);
       expect(fs.existsSync(path.join(run.old, "status.json"))).toBe(true);
     });
 });

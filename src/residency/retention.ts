@@ -15,12 +15,12 @@ export const RESIDENT_RUN_RETENTION_MS: number | undefined = undefined;
 
 /** Called under the host fence: by the mesh-wide sweep (storage/retention-cli.ts) for a resident root whose
  * host is proven dead and flock-fenced. Every existing run is then untracked. The reference snapshot
- * only skips early; each delete and compaction re-reads every registry uncached (pi-fabric#645 review
+ * only skips early; each archive re-reads every registry uncached (pi-fabric#645 review
  * round 2). `requireRegistries`: a vanished root or actors.json is a veto, not an empty registry.
- * `dryRun`: the same selection and fences, with no removal or compaction; the returned runs are the
- * ones an apply would delete (pi-fabric#645 review round 3). `measure` sizes a candidate before its final
- * check, `isRetained` is a further veto of that check, and the check and delete run back to back through
- * `removeUnreferencedRun`; `onRemove` is called after a run is removed (or, in a dry run, would be) with its
+ * `dryRun`: the same selection and fences, with no mutation; the returned runs are the
+ * ones an apply would archive (pi-fabric#645 review round 3). `measure` sizes a candidate before its final
+ * check, `isRetained` is a further veto of that check, and the check and archive run back to back through
+ * `removeUnreferencedRun`; `onRemove` is called after a run is archived (or, in a dry run, would be) with its
  * measured bytes (pi-fabric#645 review round 4). */
 export const sweepResidentRuns = (
   runsRoot: string, now = Date.now(), budgetMs = 100,
@@ -261,9 +261,9 @@ export class ResidentRequestRetention {
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan. Then its recorded short
-            // TMPDIR outside the run tree (pi-fabric#1554 P2-2), as every other run deleter does.
-            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // Retire only the judged run inode into whole-root trace custody, then retain its
+            // recorded short TMPDIR too. An archive failure never authorizes deletion.
+            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention" });
             continue;
           }
           const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
@@ -368,9 +368,9 @@ export class ResidentRequestRetention {
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858); then the
-            // run's recorded short TMPDIR (pi-fabric#1554 P2-2).
-            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // The legacy sweep uses the same whole-root custody for the run and its short TMPDIR.
+            // No platform falls back to unlinking raw traces.
+            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention" });
             continue;
           }
           compactTerminalRunEvents(file, { ...this.retention, now,

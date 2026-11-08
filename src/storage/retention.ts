@@ -577,21 +577,11 @@ const recoverEnodevTask = (directory: string): void => {
 };
 /** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
 const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
-/** smarty-dev#15878: after its run tree, a run's recorded short TMPDIR outside it, by the same verified removal. */
-const removeShortTmpdirAfterRun = (temporary: string | undefined, deleter: string): void => {
-  const judged = temporary ? ownedShortTmpdir(temporary) : undefined;
-  if (temporary && judged) verifiedRemove(temporary, judged, { deleter, fallback: rmTree(temporary) });
-};
-/** pi-fabric#1554 P2-2: verifiedRemove of a run tree named by its run id, then (only once that removed it) its recorded
- * short TMPDIR outside it. For deleters that hold their own safety proof, such as resident run retention. */
+/** Retain the whole resident run tree and its recorded short TMPDIR outside it.
+ * Callers hold the terminal/result/age proof; no legacy deletion fallback is invoked. */
 export const removeRunTreeAndShortTmpdir = (directory: string, judged: fs.Stats | undefined,
-  options: { deleter: string; fallback: () => boolean }): boolean => {
-  if (runTreeRemovalVeto(directory)) return false;
-  const temporary = recordedShortTmpdir(directory, path.basename(directory));
-  const removed = verifiedRemove(directory, judged, options).removed;
-  if (removed) removeShortTmpdirAfterRun(temporary, options.deleter);
-  return removed;
-};
+  options: { deleter: string; fallback?: () => boolean }): boolean =>
+  removeUnreferencedRun(directory, judged, undefined, false, options.deleter);
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
     const judged = ownedStat(root);
@@ -1105,17 +1095,10 @@ export const pruneActorRunArchives = (options: {
   return [];
 };
 
-/** The final pre-delete check and the delete, back to back (pi-fabric#645 review round 4), through the one verified
- * removal (smarty-dev#7916): check; verify the judged inode and its tree; move it into the graveyard and verify it
- * again; check again (`proceed`); then delete it, or move it back when the re-check finds a reference (a throwing
- * check counts as a reference). A dry run takes the first check and the full verification, with no move or delete.
- * Returns whether the run was (or would be) removed. Off Linux main's tombstone path below runs (smarty-dev#7858).
- * ponytail: no fence excludes registry writers. ActorRegistryStore's lock is an exclusive, async mkdir
- * lock with no shared mode; holding every registry's lock across each delete would stall every actor's
- * saves, and these sweeps are synchronous. The tombstone narrows the remaining window to a reference
- * written after the re-check, which names a run already renamed away: its writer finds the run missing,
- * exactly as after any completed deletion. A tombstone left by a crash is a run proven unreferenced; the
- * next sweep treats it as an ordinary run entry. */
+/** Retire a resident run into whole-root trace custody, never deletion. Recheck the judged
+ * inode/age, worker veto and references immediately before archival; a throwing reference
+ * check is a veto. A dry run makes the same checks without creating custody containers.
+ * Returns whether the run was (or would be) archived. Callers hold the result/age proof. */
 export const removeUnreferencedRun = (
   directory: string, judged: fs.Stats | undefined, referenced?: () => boolean, dryRun = false, deleter = "removeUnreferencedRun",
   bytes = 0,
@@ -1124,22 +1107,26 @@ export const removeUnreferencedRun = (
   const veto = runTreeRemovalVeto(directory);
   if (veto) { countRefusal(deleter, veto, directory, bytes); return false; }
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
-  const temporary = dryRun ? undefined : recordedShortTmpdir(directory, path.basename(directory));
-  const removed = verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check() && !runTreeRemovalVeto(directory),
-    fallback: () => mainRemoveUnreferencedRun(directory, referenced, () => check() || !!runTreeRemovalVeto(directory)) }).removed;
-  if (removed) removeShortTmpdirAfterRun(temporary, deleter);
-  return removed;
-};
-/** Main's path-based tombstone removal, unchanged: the non-Linux fallback only (smarty-dev#7858). */
-const mainRemoveUnreferencedRun = (directory: string, referenced: (() => boolean) | undefined, check: () => boolean): boolean => {
-  if (!referenced) {
-    try { fs.rmSync(directory, { recursive: true, force: true }); return true; } catch { return false; }
-  }
-  const tombstone = path.join(path.dirname(directory), `.retention-tombstone-${path.basename(directory)}`);
-  try { fs.renameSync(directory, tombstone); } catch { return false; }
-  if (check()) {
-    try { fs.renameSync(tombstone, directory); } catch { /* Kept under the tombstone name; never deleted while referenced. */ }
+  const id = path.basename(directory), archive = `${path.dirname(directory)}.trace-archive`;
+  const temporary = recordedShortTmpdir(directory, id);
+  const finalVeto = runTreeRemovalVeto(directory);
+  if (finalVeto) { countRefusal(deleter, finalVeto, directory, bytes); return false; }
+  if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
+  const current = ownedStat(directory);
+  if (!judged?.isDirectory() || !current?.isDirectory() || retentionStamp(current) !== retentionStamp(judged)) {
+    countRefusal(deleter, "run directory changed since judgment", directory, bytes);
     return false;
   }
-  try { fs.rmSync(tombstone, { recursive: true, force: true }); return true; } catch { return false; }
+  if (dryRun) { countRemoval(deleter, bytes); return true; }
+  try {
+    if (!retainCleanupRoot(directory, archive, id, "resident run retention whole-root custody")) return false;
+    if (temporary && ownedShortTmpdir(temporary)) {
+      retainCleanupRoot(temporary, archive, id, "resident run retention private TMPDIR");
+    }
+    countRemoval(deleter, bytes);
+    return true;
+  } catch {
+    countRefusal(deleter, "archive custody failed; original or held tree retained", directory, bytes);
+    return false;
+  }
 };

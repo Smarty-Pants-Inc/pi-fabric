@@ -46,8 +46,9 @@ runs:
           cache_dir_output=$(cygpath -w "$cache_dir")
         fi
         printf 'asset=%s\nsha=%s\ncache_dir=%s\n' "$asset" "$sha" "$cache_dir_output" >> "$GITHUB_OUTPUT"
-    - name: Cache pinned Bun archive
-      uses: actions/cache@v4
+    - name: Restore pinned Bun archive
+      id: restore
+      uses: actions/cache/restore@v4
       with:
         path: ${{ steps.pin.outputs.cache_dir }}/${{ steps.pin.outputs.asset }}
         key: bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}
@@ -66,6 +67,12 @@ runs:
         if [[ ! -f "$cache_dir/$BUN_ASSET" ]]; then
           gh release download -R oven-sh/bun bun-v1.4.4 -p "$BUN_ASSET" -D "$cache_dir"
         fi
+    - name: Save pinned Bun archive
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.pin.outputs.cache_dir }}/${{ steps.pin.outputs.asset }}
+        key: bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}
     - name: Verify and install Bun
       shell: bash
       env:

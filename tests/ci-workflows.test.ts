@@ -9,6 +9,7 @@ import { parse } from "yaml";
 
 type Step = {
   name?: string;
+  id?: string;
   uses?: string;
   run?: string;
   if?: string;
@@ -383,13 +384,37 @@ describe("pinned local Bun setup contract", () => {
     }
   });
 
-  it("keys the exact archive cache by SHA and scopes the GitHub token to the download step", () => {
+  it("restores and explicitly saves the exact SHA-keyed archive cache with download-scoped token", () => {
     const steps = action("setup-bun").runs?.steps ?? [];
-    const cache = steps.find((step) => step.uses === "actions/cache@v4");
-    expect(cache?.with).toEqual({
+    const cacheActions = steps.filter((step) => step.uses?.startsWith("actions/cache"));
+    expect(cacheActions.map((step) => step.uses)).toEqual([
+      "actions/cache/restore@v4",
+      "actions/cache/save@v4",
+    ]);
+    const restore = cacheActions[0]!;
+    const save = cacheActions[1]!;
+    const expectedCache = {
       path: "${{ steps.pin.outputs.cache_dir }}/${{ steps.pin.outputs.asset }}",
       key: "bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}",
-    });
+    };
+    expect(restore.id).toBe("restore");
+    expect(restore.with).toEqual(expectedCache);
+    expect(save.with).toEqual(expectedCache);
+    expect(save.if).toBe("steps.restore.outputs.cache-hit != 'true'");
+
+    const pinIndex = steps.findIndex((step) => step.id === "pin");
+    const restoreIndex = steps.indexOf(restore);
+    const downloadIndex = steps.findIndex((step) => step.name === "Download missing Bun archive");
+    const saveIndex = steps.indexOf(save);
+    const verifyIndex = steps.findIndex((step) => step.name === "Verify and install Bun");
+    expect(pinIndex).toBeGreaterThanOrEqual(0);
+    expect(downloadIndex).toBeGreaterThanOrEqual(0);
+    expect(verifyIndex).toBeGreaterThanOrEqual(0);
+    expect(pinIndex).toBeLessThan(restoreIndex);
+    expect(restoreIndex).toBeLessThan(downloadIndex);
+    expect(saveIndex).toBe(downloadIndex + 1);
+    expect(saveIndex).toBeLessThan(verifyIndex);
+
     const authenticated = steps.filter((step) => step.env?.GH_TOKEN !== undefined);
     expect(authenticated).toHaveLength(1);
     expect(authenticated[0]?.env).toEqual({

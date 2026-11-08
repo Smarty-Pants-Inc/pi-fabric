@@ -1,4 +1,5 @@
 import { AgentAdmission, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, waitForAgent, type AgentLifecycleState } from "./lifecycle.js";
+import { selectStickyRoute } from "./service-routing.js";
 import { validateAgentResult } from "./result.js";
 import { normalizeAgentServiceRequest } from "./service-schema.js";
 import type { AgentAuthorityBoundary, AgentPublicRecord, AgentControlRequest, AgentExecutionEvent, AgentExecutionResponse, AgentServiceCapabilities, AgentServiceEvent, AgentServiceOptions, AgentServiceRecord, AgentServiceRequest, AgentSessionRecord, AgentServiceSnapshot } from "./service-types.js";
@@ -20,7 +21,7 @@ type Entry = {
 };
 const copy = <T>(value: T): T => structuredClone(value);
 const publicRecord = (record: AgentServiceRecord): AgentPublicRecord => {
-  const keys = ["id", "rootId", "parentId", "depth", "generation", "name", "task", "status", "runner", "kernel", "cwd", "model", "thinking", "recursive", "startedAt", "updatedAt", "finishedAt", "currentTool", "turns", "toolCalls", "text", "value", "error", "usage", "sessionId"] as const;
+  const keys = ["routeId", "id", "rootId", "parentId", "depth", "generation", "name", "task", "status", "runner", "kernel", "cwd", "model", "thinking", "recursive", "startedAt", "updatedAt", "finishedAt", "currentTool", "turns", "toolCalls", "text", "value", "error", "usage", "sessionId"] as const;
   return copy(Object.fromEntries(keys.filter((key) => record[key] !== undefined).map((key) => [key, record[key]]))) as AgentPublicRecord;
 };
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -31,6 +32,7 @@ export class AgentService {
   readonly #options: AgentServiceOptions;
   readonly #entries = new Map<string, Entry>();
   readonly #admission: AgentAdmission;
+  readonly #stickyRoutes: readonly string[];
   readonly #pending = new Map<AbortController, Promise<unknown>>();
   readonly #closing = new AbortController();
   #close: Promise<void> | undefined;
@@ -45,8 +47,14 @@ export class AgentService {
     for (const [key, value] of Object.entries({maxStarts: options.maxStarts ?? 8, maxDepth: options.maxDepth ?? 3, maxConcurrent: options.maxConcurrent ?? 4})) {
       if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${key} must be a positive integer`);
     }
+    if (options.stickyRoutes !== undefined && !Array.isArray(options.stickyRoutes)) throw new Error("stickyRoutes must be an array of topology IDs");
+    const stickyRoutes = [...(options.stickyRoutes ?? [])];
+    if (stickyRoutes.some(id => typeof id !== "string" || !id.trim()) || new Set(stickyRoutes).size !== stickyRoutes.length) {
+      throw new Error("stickyRoutes must contain unique nonblank string topology IDs");
+    }
+    this.#stickyRoutes = Object.freeze(stickyRoutes);
     this.#options = {...options, port: options.port};
-    this.#admission = new AgentAdmission(options.maxConcurrent ?? 4, options.maxStarts ?? 8, options.maxDepth ?? 3);
+    this.#admission = new AgentAdmission(options.maxConcurrent ?? 4, options.maxStarts ?? 8, options.maxDepth ?? 3, 0, options.reservedP0 === undefined ? 0 : options.reservedP0);
     this.capabilities = Object.freeze({
       steer: Boolean(options.port.steer || options.topology),
       compact: Boolean(options.port.compact),
@@ -294,9 +302,17 @@ export class AgentService {
         if (depth > this.#admission.maxDepth) throw new Error(`Fabric agent depth limit reached (${this.#admission.maxDepth})`);
         const id = previous?.record.id ?? crypto.randomUUID().replaceAll("-", "");
         const generation = (previous?.record.generation ?? 0) + 1;
-        const prepare = {id, generation, rootId: this.#options.rootId, parentId: callerId, depth, request: copy(request), signal: controller.signal};
+        // Continuations retain their host pin, even after route reorder/removal.
+        // Fresh keyed children choose before prepare so placement and execution agree.
+        let routeId = previous?.record.routeId;
+        if (!previous && request.routingKey !== undefined) {
+          if (!this.#stickyRoutes.length) throw new Error("routingKey requires configured stickyRoutes");
+          routeId = selectStickyRoute(request.routingKey, this.#stickyRoutes);
+        }
+        const route = routeId !== undefined ? {routeId} : {};
+        const prepare = {id, generation, rootId: this.#options.rootId, parentId: callerId, depth, ...route, request: copy(request), signal: controller.signal};
         const binding = await this.#options.port.prepare?.(prepare);
-        release = await this.#admission.acquire(callerId, controller.signal);
+        release = await this.#admission.acquire(callerId, controller.signal, request.priority === "p0");
         await this.#authorize(callerId);
         this.#depth(callerId);
         if (controller.signal.aborted || this.#closing.signal.aborted || previous?.stopping) throw new Error("Agent admission aborted");
@@ -307,7 +323,7 @@ export class AgentService {
           ...previous.record, task: request.task, status: "queued", generation: previous.record.generation + 1,
           text: "", turns: 0, toolCalls: 0, updatedAt: now,
         } : {
-          id, rootId: this.#options.rootId, parentId: callerId, depth, generation: 1,
+          id, rootId: this.#options.rootId, parentId: callerId, depth, generation: 1, ...route,
           name: (request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent").replace(/[\r\n\t]+/g, " ").trim().slice(0, 60) || "Fabric agent",
           task: request.task, status: "queued", runner: "pi", kernel: "typescript", startedAt: now, updatedAt: now,
           turns: 0, toolCalls: 0, text: "", usage: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0},
@@ -469,8 +485,8 @@ export class AgentService {
   }
 
   #identity(entry: Entry): AgentControlRequest {
-    const {id, rootId, parentId, generation} = entry.record;
-    return {id, rootId, parentId, generation};
+    const {id, rootId, parentId, generation, routeId} = entry.record;
+    return {id, rootId, parentId, generation, ...(routeId !== undefined ? {routeId} : {})};
   }
 
   async #authorize(callerId: string, boundary?: AgentAuthorityBoundary): Promise<void> {
@@ -549,6 +565,7 @@ export class AgentService {
     for (const item of saved.records) {
       const request = normalizeAgentServiceRequest(item.request);
       const record = item.record;
+      if (record.routeId !== undefined && (typeof record.routeId !== "string" || !record.routeId.trim())) throw new Error("Invalid agent snapshot routeId");
       if (!record.id || record.id === saved.rootId || this.#entries.has(record.id) || record.rootId !== saved.rootId || !Number.isSafeInteger(record.depth) || record.depth < 1 || record.depth > this.#admission.maxDepth || !Number.isSafeInteger(record.generation) || record.generation < 1 || !["queued", "running", "paused", ...terminalAgentStatuses].includes(record.status)) throw new Error("Invalid agent snapshot record");
       generations += record.generation;
       if (record.status === "running" || record.status === "queued") { record.status = "paused"; delete record.finishedAt; }

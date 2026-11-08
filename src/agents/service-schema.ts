@@ -26,6 +26,8 @@ Object.assign(properties, {
   images: {type: "array", items: {type: "object", properties: {type: {const: "image"}, data: {type: "string"}, mimeType: {type: "string"}}, required: ["type", "data", "mimeType"], additionalProperties: false}},
   systemPrompt: {type: "string"},
   model: {type: "string", description: "Pi model selector for this child. The host resolves it with its own model registry and aliases; this hosted service has no exact-match mode."},
+  routingKey: {type: "string", minLength: 1, pattern: "\\S", description: "Stable work key for host-configured sticky topology routes; independent of task text"},
+  priority: {type: "string", enum: ["normal", "p0"], description: "Explicit session-child admission class; normal by default"},
 });
 const runSchema = {type: "object", properties, required: ["task"], additionalProperties: false};
 const spawnSchema = {type: "object", properties: {...properties, residency: {type: "string", enum: ["session", "durable"]}}, required: ["task"], additionalProperties: false};
@@ -76,6 +78,9 @@ export function normalizeAgentServiceRequest(input: AgentServiceRequest): AgentS
   const request = normalizeAgentRunRequest(args, {runner: "pi", timeoutMs: 0}) as AgentServiceRequest;
   if (args.images !== undefined) request.images = structuredClone(args.images) as NonNullable<AgentServiceRequest["images"]>;
   if (args.systemPrompt !== undefined) request.systemPrompt = args.systemPrompt as string;
+  // These fields belong only to the hosted service, not native run normalization.
+  if (args.routingKey !== undefined) request.routingKey = args.routingKey as string;
+  if (args.priority !== undefined) request.priority = args.priority as NonNullable<AgentServiceRequest["priority"]>;
   if (residency === "session" || residency === "durable") request.residency = residency;
   assertAgentTask(request);
   return structuredClone(request);

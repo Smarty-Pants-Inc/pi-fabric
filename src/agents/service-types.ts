@@ -1,4 +1,5 @@
 import type { AgentRunRecord, AgentRunRequest, AgentUsage } from "./types.js";
+import type { FabricActorInfo } from "../actors/types.js";
 
 export type AgentServiceRequest = Pick<AgentRunRequest,
   "task" | "name" | "model" | "thinking" | "tools" | "timeoutMs" | "schema" | "images" | "systemPrompt" | "recursive" | "cwd"
@@ -66,6 +67,11 @@ export interface AgentTopologyDeliverRequest {
   message: string;
   signal?: AbortSignal;
 }
+export interface AgentTopologyStopRequest {
+  callerId: string;
+  id: string;
+  signal?: AbortSignal;
+}
 export interface AgentTopologyCreateRequest {
   callerId: string;
   name: string;
@@ -90,6 +96,8 @@ export interface AgentTopologyPort {
   sessions(): AgentSessionRecord[] | Promise<AgentSessionRecord[]>;
   peers(callerId: string): AgentSessionRecord[] | Promise<AgentSessionRecord[]>;
   deliver(request: AgentTopologyDeliverRequest): Promise<AgentSessionRecord>;
+  /** Host owns native stop routing and acknowledgment; receipt is not worker-exit proof. */
+  stop?(request: AgentTopologyStopRequest): Promise<FabricActorInfo | AgentSessionRecord>;
   create?(request: AgentTopologyCreateRequest): Promise<AgentSessionRecord>;
   remove?(request: AgentTopologyRemoveRequest): Promise<AgentSessionRecord>;
   dispatch?(request: AgentTopologyDispatchRequest): Promise<AgentSessionRecord>;
@@ -132,7 +140,7 @@ export interface AgentServiceClient {
   join(id: string, signal?: AbortSignal): Promise<AgentPublicRecord>;
   status(id: string): Promise<AgentPublicRecord>;
   list(): Promise<AgentPublicRecord[]>;
-  stop(id: string): Promise<AgentPublicRecord>;
+  stop(id: string, signal?: AbortSignal): Promise<AgentPublicRecord | FabricActorInfo | AgentSessionRecord>;
   steer(id: string, message: string): Promise<AgentPublicRecord | AgentSessionRecord>;
   compact(id: string, instructions?: string): Promise<AgentPublicRecord>;
   resume(id: string, task?: string, signal?: AbortSignal): Promise<AgentPublicRecord>;

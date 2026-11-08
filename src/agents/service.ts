@@ -1,6 +1,7 @@
 import { AgentAdmission, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, waitForAgent, type AgentLifecycleState } from "./lifecycle.js";
 import { selectStickyRoute } from "./service-routing.js";
 import { validateAgentResult } from "./result.js";
+import type { FabricActorInfo } from "../actors/types.js";
 import { normalizeAgentServiceRequest } from "./service-schema.js";
 import type { AgentAuthorityBoundary, AgentPublicRecord, AgentControlRequest, AgentExecutionEvent, AgentExecutionResponse, AgentServiceCapabilities, AgentServiceEvent, AgentServiceOptions, AgentServiceRecord, AgentServiceRequest, AgentSessionRecord, AgentServiceSnapshot } from "./service-types.js";
 
@@ -112,11 +113,19 @@ export class AgentService {
     return [...this.#entries.values()].filter((entry) => entry.record.parentId === callerId).map((entry) => publicRecord(entry.record));
   }
 
-  async stop(callerId: string, id: string): Promise<AgentPublicRecord> {
+  async stop(callerId: string, id: string, signal?: AbortSignal): Promise<AgentPublicRecord | FabricActorInfo | AgentSessionRecord> {
     await this.#authorize(callerId);
-    const result = await this.#stop(this.#child(callerId, id));
+    const child = this.#ownedChild(callerId, id);
+    if (child) {
+      const result = await this.#stop(child);
+      await this.#authorize(callerId);
+      return publicRecord(result);
+    }
+    const stop = this.#options.topology?.stop;
+    if (!stop) throw new Error(`Unknown direct child agent: ${id}`);
+    const receipt = await stop.call(this.#options.topology, {callerId, id, ...(signal ? {signal} : {})});
     await this.#authorize(callerId);
-    return publicRecord(result);
+    return copy(receipt);
   }
 
   async steer(callerId: string, id: string, message: string): Promise<AgentPublicRecord | AgentSessionRecord> {

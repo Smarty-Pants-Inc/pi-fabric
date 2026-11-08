@@ -1,4 +1,5 @@
 import type { FabricProvider } from "../protocol.js";
+import type { FabricActorInfo } from "../actors/types.js";
 import { AgentService } from "./service.js";
 import { agentServiceArgs, agentServiceDescriptors } from "./service-schema.js";
 import type { AgentServiceAction, AgentServiceCapabilities, AgentServiceClient, AgentServiceDispatcher, AgentPublicRecord, AgentServiceRequest, AgentSessionRecord } from "./service-types.js";
@@ -14,7 +15,7 @@ export function createAgentServiceHandler(service: AgentService, callerId: strin
       case "wait": return service.wait(callerId, args.id as string, signal);
       case "status": return service.status(callerId, args.id as string);
       case "list": return service.list(callerId);
-      case "stop": return service.stop(callerId, args.id as string);
+      case "stop": return service.stop(callerId, args.id as string, signal);
       case "steer": return service.steer(callerId, args.id as string, args.message as string);
       case "followUp": return service.followUp(callerId, args.id as string, args.message as string);
       case "compact": return service.compact(callerId, args.id as string, args.instructions as string | undefined);
@@ -41,7 +42,7 @@ export function createAgentServiceClient(dispatch: AgentServiceDispatcher, capab
     join: (id, signal) => record("wait", {id}, signal),
     status: (id) => record("status", {id}),
     list: () => dispatch("list", {}) as Promise<AgentPublicRecord[]>,
-    stop: (id) => record("stop", {id}),
+    stop: (id, signal) => dispatch("stop", {id}, signal) as Promise<AgentPublicRecord | FabricActorInfo | AgentSessionRecord>,
     steer: (id, message) => record("steer", {id, message}),
     compact: (id, instructions) => record("compact", {id, ...(instructions !== undefined ? {instructions} : {})}),
     resume: (id, task, signal) => record("resume", {id, ...(task !== undefined ? {task} : {})}, signal),

@@ -26,7 +26,8 @@
 //     (bridge-nats-ledger.ts) before the cross publish.
 //  5. The source is acknowledged only after the destination's durable append (NATS: after MeshBridge
 //     reads past the delivery's sequence).
-//  6. The allow-list is static, loaded from config, and frozen: there is no runtime widening.
+//  6. The allow policy is loaded from config and frozen: explicit entries take precedence over the
+//     optional, default-off fallback for verified non-principal file roots.
 import { createHash } from "node:crypto";
 import type { MeshEvent, MeshIdentity } from "./event-log.js";
 import type { BridgePresence, BridgeSide } from "./bridge.js";
@@ -205,12 +206,24 @@ export type BridgeNatsAllowEntryInput =
     readonly id?: string;
   });
 
+/** Exact receive-only actor exception; active only with fileFleetRoots and a verified non-principal file owner. */
+export interface BridgeNatsFileAskTarget {
+  /** Native actor participant id (32 lowercase hex), never a name or selector. */
+  readonly actorId: string;
+  /** Canonical owner root id, session:<lowercase uuid>. */
+  readonly rootId: string;
+}
+
 /** The `allow` section of the link config (L5's NatsLinkConfig imports this). */
 export interface BridgeNatsAllowSection {
   /** File-side identities: mirrored into NATS KV; v2 can reach them, and they may send to v2. */
   readonly file?: readonly BridgeNatsAllowEntryInput[];
   /** NATS-side identities: mirrored into the file mesh; the hub can reach them, and they may send to the hub. */
   readonly nats?: readonly BridgeNatsAllowEntryInput[];
+  /** Default false: otherwise-unlisted verified native file Main roots, excluding principal-bound sessions, get followUp + steer only. */
+  readonly fileFleetRoots?: boolean;
+  /** Exact native file actors that may RECEIVE ask only (SEND none), while fileFleetRoots is true. */
+  readonly fileAskTargets?: readonly BridgeNatsFileAskTarget[];
 }
 
 /** A normalized, frozen allow entry: defaults applied and its home side attached. */
@@ -250,13 +263,17 @@ export const bridgeNatsDestinationClass = (entry: { readonly kind: "root" | "act
     : entry.side === "file" ? "fileParticipant"
       : entry.kind === "root" ? "movedLead" : "refused";
 
-/** The normalized allow-list the gate uses. Built once at start from the link config; never widened at runtime. */
+/** The normalized allow policy the gate uses. Built once at start; explicit entries are never widened by the fallback. */
 export interface BridgeNatsAllowListConfig {
   readonly version: 1;
   /** The MeshBridge link name: the `remoteHost` of NATS identities mirrored into the file mesh. */
   readonly link: string;
   /** The bridge's own credential-bound NATS machine (e.g. "ryzen1-bridge"); file identities are mirrored to KV under it. */
   readonly natsMachine: string;
+  /** Explicit false unless the verified non-principal file-root fallback was enabled. */
+  readonly fileFleetRoots: boolean;
+  /** Frozen exact actor/owner pins; inactive unless fileFleetRoots is true. Explicit entries take precedence. */
+  readonly fileAskTargets?: readonly BridgeNatsFileAskTarget[];
   readonly entries: readonly BridgeNatsAllowEntry[];
 }
 

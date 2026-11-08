@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   BRIDGE_NATS_CLASS_RECEIVE,
   BRIDGE_NATS_SEAT_RECEIVE,
@@ -16,6 +16,8 @@ import {
   bridgeNatsMappedCommandId,
   bridgeNatsMeshIdentity,
   bridgeNatsTopicIdempotencyKey,
+  type BridgeNatsAllowListConfig,
+  type BridgeNatsAllowSection,
   type BridgeNatsVerifiedIdentity,
 } from "../src/mesh/bridge-nats-types.js";
 
@@ -30,6 +32,20 @@ const UUID_B = "00000000-0000-4000-8000-00000000000b";
 const SEAT = `session:${UUID_B}`;
 
 describe("bridge-nats contract ids", () => {
+  it("types fileFleetRoots as an optional input boolean and an explicit normalized boolean", () => {
+    expectTypeOf<BridgeNatsAllowSection>().toHaveProperty("fileFleetRoots").toEqualTypeOf<boolean | undefined>();
+    expectTypeOf<BridgeNatsAllowListConfig>().toHaveProperty("fileFleetRoots").toEqualTypeOf<boolean>();
+  });
+
+  it("types fileAskTargets as optional exact actor/owner pins, with no name or permission selector", () => {
+    type AskTarget = { readonly actorId: string; readonly rootId: string };
+    expectTypeOf<BridgeNatsAllowSection>().toHaveProperty("fileAskTargets").toEqualTypeOf<readonly AskTarget[] | undefined>();
+    expectTypeOf<NonNullable<BridgeNatsAllowListConfig["fileAskTargets"]>[number]>().toEqualTypeOf<AskTarget>();
+    // Seat sends can explicitly include ask; their inbound destination-class cap does not change.
+    expect(BRIDGE_NATS_OPERATIONS).toContain("ask");
+    expect(BRIDGE_NATS_SEAT_RECEIVE).toEqual(["followUp", "cancel"]);
+  });
+
   it("mints a deterministic, link-scoped NATS envelope id that NATS and the control plane accept", () => {
     const a = bridgeNatsEnvelopeId("nats-intel1", "0b8f6a52-6a0e-4f43-9a51-7c1d3f0e2a11");
     expect(a).toBe(bridgeNatsEnvelopeId("nats-intel1", "0b8f6a52-6a0e-4f43-9a51-7c1d3f0e2a11"));

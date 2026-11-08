@@ -5,7 +5,9 @@
 // What this module decides, and from what:
 //  - Who a message is from: ONLY the presence of the side it came from (and, on NATS, the delivery's
 //    credential-bound source machine). An event's `from`, body or text is a lookup key at most.
-//  - Who may cross: ONLY the static allow-list, parsed once and frozen. There is no add/remove API.
+//  - Who may cross: the frozen allow policy. Explicit entries take precedence over the optional,
+//    default-off followUp + steer fallback for verified non-principal native file Main roots, and
+//    exact receive-only ask actor pins owned by those roots.
 //  - Which ids are principal seats: ONLY setup/org.json `principals[].orgInstance.fabricSession`, read
 //    with smarty-send's strict rules; a seat entry must equal that pin exactly.
 //
@@ -225,7 +227,10 @@ export const parseBridgeNatsAllowSection = (
   }
   const section = raw === undefined ? {} : raw;
   if (!isPlainObject(section)) throw new BridgeNatsAllowListError("allow", "must be a JSON object");
-  strictKeys(section, "allow", ["file", "nats"]);
+  strictKeys(section, "allow", ["file", "nats", "fileFleetRoots", "fileAskTargets"]);
+  if (section.fileFleetRoots !== undefined && typeof section.fileFleetRoots !== "boolean") {
+    throw new BridgeNatsAllowListError("allow.fileFleetRoots", "must be a boolean");
+  }
   const entries: BridgeNatsAllowEntry[] = [];
   const seen = new Set<string>();
   for (const side of ["file", "nats"] as const) {
@@ -245,7 +250,29 @@ export const parseBridgeNatsAllowSection = (
       entries.push(entry);
     });
   }
-  return deepFreeze({ version: 1 as const, link: options.link, natsMachine: options.natsMachine, entries });
+  let fileAskTargets: { actorId: string; rootId: string }[] | undefined;
+  if (section.fileAskTargets !== undefined) {
+    if (!Array.isArray(section.fileAskTargets) || section.fileAskTargets.length > BRIDGE_NATS_ALLOW_MAX) {
+      throw new BridgeNatsAllowListError("allow.fileAskTargets", `must be a list of at most ${BRIDGE_NATS_ALLOW_MAX} exact actor/owner pins`);
+    }
+    fileAskTargets = section.fileAskTargets.map((value: unknown, index: number) => {
+      const field = `allow.fileAskTargets[${index}]`;
+      if (!isPlainObject(value)) throw new BridgeNatsAllowListError(field, "must be a JSON object");
+      strictKeys(value, field, ["actorId", "rootId"]);
+      if (!full(ACTOR_ID, value.actorId)) {
+        throw new BridgeNatsAllowListError(`${field}.actorId`, "must be an actor id (32 lowercase hex)");
+      }
+      if (!full(BRIDGE_NATS_SESSION_ID, value.rootId)) {
+        throw new BridgeNatsAllowListError(`${field}.rootId`, "must be a canonical root id, session:<lowercase uuid>");
+      }
+      const key = `actor-id:${value.actorId}`;
+      if (seen.has(key)) throw new BridgeNatsAllowListError(field, "names an identity already listed");
+      seen.add(key);
+      return { actorId: value.actorId, rootId: value.rootId };
+    });
+  }
+  return deepFreeze({ version: 1 as const, link: options.link, natsMachine: options.natsMachine,
+    fileFleetRoots: section.fileFleetRoots === true, ...(fileAskTargets !== undefined ? { fileAskTargets } : {}), entries });
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -364,6 +391,10 @@ export const checkBridgeNatsSeatPins = (config: BridgeNatsAllowListConfig, pins:
 // The gate
 // ---------------------------------------------------------------------------------------------
 
+const FILE_FLEET_OPERATIONS: readonly BridgeNatsOperation[] = Object.freeze(["followUp", "steer"] as const);
+const FILE_ASK_RECEIVE: readonly BridgeNatsOperation[] = Object.freeze(["ask"] as const);
+const FILE_ASK_SEND: readonly BridgeNatsOperation[] = Object.freeze([]);
+
 export interface BridgeNatsIdentityOptions {
   readonly pins: BridgeNatsSeatPins;
   readonly clock?: () => number;
@@ -393,6 +424,7 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
   readonly config: BridgeNatsAllowListConfig;
   readonly #clock: () => number;
   readonly #maxAgeMs: number;
+  readonly #protectedRoots: ReadonlySet<string>;
   readonly #roots = new Map<string, BridgeNatsAllowEntry>();
   readonly #actors = new Map<string, BridgeNatsAllowEntry>();
   /** Identities this gate issued; allow() refuses any other object, however it is shaped. */
@@ -404,6 +436,7 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
     }
     checkBridgeNatsSeatPins(config, options.pins);
     this.config = config;
+    this.#protectedRoots = new Set(options.pins.bound.keys());
     this.#clock = options.clock ?? Date.now;
     const maxAgeMs = options.maxAgeMs ?? BRIDGE_NATS_IDENTITY_MAX_AGE_MS;
     if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) throw new TypeError("maxAgeMs must be a positive number");
@@ -471,14 +504,36 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
         return refuse(BRIDGE_NATS_REFUSAL.notAllowed, `${id} is not a canonical root`);
       }
       entry = this.#roots.get(record.id);
+      // Only after the native, unique, live, fresh canonical Main checks above. Never replace an
+      // explicit entry (including one on NATS), admit a seat/keeper rotation, or mutate config.entries.
+      if (!entry && side === "file" && this.config.fileFleetRoots && !this.#protectedRoots.has(record.id)) {
+        entry = Object.freeze({ kind: "root", side: "file", id: record.id,
+          send: FILE_FLEET_OPERATIONS, receive: FILE_FLEET_OPERATIONS });
+      }
     } else if (record.kind === "actor") {
       // An actor's id is always an actor id (32 lowercase hex), pinned or not: a record that resolves to a
       // session id (a root's, a principal seat's, a keeper rotation's) can never speak as an actor entry.
       if (!full(ACTOR_ID, record.id) || this.#roots.has(record.id) || !full(BRIDGE_NATS_SESSION_ID, record.rootId)) {
         return refuse(BRIDGE_NATS_REFUSAL.notAllowed, `${id} is not an actor id`);
       }
-      entry = this.#actors.get(`${record.rootId}\0${record.name}`);
+      const explicit = this.#actors.get(`${record.rootId}\0${record.name}`);
+      entry = explicit;
       if (entry?.kind === "actor" && entry.id !== undefined && entry.id !== record.id) entry = undefined;
+      // A named explicit entry remains authoritative even when its id pin does not match. The
+      // exception never selects by name, never applies on NATS, and borrows no principal authority.
+      if (!explicit && side === "file" && this.config.fileFleetRoots && !this.#protectedRoots.has(record.rootId) &&
+          this.config.fileAskTargets?.some(target => target.actorId === record.id && target.rootId === record.rootId)) {
+        // Reuse the root gate, including native/mirror ambiguity on both sides, freshness and
+        // explicit-side precedence. An actor must belong to that live root's current owner epoch.
+        const owner = this.#verify("file", record.rootId, view, other, "target");
+        if (!owner.ok) return owner;
+        if (record.ownerIdentityId !== owner.identity.id || owner.identity.ownerIdentityId !== owner.identity.id ||
+            !record.ownerIncarnation || record.ownerIncarnation !== owner.identity.ownerIncarnation) {
+          return refuse(missing, `${id}: its owner identity or incarnation does not match its live root`);
+        }
+        entry = Object.freeze({ kind: "actor", side: "file", id: record.id, rootId: record.rootId, name: record.name,
+          send: FILE_ASK_SEND, receive: FILE_ASK_RECEIVE });
+      }
     }
     if (!entry) return refuse(BRIDGE_NATS_REFUSAL.notAllowed, `${id} is not on the allow-list`);
     if (entry.side !== side) return refuse(BRIDGE_NATS_REFUSAL.sideMismatch, `${id} is allow-listed on ${entry.side}, not ${side}`);

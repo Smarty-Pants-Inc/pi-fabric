@@ -11,7 +11,7 @@ import {
   createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
 } from "./bridge-nats-identity.js";
 import { bridgeNatsClaimAction, openBridgeNatsLedger } from "./bridge-nats-ledger.js";
-import { openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
+import { natsBridgeAdmit, openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
   bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
@@ -28,7 +28,7 @@ import { systemdWatchdogNotify } from "./systemd-watchdog.js";
  *
  * Every crossing passes three independent checks: MeshBridge's own (sender from presence,
  * addressed recipient, held mirrors at commit), the carrier's (verified presence on the source
- * side, the KV source machine, ledger-bound ACKs), and L3's allow gate (static list, destination
+ * side, the KV source machine, ledger-bound ACKs), and L3's allow gate (frozen policy, destination
  * class, principal carry or strip). There is no relay hook: spoke relays and NATS -> factory
  * topics are PR 2, and MeshBridge fails a cross-spoke command closed without one.
  */
@@ -179,24 +179,36 @@ export const natsLinkAuthorizers = (gate: BridgeNatsIdentityGate, views: {
   },
 });
 
-/** Only file identities on the allow-list are mirrored into KV (roots by id; actors by root + name, and id when pinned). */
-export const natsLinkMirrorAllowed = (allow: BridgeNatsAllowListConfig) =>
-  (participant: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name">): boolean =>
+/** Explicit file identities plus eligible fallback roots/ask actors; missing seat pins disable only the fallback. */
+export const natsLinkMirrorAllowed = (allow: BridgeNatsAllowListConfig, pins?: BridgeNatsSeatPins) => {
+  const admit = natsBridgeAdmit({
+    file: allow.entries.filter(entry => entry.side === "file"), nats: allow.entries.filter(entry => entry.side === "nats"),
+    fileFleetRoots: allow.fileFleetRoots, ...(allow.fileAskTargets !== undefined ? { fileAskTargets: allow.fileAskTargets } : {}),
+    ...(pins ? { protectedFileRootIds: [...pins.bound.keys()] } : {}),
+  });
+  return (participant: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name"> &
+    Partial<Pick<FabricParticipantRecord, "remoteHost" | "bridgeVia" | "ownerHostId" | "ownerIdentityId" | "ownerIncarnation">>): boolean =>
     allow.entries.some(entry => entry.side === "file" && (entry.kind === "root"
       ? participant.kind === "root" && participant.id === entry.id
       : participant.kind === "actor" && participant.rootId === entry.rootId && participant.name === entry.name &&
-        (entry.id === undefined || entry.id === participant.id)));
+        (entry.id === undefined || entry.id === participant.id))) || (allow.fileFleetRoots && admit(participant, "toNats"));
+};
 
 /**
- * Whether an inbound command's target is named on allow.file, so a moment's KV lag may be waited for:
- * a root by id, a pinned actor by id, an unpinned actor by the native file record answering to the id.
+ * Explicit allow.file targets retain their KV-lag wait. A dynamic root or ask actor waits only after this same
+ * policy's gate verifies it against both current presence views, never merely for a session-shaped id.
  */
-export const natsLinkFileTargetAllowed = (allow: BridgeNatsAllowListConfig, fileView: () => BridgeNatsPresenceView) =>
-  (targetId: string): boolean => allow.entries.some(entry => entry.side === "file" && (entry.kind === "root"
-    ? entry.id === targetId
-    : entry.id !== undefined ? entry.id === targetId
-      : fileView().records(targetId).some(record => record.kind === "actor" && record.mirroredBy === undefined &&
-        record.rootId === entry.rootId && record.name === entry.name)));
+export const natsLinkFileTargetAllowed = (allow: BridgeNatsAllowListConfig, fileView: () => BridgeNatsPresenceView,
+  gate?: BridgeNatsIdentityGate, natsView?: () => BridgeNatsPresenceView) =>
+  (targetId: string): boolean => {
+    if (allow.entries.some(entry => entry.side === "file" && (entry.kind === "root"
+      ? entry.id === targetId
+      : entry.id !== undefined ? entry.id === targetId
+        : fileView().records(targetId).some(record => record.kind === "actor" && record.mirroredBy === undefined &&
+          record.rootId === entry.rootId && record.name === entry.name)))) return true;
+    return allow.fileFleetRoots && gate?.config === allow && natsView !== undefined &&
+      gate.verifyTarget("file", targetId, fileView(), natsView()).ok;
+  };
 
 /** L3's durable ledger as the carrier's ledger port. */
 export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsCarrierLedger => {
@@ -278,10 +290,13 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
   if (allow.link !== config.link || allow.natsMachine !== config.nats.machine) {
     throw new Error("startNatsLink: the allow-list was parsed for another link or NATS machine");
   }
-  const gate = createBridgeNatsIdentityGate(allow, { pins: factories.seatPins?.() ?? loadBridgeNatsSeatPins(config.orgJson) });
-  // L1's port admits presence from the allow section's two lists (the side is the list).
+  const pins = factories.seatPins?.() ?? loadBridgeNatsSeatPins(config.orgJson);
+  const gate = createBridgeNatsIdentityGate(allow, { pins });
+  // Pass the same fixed policy and protected seat/keeper ids to L1's independent KV admission.
   const portConfig: NatsBridgeSideConfig = { link: config.link, nats: config.nats, allow: {
-    file: allow.entries.filter(entry => entry.side === "file"), nats: allow.entries.filter(entry => entry.side === "nats") } };
+    file: allow.entries.filter(entry => entry.side === "file"), nats: allow.entries.filter(entry => entry.side === "nats"),
+    fileFleetRoots: allow.fileFleetRoots, ...(allow.fileAskTargets !== undefined ? { fileAskTargets: allow.fileAskTargets } : {}),
+    protectedFileRootIds: [...pins.bound.keys()] } };
   const store = new MeshStore(config.file.mesh, MAX_EVENT_BYTES, MAX_READ_EVENTS, {
     lockProtocol: config.file.lockProtocol,
     ...(config.file.stateBackend !== undefined ? { stateBackend: config.file.stateBackend } : {}),
@@ -306,10 +321,10 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     const identity = { id: `bridge:${config.name}`, name: "mesh-bridge", kind: "main" as const };
     const link = createNatsFileLink({
       store, localName: config.name, link: config.link, cursorPath: path.join(config.stateDir, "cursor.json"),
-      port, ledger, authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow), log,
+      port, ledger, authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow, pins), log,
       // L1's port lists native file actors itself (N1): the mirror set carries roots only.
       mirrorActors: false,
-      waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
+      waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view(), gate, () => openedPort.presenceView()),
       bridge: {
         stopMs: STOP_MS, notifyWatchdog: systemdWatchdogNotify,
         ...(config.directionStallAfterMs === undefined ? {} : { directionStallAfterMs: config.directionStallAfterMs }),

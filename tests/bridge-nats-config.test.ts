@@ -87,7 +87,7 @@ describe.skipIf(process.platform === "win32")("nats-link config (Linux/macOS onl
     // L3's parser: one frozen entries list, each entry with its home side and defaults.
     const parsed = natsLinkAllowListConfig(config);
     expect(Object.isFrozen(parsed)).toBe(true);
-    expect(parsed).toEqual({ version: 1, link: "v2", natsMachine: "ryzen1-bridge", entries: [
+    expect(parsed).toEqual({ version: 1, link: "v2", natsMachine: "ryzen1-bridge", fileFleetRoots: false, entries: [
       { ...FILE[0], side: "file" },
       // An entry that omits receive may only receive followUp.
       { ...FILE[1], side: "file", receive: ["followUp"] },
@@ -103,6 +103,44 @@ describe.skipIf(process.platform === "win32")("nats-link config (Linux/macOS onl
       stallReason: "/srv/nats-link/v2/cursor.json.last-stall-reason",
       ledger: "/srv/nats-link/v2/ledger",
     });
+  });
+
+  it("preserves fileFleetRoots through raw config and normalized allow-list without widening entries", () => {
+    const baseline = natsLinkAllowListConfig(parseNatsLinkConfig(sample()));
+    expect(baseline).toMatchObject({ fileFleetRoots: false });
+    for (const fileFleetRoots of [false, true]) {
+      const config = parseNatsLinkConfig(sample({ allow: { ...ALLOW, fileFleetRoots } }));
+      expect(config.allow).toEqual({ ...ALLOW, fileFleetRoots });
+      expect(Object.isFrozen(config.allow)).toBe(true);
+      const normalized = natsLinkAllowListConfig(config);
+      expect(normalized).toMatchObject({ fileFleetRoots });
+      expect(normalized.entries).toEqual(baseline.entries);
+      expect(Object.isFrozen(normalized)).toBe(true);
+    }
+    expect(natsLinkAllowListConfig(parseNatsLinkConfig(sample({ allow: { fileFleetRoots: true } }))))
+      .toMatchObject({ fileFleetRoots: true, entries: [] });
+    for (const fileFleetRoots of [null, "true", "false", 0, 1, [], {}]) {
+      refused(sample({ allow: { ...ALLOW, fileFleetRoots } }), "allow.fileFleetRoots");
+    }
+    refused(sample({ allow: { ...ALLOW, fileFleetRoot: true } }), "allow");
+    refused(sample({ fileFleetRoots: true }), "config"); // It is not a top-level bypass.
+  });
+
+  it("preserves exact fileAskTargets through raw and normalized config without widening seat receive or explicit actors", () => {
+    const actorId = "a".repeat(32);
+    const fileAskTargets = [{ actorId, rootId: LEAD }];
+    const nats = NATS_ALLOW.map(entry => entry.principal === "Kate" ? { ...entry, send: ["followUp", "ask"] } : entry);
+    const config = parseNatsLinkConfig(sample({ allow: { ...ALLOW, nats, fileFleetRoots: true, fileAskTargets } }));
+    expect(config.allow).toEqual({ ...ALLOW, nats, fileFleetRoots: true, fileAskTargets });
+    const normalized = natsLinkAllowListConfig(config);
+    expect(normalized).toMatchObject({ fileFleetRoots: true, fileAskTargets });
+    expect(normalized.entries).toEqual(natsLinkAllowListConfig(parseNatsLinkConfig(sample({ allow: { ...ALLOW, nats } }))).entries);
+    expect(normalized.entries.find(entry => entry.id === KATE)).toMatchObject({ send: ["followUp", "ask"], receive: ["followUp", "cancel"] });
+    expect(Object.isFrozen(config.allow) && Object.isFrozen(normalized)).toBe(true);
+    refused(sample({ allow: { fileFleetRoots: true, fileAskTargets: [{ actorId: "*", rootId: LEAD }] } }), "allow.fileAskTargets[0].actorId");
+    refused(sample({ allow: { fileFleetRoots: true, fileAskTargets: [{ actorId, rootId: LEAD, name: "default" }] } }), "allow.fileAskTargets[0]");
+    refused(sample({ allow: { ...ALLOW, nats: [{ ...nats[0], receive: ["followUp", "ask"] }], fileFleetRoots: true, fileAskTargets } }), "allow.nats[0].receive");
+    refused(sample({ fileAskTargets }), "config"); // Never a top-level bypass.
   });
 
   it("defaults the direction stall deadline to 180 s and accepts bounded safe integers", () => {

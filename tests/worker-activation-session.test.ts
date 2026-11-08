@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager, createBashToolDefinition, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { ActivationSession } from "../src/worker/activation-session.js";
+import { SESSION_ARCHIVE_DIR, SESSION_ARCHIVE_MANIFEST } from "../src/storage/session-archive.js";
 
 const roots: string[] = [];
 const root = () => {
@@ -36,6 +37,16 @@ const compactedActivation = (journal: string, dir: string) => {
   expect(JSON.stringify(session.buildSessionContext().messages)).toContain("LOCAL_EXCERPT");
   expect(JSON.stringify(session.buildSessionContext().messages)).not.toContain("FULL_ORIGINAL_RESULT");
   return {activation, original, activationId};
+};
+const expectArchivedActivation = (activation: ActivationSession, bytes: Buffer) => {
+  const archive = path.join(path.dirname(activation.file), SESSION_ARCHIVE_DIR);
+  const records = fs.readFileSync(path.join(archive, SESSION_ARCHIVE_MANIFEST), "utf8").split("\n").filter(Boolean)
+    .map(line => JSON.parse(line) as Record<string, unknown>);
+  const moved = records.find(record => record.phase === "MOVED-TO" && record.from === path.resolve(activation.file));
+  expect(JSON.parse(bytes.toString("utf8").split("\n", 1)[0]!).type).toBe("session");
+  expect(moved?.to).toEqual(expect.any(String));
+  expect(fs.readFileSync(moved!.to as string)).toEqual(bytes);
+  expect(fs.existsSync(activation.file)).toBe(false);
 };
 
 describe("activation journal retention", () => {
@@ -78,6 +89,23 @@ describe("activation journal retention", () => {
     rotated.appendMessage(assistant("new reply"));
     expect(await probe("after-rotation")).not.toBe(original);
   });
+  it.each([false, true])("archives a header-only activation session without changing the journal (existing: %s)", existing => {
+    const dir = root();
+    const journal = path.join(dir, "actor.jsonl");
+    if (existing) {
+      const prior = SessionManager.open(journal);
+      prior.appendMessage(user("PRIOR_HISTORY"));
+      prior.appendMessage(assistant("prior reply"));
+    }
+    const before = fs.existsSync(journal) ? fs.readFileSync(journal) : undefined;
+    const activation = new ActivationSession(journal, path.join(dir, "empty"), dir);
+    const rawActivation = fs.readFileSync(activation.file);
+    activation.retain();
+    expectArchivedActivation(activation, rawActivation);
+    if (before) expect(fs.readFileSync(journal)).toEqual(before);
+    else expect(fs.existsSync(journal)).toBe(false);
+  });
+
   it.each([false, true])("retains every local inference record as non-message audit data (existing journal: %s)", existing => {
     const dir = root();
     const journal = path.join(dir, "actor.jsonl");
@@ -89,8 +117,24 @@ describe("activation journal retention", () => {
     const before = fs.existsSync(journal) ? fs.readFileSync(journal) : Buffer.alloc(0);
     const priorLeaf = existing ? SessionManager.open(journal).getLeafId() : null;
     const {activation, original, activationId} = compactedActivation(journal, dir);
+    const rawActivation = fs.readFileSync(activation.file);
     activation.retain();
+    expectArchivedActivation(activation, rawActivation);
     const after = fs.readFileSync(journal);
+    const activationHeader = JSON.parse(rawActivation.toString("utf8").split("\n", 1)[0]!) as Record<string, unknown>;
+    const expectedEntries: Record<string, unknown>[] = original.map(entry => {
+      const durable: Record<string, unknown> = entry.type === "compaction" || entry.type === "context_edit"
+        ? { type: "custom", customType: "fabric-activation-context", id: entry.id,
+          parentId: entry.parentId, timestamp: entry.timestamp,
+          data: { scope: "activation", activationId, entry } }
+        : { ...entry };
+      if (durable.parentId === null) durable.parentId = priorLeaf;
+      return durable;
+    });
+    const current = before.toString("utf8");
+    const prefix = current ? (current.endsWith("\n") ? "" : "\n") : JSON.stringify(activationHeader) + "\n";
+    const expectedJournal = Buffer.from(current + prefix + expectedEntries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    expect(after).toEqual(expectedJournal);
     expect(after.subarray(0, before.length)).toEqual(before);
     const restored = SessionManager.open(journal);
     const retained = restored.getBranch().slice(existing ? 2 : 0);
@@ -142,6 +186,24 @@ describe("activation journal retention", () => {
     expect(context).toContain("CURRENT_ACTIVATION_DIRECTIONS");
     expect(context).not.toContain("GLOBAL_RETAINED_SENTINEL");
     expect(context).not.toContain("GENUINE_GLOBAL_SUMMARY");
+  });
+
+  it("keeps raw activation evidence in place when the durable journal append fails", () => {
+    const dir = root();
+    const journal = path.join(dir, "actor.jsonl");
+    const {activation} = compactedActivation(journal, dir);
+    const rawActivation = fs.readFileSync(activation.file);
+    const appendFailure = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {
+      throw new Error("journal append failed");
+    });
+    try {
+      expect(() => activation.retain()).toThrow("journal append failed");
+    } finally {
+      appendFailure.mockRestore();
+    }
+    expect(fs.existsSync(activation.file)).toBe(true);
+    expect(fs.readFileSync(activation.file)).toEqual(rawActivation);
+    expect(fs.existsSync(path.join(dir, SESSION_ARCHIVE_DIR))).toBe(false);
   });
 
   it("refuses concurrent durable journal changes and leaves isolated evidence recoverable", () => {

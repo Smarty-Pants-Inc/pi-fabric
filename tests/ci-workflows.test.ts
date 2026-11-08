@@ -52,7 +52,6 @@ const manifest = JSON.parse(fs.readFileSync(new URL("package.json", root), "utf8
 const workflowDirectory = fileURLToPath(new URL(".github/workflows/", root));
 const workflows = fs.readdirSync(workflowDirectory).filter((name) => /\.y.*ml$/.test(name));
 const workflow = () => parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8")) as Workflow;
-const i9Workflow = () => parse(fs.readFileSync(new URL(".github/workflows/windows-i9.yml", root), "utf8")) as Workflow;
 const workflowInventory = () => Object.fromEntries(workflows.map((file) => [
   file,
   parse(fs.readFileSync(new URL(`.github/workflows/${file}`, root), "utf8")) as Workflow,
@@ -73,78 +72,13 @@ function curlsGitHubReleaseDownload(source: string): boolean {
   return /\bcurl\b/i.test(source) && /github\.com\/[^\s"'`]*\/releases\/download(?:\/|\b)/i.test(source);
 }
 
-const i9JobId = "windows-i9";
-const i9WorkflowFile = "windows-i9.yml";
-const i9If = "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')";
-const i9ConcurrencyGroup = "windows-i9-${{ github.ref }}";
-const originalPullRequestBranches = ["main", "refactor/sd-6477-**", "feat/sd-6477-**"];
 const hostedRunnerLabels = ["ubuntu-latest", "windows-latest"];
-const spoofableRunnerMarkers = ["GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "PI_TEST_HOSTED_ONLY_PARENT_ADMITTED", "PI_TEST_FLEET_HOST"];
 
-function isSelfHosted(job: Job): boolean {
-  const labels = Array.isArray(job["runs-on"]) ? job["runs-on"] : [job["runs-on"]];
-  return labels.some((label) => typeof label === "string" && label.toLowerCase() === "self-hosted");
-}
-
-function assertI9RunnerAdmission(inventory: Record<string, Workflow>): void {
-  expect(inventory[i9WorkflowFile]?.jobs[i9JobId]).toBeDefined();
-  const selfHostedJobs = Object.entries(inventory).flatMap(([file, config]) =>
-    Object.entries(config.jobs)
-      .filter(([, job]) => isSelfHosted(job))
-      .map(([id]) => `${file}:${id}`),
-  ).sort();
-  expect(selfHostedJobs).toEqual([`${i9WorkflowFile}:${i9JobId}`]);
-
-  for (const [file, config] of Object.entries(inventory)) {
-    for (const [id, job] of Object.entries(config.jobs)) {
-      if (file === i9WorkflowFile && id === i9JobId) {
-        expect(job["runs-on"]).toEqual(["self-hosted", "Windows", "X64", "smarty-ci-windows-x64"]);
-      } else {
-        // Unknown literals, expressions, and matrix selections fail closed.
-        expect(hostedRunnerLabels).toContain(job["runs-on"]);
-      }
-    }
-  }
-}
-
-function assertI9EventAdmission(i9Config: Workflow, testConfig: Workflow): void {
-  expect(Object.keys(i9Config.on ?? {}).sort()).toEqual(["push", "workflow_dispatch"]);
-  expect(i9Config.on?.push?.branches).toEqual(["main"]);
-  expect(i9Config.on?.workflow_dispatch).toBeDefined();
-  expect(i9Config.on?.pull_request).toBeUndefined();
-  expect(i9Config.on?.pull_request_target).toBeUndefined();
-  expect(i9Config.jobs[i9JobId]?.if).toBe(i9If);
-  expect(i9Config.name).toBe("Windows i9");
-  expect(i9Config.permissions?.contents).toBe("read");
-
-  expect(Object.keys(testConfig.on ?? {}).sort()).toEqual(["pull_request", "push"]);
-  expect(testConfig.on?.push?.branches).toEqual(["main"]);
-  expect(testConfig.on?.pull_request?.branches).toEqual(originalPullRequestBranches);
-  expect(testConfig.on?.workflow_dispatch).toBeUndefined();
-  expect(testConfig.on?.pull_request_target).toBeUndefined();
-  expect(testConfig.jobs[i9JobId]).toBeUndefined();
-}
-
-function assertI9WorkflowIsolation(testConfig: Workflow, i9Config: Workflow): void {
-  expect(testConfig.jobs[i9JobId]).toBeUndefined();
-  expect(testConfig.on?.workflow_dispatch).toBeUndefined();
-  expect(i9Config.on?.workflow_dispatch).toBeDefined();
-  expect(i9Config.concurrency.group).toBe(i9ConcurrencyGroup);
-  expect(i9Config.concurrency.group).not.toBe(testConfig.concurrency.group);
-  expect(i9Config.concurrency["cancel-in-progress"]).toBe(false);
-}
-
-function assertI9RunnerEnvironment(inventory: Record<string, Workflow>, setupAction: ActionConfig): void {
+function assertHostedRunnerSetup(inventory: Record<string, Workflow>, setupAction: ActionConfig): void {
   expect(setupAction.inputs?.["runner-environment"]?.default).toBe("github-hosted");
-  const actionSteps = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs)
-    .flatMap(([id, job]) => (job.steps ?? [])
-      .filter((step) => step.uses === "./.github/actions/check-setup")
-      .map((step) => ({ file, id, step }))));
-  expect(actionSteps.some(({ file, id }) => file === i9WorkflowFile && id === i9JobId)).toBe(true);
-  for (const { file, id, step } of actionSteps) {
-    if (file === i9WorkflowFile && id === i9JobId) expect(step.with?.["runner-environment"]).toBe("self-hosted");
-    else expect(step.with?.["runner-environment"]).not.toBe("self-hosted");
-  }
+  const actionSteps = Object.values(inventory).flatMap((config) => Object.values(config.jobs)
+    .flatMap((job) => (job.steps ?? []).filter((step) => step.uses === "./.github/actions/check-setup")));
+  for (const step of actionSteps) expect(step.with?.["runner-environment"]).not.toBe("self-hosted");
 
   const admission = setupAction.runs?.steps?.find((step) => step.env?.EXPECTED_RUNNER_ENVIRONMENT !== undefined);
   expect(admission?.env?.EXPECTED_RUNNER_ENVIRONMENT).toBe("${{ inputs.runner-environment }}");
@@ -153,104 +87,6 @@ function assertI9RunnerEnvironment(inventory: Record<string, Workflow>, setupAct
   );
   expect(admission?.env?.RUNNER_ENVIRONMENT).toBeUndefined();
   expect(admission?.env?.GITHUB_ACTIONS).toBeUndefined();
-
-  const i9 = inventory[i9WorkflowFile]!.jobs[i9JobId]!;
-  const envs = [i9.env, ...(i9.steps ?? []).map((step) => step.env)].filter((env): env is Record<string, string> => env !== undefined);
-  for (const marker of spoofableRunnerMarkers) {
-    expect(envs.some((env) => Object.hasOwn(env, marker))).toBe(false);
-    const assignment = new RegExp(`(?:\\$env:)?\\b${marker}\\s*=`);
-    expect((i9.steps ?? []).some((step) => assignment.test(step.run ?? ""))).toBe(false);
-  }
-}
-
-function hostedOnlyExclusionLines(): string[] {
-  const source = fs.readFileSync(new URL("vitest.config.cts", root), "utf8");
-  const marker = "const hostedOnlyDeletionSuites = [";
-  const start = source.indexOf(marker);
-  const end = source.indexOf("\n];", start);
-  expect(start).toBeGreaterThanOrEqual(0);
-  expect(end).toBeGreaterThan(start);
-  const entries = source.slice(start + marker.length, end).split(/\r?\n/).filter((line) => line.trim().length > 0)
-    .map((line) => {
-      const match = /^\s*"([^"]+)"\s*,\s*\/\/\s*(.+?)\s*$/.exec(line);
-      expect(match).not.toBeNull();
-      expect(match![1]).toMatch(/^tests\/[^/]+\.test\.ts$/);
-      expect(match![2]!.trim().length).toBeGreaterThan(0);
-      return `${match![1]} # ${match![2]}`;
-    });
-  expect(entries).toHaveLength(15);
-  return entries;
-}
-
-function assertI9ExclusionReport(job: Job, authoritativeLines: string[]): void {
-  const report = job.steps?.find((step) => step.name === "Report hosted-only exclusions on i9");
-  expect(report).toBeDefined();
-  expect(report?.shell).toBe("pwsh");
-  expect(report?.run).toContain("Write-Output");
-  const lines = (report?.run ?? "").split(/\r?\n/);
-  const opening = lines.findIndex((line) => line.includes("@'"));
-  const closing = lines.findIndex((line, index) => index > opening && line.trim().startsWith("'@"));
-  expect(opening).toBeGreaterThanOrEqual(0);
-  expect(closing).toBeGreaterThan(opening);
-  const reported = lines.slice(opening + 1, closing).map((line) => line.trim());
-  expect(reported).toHaveLength(15);
-  for (const entry of reported) expect(entry).toMatch(/^tests\/[^/]+\.test\.ts # \S.+$/);
-  expect(reported).toEqual(authoritativeLines);
-}
-
-function assertI9JobOperations(i9Config: Workflow, testConfig: Workflow): void {
-  const job = i9Config.jobs[i9JobId]!;
-  const steps = job.steps ?? [];
-  expect(job["continue-on-error"]).toBe(true);
-  expect(job["timeout-minutes"]).toBe(90);
-  expect(job.strategy?.matrix).toBeUndefined();
-
-  const first = steps[0];
-  const last = steps.at(-1);
-  expect(first?.name).toMatch(/^Hold\b/);
-  expect(last?.name).toMatch(/^Release\b/);
-  expect(last?.if).toBe("always()");
-  expect(first?.shell).toBe("pwsh");
-  expect(last?.shell).toBe("pwsh");
-  expect(first?.run).toContain("& 'C:\\ProgramData\\smarty-heavy-lock\\heavy-lock.ps1' -Hold $env:SMARTY_HEAVY_LOCK_MARKER");
-  expect(last?.run).toContain("& 'C:\\ProgramData\\smarty-heavy-lock\\heavy-lock.ps1' -Release $env:SMARTY_HEAVY_LOCK_MARKER");
-  const marker = first?.env?.SMARTY_HEAVY_LOCK_MARKER;
-  for (const part of ["${{ runner.temp }}", "${{ github.run_id }}", "windows-i9", "${{ github.run_attempt }}"]) {
-    expect(marker).toContain(part);
-  }
-  expect(first?.env).toBeDefined();
-  expect(Object.keys(first?.env ?? {}).length).toBeGreaterThan(0);
-  expect(Object.values(first?.env ?? {}).every((value) => value.length > 0)).toBe(true);
-  expect(last?.env).toEqual(first?.env);
-
-  const shards = steps.find((step) => step.name === "Affected tests (10 serial shards)");
-  const shardRun = shards?.run ?? "";
-  expect(shards?.shell).toBe("pwsh");
-  expect(shards?.["continue-on-error"]).not.toBe(true);
-  expect(shardRun.replace(/\s+/g, " ")).toMatch(/for\s*\(\$shard\s*=\s*1;\s*\$shard\s*-le\s*10;\s*\$shard\+\+\)/);
-  expect(shardRun).toContain('bun run test:affected "--shard=$shard/10"');
-  expect(shardRun).toContain('$env:PI_TEST_REPORT_DIR = $reportDir');
-  expect(shardRun).toContain('"affected-windows-latest-$shard"');
-  expect(shardRun).toContain("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
-
-  const shardIndex = steps.indexOf(shards!);
-  const discoverIndex = steps.findIndex((step) => step.name === "Discover unsharded affected test files (no test execution)");
-  const parityIndex = steps.findIndex((step) => step.run?.includes("node scripts/ci-test-counts.mjs"));
-  const parity = steps[parityIndex];
-  expect(discoverIndex).toBeGreaterThanOrEqual(0);
-  expect(parityIndex).toBeGreaterThan(shardIndex);
-  expect(parityIndex).toBeGreaterThan(discoverIndex);
-  expect(parity?.run).toContain("windows-latest 10");
-  expect(parity?.run).toContain("unsharded-selection.json");
-
-  const regressions = steps.findIndex((step) => step.uses === "./.github/actions/check-regressions");
-  const typeCheck = steps.findIndex((step) => step.run === "bunx vitest run tests/type-checker.test.ts");
-  const smoke = steps.findIndex((step) => step.run === "bun run test:smoke");
-  expect(regressions).toBeGreaterThanOrEqual(0);
-  expect(typeCheck).toBeGreaterThan(regressions);
-  expect(smoke).toBeGreaterThan(typeCheck);
-
-  expect(testConfig.jobs["check-windows"]?.needs).toEqual(["windows-gates", "windows-tests", "windows-acceptance"]);
 }
 
 // These are contract assertions for PR CI, not a reason to execute the suite on an editing host.
@@ -544,185 +380,13 @@ describe("pinned local Bun setup contract", () => {
   );
 });
 
-describe("Windows i9 test observation contract", () => {
-  it("reserves exactly one named self-hosted job for windows-i9 and keeps every other job hosted", () => {
-    assertI9RunnerAdmission(workflowInventory());
-  });
-
-  it("rejects any second self-hosted job within windows-i9.yml", () => {
-    const mutant = structuredClone(workflowInventory());
-    mutant[i9WorkflowFile]!.jobs["other-self-hosted"] = {
-      "runs-on": ["self-hosted", "Windows", "other"],
-    };
-    expect(() => assertI9RunnerAdmission(mutant)).toThrow();
-  });
-
-  it("allows hosted jobs in another .yaml workflow with only the exact i9 exception", () => {
-    const mutant = structuredClone(workflowInventory());
-    mutant["other.yaml"] = structuredClone(mutant["entropy.yml"]!);
-    assertI9RunnerAdmission(mutant);
-  });
-
-  it("rejects a self-hosted job added by another workflow", () => {
-    const mutant = structuredClone(workflowInventory());
-    mutant["newfile.yml"] = structuredClone(mutant["entropy.yml"]!);
-    mutant["newfile.yml"]!.jobs["other-self-hosted"] = {
-      name: "unapproved self-hosted job",
-      "runs-on": ["self-hosted", "windows", "other"],
-    };
-    expect(() => assertI9RunnerAdmission(mutant)).toThrow();
-  });
-
-  it("rejects a duplicate windows-i9 exception in another workflow", () => {
-    const mutant = structuredClone(workflowInventory());
-    mutant["newfile.yml"] = structuredClone(mutant["entropy.yml"]!);
-    mutant["newfile.yml"]!.jobs[i9JobId] = structuredClone(mutant[i9WorkflowFile]!.jobs[i9JobId]!);
-    expect(() => assertI9RunnerAdmission(mutant)).toThrow();
-  });
-
-  const unresolvedRunnerMutations: Array<[string, (job: Job) => void]> = [
-    ["a direct string expression", (job) => { job["runs-on"] = "${{ inputs.runner }}"; }],
-    ["an expression in a runs-on array", (job) => { job["runs-on"] = ["${{ 'self-hosted' }}", "Windows"]; }],
-    ["a self-hosted matrix selection", (job) => {
-      job["runs-on"] = "${{ matrix.runner }}";
-      job.strategy = { matrix: { runner: ["ubuntu-latest", "self-hosted"] } };
-    }],
-  ];
-  it.each(unresolvedRunnerMutations)("fails closed for %s", (_case, configureJob) => {
-    const mutant = structuredClone(workflowInventory());
-    mutant["newfile.yml"] = structuredClone(mutant["entropy.yml"]!);
-    const job: Job = { "runs-on": "ubuntu-latest" };
-    configureJob(job);
-    mutant["newfile.yml"]!.jobs["unresolved-runner"] = job;
-    expect(() => assertI9RunnerAdmission(mutant)).toThrow();
-  });
-
-  it("keeps Test unchanged and allows i9 dispatch in its independent non-cancelling workflow", () => {
-    const testConfig = workflow();
-    const i9Config = i9Workflow();
-    assertI9EventAdmission(i9Config, testConfig);
-    assertI9WorkflowIsolation(testConfig, i9Config);
-  });
-
-  it("rejects reinserting windows-i9 into test.yml", () => {
-    const testMutant = structuredClone(workflow());
-    testMutant.jobs[i9JobId] = structuredClone(i9Workflow().jobs[i9JobId]!);
-    expect(() => assertI9WorkflowIsolation(testMutant, i9Workflow())).toThrow();
-  });
-
-  it("rejects workflow_dispatch on the hosted Test workflow", () => {
-    const testMutant = structuredClone(workflow());
-    testMutant.on!.workflow_dispatch = {};
-    expect(() => assertI9WorkflowIsolation(testMutant, i9Workflow())).toThrow();
-  });
-
-  it("rejects sharing Test's concurrency group with i9", () => {
-    const testConfig = workflow();
-    const i9Mutant = structuredClone(i9Workflow());
-    i9Mutant.concurrency.group = testConfig.concurrency.group;
-    expect(() => assertI9WorkflowIsolation(testConfig, i9Mutant)).toThrow();
-  });
-
-  it("rejects cancellation of an in-flight i9 run", () => {
-    const testConfig = workflow();
-    const i9Mutant = structuredClone(i9Workflow());
-    i9Mutant.concurrency["cancel-in-progress"] = true;
-    expect(() => assertI9WorkflowIsolation(testConfig, i9Mutant)).toThrow();
-  });
-
-  it("admits i9 only on trusted main push or dispatch and preserves Test's PR triggers", () => {
-    assertI9EventAdmission(i9Workflow(), workflow());
-  });
-
-  it("rejects weaker i9 ref and OR conditions", () => {
-    const weakenedConditions = [
-      "github.ref == 'refs/heads/main' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch')",
-      "github.ref != 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')",
-    ];
-    for (const condition of weakenedConditions) {
-      const mutant = structuredClone(i9Workflow());
-      mutant.jobs[i9JobId]!.if = condition;
-      expect(() => assertI9EventAdmission(mutant, workflow())).toThrow();
+describe("GitHub-hosted runner admission", () => {
+  it("requires every workflow job to use an allowlisted hosted runner label", () => {
+    for (const [file, config] of Object.entries(workflowInventory())) {
+      for (const [id, job] of Object.entries(config.jobs)) {
+        expect(hostedRunnerLabels, `${file}:${id}`).toContain(job["runs-on"]);
+      }
     }
-  });
-
-  it.each([
-    ["pull_request", "github.event_name == 'pull_request'"],
-    ["pull_request_target", "github.event_name == 'pull_request_target'"],
-  ])("rejects an i9 job condition that admits %s", (_event, addedEvent) => {
-    const mutant = structuredClone(i9Workflow());
-    mutant.jobs[i9JobId]!.if = `github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || ${addedEvent})`;
-    expect(() => assertI9EventAdmission(mutant, workflow())).toThrow();
-  });
-
-  it("rejects widened push branches, changed PR branches, or pull_request_target triggers", () => {
-    const mutations: Array<{ target: "i9" | "test"; mutate: (config: Workflow) => void }> = [
-      { target: "i9", mutate: (config) => { config.on!.push!.branches = ["main", "release/**"]; } },
-      { target: "test", mutate: (config) => { config.on!.pull_request!.branches = ["main"]; } },
-      { target: "i9", mutate: (config) => { config.on!.pull_request_target = { branches: ["main"] }; } },
-      { target: "test", mutate: (config) => { config.on!.pull_request_target = { branches: ["main"] }; } },
-    ];
-    for (const { target, mutate } of mutations) {
-      const i9Mutant = structuredClone(i9Workflow());
-      const testMutant = structuredClone(workflow());
-      mutate(target === "i9" ? i9Mutant : testMutant);
-      expect(() => assertI9EventAdmission(i9Mutant, testMutant)).toThrow();
-    }
-  });
-
-  it("defaults setup to hosted and compares every setup consumer's actual runner environment with the input", () => {
-    assertI9RunnerEnvironment(workflowInventory(), action("check-setup"));
-  });
-
-  it("rejects a changed hosted default or self-hosted setup passed by another job", () => {
-    const wrongDefault = structuredClone(action("check-setup"));
-    wrongDefault.inputs!["runner-environment"]!.default = "self-hosted";
-    expect(() => assertI9RunnerEnvironment(workflowInventory(), wrongDefault)).toThrow();
-
-    const wrongConsumer = structuredClone(workflowInventory());
-    const windowsSetup = wrongConsumer["test.yml"]!.jobs["windows-tests"]!.steps!.find((step) => step.uses === "./.github/actions/check-setup")!;
-    windowsSetup.with = { ...windowsSetup.with, "runner-environment": "self-hosted" };
-    expect(() => assertI9RunnerEnvironment(wrongConsumer, action("check-setup"))).toThrow();
-  });
-
-  it.each(spoofableRunnerMarkers)("rejects spoofing the %s runner marker", (marker) => {
-    const mutant = structuredClone(workflowInventory());
-    const i9 = mutant[i9WorkflowFile]!.jobs[i9JobId]!;
-    i9.env = { ...i9.env, [marker]: "true" };
-    expect(() => assertI9RunnerEnvironment(mutant, action("check-setup"))).toThrow();
-  });
-
-  it("reports the exact named hosted-only exclusions and their authoritative reasons", () => {
-    assertI9ExclusionReport(i9Workflow().jobs[i9JobId]!, hostedOnlyExclusionLines());
-  });
-
-  it("rejects a missing hosted-only exclusion", () => {
-    const mutant = structuredClone(i9Workflow());
-    const report = mutant.jobs[i9JobId]!.steps!.find((step) => step.name === "Report hosted-only exclusions on i9")!;
-    const expected = hostedOnlyExclusionLines()[0]!;
-    report.run = report.run!.split(/\r?\n/).filter((line) => line.trim() !== expected).join("\n");
-    expect(() => assertI9ExclusionReport(mutant.jobs[i9JobId]!, hostedOnlyExclusionLines())).toThrow();
-  });
-
-  it("rejects an unnamed hosted-only exclusion", () => {
-    const mutant = structuredClone(i9Workflow());
-    const report = mutant.jobs[i9JobId]!.steps!.find((step) => step.name === "Report hosted-only exclusions on i9")!;
-    const expected = hostedOnlyExclusionLines()[0]!;
-    const reason = expected.split(" # ")[1]!;
-    report.run = report.run!.replace(expected, `# ${reason}`);
-    expect(() => assertI9ExclusionReport(mutant.jobs[i9JobId]!, hostedOnlyExclusionLines())).toThrow();
-  });
-
-  it("rejects a hosted-only exclusion without a reason", () => {
-    const mutant = structuredClone(i9Workflow());
-    const report = mutant.jobs[i9JobId]!.steps!.find((step) => step.name === "Report hosted-only exclusions on i9")!;
-    const expected = hostedOnlyExclusionLines()[0]!;
-    report.run = report.run!.replace(expected, expected.split(" # ")[0]!);
-    expect(() => assertI9ExclusionReport(mutant.jobs[i9JobId]!, hostedOnlyExclusionLines())).toThrow();
-  });
-
-  it("keeps i9 serial shards, native failures, parity, and Windows acceptance ordering", () => {
-    assertI9JobOperations(i9Workflow(), workflow());
   });
 });
 
@@ -750,9 +414,9 @@ describe("hosted sharded required checks", () => {
 
   it("keeps hosted-only admission, pinned brokers, systemd, and singleton smoke/cleanup/package semantics", () => {
     const config = workflow();
-    assertI9RunnerAdmission(workflowInventory());
-    const setup = action("check-setup").runs!.steps as Step[];
-    assertI9RunnerEnvironment(workflowInventory(), action("check-setup"));
+    const setupAction = action("check-setup");
+    const setup = setupAction.runs!.steps as Step[];
+    assertHostedRunnerSetup(workflowInventory(), setupAction);
     expect(setup.find((step) => step.name === "Install pinned nats-server for session-channel acceptance")?.run).toBe("bash scripts/install-pinned-nats-server.sh");
     expect(config.jobs["linux-tests"]!.steps?.some((step: Step) => step.uses === "./.github/actions/check-systemd")).toBe(true);
     expect(acceptance("windows").steps?.filter((step) => step.run === "bun run test:smoke")).toHaveLength(1);

@@ -1,11 +1,58 @@
 import fs from "node:fs";
 import path from "node:path";
-import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
+import { readPhysicalHostIdentity, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
+import { ownedStat } from "../storage/scratch.js";
 import type { AgentRunResult, AgentRunStopCaller, AgentRunStopIntent } from "./types.js";
 import type { CompletionRecipient } from "./completion-journal.js";
 
 export const ARCHIVE_PENDING_FILE = "archive-pending.json";
 export const ACTOR_RUN_ARCHIVE_PENDING_FILE = "actor-run-archive-pending.json";
+export interface ActorWorkerStopProof {
+  pid: number;
+  startTime: string;
+  status: "completed" | "failed" | "timed_out" | "stopped";
+}
+interface ActorRunArchiveCustody {
+  format: 1;
+  runId: string;
+  actorId: string;
+  sessionFile: string;
+  nativeExit?: ActorWorkerStopProof & { scope: "execution"; machineId: string; bootId: string };
+}
+
+/** Existing actor-log custody, never a worker status/primary-exit receipt. */
+export const readActorRunArchiveCustody = (directory: string, runId: string, actorId: string, sessionFile: string): ActorRunArchiveCustody | undefined => {
+  try {
+    const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
+    const stat = ownedStat(file);
+    if (!ownedStat(directory)?.isDirectory() || !stat?.isFile() || stat.size > 4096) return undefined;
+    const marker = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (marker?.format !== 1 || marker.runId !== runId || marker.actorId !== actorId || marker.sessionFile !== sessionFile) return undefined;
+    return marker;
+  } catch { return undefined; }
+};
+
+export const readActorWorkerStopProof = (directory: string, runId: string, actorId: string, sessionFile: string): ActorWorkerStopProof | undefined => {
+  const exit = readActorRunArchiveCustody(directory, runId, actorId, sessionFile)?.nativeExit;
+  const host = readPhysicalHostIdentity();
+  if (!exit || !host || exit.scope !== "execution" || exit.machineId !== host.machineId || exit.bootId !== host.bootId ||
+      !Number.isSafeInteger(exit.pid) || exit.pid <= 1 || exit.pid === process.pid ||
+      typeof exit.startTime !== "string" || !/^\d+$/.test(exit.startTime) ||
+      !["completed", "failed", "timed_out", "stopped"].includes(exit.status)) return undefined;
+  return { pid: exit.pid, startTime: exit.startTime, status: exit.status };
+};
+
+/** Caller must own and have joined the exact whole execution; identity alone grants nothing. */
+export const persistActorWorkerStopProof = (directory: string, runId: string, actorId: string, sessionFile: string, proof: ActorWorkerStopProof): boolean => {
+  const marker = readActorRunArchiveCustody(directory, runId, actorId, sessionFile);
+  const host = readPhysicalHostIdentity();
+  if (!marker || !host || !Number.isSafeInteger(proof.pid) || proof.pid <= 1 || proof.pid === process.pid ||
+      typeof proof.startTime !== "string" || !/^\d+$/.test(proof.startTime) || !["completed", "failed", "timed_out", "stopped"].includes(proof.status)) return false;
+  writeJsonAtomic(path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE), {
+    format: 1, runId, actorId, sessionFile, nativeExit: { ...proof, scope: "execution", ...host },
+  }, { durable: true });
+  return true;
+};
 export interface PendingRunArchive {
   format: 1;
   kind: "settlement" | "shutdown";
@@ -34,6 +81,17 @@ export const persistRunStopIntent = (directory: string, reason: "explicit" | "de
     ...(stopPath ? { path: stopPath } : {}),
     ...(recovery ? { recoveryRecord: recovery } : {}),
   } }, { durable: true });
+};
+
+/** Direct durable custody only; malformed receipts refuse, never fall back to worker status. */
+export const readDurableRunStopIntent = (directory: string): ArchiveCustodyRecord["stopIntent"] => {
+  const record = read(directory);
+  if (!record || typeof record !== "object" || Array.isArray(record) || record.format !== 1) throw new Error("Unknown archive custody format");
+  const intent = record.stopIntent;
+  if (intent !== undefined && (!intent || typeof intent !== "object" || Array.isArray(intent) ||
+      (intent.reason !== "explicit" && intent.reason !== "deadline") ||
+      typeof intent.requestedAt !== "number" || !Number.isFinite(intent.requestedAt))) throw new Error("Malformed durable run stop intent");
+  return intent;
 };
 
 export const readRunStopIntent = (directory: string, statusRecord?: Record<string, unknown>): ArchiveCustodyRecord["stopIntent"] => {

@@ -94,6 +94,50 @@ describe("strict cooperative resident actor admission boundary", () => {
     });
   }, 25_000);
 
+  // Exact host-owned native stop proof requires the Linux PID/birth identity.
+  it.skipIf(process.platform !== "linux")("durably transfers a pre-cut native failure under strict hold and checkpoints without launching its FIFO tail", async () => {
+    const { dir, actors, agents } = fixture(false);
+    const actor = await actors.create(spec("failed-under-hold"));
+    const release = path.join(dir, "failure-release");
+    actors.tell(actor.id, "FAIL_DIRECTIVE", { fakeWorkerFinishGate: release });
+    await changed(actors, () => !!actors.status(actor.id).inFlightRun);
+    const runId = actors.status(actor.id).inFlightRun!.id;
+    const worker = agents.workerIdentity(runId);
+    expect(worker).toMatchObject({ open: true, startTime: expect.stringMatching(/^\d+$/) });
+    if (!worker?.startTime) throw new Error("The native worker PID/birth identity was unavailable");
+    const proof = { actorId: actor.id, runId, pid: worker.pid, startTime: worker.startTime };
+    const runDirectory = path.join(dir, "runs", runId);
+    const actorDirectory = path.join(dir, "project", actor.id);
+    const marker = path.join(runDirectory, "actor-run-archive-pending.json");
+    expect(fs.existsSync(marker)).toBe(true);
+    const tail = actors.tell(actor.id, "fifo-tail").messageId;
+    actors.pauseForRelease({ strict: true });
+    fs.writeFileSync(release, "fail naturally");
+    await changed(actors, () => actors.releaseCustodyCount() === 0);
+
+    expect(agents.status(runId).status).toBe("failed"); // Retain the real debugging handle.
+    expect(agents.workerIdentity(runId)).toMatchObject({ pid: worker.pid, startTime: worker.startTime, open: false });
+    // Read the saved receipt BEFORE checkpointing can persist any staged registry value.
+    const row = json(path.join(dir, "project", "actors.json")).actors.find((value: any) => value.id === actor.id);
+    expect(row).toMatchObject({ lastRunId: runId, lastCleanedRunWorker: proof });
+    expect(actors.drainSpec(actor.id).lastCleanedRunWorker).toEqual(proof);
+    expect(json(path.join(actorDirectory, "runs", runId, "status.json")).status).toBe("failed");
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(actors.releaseAdmissionHeld).toBe(true);
+    expect(actors.status(actor.id)).toMatchObject({ lastRunId: runId, queued: 1 });
+    expect(actors.status(actor.id).inFlightRun).toBeUndefined();
+
+    await actors.checkpointForRelease();
+    const receipt = actors.releaseCheckpointReceipt() as any;
+    const queue = receipt.project.queues.find((value: any) => value.actorId === actor.id);
+    expect(queue.items.map((item: any) => item.id)).toEqual([tail]);
+    expect(queue.items.map((item: any) => [item.attempts, item.preparationAttempts, item.executionStarted])).toEqual([[0, 0, false]]);
+    expect(json(queue.file).items).toEqual(queue.items);
+    expect(receipt.project.cursor.persisted).toBe(true);
+    expect(actors.releaseAdmissionHeld).toBe(true);
+    expect(agents.list().map(run => run.id)).toEqual([runId]);
+  }, 25_000);
+
   it.each(["project", "session"] as const)("checks disk queues/order/attempts, registry and completion obligations before both cursor receipts (default %s)", async defaultScope => {
     const { dir, actors } = fixture(true, defaultScope);
     const values = await Promise.all((["project", "session"] as const).map(scope => actors.create(spec(`queued-${scope}`, scope))));

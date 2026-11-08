@@ -11,6 +11,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 
 const identity: MeshIdentity = { id: "session:redrive-test", name: "main", kind: "main", sessionId: "redrive-test" };
 const roots: string[] = [];
@@ -24,11 +25,11 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 10_000): Promise<vo
   }
 };
 
-const fixture = (persistent = true, closeGraceMs = 0) => {
+const fixture = (persistent = true, closeGraceMs = 0, retainRuns = true) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-unstarted-redrive-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, sessionExport: false }, {
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns, sessionExport: false }, {
     runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     identityId: identity.id, mainAgentId: identity.id,
   });
@@ -242,6 +243,64 @@ else setInterval(() => {}, 1_000);
     } });
     expect(alarms(h.mesh)).toHaveLength(0);
   });
+
+  it.each([true, false])("selects removal cleanup only for non-retained runs (retainRuns=%s)", async (retainRuns) => {
+    const h = fixture(true, 0, retainRuns);
+    try {
+      const actor = await actorRequest(h.actors, "removal-retention-reviewer");
+      const runs = vi.spyOn(h.agents, "run");
+      await h.mesh.publish({ topic: "review.requests", from: identity, kind: "ci-complete",
+        data: { replayId: "remove-retention:review@1" }, text: "HANG until actor removal" });
+      await waitFor(() => h.actors.status(actor.id).inFlightRun !== undefined);
+      const runId = h.actors.status(actor.id).inFlightRun!.id;
+      const runDirectory = h.agents.runDirectory(runId)!;
+      expect(runDirectory).toBe(path.join(h.root, "runs", runId));
+      expect(h.agents.workerIdentity(runId)).toMatchObject({ open: true });
+      const session = fs.readFileSync(actor.sessionFile!, "utf8");
+      const archived = fleetSessionArchive(h.mesh.root, identity.id, actor.id);
+      const selections: Array<{ runId: string; workerOpen: boolean | undefined; archived: boolean; saved: unknown }> = [];
+      const realCleanup = h.agents.cleanup.bind(h.agents);
+      // Observe selection BEFORE real cleanup: Linux's pending native archive marker can
+      // refuse consumption and otherwise mask the Windows retained-handle regression.
+      // No worker identity, exit proof, stop, join, or cleanup result is synthesized.
+      const cleanup = vi.spyOn(h.agents, "cleanup").mockImplementation(async (...args) => {
+        selections.push({ runId: args[0], workerOpen: h.agents.workerIdentity(args[0])?.open,
+          archived: fs.existsSync(path.join(archived, "session.jsonl")),
+          saved: JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")) });
+        return realCleanup(...args);
+      });
+
+      const removed = await h.actors.remove(actor.id, { dropQueued: true });
+      // This is the mutation-negative assertion even when real cleanup refuses on Linux.
+      expect(cleanup).toHaveBeenCalledTimes(retainRuns ? 0 : 1);
+      expect(removed).toEqual({ removed: true });
+      expect(h.actors.pendingRemovals()).toEqual([]);
+      expect(h.actors.cleanupObligation(actor.id)).toBeUndefined();
+      expect(() => h.actors.status(actor.id)).toThrow(/Unknown Fabric actor/);
+      expect(fs.existsSync(path.join(h.root, "actors", `removal-${actor.id}.json`))).toBe(false);
+      expect(fs.existsSync(path.dirname(actor.sessionFile!))).toBe(false);
+      expect(fs.readFileSync(path.join(archived, "session.jsonl"), "utf8")).toBe(session);
+      expect(runs).toHaveBeenCalledTimes(1);
+      expect(alarms(h.mesh)).toHaveLength(0);
+      const saved = retainRuns
+        ? JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8"))
+        : selections[0]?.saved;
+      expect(saved).toMatchObject({ status: "stopped", stopIntent: {
+        reason: "explicit", by: { kind: identity.kind, id: identity.id }, path: "actors.remove",
+      } });
+      if (retainRuns) {
+        expect(h.agents.runDirectory(runId)).toBe(runDirectory);
+        expect(h.agents.status(runId)).toMatchObject({ status: "stopped" });
+        expect(h.agents.workerIdentity(runId)).toMatchObject({ open: false });
+      } else {
+        expect(selections).toEqual([expect.objectContaining({ runId, workerOpen: false, archived: true })]);
+      }
+    } finally {
+      await h.actors.close();
+      await h.agents.close();
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("records explicit actors.stop provenance in terminal run status without re-driving", async () => {
     const h = fixture();

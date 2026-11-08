@@ -10,6 +10,7 @@ vi.mock("../src/storage/retention-platform.js", () => ({ retentionV2Enabled: () 
 const recorded = vi.hoisted(() => ({
   collectors: [] as ResidentRequestRetention[],
   mutations: [] as Array<{ target: string; deleter: string; judged: unknown }>,
+  archives: [] as Array<{ source: string; archive: string; id: string; reason: string }>,
   compactions: [] as string[],
 }));
 vi.mock("../src/residency/retention.js", async (importOriginal) => {
@@ -26,10 +27,17 @@ vi.mock("../src/residency/retention.js", async (importOriginal) => {
 });
 vi.mock("../src/storage/verified-remove.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../src/storage/verified-remove.js")>(),
-  // Never invoke proceed/fallback/native removal, including event replacement.
+  // Never invoke proceed/fallback/native metadata removal, including event replacement.
   verifiedRemove: (target: string, judged: unknown, options: { deleter: string }) => {
     recorded.mutations.push({ target, judged, deleter: options.deleter });
     return { removed: false, reason: "recorded only (test)" };
+  },
+}));
+vi.mock("../src/agents/worktree-manager.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/agents/worktree-manager.js")>(),
+  retainCleanupRoot: (source: string, archive: string, id: string, reason = "agent cleanup whole-root custody") => {
+    recorded.archives.push({ source, archive, id, reason });
+    return undefined; // Recorded-only: never create custody containers or move fixture trees.
   },
 }));
 vi.mock("../src/storage/retention.js", async (importOriginal) => {
@@ -66,6 +74,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   recorded.collectors.length = 0;
   recorded.mutations.length = 0;
+  recorded.archives.length = 0;
   recorded.compactions.length = 0;
   // No teardown deletion: the invoking owner retains these private roots.
 });
@@ -157,13 +166,15 @@ describe("ResidentHost legacy retention custody wiring", () => {
         deleter: "residentRequestCollect", judged: expect.anything(),
       });
       expect(recorded.compactions).toEqual(retainRuns ? [unrelated] : []);
-      // Collection still proves custody when retainRuns=false; when true, archive
-      // recovery and acknowledged-exchange collection progress without log mutation.
-      expect(recorded.mutations.filter(({ deleter }) => deleter !== "residentRequestCollect")).toEqual(retainRuns ? [] : [{
-        target: unrelated, deleter: "residentRunRetention",
-        judged: expect.objectContaining({ ino: expect.any(Number), dev: expect.any(Number) }),
+      expect(recorded.archives.filter(call => call.reason === "resident run retention whole-root custody")).toEqual(retainRuns ? [] : [{
+        source: unrelated, archive: `${path.join(config.residencyRoot, "runs")}.trace-archive`, id: "unrelated",
+        reason: "resident run retention whole-root custody",
       }]);
-      // No exit proof is needed for an inert compaction. The removal case
+      expect(recorded.archives.filter(({ id }) => id === result.id)).toEqual([]);
+      // Acknowledged-exchange metadata collection still progresses; eligible
+      // unowned trace archival is recorded, while manager-owned traces stay untouched.
+      expect(recorded.mutations.filter(({ deleter }) => deleter !== "residentRequestCollect")).toEqual([]);
+      // No exit proof is needed for an inert compaction. The archive case
       // must still obtain fresh native absence evidence; no safety mock.
       if (retainRuns) expect(nativeExitChecks).not.toHaveBeenCalled();
       else expect(nativeExitChecks).toHaveBeenCalledWith(2147483647, 0);

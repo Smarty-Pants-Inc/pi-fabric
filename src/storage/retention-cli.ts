@@ -170,9 +170,9 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
     return { ...result, summary };
   } finally { stopRemovalTally(); setWindowsVerifiedRemoval(false); }
 };
-/** smarty-dev#16444 (R-keep-all-traces): these "deleters" never delete. They move session traces into the actor's
- * session-archive/; their bytes stay on disk, so they count as archived, never as freed. */
-const ARCHIVING_DELETERS: ReadonlySet<string> = new Set(["pruneActorSessionBackups"]);
+/** smarty-dev#16444 (R-keep-all-traces): pruneActorSessionBackups moves session traces into actor session-archive/.
+ * Resident runs are archived too, so both deleters leave bytes on disk and count as archived, never freed. */
+const ARCHIVING_DELETERS: ReadonlySet<string> = new Set(["pruneActorSessionBackups", "sweepResidentRuns"]);
 /** The operator's lines: per deleter, then the one total (GiB) on its own line. */
 export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): string[] => {
   const lines: string[] = [];
@@ -520,17 +520,17 @@ const sweep = async (meshRoot: string, options: {
       // Always preview stale diagnostic records under the dead host's own flock fence; apply remains unreachable.
       sweepResidentGenerationRecords(root, now, veto, true, change => changes.push(change));
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
-      // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
+      // preserved-result and latest-run fences as archival on a live host (smarty-dev#3252).
       if (options.runRetentionMs !== undefined) {
-        // Same final pre-delete check as the actor-run pass below: before each delete every discovered registry's
+        // Same final pre-archive check as the actor-run pass below: before each archive every discovered registry's
         // stamp is re-validated against the cached references and a changed registry is re-parsed; a vanished or unreadable one vetoes (review round 2).
         // A dry run takes the same selection and fences without mutating, so its preview lists
-        // the runs --apply deletes (review round 3). Sizes are taken before the final check, which also
-        // re-discovers the registry roots, and the check and delete run back to back (review round 4).
+        // the runs --apply archives (review round 3). Sizes are taken before the final check, which also
+        // re-discovers the registry roots, and the check and archive run back to back (review round 4).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
           actorRoots: registries, references: checked, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true,
           isRetained: () => veto(), measure: treeBytes,
-          onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }),
+          onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: bytes }),
           onCompact: change => changes.push(change),
           retentionMs: options.residentRunRetentionMs ?? options.runRetentionMs,
         }));

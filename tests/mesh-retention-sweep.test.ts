@@ -448,13 +448,13 @@ describe.skipIf(process.platform !== "linux")("dead-resident sweep final pre-del
   });
 
   // pi-fabric#645 review round 3: the default CLI mode (--runs-older-than, dry run) previews the
-  // dead-resident runs --apply deletes, through the same selection and fences, without mutating.
+  // dead-resident runs --apply archives, through the same selection and fences, without mutating.
   const snapshot = (root: string): unknown[] => fs.readdirSync(root).sort().map(name => {
     const file = path.join(root, name); const stat = fs.lstatSync(file);
     return [name, stat.ino, stat.mtimeMs, stat.ctimeMs, stat.isDirectory() ? snapshot(file) : fs.readFileSync(file, "utf8")];
   });
 
-  it("dry run lists the dead-resident runs --apply then deletes, and leaves the disk unchanged", async () => {
+  it("dry run lists the dead-resident runs --apply archives, retains their bytes, and leaves the disk unchanged", async () => {
     const { mesh, resident } = deadResident();
     const host = path.join(mesh.root, "residency", "host");
     const young = run(path.join(host, "runs", "young-resident"), { status: "completed", finishedAt: NOW - 1_000 });
@@ -464,9 +464,10 @@ describe.skipIf(process.platform !== "linux")("dead-resident sweep final pre-del
     expect(plan.skipped).toEqual([]);
     expect(plan.removedRuns).toContain(resident);
     expect(plan.removedRuns).not.toContain(young);
-    expect(plan.changes.find(change => change.path === resident)).toMatchObject({ afterBytes: 0 });
-    expect(plan.changes.find(change => change.path === resident)!.beforeBytes).toBeGreaterThan(0);
-    // ponytail: the apply half (it deletes exactly the plan) is disabled until smarty-dev#7916; re-enable there.
+    const archived = plan.changes.find(change => change.path === resident)!;
+    expect(archived.beforeBytes).toBeGreaterThan(0);
+    expect(archived.afterBytes).toBe(archived.beforeBytes);
+    // The apply half is disabled until smarty-dev#10678; archival must never count these bytes as freed.
   });
 
   it("dry run fails closed like --apply when a registry becomes unreadable after the snapshot", async () => {
@@ -691,12 +692,12 @@ describe("final pre-delete check fences", () => {
     if (process.platform === "linux") expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/uncertain/) });
   });
 
-  // smarty-dev#7916 (ASK 2 condition a): the per-delete check stats only actors/ and its non-registry children. A new
-  // registry at actors/<session>/actors.json that references the run stops the --apply delete, whether its session
-  // directory is new, already existed without a registry, or appears after the move into the graveyard. The last is
+  // smarty-dev#7916 (ASK 2 condition a): the per-run final check stats only actors/ and its non-registry children. A new
+  // registry at actors/<session>/actors.json that references the run stops the --apply archive, whether its session
+  // directory is new, already existed without a registry, or appears during the archive checks. The last is
   // the race shape of round 4 (CODE c6106402825): a listed non-registry directory gains actors.json after the check's
-  // probe; the helper's second check (proceed) probes again, stops the sweep and moves the run back.
-  for (const when of ["new session directory", "existing session directory", "after the graveyard move", "existing session directory, after the graveyard move"] as const) {
+  // probe; the fresh reference check keeps the referenced run in place.
+  for (const when of ["new session directory", "existing session directory", "during archive checks", "existing session directory, during archive checks"] as const) {
     // smarty-dev#10678: apply rejects at the boundary; the seam is never armed (the race returns with the protocol).
     it.skipIf(process.platform !== "linux")(`--apply rejects before the new actors/<session>/actors.json seam is armed (${when}; smarty-dev#10678)`, async () => {
       const mesh = deadRootMesh();
@@ -706,7 +707,7 @@ describe("final pre-delete check fences", () => {
       const rows = [{ id: "adopter", status: "idle", lastRunId: "old" }];
       const create = () => write(path.join(session, "actors.json"), JSON.stringify({ actors: rows }));
       let injected: () => boolean;
-      if (when.endsWith("after the graveyard move")) {
+      if (when.endsWith("during archive checks")) {
         const { verifiedRemoveTestHooks } = await import("../src/storage/verified-remove.js");
         let done = false;
         verifiedRemoveTestHooks.beforeOpen = target => { if (target === mesh.old && !done) { done = true; create(); } };
@@ -825,8 +826,8 @@ describe("final pre-delete check fences", () => {
     expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
   });
 
-  it.skipIf(process.platform !== "linux")("re-checks after the graveyard move and restores a run referenced in between", () => {
-    const runs = tmp("fabric-tombstone-");
+  it.skipIf(process.platform !== "linux")("re-checks before archive and keeps a run referenced at the final check", () => {
+    const runs = tmp("fabric-run-archive-final-check-");
     const target = run(path.join(runs, "target"), { status: "completed", finishedAt: 1 });
     const judged = () => fs.lstatSync(target);
     let calls = 0;

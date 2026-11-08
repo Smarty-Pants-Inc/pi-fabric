@@ -6,13 +6,12 @@ import {
   claimMeshRetentionSweep, FABRIC_RUN_ROOT_PREFIX, pruneActorSessionBackups,
   removeEmptyRunRoot, sweepTempRunRoots,
 } from "../src/storage/retention.js";
-import { sweepResidentRuns } from "../src/residency/retention.js";
 import { closeScratch, createScratch, sweepScratch } from "../src/storage/scratch.js";
 import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
 
 // smarty-dev#7916 acceptance: for each actual verified deleter, a swap between judgment and deletion deletes nothing;
-// no getuid deletes nothing; a future-dated backup name never costs the newest backup. Actor run archives are kept
-// outright; temp-run root routes are covered here and by retention-runroot-swaps.test.ts and retention-dead-owner.test.ts.
+// no getuid deletes nothing; a future-dated backup name never costs the newest backup. Actor and resident run archives
+// are keep-all; temp-run root routes are covered here and by retention-runroot-swaps.test.ts and retention-dead-owner.test.ts.
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const DEAD = "2147483647";
@@ -32,7 +31,6 @@ const run = (directory: string, status: Record<string, unknown> = { status: "com
   write(path.join(directory, "reply.json"), '{"text":"done"}');
   return directory;
 };
-const old = (file: string) => { const at = (NOW - 30 * DAY) / 1000; fs.utimesSync(file, at, at); return file; };
 /** The whole observable tree below a path (lstat, no following), for "nothing deleted" checks. */
 const shape = (file: string): unknown => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
@@ -84,11 +82,6 @@ const armSwap = async (target: string, swap: Swap): Promise<() => Record<string,
 
 interface Fixture { target: string; act: () => unknown }
 const FIXTURES: Record<string, () => Fixture> = {
-  sweepResidentRuns: () => {
-    const residency = tmp("fabric-vr-resident-");
-    const target = old(run(path.join(residency, "runs", "old")));
-    return { target, act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
-  },
   // Temp-root retention archives run trees separately; these fixtures target its verified empty-root deletion.
   "pruneClosedRunRoot (sweepTempRunRoots)": () => {
     const tempRoot = tmp("fabric-vr-closed-");
@@ -128,7 +121,8 @@ const FIXTURES: Record<string, () => Fixture> = {
   },
 };
 // The public mesh pass is not in FIXTURES: its apply rejects at the boundary until smarty-dev#10678 (pi-fabric#1014 SEC
-// P2-1), so no helper seam can fire through it. Actor-run archives are keep-all; the swap matrix covers dead resident runs and temp-run root routes. pruneActorSessionBackups only renames/moves backups; it is not a deleter.
+// P2-1), so no helper seam can fire through it. Actor and resident run archives are keep-all; the swap matrix covers
+// temp-run root routes. pruneActorSessionBackups only renames/moves backups; it is not a deleter.
 const meshPass = () => {
   const root = tmp("fabric-vr-mesh-");
   const registry = path.join(root, "actors", "project");

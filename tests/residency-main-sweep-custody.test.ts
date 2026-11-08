@@ -10,15 +10,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("../src/storage/retention-platform.js", () => ({ retentionV2Enabled: () => false }));
 const recorded = vi.hoisted(() => ({
   mutations: [] as Array<{ target: string; deleter: string; judged: unknown }>,
+  archives: [] as Array<{ source: string; archive: string; id: string; reason: string }>,
   compactions: [] as string[],
 }));
 vi.mock("../src/storage/verified-remove.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../src/storage/verified-remove.js")>(),
-  // Never call proceed, fallback or the real remover: record run removal
-  // at its final mutation boundary; event compaction must never reach it.
+  // Never call proceed, fallback or the real remover: record metadata mutations;
+  // event compaction must never reach it.
   verifiedRemove: (target: string, judged: unknown, options: { deleter: string }) => {
     recorded.mutations.push({ target, judged, deleter: options.deleter });
     return { removed: false, reason: "recorded only (test)" };
+  },
+}));
+vi.mock("../src/agents/worktree-manager.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/agents/worktree-manager.js")>(),
+  retainCleanupRoot: (source: string, archive: string, id: string, reason = "agent cleanup whole-root custody") => {
+    recorded.archives.push({ source, archive, id, reason });
+    return undefined; // Recorded-only: never create custody containers or move fixture trees.
   },
 }));
 vi.mock("../src/storage/retention.js", async (importOriginal) => {
@@ -38,6 +46,7 @@ const EXITED_PID = "2147483647";
 afterEach(() => {
   vi.restoreAllMocks();
   recorded.mutations.length = 0;
+  recorded.archives.length = 0;
   recorded.compactions.length = 0;
   // No fixture teardown: the invoking owner retains/removes its private roots.
 });
@@ -106,13 +115,15 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
     expect(custody.run.mock.calls.map(([id]) => id).sort()).toEqual(["owned", "unrelated"]);
     expect(recover.mock.calls.map(([run]) => run)).toEqual([unrelated]);
     expect(recorded.compactions).toEqual(retainRuns ? [unrelated] : []);
-    // retainRuns=false still proves the custody veto against a real eligible removal.
+    // retainRuns=false still proves the custody veto against eligible archival.
     // retainRuns=true visits/recoveries progress, but preserving traces has no mutation.
-    expect(recorded.mutations).toEqual(retainRuns ? [] : [{
-      target: unrelated, deleter: "residentRunRetention",
-      judged: expect.objectContaining({ ino: expect.any(Number), dev: expect.any(Number) }),
+    expect(recorded.mutations).toEqual([]);
+    expect(recorded.archives.filter(call => call.reason === "resident run retention whole-root custody")).toEqual(retainRuns ? [] : [{
+      source: unrelated, archive: `${path.join(root, "runs")}.trace-archive`, id: "unrelated",
+      reason: "resident run retention whole-root custody",
     }]);
-    // The removal case must still pass fresh native absence and owned
+    expect(recorded.archives.filter(({ id }) => id === "owned")).toEqual([]);
+    // The archive case must still pass fresh native absence and owned
     // tree/saved-result checks. No exit proof is needed for an inert compaction.
     if (retainRuns) expect(nativeExitChecks).not.toHaveBeenCalled();
     else expect(nativeExitChecks).toHaveBeenCalledWith(Number(EXITED_PID), 0);
@@ -141,6 +152,7 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
     try { collector.sweep(now, new Set(), 10_000); } finally { collector.close(); }
     expect(recover.mock.calls.map(([run]) => run)).toEqual([unrelated]);
     expect(recorded.mutations).toEqual([]);
+    expect(recorded.archives).toEqual([]);
     expect(recorded.compactions).toEqual([unrelated]);
     expect(snapshot(owned)).toEqual(ownedBefore);
   });

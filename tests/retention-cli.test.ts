@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MESH_RETENTION_APPLY_DISABLED_CODE, MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, MeshRetentionApplyDisabledError, sweepMeshRetention, writeReport } from "../src/storage/retention-cli.js";
+import { MESH_RETENTION_APPLY_DISABLED_CODE, MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, MeshRetentionApplyDisabledError, sweepMeshRetention, summaryLines, writeReport } from "../src/storage/retention-cli.js";
 import { pruneActorSessionBackups } from "../src/storage/retention.js";
 import { lockFile } from "../src/residency/file-lock.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -65,6 +65,31 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(plan.summary.applyRefusal).toBeUndefined();
     await applyRejects(root, { now: 7 * 3600000 });
     expect(fs.existsSync(path.join(actor, "session.jsonl.20260927T150000000Z.bak"))).toBe(true);
+  });
+
+  it("reports resident run archives as retained bytes and keeps metadata deletions in freed totals", async () => {
+    const { root, host } = make();
+    const run = path.join(host, "runs", "terminal");
+    fs.appendFileSync(path.join(run, "events.jsonl"), JSON.stringify({ sequence: 401, detail: "x".repeat(600 * 1024) }) + "\n");
+    fs.utimesSync(run, 1, 1);
+    const before = snapshot(root);
+    const plan = await sweepMeshRetention(root, { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000 });
+    expect(snapshot(root)).toEqual(before);
+    expect(plan.removedRuns).toEqual([run]);
+    const residentChange = plan.changes.find(change => change.path === run);
+    expect(residentChange).toMatchObject({ beforeBytes: expect.any(Number), afterBytes: expect.any(Number) });
+    expect(residentChange?.beforeBytes).toBeGreaterThan(512 * 1024);
+    expect(residentChange?.afterBytes).toBe(residentChange?.beforeBytes);
+    const lines = summaryLines(true, plan.summary);
+    expect(lines.some(line => /^sweepResidentRuns: would archive 1 \(\d+ bytes\), refused 0$/.test(line))).toBe(true);
+    expect(lines).toContain("WOULD_FREE_GIB=0.000");
+
+    const tally = (bytes: number) => ({ removed: 1, bytes, refused: {}, refusedBytes: {}, examples: {} });
+    const mixedLines = summaryLines(true, { deleters: {
+      sweepResidentRuns: tally(1024 ** 3), residentGenerationRecords: tally(1024 ** 3 / 8),
+    }, registries: { count: 0, parses: 0, maxParsesPerRegistry: 0, rootRewalks: 0 } });
+    expect(mixedLines).toContain("residentGenerationRecords: would delete 1 (134217728 bytes), refused 0");
+    expect(mixedLines).toContain("WOULD_FREE_GIB=0.125");
   });
 
   it("enumerates an owned actor registry larger than 1 MiB in a dry run without losing latest-run vetoes", async () => {

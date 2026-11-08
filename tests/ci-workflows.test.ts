@@ -1,4 +1,8 @@
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
@@ -369,6 +373,125 @@ describe("pinned local Bun setup contract", () => {
       BUN_CACHE_DIR: "${{ steps.pin.outputs.cache_dir }}",
     });
   });
+
+  it.skipIf(process.platform === "win32")(
+    "runs the extracted bunx before publishing PATH (POSIX fixture; Windows uses the native action in CI)",
+    () => {
+      const fixtureDir = fs.mkdtempSync(join(tmpdir(), "setup-bun-bunx-"));
+      try {
+        const runnerTemp = join(fixtureDir, "runner-temp");
+        const cacheDir = join(fixtureDir, "cache");
+        const toolsDir = join(fixtureDir, "tools");
+        fs.mkdirSync(runnerTemp);
+        fs.mkdirSync(cacheDir);
+        fs.mkdirSync(toolsDir);
+
+        const runnerOs = process.platform === "darwin" ? "macOS" : "Linux";
+        const asset = runnerOs === "macOS" ? "bun-darwin-x64.zip" : "bun-linux-x64.zip";
+        const archivePath = join(cacheDir, asset);
+        const archive = Buffer.from("fixture archive; extraction is controlled by the unzip stub");
+        fs.writeFileSync(archivePath, archive);
+        const archiveSha = createHash("sha256").update(archive).digest("hex");
+        const githubPath = join(fixtureDir, "github-path");
+        const invocationPathLog = join(fixtureDir, "invocation-paths");
+        const publicationLog = join(fixtureDir, "publication-states");
+        const fixtureBun = join(fixtureDir, "fixture-bun");
+        fs.writeFileSync(fixtureBun, [
+          "#!/bin/sh",
+          "set -eu",
+          'printf \'%s\\n\' "$PATH" >> "$BUN_FIXTURE_PATH_LOG"',
+          'if [ -s "$GITHUB_PATH" ]; then printf \'published\\n\' >> "$BUN_FIXTURE_PUBLICATION_LOG"; else printf \'not-published\\n\' >> "$BUN_FIXTURE_PUBLICATION_LOG"; fi',
+          'case "${0##*/}" in bunx|bunx.exe) version="$BUN_FIXTURE_BUNX_VERSION" ;; *) version=1.4.4 ;; esac',
+          'printf \'%s\\n\' "$version"',
+          "",
+        ].join("\n"));
+
+        const unzipStub = join(toolsDir, "unzip");
+        fs.writeFileSync(unzipStub, [
+          "#!/bin/sh",
+          "set -eu",
+          '[ "$1" = "-q" ] && [ "$3" = "-d" ]',
+          'asset=${2##*/}',
+          'unpacked=${asset%.zip}',
+          'mkdir -p "$4/$unpacked"',
+          'cp "$BUN_FIXTURE_BUN" "$4/$unpacked/bun"',
+          "",
+        ].join("\n"));
+        fs.chmodSync(unzipStub, 0o755);
+
+        const installStep = action("setup-bun").runs?.steps?.find((step) => step.name === "Verify and install Bun");
+        expect(installStep?.run).toBeTruthy();
+        const installerEnv = {
+          ...process.env,
+          PATH: `${toolsDir}${delimiter}${process.env.PATH ?? ""}`,
+          RUNNER_OS: runnerOs,
+          RUNNER_ARCH: "X64",
+          RUNNER_TEMP: runnerTemp,
+          BUN_ASSET: asset,
+          BUN_SHA: archiveSha,
+          BUN_CACHE_DIR: cacheDir,
+          GITHUB_PATH: githubPath,
+          BUN_FIXTURE_BUN: fixtureBun,
+          BUN_FIXTURE_PATH_LOG: invocationPathLog,
+          BUN_FIXTURE_PUBLICATION_LOG: publicationLog,
+          BUN_FIXTURE_BUNX_VERSION: "1.4.4",
+        };
+        const runInstaller = () => spawnSync("/bin/bash", ["-c", installStep!.run!], {
+          cwd: cacheDir,
+          env: installerEnv,
+          encoding: "utf8",
+        });
+
+        const installed = runInstaller();
+        expect(installed.status).toBe(0);
+        expect(installed.stderr).toBe("");
+        const publishedEntries = fs.readFileSync(githubPath, "utf8").trim().split(/\r?\n/);
+        expect(publishedEntries).toHaveLength(1);
+        const binDir = publishedEntries[0]!;
+        expect(basename(binDir)).toBe(asset.slice(0, -".zip".length));
+        expect(fs.readdirSync(binDir).sort()).toEqual(["bun", "bunx"]);
+
+        const bunx = join(binDir, "bunx");
+        expect(fs.lstatSync(bunx).isSymbolicLink()).toBe(true);
+        expect(fs.readlinkSync(bunx)).toBe("bun");
+        fs.accessSync(bunx, fs.constants.X_OK);
+        const bunxRun = spawnSync(bunx, ["--version"], {
+          env: {
+            PATH: binDir,
+            GITHUB_PATH: githubPath,
+            BUN_FIXTURE_PATH_LOG: invocationPathLog,
+            BUN_FIXTURE_PUBLICATION_LOG: publicationLog,
+            BUN_FIXTURE_BUNX_VERSION: "1.4.4",
+          },
+          encoding: "utf8",
+        });
+        expect(bunxRun.status).toBe(0);
+        expect(bunxRun.stdout.trim()).toBe("1.4.4");
+        expect(fs.readFileSync(invocationPathLog, "utf8").trim().split(/\r?\n/).at(-1)).toBe(binDir);
+        expect(fs.readFileSync(publicationLog, "utf8").trim().split(/\r?\n/)).toEqual([
+          "not-published",
+          "not-published",
+          "published",
+        ]);
+
+        fs.writeFileSync(githubPath, "");
+        installerEnv.BUN_FIXTURE_BUNX_VERSION = "1.4.5";
+        const rejected = runInstaller();
+        expect(rejected.status).not.toBe(0);
+        expect(rejected.stderr).toContain("Expected bunx 1.4.4, got: 1.4.5");
+        expect(fs.readFileSync(githubPath, "utf8")).toBe("");
+        expect(fs.readFileSync(publicationLog, "utf8").trim().split(/\r?\n/)).toEqual([
+          "not-published",
+          "not-published",
+          "published",
+          "not-published",
+          "not-published",
+        ]);
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("Windows i9 test observation contract", () => {

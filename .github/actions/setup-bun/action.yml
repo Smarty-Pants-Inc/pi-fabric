@@ -103,6 +103,18 @@ runs:
           echo "::error::Expected Bun 1.4.4, got: $version" >&2
           exit 1
         fi
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          cp "$bin_dir/$binary" "$bin_dir/bunx.exe"
+          bunx="$bin_dir/bunx.exe"
+        else
+          ln -s bun "$bin_dir/bunx"
+          bunx="$bin_dir/bunx"
+        fi
+        bunx_version=$("$bunx" --version)
+        if [[ "$bunx_version" != 1.4.4 ]]; then
+          echo "::error::Expected bunx 1.4.4, got: $bunx_version" >&2
+          exit 1
+        fi
         path_entry="$bin_dir"
         if [[ "$RUNNER_OS" == Windows ]]; then
           path_entry=$(cygpath -w "$bin_dir")

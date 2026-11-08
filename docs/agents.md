@@ -26,6 +26,61 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
+### Hosted AgentService: sticky placement and P0 capacity
+
+For an embedded host using `AgentService`, configure `stickyRoutes` with opaque
+**topology agent/pair IDs**, not models or raw execution ports. A session child's
+explicit `routingKey` selects one ID by rendezvous hashing **before `prepare`**.
+Use a stable PR identity as the key, not its changing head SHA or task text:
+
+```ts host
+import {
+  AgentService, createAgentServiceClient, createAgentServiceHandler,
+} from "pi-fabric/agents";
+
+// hostPort is one AgentExecutionPort. Its prepare/execute/resume, controls and
+// cleanup resolve request.routeId to the host's existing topology agent/pair.
+const service = new AgentService({
+  rootId: "review-session",
+  port: hostPort,
+  stickyRoutes: ["topology:review-pair-a", "topology:review-pair-b"],
+  maxConcurrent: 4,
+  reservedP0: 1,
+});
+const agents = createAgentServiceClient(
+  createAgentServiceHandler(service, "review-session"), service.capabilities,
+);
+const review = await agents.run({
+  task: "Review the latest PR head",
+  routingKey: "org/repo/pull/71",
+  priority: "normal",
+});
+const urgent = await agents.spawn({ task: "Handle the incident", priority: "p0" });
+```
+
+The host copies and validates route configuration at construction: IDs must be
+unique nonblank strings and retain their exact spelling. Keyed session children
+require a nonempty configured route list; unkeyed children keep legacy placement.
+Route order does not affect selection. Each child's host-selected `routeId`
+appears in its public record, host events and snapshot, and accompanies every port
+operation. Restore/resume retains that ID and the child's identity across
+continuation generations, even if routes were reordered or the ID was removed
+from current configuration; the host must still resolve retained IDs. A fresh
+child uses current configuration. Guests cannot supply `routeId`, and port
+progress/results cannot replace it. Host checkpoints remain private.
+
+`reservedP0` defaults to `0` and must be an integer from `0` through
+`maxConcurrent` inclusive. It reserves **per-parent session one-shot child**
+capacity for explicit `priority: "p0"`; all-reserved is intentionally P0-only.
+Normal children (omitted priority or `"normal"`) cannot use the reserve. P0 can
+also use shared slots, but cannot exceed the same per-parent concurrency ceiling.
+A queued normal child does not block eligible P0 work. Priority is never inferred
+from task text and does not bypass root-wide `maxStarts`, lineage, depth,
+authority, cancellation or cleanup rules. These fields add no topology actions,
+model routing or scheduler. The reservation does **not** govern
+`topology.dispatch` durable spawn or actor mailboxes; neither actor admission nor
+`maxStarts` receives a separate P0 budget.
+
 ### Background completion inbox
 
 `agents.spawn` returns immediately; independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.

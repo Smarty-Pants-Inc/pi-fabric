@@ -13,14 +13,24 @@ export function assertAgentTask(request: {task: string; recursive?: boolean; ext
 export class AgentAdmission {
   readonly #parents = new Map<string, Semaphore>();
   starts: number;
-  constructor(readonly concurrency: number, readonly maxStarts = Infinity, readonly maxDepth = Infinity, starts = 0) {
+  /** reservedP0 may equal concurrency, leaving no normal admission capacity. */
+  constructor(readonly concurrency: number, readonly maxStarts = Infinity, readonly maxDepth = Infinity, starts = 0, readonly reservedP0 = 0) {
     if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("Agent concurrency must be positive");
+    if (!Number.isSafeInteger(reservedP0) || reservedP0 < 0 || reservedP0 > concurrency) {
+      throw new Error("Agent reservedP0 must be a safe integer between zero and concurrency");
+    }
     this.starts = starts;
   }
-  acquire(parentId: string, signal?: AbortSignal): Promise<() => void> {
+  #parent(parentId: string): Semaphore {
     let semaphore = this.#parents.get(parentId);
-    if (!semaphore) this.#parents.set(parentId, semaphore = new Semaphore(this.concurrency));
-    return semaphore.acquire(signal);
+    if (!semaphore) this.#parents.set(parentId, semaphore = new Semaphore(this.concurrency, this.reservedP0));
+    return semaphore;
+  }
+  tryAcquire(parentId: string, signal?: AbortSignal, priority = false): (() => void) | undefined {
+    return this.#parent(parentId).tryAcquire(signal, priority);
+  }
+  acquire(parentId: string, signal?: AbortSignal, priority = false): Promise<() => void> {
+    return this.#parent(parentId).acquire(signal, priority);
   }
   admit(depth: number): void {
     if (depth > this.maxDepth) throw new Error(`Fabric agent depth limit reached (${this.maxDepth})`);

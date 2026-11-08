@@ -2,11 +2,18 @@ import type { AgentRunRecord, AgentRunRequest, AgentUsage } from "./types.js";
 
 export type AgentServiceRequest = Pick<AgentRunRequest,
   "task" | "name" | "model" | "thinking" | "tools" | "timeoutMs" | "schema" | "images" | "systemPrompt" | "recursive" | "cwd"
-> & { runner?: "pi"; kernel?: "typescript" | "inherit"; extensions?: true; worktree?: false; residency?: "session" | "durable" };
+> & { runner?: "pi"; kernel?: "typescript" | "inherit"; extensions?: true; worktree?: false; residency?: "session" | "durable";
+  /** Stable work identity, independent of task text or PR head. Requires host stickyRoutes. */
+  routingKey?: string;
+  /** Explicit session-child admission class; never inferred from the prompt. */
+  priority?: "normal" | "p0";
+};
 export type AgentServiceStatus = AgentRunRecord["status"] | "paused";
 export type AgentServiceRecord = Omit<AgentRunRecord, "status" | "transport" | "cwd"> & {
   status: AgentServiceStatus; cwd?: string;
   rootId: string; parentId: string; depth: number; generation: number; checkpoint?: unknown;
+  /** Host-selected opaque topology agent/pair ID, pinned across continuations. */
+  routeId?: string;
 };
 /** Model-facing records never carry opaque host checkpoints. */
 export type AgentPublicRecord = Omit<AgentServiceRecord, "checkpoint">;
@@ -15,6 +22,8 @@ export interface AgentPrepareRequest extends AgentControlRequest {
 }
 export interface AgentControlRequest {
   rootId: string; parentId: string; id: string; generation: number;
+  /** Resolved by the single host execution port; never a guest request argument. */
+  routeId?: string;
 }
 export interface AgentExecutionRequest extends AgentPrepareRequest, AgentControlRequest {
   binding: unknown; checkpoint?: unknown;
@@ -101,6 +110,10 @@ export interface AgentAuthorityBoundary { checkpoint?: boolean }
 export interface AgentServiceOptions {
   rootId: string; port: AgentExecutionPort;
   maxStarts?: number; maxDepth?: number; maxConcurrent?: number;
+  /** Copied once. Opaque topology agent/pair IDs for keyed session children. */
+  stickyRoutes?: string[];
+  /** Per-parent session-child capacity reserved for explicit P0; default 0, up to maxConcurrent. */
+  reservedP0?: number;
   assertAuthority?(callerId: string, boundary?: AgentAuthorityBoundary): void | Promise<void>;
   onEvent?(event: AgentServiceEvent): void | Promise<void>;
   snapshot?: AgentServiceSnapshot;

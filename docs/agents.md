@@ -63,11 +63,25 @@ unique nonblank strings and retain their exact spelling. Keyed session children
 require a nonempty configured route list; unkeyed children keep legacy placement.
 Route order does not affect selection. Each child's host-selected `routeId`
 appears in its public record, host events and snapshot, and accompanies every port
-operation. Restore/resume retains that ID and the child's identity across
-continuation generations, even if routes were reordered or the ID was removed
-from current configuration; the host must still resolve retained IDs. A fresh
-child uses current configuration. Guests cannot supply `routeId`, and port
-progress/results cannot replace it. Host checkpoints remain private.
+operation. Without a liveness callback, restore/resume retains that ID and the
+child's identity across continuation generations, even if routes were reordered
+or the ID was removed from current configuration; the host must still resolve
+retained IDs. A fresh child uses current configuration.
+
+An optional `port.liveRoutes(): readonly string[] | Promise<readonly string[]>`
+callback supplies one liveness snapshot. Fresh keyed children rendezvous over
+configured routes reported live. On restore/resume, a pinned route reported live
+is retained even if it is absent from current configuration; otherwise, the
+service rendezvous-hashes the same `routingKey` over configured live candidates
+and re-pins before `prepare` or `resume`. If there are no live candidates, the
+keyed child is refused with a clear no-live-sticky-route error before admission.
+Omitting the callback preserves the static behavior above; unkeyed legacy
+placement is unaffected, so only keys whose pinned route is dead move. There is
+one liveness snapshot and no execution retry or replay: the selected route is
+attempted at most once. A route that dies after the snapshot is not reselected.
+
+Guests cannot supply `routeId`, and port progress/results cannot replace it. Host
+checkpoints remain private.
 
 `reservedP0` defaults to `0` and must be an integer from `0` through
 `maxConcurrent` inclusive. It reserves **per-parent session one-shot child**

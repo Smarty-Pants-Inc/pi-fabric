@@ -566,6 +566,8 @@ export class ActorQueueCheckpointError extends Error {
 
 /** A mesh write is normally bounded at 10s; give each actor setup await its own 30s ceiling. */
 export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
+// Leave response-publication headroom inside both resident clients' 30s exchange.
+export const ACTOR_SESSION_RESET_TIMEOUT_MS = 25_000;
 /** Windows metadata work yields after each actor; other platforms retain bounded batches. */
 export const ACTOR_RETENTION_BATCH_SIZE = { win32: 1, other: 8 } as const;
 /** Caller-owned asks have a finite budget; callerless work remains pending (#816). */
@@ -920,7 +922,9 @@ export class ActorManager {
   readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
   readonly #pendingDeliveryOutcomes = new Map<string, DeliveryOutcomeRecord[]>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
-  readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
+  readonly #pendingResets = new Map<string, Array<{
+    expiresAt: number; expire(): void; resolve(info: FabricActorInfo): void; reject(error: Error): void;
+  }>>();
   readonly #maxSessionBytes: number;
   readonly #transientBlockCooldownMs: number;
   readonly #transientBlockMaxMs: number;
@@ -1336,6 +1340,12 @@ export class ActorManager {
             // backlog discovered by a same-root creator's residency fallback (#11107).
             if (this.#deadLetterRetirementPending.has(actor.id)) this.#replayDeadLetters(actor);
           }
+        }
+        // Slot/participant revocation can remove management authority (or the
+        // registry row) before an accepted removal's own serial drain settles.
+        // Observe only those already-owned drains; never re-admit their work.
+        for (const actor of this.#draining.values()) {
+          if (this.#removals.has(actor.id)) this.#reconcileActorRun(actor, Date.now());
         }
         this.#confirmDeliveryOutcomes();
         this.#flushFilterState();
@@ -2130,8 +2140,9 @@ export class ActorManager {
 
   #assertSlotExecutionSettled(cleanup: RemovalCleanup): void {
     if (!cleanup.slotTopics) return;
+    const slot = `protected slot topics: ${cleanup.slotTopics.join(", ")}`;
     if (cleanup.slotLaunchUnknown || this.#slotLaunchUnknown.has(cleanup.id)) {
-      throw new Error("Protected actor launch outcome is unidentified; native execution settlement must be reconciled before cleanup");
+      throw new Error(`Protected actor launch outcome is unidentified; native execution settlement must be reconciled before cleanup (${slot})`);
     }
     const runs = new Set([...(cleanup.slotRunIds ?? []), ...(this.#slotRunIds.get(cleanup.id) ?? []),
       ...(cleanup.lastRunId ? [cleanup.lastRunId] : []),
@@ -2139,7 +2150,7 @@ export class ActorManager {
     for (const runId of runs) {
       // Native retained-tree custody checks descendants, unknown launch outcomes,
       // pending stop/release and lost contact. A terminal status alone is NOT proof.
-      if (this.agents.retentionCustodyVeto(runId) !== false) throw new Error(`Protected actor execution ${runId} is not proven settled; cleanup retained`);
+      if (this.agents.retentionCustodyVeto(runId) !== false) throw new Error(`Protected actor execution ${runId} is not proven settled; cleanup retained (${slot})`);
     }
   }
 
@@ -3095,7 +3106,7 @@ export class ActorManager {
    * finishes on the old session first; it is not interrupted. The session file is archived
    * beside it; instructions, topics, bindings, the queue and the message log are kept.
    */
-  async resetSession(id: string, options: { beforeCommit?: (id: string) => void } = {}): Promise<FabricActorInfo> {
+  async resetSession(id: string, options: { beforeCommit?: (id: string) => void; timeoutMs?: number } = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#draining.get(actor.id);
     // A drain owns admission before it installs its abort controller, including
@@ -3103,8 +3114,29 @@ export class ActorManager {
     if (actor.draining || running || this.#inFlight.has(actor.id) || actor.abortController) {
       options.beforeCommit?.(actor.id);
       return new Promise((resolve, reject) => {
+        const timeoutMs = Math.max(1, options.timeoutMs ?? ACTOR_SESSION_RESET_TIMEOUT_MS);
+        const waiter = {
+          expiresAt: Date.now() + timeoutMs,
+          expire: () => {
+            const pending = this.#pendingResets.get(actor.id);
+            const index = pending?.indexOf(waiter) ?? -1;
+            // The synchronous boundary owns consumed waiters: archival may
+            // already be committed and publication has its preparation deadline.
+            if (index < 0) return;
+            pending!.splice(index, 1);
+            if (pending!.length === 0) this.#pendingResets.delete(actor.id);
+            // Remove intent BEFORE answering timeout: a late run boundary must
+            // not archive on behalf of a resident command that already failed.
+            waiter.reject(new ActorSessionResetCancelledError(actor.id,
+              `Fabric actor ${actor.id} session reset timed out after ${timeoutMs}ms`));
+          },
+          resolve: (info: FabricActorInfo) => { clearTimeout(timer); resolve(info); },
+          reject: (error: Error) => { clearTimeout(timer); reject(error); },
+        };
+        const timer = setTimeout(waiter.expire, timeoutMs);
+        timer.unref?.();
         const waiters = this.#pendingResets.get(actor.id) ?? [];
-        waiters.push({ resolve, reject });
+        waiters.push(waiter);
         this.#pendingResets.set(actor.id, waiters);
       });
     }
@@ -3167,6 +3199,11 @@ export class ActorManager {
     const running = this.#runningActor(actor.id);
     if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) return undefined;
     const live = this.#liveActor(actor);
+    // A native completion may reach this boundary before an overdue timer is
+    // dispatched. Expiry is a deadline, not authority borrowed from timer order.
+    for (const waiter of [...(this.#pendingResets.get(actor.id) ?? [])]) {
+      if (Date.now() >= waiter.expiresAt) waiter.expire();
+    }
     const waiters = this.#pendingResets.get(actor.id);
     this.#pendingResets.delete(actor.id);
     if (waiters && (!this.#actors.has(actor.id) || !this.#canManage(actor.id))) {
@@ -9302,6 +9339,11 @@ export class ActorManager {
     return exit?.unfinished === true && exit.exitedAt === exitedAt && Date.now() - exit.exitedAt > 5_000;
   }
 
+  /** An accepted removal retains its original drain even after slot/participant revocation. */
+  #ownsRemovalDrain(actor: ManagedActor): boolean {
+    return this.#removals.has(actor.id) && this.#draining.get(actor.id) === actor;
+  }
+
   /**
    * Native close/status monitoring is the normal path. The existing mesh event
    * wake plus its 5s idle maintenance safety net recover a lost continuation;
@@ -9332,17 +9374,18 @@ export class ActorManager {
       return;
     }
     const recovery = this.#runReconciliations.get(actor.id);
-    if (!run || !recovery || recovery.runId !== run.id || recovery.pending || now < (recovery.retryAt ?? 0) ||
-        now - run.startedAt < ACTOR_DEAD_WORKER_RECONCILE_AFTER_MS || this.#closing || this.#releaseStrict ||
-        this.#canConsumeMesh?.() === false || !this.#canManage(actor.id)) return;
+    const removing = this.#ownsRemovalDrain(actor);
+    if (!recovery || recovery.runId !== run.id || recovery.pending || now < (recovery.retryAt ?? 0) ||
+        (!removing && now - run.startedAt < ACTOR_DEAD_WORKER_RECONCILE_AFTER_MS) || this.#closing || this.#releaseStrict ||
+        this.#canConsumeMesh?.() === false || (!removing && !this.#canManage(actor.id))) return;
     const exit = this.agents.actorWorkerExit(run.id, actor.id);
     if (!exit || now - exit.exitedAt <= 5_000) return;
-    const current = () => !this.#closing && this.#actors.has(actor.id) && this.#canManage(actor.id) &&
-      this.#runningActor(actor.id)?.inFlightRun === run;
+    const current = () => !this.#closing && (this.#ownsRemovalDrain(actor) ||
+      (this.#actors.has(actor.id) && this.#canManage(actor.id))) && this.#runningActor(actor.id)?.inFlightRun === run;
     // Known-terminal results may have a stranded original continuation too, but
     // are not stuck work. Recheck both classification and captured episode after
     // the asynchronous alarm claim; NEXT must never inherit the old notice.
-    if (exit.unfinished) {
+    if (exit.unfinished && !removing) {
       const reason = this.#runGone(run.id) === "worker-pid-reused" ? "worker-pid-reused" : "worker-gone";
       this.#alarmActorState(actor, "actor-run-stuck", run.startedAt, 0, now, () => ({
         actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, runId: run.id,

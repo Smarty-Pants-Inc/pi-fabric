@@ -110,6 +110,7 @@ export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_STOP_MS = 5_000;
 const LOCK_RETRY_MIN_MS = 100;
 const LOCK_RETRY_MAX_MS = 2_000;
+const BRIDGE_NOTIFICATION_WINDOW_MS = LOCK_RETRY_MIN_MS;
 // A WAL-cap refusal (FABRIC_MESH_STATE_WAL_CAP) can last until the operator rolls back: log it at most once a minute.
 const WAL_CAP_LOG_MS = 60_000;
 // A capped WAL stays capped until a reader lets go or the operator rolls back: back off 1 s doubling to 30 s,
@@ -438,7 +439,7 @@ export interface BridgeSide {
   /** Install before the first snapshot. Changes are latched during in-flight work.
    * Watch failure is fatal. undefined selects transitional legacy-remote polling only with
    * reported protocolVersion 1; local stores always require watches. Manual step() needs no subscription. */
-  subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
+  subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void, log?: (message: string) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
   /** Reported hello version, required before a remote may use the pre-capability polling path. */
   readonly protocolVersion?: number | undefined;
   /** An open, negotiated traffic lane remains usable despite a retained pending mirror. */
@@ -1079,14 +1080,17 @@ export class StoreBridgeSide implements BridgeSide {
       this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }));
   }
 
-  subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): () => void {
+  subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void, log?: (message: string) => void): () => void {
     let active = true;
     let queued = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    let burst: ReturnType<typeof setImmediate> | undefined;
+    let burst: ReturnType<typeof setTimeout> | undefined;
+    let eventBurst: ReturnType<typeof setImmediate> | undefined;
     let scanNext = false;
     let eventsNext = false;
     let retryMs = LOCK_RETRY_MIN_MS;
+    let deferredCaptures = 0;
+    let deferredLoggedAt = Date.now();
     let baseline: ReturnType<typeof snapshot> | undefined;
     // File snapshots are private, copy-on-write parses: reuse their read-only entries.
     // Other backends use detached prefix reads, reused only within one snapshot.
@@ -1134,30 +1138,43 @@ export class StoreBridgeSide implements BridgeSide {
     };
     // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
     // read then sees old state and may receive no later fs event. Fence the observation
-    // against the pending writer, retrying actual contention only, never idle polling.
-    // smarty-dev#10391: the snapshot reads every host, participant and handoff row and the participant and
-    // lease files. Taken inside the fence, it held state.db's write lock on EVERY change notification of the
-    // mesh, for each bridge: on a busy hub each state write woke every bridge into a full scan under the lock,
-    // so the bridges' share grew with the load (the idle spin). It is taken first; the fence then only proves
-    // that no such row changed since its revision (the pending writer has committed by then) and that both
-    // file directories kept their stamps. A failed proof takes it again; the last try runs inside the fence.
+    // against the pending writer; failed proofs retry only with bounded backoff, never idle polling.
+    // The fence exists because a WAL write may be observed before its writer's COMMIT/wal-index publication;
+    // that read can see old state and receive no later fs event. A successful fence proves the out-of-fence
+    // observation followed the pending writer and that neither the relevant rows nor file directories changed.
+    // Previously a final in-fence full snapshot guaranteed progress after failed proofs, but its rows/files/hash
+    // scan held the SQLite write lock and amplified every notification. Retry only bounded out-of-fence captures;
+    // if churn defeats all proofs, defer to the next notification/retry rather than widening the lock.
     const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
-    const capture = (): ReturnType<typeof snapshot> => {
+    const capture = (): ReturnType<typeof snapshot> | undefined => {
       if (this.store.stateBackend !== "sqlite") return snapshot();
-      for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS - 1; attempt += 1) {
+      for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS; attempt += 1) {
         const revision = this.store.stateRevision();
         const stamps = files();
         const value = snapshot();
         if (revision !== undefined && this.store.withStateWriteFence(() =>
           this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
       }
-      return this.store.withStateWriteFence(snapshot);
+      deferredCaptures += 1;
+      const now = Date.now();
+      if (now - deferredLoggedAt >= 60_000) {
+        log?.(`bridge ${this.peer}: capture deferred: ${deferredCaptures} in last 60s (retry ${retryMs}ms)`);
+        deferredCaptures = 0;
+        deferredLoggedAt = now;
+      }
+      return undefined;
     };
     const flush = (): void => {
       queued = false;
       if (!active) return;
       try {
         const next = capture();
+        if (!next) {
+          queued = true;
+          retryTimer = setTimeout(() => { retryTimer = undefined; flush(); }, retryMs);
+          retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+          return;
+        }
         retryMs = LOCK_RETRY_MIN_MS;
         if (!baseline || next.digest !== baseline.digest) {
           const previousExpiry = new Map(baseline?.native.hosts.map(host => [host.record.id, host.expiresAt]) ?? []);
@@ -1174,7 +1191,8 @@ export class StoreBridgeSide implements BridgeSide {
         } else failed(error instanceof Error ? error : new Error(String(error)));
       }
     };
-    // One check-phase tick per notification burst: the burst's scan (if any) first, then its event wake.
+    // A fixed short window coalesces fs notification bursts and bounds change-mirror latency; the burst's
+    // scan (if any) runs first, then its event wake. Repeated notifications do not slide the deadline.
     // A lease renewal followed by routed work arrives as one burst; classifying the lease before the
     // directions wake lets their authority check see the pending lease and refresh it now, instead of
     // forwarding under the old mirror and leaving the renewal to the half-lease flush.
@@ -1190,12 +1208,29 @@ export class StoreBridgeSide implements BridgeSide {
       // runs after the whole poll phase has delivered its notifications; any arriving while one is queued or
       // a busy retry waits join it, and a later burst queues at most one trailing scan. Events never scan
       // and never wait for a busy retry: they wait at most for this tick's own scan.
-      if (kind === "events") eventsNext = true;
-      else if (queued) return;
+      if (kind === "events") {
+        eventsNext = true;
+        if (!scanNext && burst === undefined) {
+          eventBurst ??= setImmediate(() => {
+            eventBurst = undefined;
+            if (!active || scanNext || burst !== undefined) return;
+            eventsNext = false;
+            changed("events");
+          });
+          return;
+        }
+      } else if (queued) return;
       else { queued = true; scanNext = true; }
-      burst ??= setImmediate(tick);
+      burst ??= setTimeout(tick, BRIDGE_NOTIFICATION_WINDOW_MS);
     }, failed);
-    try { baseline = capture(); }
+    try {
+      baseline = capture();
+      if (!baseline) {
+        queued = true;
+        retryTimer = setTimeout(() => { retryTimer = undefined; flush(); }, retryMs);
+        retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+      }
+    }
     catch (error) {
       if (!isMeshRetryableBusy(error)) { close(); throw error; }
       // Keep installed watches and let the other side subscribe. A zero-wait SQLite
@@ -1208,7 +1243,8 @@ export class StoreBridgeSide implements BridgeSide {
     return () => {
       active = false;
       if (retryTimer !== undefined) clearTimeout(retryTimer);
-      if (burst !== undefined) clearImmediate(burst);
+      if (burst !== undefined) clearTimeout(burst);
+      if (eventBurst !== undefined) clearImmediate(eventBurst);
       close();
     };
   }
@@ -5399,7 +5435,7 @@ export class MeshBridge {
           while (unsubscribers.length < sides.length && !this.#stopped) {
             const side = sides[unsubscribers.length]!;
             if (!side.subscribeChanges && unsubscribers.length === 0) throw new Error("The local bridge side requires filesystem change notifications");
-            const unsubscribe = await side.subscribeChanges?.(changed, failed);
+            const unsubscribe = await side.subscribeChanges?.(changed, failed, message => this.#log(message));
             if (!unsubscribe) {
               if (unsubscribers.length === 0) throw new Error("The local bridge side requires filesystem change notifications");
               if (side.protocolVersion !== LEGACY_BRIDGE_PROTOCOL_VERSION) {

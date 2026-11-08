@@ -23,7 +23,9 @@ import { createFileActorDirectory, readFileActorsForMirror } from "./bridge-nats
 import type { MeshIdentity } from "./event-log.js";
 import type { BridgePresence } from "./bridge.js";
 import {
+  BRIDGE_NATS_SESSION_ID,
   bridgeNatsLinkIdentity,
+  type BridgeNatsFileAskTarget,
   type BridgeNatsMirrorSet,
   type BridgeNatsPort,
   type BridgeNatsPortDelivery,
@@ -217,21 +219,52 @@ export type NatsBridgeAllowLike =
   | { readonly kind: "root"; readonly id: string; readonly machine?: string }
   | { readonly kind: "actor"; readonly rootId: string; readonly name: string; readonly id?: string };
 
+/** Port admission policy; the protected ids are internal startNatsLink context, never public JSON. */
+export interface NatsBridgePresenceAllow {
+  readonly file?: readonly NatsBridgeAllowLike[];
+  readonly nats?: readonly NatsBridgeAllowLike[];
+  readonly fileFleetRoots?: boolean;
+  readonly fileAskTargets?: readonly BridgeNatsFileAskTarget[];
+  /** Every org.json principal seat and keeper rotation (pins.bound). Missing context disables the fallback. */
+  readonly protectedFileRootIds?: readonly string[];
+}
+
 /**
- * Presence admission from the link config's allow section: `allow.file` names what may be held in
- * KV (toNats), `allow.nats` what may be mirrored into the file mesh (toFile). Exact ids only; an
- * actor by its owner root and name (and its id when pinned). A NATS root pinned to a machine is
- * admitted only from that machine.
+ * Presence admission from the link config's allow section: explicit entries take precedence on
+ * either side. The optional file-root fallback excludes principal-bound ids; actors need an exact
+ * ask target pin under a non-principal file root. Callers still prove native live presence,
+ * freshness, uniqueness and owner epochs before holding KV rows.
+ * A NATS root pinned to a machine is admitted only from that machine.
  */
-export const natsBridgeAdmit = (allow: { readonly file?: readonly NatsBridgeAllowLike[]; readonly nats?: readonly NatsBridgeAllowLike[] }) => {
+export const natsBridgeAdmit = (allow: NatsBridgePresenceAllow) => {
   const file = Object.freeze([...(allow.file ?? [])].map(entry => Object.freeze({ ...entry })));
   const nats = Object.freeze([...(allow.nats ?? [])].map(entry => Object.freeze({ ...entry })));
-  return (record: FabricParticipantRecord, direction: "toNats" | "toFile", machine?: string): boolean =>
-    (direction === "toNats" ? file : nats).some(entry => entry.kind === "root"
+  const fileFleetRoots = allow.fileFleetRoots === true;
+  const fileAskTargets = Object.freeze([...(allow.fileAskTargets ?? [])].map(target => Object.freeze({ ...target })));
+  const protectedRoots = allow.protectedFileRootIds === undefined ? undefined : new Set(allow.protectedFileRootIds);
+  const explicitRoots = new Set([...file, ...nats].flatMap(entry => entry.kind === "root" ? [entry.id] : []));
+  return (record: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name"> &
+    Partial<Pick<FabricParticipantRecord, "remoteHost" | "bridgeVia" | "ownerHostId" | "ownerIdentityId" | "ownerIncarnation">>,
+    direction: "toNats" | "toFile", machine?: string): boolean => {
+    if ((direction === "toNats" ? file : nats).some(entry => entry.kind === "root"
       ? record.kind === "root" && record.id === entry.id && record.rootId === entry.id &&
         (direction === "toNats" || entry.machine === undefined || entry.machine === machine)
       : direction === "toNats" && record.kind === "actor" && record.rootId === entry.rootId && record.name === entry.name &&
-        (entry.id === undefined || entry.id === record.id));
+        (entry.id === undefined || entry.id === record.id))) return true;
+    if (direction !== "toNats" || !fileFleetRoots || protectedRoots === undefined ||
+        record.remoteHost !== undefined || record.bridgeVia !== undefined) return false;
+    if (record.kind === "root") return typeof record.id === "string" && record.rootId === record.id &&
+      BRIDGE_NATS_SESSION_ID.exec(record.id)?.[0] === record.id && !explicitRoots.has(record.id) && !protectedRoots.has(record.id);
+    // Never override an explicit actor (including a mismatching id pin or an entry on NATS), or
+    // route an actor through an owner pinned to NATS. The native listing proves the owner's life.
+    return record.kind === "actor" && /^[0-9a-f]{32}$/.exec(record.id)?.[0] === record.id &&
+      BRIDGE_NATS_SESSION_ID.exec(record.rootId)?.[0] === record.rootId && !protectedRoots.has(record.rootId) &&
+      record.ownerHostId === record.rootId && record.ownerIdentityId === record.rootId && !!record.ownerIncarnation &&
+      !nats.some(entry => entry.kind === "root" && entry.id === record.rootId) &&
+      ![...file, ...nats].some(entry => entry.kind === "actor" && (entry.id === record.id ||
+        (entry.rootId === record.rootId && entry.name === record.name))) &&
+      fileAskTargets.some(target => target.actorId === record.id && target.rootId === record.rootId);
+  };
 };
 
 const meshKind = (kind: FabricParticipantRecord["kind"]): MeshIdentity["kind"] | undefined =>
@@ -554,7 +587,7 @@ export interface NatsBridgeSideConfig {
     readonly livenessStream: string;
     readonly pathBMachines: readonly string[];
   };
-  readonly allow: { readonly file?: readonly NatsBridgeAllowLike[]; readonly nats?: readonly NatsBridgeAllowLike[] };
+  readonly allow: NatsBridgePresenceAllow;
 }
 
 export interface OpenNatsBridgeSideOptions {

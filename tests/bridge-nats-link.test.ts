@@ -4,16 +4,22 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createFileActorDirectory, readFileActorsForMirror } from "../src/mesh/bridge-nats-actors.js";
 import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
 import { createNatsFileLink, NatsCarrierDeferredError, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { BRIDGE_NATS_LEDGER_LOCK, openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
-import type { NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
+import { natsLinkAllowListConfig, parseNatsLinkConfig, type NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
+import { NatsBridgePort, natsBridgeAdmit, type NatsBridgeInboxSource, type NatsBridgeSideConfig } from "../src/mesh/bridge-nats-port.js";
 import { natsCarrierLedger, natsLinkAuthorizers, natsLinkFileTargetAllowed, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
 import { bridgeNatsMappedCommandId, type BridgeNatsAllowSection } from "../src/mesh/bridge-nats-types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
+import { FabricControlPlane, type FabricControlCommand } from "../src/topology/control-plane.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
+import { hashToken } from "../src/transport/nats/subjects.js";
+import { kvWorld, seedNative } from "./helpers/bridge-nats-kv.js";
 import {
   BRIDGE_MACHINE, FakePort, LINK, POD_MACHINE, fileLead, linkIdentity, natsLead, route, settle,
 } from "./helpers/bridge-nats-l2-fakes.js";
@@ -231,6 +237,309 @@ describe("startNatsLink composition with L3's allow gate", () => {
     await link.bridge.step();
     expect(listed.acked).toBe(1);
     expect(events("fabric.control.command").map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual(["env-listed"]);
+  });
+
+  // Keep: a trust boundary across actual config -> startNatsLink -> carrier -> port admission.
+  // This fake still records wire sends, but applies production natsBridgeAdmit to mirror candidates
+  // and exposes a KV route only for admitted rows. A dropped flag at either filter breaks the flow.
+  describe.skipIf(WINDOWS)("fileFleetRoots through the production start pipeline", () => {
+    const movedSeat: MeshIdentity = { id: "session:66666666-6666-4666-8666-666666666666", name: "org-kate", kind: "main" };
+    const fileSeat: MeshIdentity = { id: "session:77777777-7777-4777-8777-777777777777", name: "org-paul", kind: "main" };
+    const fileRotation: MeshIdentity = { id: "session:88888888-8888-4888-8888-888888888888", name: "org-paul-rotation", kind: "main" };
+    const actor: MeshIdentity = { id: "a".repeat(32), name: "unlisted-worker", kind: "actor" };
+    const fleetPins: BridgeNatsSeatPins = {
+      seats: new Map([["Kate", movedSeat.id], ["Paul", fileSeat.id]]),
+      bound: new Map([[movedSeat.id, "Kate"], [fileSeat.id, "Paul"], [fileRotation.id, "Paul"]]),
+    };
+    const actorRecord = (): FabricParticipantRecord => ({ ...participant(offList, "inc-not-listed"), id: actor.id,
+      kind: "actor", rootId: offList.id, ownerHostId: offList.id, ownerIdentityId: offList.id, name: actor.name });
+    const fleetFixture = async (fileFleetRoots: boolean | undefined, normalized = false) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-fleet-roots-"));
+      roots.push(root);
+      const initial = await meshRoot(root);
+      for (const identity of [fileSeat, fileRotation]) {
+        await initial.put({ key: key("topology/hosts/", identity.id), value: host(identity), identity });
+        await initial.put({ key: key("topology/participants/", identity.id), value: participant(identity, `inc-${identity.name}`), identity });
+      }
+      await initial.put({ key: key("topology/participants/", actor.id), value: actorRecord(), identity: offList });
+      initial.closeState();
+      stores.pop();
+      const config = parseNatsLinkConfig({ version: 1, name: "ryzen1", link: LINK,
+        file: { mesh: path.join(root, "hub"), lockProtocol: 1 }, stateDir: path.join(root, "state"),
+        allow: { ...ALLOW, ...(fileFleetRoots === undefined ? {} : { fileFleetRoots }), nats: [...ALLOW.nats!,
+          { kind: "root", id: movedSeat.id, principal: "Kate", machine: POD_MACHINE,
+            send: ["followUp", "steer", "ask", "cancel"], receive: ["followUp", "cancel"] }] },
+        nats: { servers: ["tls://nats.invalid:4222"], machine: BRIDGE_MACHINE, credentials: path.join(root, "user.creds"),
+          caFile: path.join(root, "ca.pem"), custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
+          pathBMachines: [BRIDGE_MACHINE, POD_MACHINE], operatorMachine: "fabric-ops" } });
+      const port = fakePort();
+      port.natsPresence = {
+        hosts: [...port.natsPresence.hosts, { record: host(movedSeat), expiresAt: NOW + 86_400_000, observedAt: NOW }],
+        participants: [...port.natsPresence.participants, participant(movedSeat, `inc-${movedSeat.name}`)],
+        reserved: [...port.natsPresence.reserved, movedSeat.id],
+      };
+      port.routes.set(movedSeat.id, route(movedSeat, POD_MACHINE));
+      let portConfig: NatsBridgeSideConfig | undefined;
+      let fileStore: MeshStore | undefined;
+      let admit: ReturnType<typeof natsBridgeAdmit> | undefined;
+      const candidates: FabricParticipantRecord[][] = [];
+      const controller = new AbortController();
+      const logs: string[] = [];
+      const handle = await startNatsLink(normalized ? { ...config, allow: natsLinkAllowListConfig(config) } : config, {
+        signal: controller.signal, log: line => logs.push(line), factories: { seatPins: () => fleetPins,
+          openPort: async (captured, options) => {
+            portConfig = captured;
+            fileStore = options.fileStore;
+            admit = natsBridgeAdmit(captured.allow);
+            const recordMirror = port.mirror.bind(port);
+            port.mirror = async set => {
+              candidates.push([...set.participants]); // Before L1's filter: a correct port must not hide an overbroad carrier selector.
+              const participants = set.participants.filter(entry => admit!(entry, "toNats"));
+              await recordMirror({ ...set, participants });
+              for (const entry of set.participants) port.routes.delete(entry.id);
+              for (const entry of participants) {
+                const identity = set.hosts.find(host => host.record.id === entry.ownerHostId)?.record.identity;
+                if (identity) port.routes.set(entry.id, route(identity, BRIDGE_MACHINE, entry.ownerIncarnation));
+              }
+            };
+            return port;
+          } },
+      });
+      closers.push(async () => { controller.abort(); await handle.closed; });
+      const events = (topic: string) => fileStore!.read({ after: 0, limit: fileStore!.maxReadEvents }).filter(event => event.topic === topic);
+      const publish = (operation: string, commandId: string, target = natsLead, from = offList, extra: Record<string, unknown> = {}) => fileStore!.publish({
+        topic: "fabric.control.command", kind: operation, from, to: target.id,
+        principal: { id: "herdr:paul", binding: "herdr-client" },
+        data: { version: 1, commandId, targetId: target.id, operation, replyTo: from.id,
+          ownerIncarnation: `inc-${target.name}`, message: "fleet message", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000,
+          destinationRemoteHost: LINK, ...extra },
+      });
+      const answer = (commandId: string) => events("fabric.control.ack").find(event => (event.data as { commandId?: string }).commandId === commandId);
+      const inbound = () => events("fabric.control.command").filter(event => event.verification === "bridge");
+      const select = natsLinkMirrorAllowed(natsLinkAllowListConfig(config), fleetPins);
+      return { port, portConfig: portConfig!, admit: admit!, select, candidates, publish, answer, inbound, logs };
+    };
+
+    it.each([undefined, false])("does not admit an unlisted live file root when fileFleetRoots is %s", async flag => {
+      const f = await fleetFixture(flag);
+      expect(f.admit(participant(offList, "inc-not-listed"), "toNats")).toBe(false);
+      expect(f.port.mirrors.at(-1)!.participants.map(entry => entry.id)).not.toContain(offList.id);
+      await f.publish("followUp", "fleet-off", movedSeat);
+      await vi.waitFor(() => expect(f.answer("fleet-off")).toMatchObject({ kind: "rejected",
+        data: { notRun: true, errorCode: "BRIDGE_NATS_NOT_ALLOWED" } }));
+      expect(f.port.sent.filter(envelope => envelope.kind === "command")).toEqual([]);
+    });
+
+    it.each([false, true])("sends to a moved seat and receives followUp+steer with flag on (normalized=%s)", async normalized => {
+      const f = await fleetFixture(true, normalized);
+      expect(f.portConfig.allow).toMatchObject({ fileFleetRoots: true });
+      expect(f.admit(participant(offList, "inc-not-listed"), "toNats")).toBe(true);
+      expect(f.port.mirrors.at(-1)!.participants.map(entry => entry.id)).toContain(offList.id);
+      await f.publish("followUp", "fleet-follow-seat", movedSeat);
+      await vi.waitFor(() => expect(f.port.sent.find(envelope => envelope.kind === "command" && envelope.targetId === movedSeat.id))
+        .toMatchObject({ from: offList, operation: "followUp", body: {
+          commandId: bridgeNatsMappedCommandId(LINK, "toNats", offList.id, "fleet-follow-seat") } }));
+      expect(f.port.sent.find(envelope => envelope.kind === "command" && envelope.targetId === movedSeat.id)?.principal).toBeUndefined();
+      const follow = f.port.deliver(natsCommand("fleet-in-follow", "followUp", "fleet-in-follow", offList));
+      const steer = f.port.deliver(natsCommand("fleet-in-steer", "steer", "fleet-in-steer", offList));
+      await vi.waitFor(() => expect(f.inbound().map(event => event.kind)).toEqual(["followUp", "steer"]));
+      await vi.waitFor(() => expect([follow.acked, steer.acked]).toEqual([1, 1]));
+      expect(f.inbound().map(event => (event.data as { commandId: string }).commandId)).toEqual([
+        bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "fleet-in-follow"),
+        bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "fleet-in-steer"),
+      ]);
+      expect(f.inbound().every(event => event.to === offList.id && event.from.id === natsLead.id)).toBe(true);
+      await f.publish("steer", "fleet-steer-seat", movedSeat);
+      await vi.waitFor(() => expect(f.answer("fleet-steer-seat")).toMatchObject({ kind: "rejected",
+        data: { notRun: true, errorCode: "BRIDGE_NATS_DESTINATION_CLASS_REFUSED" } }));
+      expect(f.port.sent.filter(envelope => envelope.kind === "command").map(envelope => envelope.operation)).toEqual(["followUp"]);
+    });
+
+    it("both production KV filters exclude actors, pinned principal seats and rotations, not ordinary fleet roots", async () => {
+      const f = await fleetFixture(true);
+      const selected = f.candidates.at(-1)!.map(entry => entry.id);
+      const mirrored = f.port.mirrors.at(-1)!.participants.map(entry => entry.id);
+      expect(selected).toContain(offList.id);
+      expect(mirrored).toContain(offList.id);
+      expect(mirrored).toContain(fileLead.id); // Explicit file entries remain admitted.
+      expect(f.select(participant(offList, "inc-not-listed"))).toBe(true);
+      expect(f.select(participant(fileLead, "inc-file-lead"))).toBe(true);
+      for (const candidate of [actorRecord(), participant(fileSeat, "inc-seat"), participant(fileRotation, "inc-rotation"),
+        participant(movedSeat, "inc-moved-seat"), { ...participant(offList, "inc-bad"),
+          id: "session:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", rootId: fileLead.id },
+        { ...participant(offList, "inc-bad"), id: `${offList.id}\n`, rootId: `${offList.id}\n` }]) {
+        expect(f.admit(candidate, "toNats"), candidate.id).toBe(false);
+        expect(f.select(candidate), candidate.id).toBe(false);
+        expect(selected, candidate.id).not.toContain(candidate.id);
+        expect(mirrored, candidate.id).not.toContain(candidate.id);
+      }
+      expect(f.admit(participant(offList, "inc-not-listed"), "toFile", POD_MACHINE)).toBe(false);
+    });
+
+    it("does not dynamically grant ask or cancel in either carrier direction", async () => {
+      const f = await fleetFixture(true);
+      for (const operation of ["ask", "cancel"] as const) {
+        const extra = operation === "cancel" ? { cancelCommandId: "fleet-original" } : {};
+        await f.publish(operation, `fleet-out-${operation}`, natsLead, offList, extra);
+        await vi.waitFor(() => expect(f.answer(`fleet-out-${operation}`)).toMatchObject({ kind: "rejected",
+          data: { notRun: true, errorCode: "BRIDGE_NATS_OPERATION_NOT_ALLOWED" } }));
+        const envelope = natsCommand(`fleet-in-${operation}`, operation, `fleet-in-${operation}`, offList);
+        const delivery = f.port.deliver({ ...envelope, body: { ...envelope.body, ...extra } });
+        await vi.waitFor(() => expect(delivery.acked).toBe(1));
+        expect(f.port.sent.find(sent => sent.id === `ack:fleet-in-${operation}`)).toMatchObject({ kind: "ack",
+          body: { notRun: true, errorCode: "BRIDGE_NATS_OPERATION_NOT_ALLOWED" } });
+      }
+      expect(f.port.sent.filter(envelope => envelope.kind === "command")).toEqual([]);
+      expect(f.inbound()).toEqual([]);
+    });
+
+    it("keeps restrictive explicit entries authoritative at the carrier despite the fleet opt-in", async () => {
+      const f = await fleetFixture(true);
+      // ALLOW explicitly permits fileLead to send/receive followUp, but not steer.
+      await f.publish("steer", "fleet-listed-steer", natsLead, fileLead);
+      await vi.waitFor(() => expect(f.answer("fleet-listed-steer")).toMatchObject({ kind: "rejected",
+        data: { notRun: true, errorCode: "BRIDGE_NATS_OPERATION_NOT_ALLOWED" } }));
+      const inbound = f.port.deliver(natsCommand("fleet-listed-in-steer", "steer", "fleet-listed-in-steer"));
+      await vi.waitFor(() => expect(inbound.acked).toBe(1));
+      expect(f.port.sent.find(envelope => envelope.id === "ack:fleet-listed-in-steer"))
+        .toMatchObject({ kind: "ack", body: { notRun: true, errorCode: "BRIDGE_NATS_OPERATION_NOT_ALLOWED" } });
+      expect(f.inbound()).toEqual([]);
+      await f.publish("followUp", "fleet-listed-follow", natsLead, fileLead);
+      await vi.waitFor(() => expect(f.port.sent.filter(envelope => envelope.kind === "command").map(envelope => envelope.operation)).toEqual(["followUp"]));
+    });
+  });
+
+  // Keep: a trust boundary. Real start, MeshBridge, native actor directory, production port/KV
+  // admission, durable ledger and file owner control plane. Only broker KV and wire I/O are fake.
+  describe.skipIf(WINDOWS)("fileAskTargets through start and the port's own fileActors path", () => {
+    const seat: MeshIdentity = { id: "session:99999999-9999-4999-8999-999999999999", name: "org-kate", kind: "main" };
+    const actor: MeshIdentity = { id: "b".repeat(32), name: "inbox", kind: "actor" };
+    const otherActor: MeshIdentity = { id: "c".repeat(32), name: actor.name, kind: "actor" };
+    const actorParticipant = (identity: MeshIdentity): FabricParticipantRecord => {
+      const { sessionId: _session, ...owner } = participant(offList, "inc-not-listed");
+      return { ...owner, id: identity.id, kind: "actor", name: identity.name, parentId: offList.id,
+        capabilities: ["ask", "followUp", "steer", "fabric"] };
+    };
+
+    it.each([false, true])("returns a seat's actor ask as a bound ACK, never a new seat operation (normalized=%s)", async normalized => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-inbox-ask-"));
+      roots.push(root);
+      const initial = await meshRoot(root);
+      for (const identity of [actor, otherActor]) await initial.put({
+        key: key("topology/participants/", identity.id), value: actorParticipant(identity), identity: offList,
+      });
+      initial.closeState();
+      stores.pop();
+      const fileAskTargets = [{ actorId: actor.id, rootId: offList.id }];
+      const config = parseNatsLinkConfig({ version: 1, name: "ryzen1", link: LINK,
+        file: { mesh: path.join(root, "hub"), lockProtocol: 1 }, stateDir: path.join(root, "state"),
+        allow: { fileFleetRoots: true, fileAskTargets, nats: [{ kind: "root", id: seat.id, principal: "Kate", machine: POD_MACHINE,
+          send: ["ask", "followUp", "steer", "cancel"], receive: ["followUp", "cancel"] }] },
+        nats: { servers: ["tls://nats.invalid:4222"], machine: BRIDGE_MACHINE, credentials: path.join(root, "user.creds"),
+          caFile: path.join(root, "ca.pem"), custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
+          pathBMachines: [BRIDGE_MACHINE, POD_MACHINE], operatorMachine: "fabric-ops" } });
+      const world = kvWorld();
+      seedNative(world, POD_MACHINE, participant(seat, `inc-${seat.name}`), Date.now());
+      const wire = new FakePort();
+      // Scripted broker inbox, decoded by the real NatsBridgePort (including subject/source binding).
+      const inbox: NatsBridgeInboxSource = { isVerified: () => true, async *consume(signal) {
+        for await (const delivery of wire.inbox(signal)) {
+          const envelope = delivery.envelope;
+          yield { subject: `fabric.in.${BRIDGE_MACHINE}.${hashToken(envelope.to.hostId)}.${envelope.kind === "command" ? "cmd" : "ack"}.${hashToken(envelope.targetId)}.${delivery.sourceMachine}`,
+            data: Buffer.from(JSON.stringify({ format: 1, sourceMachine: delivery.sourceMachine, envelope })),
+            info: { streamSequence: delivery.streamSequence, deliveryCount: delivery.attempt },
+            ackAck: async () => { await delivery.ack(); return true; }, nak: () => delivery.nak(),
+            term: (reason?: string) => { void delivery.term(reason ?? "refused"); }, working: () => delivery.working() };
+        }
+      } };
+      let captured: NatsBridgeSideConfig | undefined;
+      let store: MeshStore | undefined;
+      let port: NatsBridgePort | undefined;
+      let ledger: FileBridgeNatsLedger | undefined;
+      const rootMirrorActors: string[][] = [];
+      const nativeActors: string[][] = [];
+      const controller = new AbortController();
+      const handle = await startNatsLink(normalized ? { ...config, allow: natsLinkAllowListConfig(config) } : config, {
+        signal: controller.signal, log: () => undefined, factories: {
+          seatPins: () => ({ seats: new Map([["Kate", seat.id]]), bound: new Map([[seat.id, "Kate"]]) }),
+          openLedger: async dir => { ledger = await openBridgeNatsLedger({ dir }); return ledger; },
+          openPort: async (portConfig, options) => {
+            captured = portConfig;
+            store = options.fileStore;
+            const directory = await createFileActorDirectory(store, LINK);
+            port = new NatsBridgePort({ link: LINK, inbox, admit: natsBridgeAdmit(portConfig.allow),
+              transport: world.transport(BRIDGE_MACHINE, linkIdentity.id, envelope => wire.send(envelope)),
+              fileActors: () => { const read = readFileActorsForMirror(directory); nativeActors.push(read.actors.map(entry => entry.id)); return read; },
+              onClose: () => wire.close() });
+            const mirror = port.mirror.bind(port);
+            vi.spyOn(port, "mirror").mockImplementation(async (set, at) => {
+              rootMirrorActors.push(set.participants.filter(entry => entry.kind === "actor").map(entry => entry.id));
+              await mirror(set, at);
+            });
+            await port.start(options.signal);
+            return port;
+          },
+        },
+      });
+      let owner: FabricControlPlane | undefined;
+      closers.push(async () => { await owner?.close(); controller.abort(); await handle.closed; });
+      const events = (topic: string) => store!.read({ after: 0, limit: store!.maxReadEvents }).filter(event => event.topic === topic);
+      expect(captured!.allow).toMatchObject({ fileFleetRoots: true, fileAskTargets });
+      expect(rootMirrorActors.length).toBeGreaterThan(0);
+      expect(rootMirrorActors.every(ids => ids.length === 0)).toBe(true); // start still uses mirrorActors:false.
+      expect(nativeActors.some(ids => ids.includes(actor.id) && ids.includes(otherActor.id))).toBe(true);
+      await vi.waitFor(() => expect(port!.resolve(actor.id)).toMatchObject({ identity: actor,
+        route: { machine: BRIDGE_MACHINE, ownerHostId: offList.id, ownerIdentityId: offList.id, live: true } }));
+      expect(port!.resolve(otherActor.id)).toBeUndefined(); // Same owner AND name is still not an exact id pin.
+
+      const receive = vi.fn((_command: FabricControlCommand) => ({ accepted: true, messageId: "actor-answer", result: { text: "inbox is clear" } }));
+      owner = new FabricControlPlane(store!, offList, { enabled: true, hostId: offList.id, ownerIncarnation: "inc-not-listed", pollMs: 10 });
+      owner.start(receive);
+      const request = (id: string, operation: string, target = actor) => ({
+        id, kind: "command", to: { machine: BRIDGE_MACHINE, hostId: offList.id }, targetId: target.id, operation, from: seat,
+        body: { version: 1, commandId: id, targetId: target.id, operation, replyTo: seat.id, ownerIncarnation: "inc-not-listed",
+          message: "check the inbox", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
+      });
+      const ask = request("seat-inbox-ask", "ask");
+      const delivery = wire.deliver(ask);
+      await vi.waitFor(() => expect(wire.sent.find(sent => sent.id === `ack:${ask.id}`)).toMatchObject({
+        kind: "ack", operation: "accepted", from: offList, targetId: actor.id,
+        to: { machine: POD_MACHINE, hostId: seat.id }, body: { accepted: true, commandId: ask.body.commandId,
+          targetId: actor.id, bodyDigest: controlBodyFingerprint(ask.body), result: { text: "inbox is clear" } },
+      }));
+      await vi.waitFor(() => expect(delivery.acked).toBe(1));
+      expect(receive).toHaveBeenCalledOnce();
+      const mapped = bridgeNatsMappedCommandId(LINK, "toFile", seat.id, ask.body.commandId);
+      expect(receive.mock.calls[0]?.[0]).toMatchObject({ operation: "ask", commandId: mapped, targetId: actor.id });
+      expect(events("fabric.control.command")).toHaveLength(1);
+      expect(events("fabric.control.command")[0]).toMatchObject({ verification: "bridge", kind: "ask", from: seat, to: offList.id,
+        data: { commandId: mapped, targetId: actor.id } });
+      expect(events("fabric.control.ack")).toContainEqual(expect.objectContaining({ from: offList, to: seat.id,
+        data: expect.objectContaining({ accepted: true, commandId: mapped, targetId: actor.id, result: { text: "inbox is clear" } }) }));
+      await vi.waitFor(() => expect(ledger!.lookup("toFile", mapped)).toMatchObject({ state: "ackForwarded", operation: "ask",
+        originalCommandId: ask.body.commandId, requesterId: seat.id, replyTo: seat.id, sourceMachine: POD_MACHINE,
+        targetId: actor.id, bodyDigest: controlBodyFingerprint(ask.body), ack: { accepted: true, fromId: offList.id } }));
+
+      const steer = wire.deliver(request("seat-inbox-steer", "steer"));
+      const unlisted = wire.deliver(request("seat-other-inbox-ask", "ask", otherActor));
+      await vi.waitFor(() => expect([steer.acked, unlisted.acked]).toEqual([1, 1]));
+      expect(wire.sent.find(sent => sent.id === "ack:seat-inbox-steer")).toMatchObject({ kind: "ack",
+        body: { accepted: false, notRun: true, errorCode: "BRIDGE_NATS_OPERATION_NOT_ALLOWED" } });
+      expect(wire.sent.find(sent => sent.id === "ack:seat-other-inbox-ask")).toMatchObject({ kind: "ack",
+        body: { accepted: false, notRun: true, errorCode: "BRIDGE_NATS_NOT_ALLOWED" } });
+      expect(receive).toHaveBeenCalledOnce();
+      // The receive-only exception never turns the actor into an initiating sender. The real ACK
+      // above still succeeds because it is an answer to the durable claim, not an inbound seat op.
+      await store!.publish({ topic: "fabric.control.command", kind: "followUp", from: actor, to: seat.id,
+        data: { version: 1, commandId: "actor-must-not-initiate", targetId: seat.id, operation: "followUp", replyTo: offList.id,
+          ownerIncarnation: `inc-${seat.name}`, message: "unsolicited", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000,
+          destinationRemoteHost: LINK } });
+      await vi.waitFor(() => expect(events("fabric.control.ack")).toContainEqual(expect.objectContaining({
+        data: expect.objectContaining({ commandId: "actor-must-not-initiate", accepted: false, notRun: true,
+          errorCode: "BRIDGE_NATS_OPERATION_NOT_ALLOWED" }) })));
+      expect(wire.sent.filter(sent => sent.kind === "command")).toEqual([]);
+      expect(events("fabric.control.command").filter(event => event.verification === "bridge").map(event => event.kind)).toEqual(["ask"]);
+    });
   });
 
   it("startNatsLink refuses on Windows by name, before anything opens", async () => {

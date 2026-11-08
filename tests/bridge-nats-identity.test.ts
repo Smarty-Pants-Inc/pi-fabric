@@ -98,7 +98,7 @@ const refusal = (verified: { ok: boolean; refuse?: string }): string | undefined
 describe("parseBridgeNatsAllowSection", () => {
   it("normalizes, attaches the home side, applies defaults and freezes", () => {
     const parsed = config();
-    expect(parsed).toMatchObject({ version: 1, link: LINK, natsMachine: BRIDGE });
+    expect(parsed).toMatchObject({ version: 1, link: LINK, natsMachine: BRIDGE, fileFleetRoots: false });
     expect(parsed.entries.map(entry => entry.side)).toEqual(["file", "file", "file", "nats", "nats"]);
     const kate = parsed.entries.find(entry => entry.kind === "root" && entry.id === KATE_SEAT)!;
     expect(kate.send).toEqual(["followUp"]); // default
@@ -142,6 +142,67 @@ describe("parseBridgeNatsAllowSection", () => {
       expect((error as BridgeNatsAllowListError).field).toBe(field);
       expect((error as Error).message).not.toContain(LEAD.slice(8)); // never echoes a value
     }
+  });
+
+  it("accepts only a boolean fileFleetRoots opt-in and normalizes omission to false", () => {
+    for (const raw of [undefined, {}, { fileFleetRoots: false }]) {
+      expect(parseBridgeNatsAllowSection(raw, { link: LINK, natsMachine: BRIDGE })).toMatchObject({ fileFleetRoots: false });
+    }
+    const enabled = parseBridgeNatsAllowSection({ ...ALLOW, fileFleetRoots: true }, { link: LINK, natsMachine: BRIDGE });
+    expect(enabled).toMatchObject({ fileFleetRoots: true });
+    expect(enabled.entries).toEqual(config().entries);
+    expect(Object.isFrozen(enabled)).toBe(true);
+    for (const fileFleetRoots of [null, 0, 1, "true", "false", [], {}]) {
+      expect(() => parseBridgeNatsAllowSection({ fileFleetRoots }, { link: LINK, natsMachine: BRIDGE }))
+        .toThrow(expect.objectContaining({ field: "allow.fileFleetRoots" }));
+    }
+    expect(() => parseBridgeNatsAllowSection({ fileFleetRoot: true }, { link: LINK, natsMachine: BRIDGE }))
+      .toThrow(expect.objectContaining({ field: "allow" }));
+  });
+
+  it("preserves exact fileAskTargets separately from explicit entries and freezes their identity pins", () => {
+    const fileAskTargets = [{ actorId: SUPERVISOR, rootId: LEAD }];
+    const explicit = { file: ALLOW.file.filter(entry => entry.kind === "root"), nats: ALLOW.nats };
+    const parsed = parseBridgeNatsAllowSection({ ...explicit, fileFleetRoots: true, fileAskTargets }, { link: LINK, natsMachine: BRIDGE });
+    expect(parsed).toMatchObject({ fileFleetRoots: true, fileAskTargets });
+    expect(parsed.entries).toEqual(parseBridgeNatsAllowSection(explicit, { link: LINK, natsMachine: BRIDGE }).entries);
+    const targets = (parsed as typeof parsed & { fileAskTargets: typeof fileAskTargets }).fileAskTargets;
+    expect(Object.isFrozen(targets) && Object.isFrozen(targets[0])).toBe(true);
+    fileAskTargets[0]!.actorId = "f".repeat(32);
+    expect(targets[0]).toEqual({ actorId: SUPERVISOR, rootId: LEAD });
+  });
+
+  it.each([
+    ["a non-list", null, "allow.fileAskTargets"],
+    ["an object instead of a list", { actorId: SUPERVISOR, rootId: LEAD }, "allow.fileAskTargets"],
+    ["a missing actor id", [{ rootId: LEAD }], "allow.fileAskTargets[0].actorId"],
+    ["a missing owner", [{ actorId: SUPERVISOR }], "allow.fileAskTargets[0].rootId"],
+    ["an actor name", [{ actorId: "supervisor", rootId: LEAD }], "allow.fileAskTargets[0].actorId"],
+    ["a wildcard actor", [{ actorId: "*", rootId: LEAD }], "allow.fileAskTargets[0].actorId"],
+    ["an uppercase actor id", [{ actorId: SUPERVISOR.toUpperCase(), rootId: LEAD }], "allow.fileAskTargets[0].actorId"],
+    ["an actor id with a newline", [{ actorId: `${SUPERVISOR}\n`, rootId: LEAD }], "allow.fileAskTargets[0].actorId"],
+    ["a session id as actor", [{ actorId: LEAD, rootId: LEAD }], "allow.fileAskTargets[0].actorId"],
+    ["a bare owner UUID", [{ actorId: SUPERVISOR, rootId: LEAD.slice(8) }], "allow.fileAskTargets[0].rootId"],
+    ["an uppercase owner UUID", [{ actorId: SUPERVISOR, rootId: PAUL_SEAT.toUpperCase() }], "allow.fileAskTargets[0].rootId"],
+    ["an owner id with a newline", [{ actorId: SUPERVISOR, rootId: `${LEAD}\n` }], "allow.fileAskTargets[0].rootId"],
+    ["a wildcard owner", [{ actorId: SUPERVISOR, rootId: "*" }], "allow.fileAskTargets[0].rootId"],
+    ["a name selector", [{ actorId: SUPERVISOR, rootId: LEAD, name: "supervisor" }], "allow.fileAskTargets[0]"],
+    ["a default selector", [{ actorId: SUPERVISOR, rootId: LEAD, default: true }], "allow.fileAskTargets[0]"],
+    ["a send grant", [{ actorId: SUPERVISOR, rootId: LEAD, send: ["followUp"] }], "allow.fileAskTargets[0]"],
+    ["a receive override", [{ actorId: SUPERVISOR, rootId: LEAD, receive: ["steer"] }], "allow.fileAskTargets[0]"],
+    ["a repeated actor", [{ actorId: SUPERVISOR, rootId: LEAD }, { actorId: SUPERVISOR, rootId: LEAD }], "allow.fileAskTargets[1]"],
+    ["one actor under two owners", [{ actorId: SUPERVISOR, rootId: LEAD }, { actorId: SUPERVISOR, rootId: STRANGER }], "allow.fileAskTargets[1]"],
+  ])("refuses fileAskTargets with %s", (_name, fileAskTargets, field) => {
+    expect(() => parseBridgeNatsAllowSection({ fileFleetRoots: true, fileAskTargets }, { link: LINK, natsMachine: BRIDGE }))
+      .toThrow(expect.objectContaining({ field }));
+  });
+
+  it.each(["file", "nats"] as const)("refuses an exact actor pinned in both fileAskTargets and allow.%s", side => {
+    const entry = { kind: "actor", rootId: LEAD, name: "supervisor", id: SUPERVISOR,
+      ...(side === "nats" ? { machine: "lead-v2" } : {}) };
+    expect(() => parseBridgeNatsAllowSection({ fileFleetRoots: true,
+      fileAskTargets: [{ actorId: SUPERVISOR, rootId: LEAD }], [side]: [entry] }, { link: LINK, natsMachine: BRIDGE }))
+      .toThrow(BridgeNatsAllowListError);
   });
 
   it("refuses a bad link name or an operator bridge machine", () => {
@@ -323,6 +384,239 @@ describe("BridgeNatsIdentity: senders and targets come only from presence", () =
     expect(refusal(gateAt().verifySender("file", LEAD, agent, natsView([], false)))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
     const off = view("file", [record("file", { id: LEAD, rootId: STRANGER })]);
     expect(refusal(gateAt().verifySender("file", LEAD, off, natsView([], false)))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+  });
+});
+
+// Keep: a trust boundary. The opt-in admits a class of verified native file roots, not arbitrary
+// event senders, actors, principal seats, NATS roots or extra control/principal authority.
+describe("BridgeNatsIdentity fileFleetRoots", () => {
+  const fleetGate = (fileFleetRoots: boolean | undefined = true,
+    entries: { file: readonly unknown[]; nats: readonly unknown[] } = ALLOW) => createBridgeNatsIdentityGate(
+    parseBridgeNatsAllowSection({ ...entries, ...(fileFleetRoots === undefined ? {} : { fileFleetRoots }) },
+      { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => NOW });
+  const liveFile = () => fileView([record("file", { id: STRANGER })]);
+
+  it.each([undefined, false])("leaves an unlisted verified live file main root refused when flag is %s", fileFleetRoots => {
+    const gate = fileFleetRoots === undefined ? gateAt() : fleetGate(fileFleetRoots);
+    expect(refusal(gate.verifySender("file", STRANGER, liveFile(), natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    expect(refusal(gate.verifyTarget("file", STRANGER, liveFile(), natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+  });
+
+  it("admits an unlisted canonical file main root from live native presence without changing static entries", () => {
+    const gate = fleetGate();
+    const before = [...gate.config.entries];
+    const sender = identity(gate.verifySender("file", STRANGER, liveFile(), natsView()));
+    const target = identity(gate.verifyTarget("file", STRANGER, liveFile(), natsView()));
+    const seat = identity(gate.verifyTarget("nats", KATE_SEAT, natsView(), liveFile()));
+    const moved = identity(gate.verifySender("nats", MOVED, natsView(), liveFile(), "lead-v2"));
+    expect(sender).toMatchObject({ side: "file", id: STRANGER, kind: "main", entry: { kind: "root", side: "file", id: STRANGER } });
+    expect(sender.entry.kind === "root" ? sender.entry.principal : undefined).toBeUndefined();
+    expect(sender.entry.principals ?? []).toEqual([]);
+    expect(Object.isFrozen(sender.entry)).toBe(true);
+    expect(gate.allow({ direction: "toNats", sender, target: seat, subject: { type: "control", operation: "followUp" } }))
+      .toMatchObject({ ok: true, principal: "none" });
+    expect(refusal(gate.allow({ direction: "toNats", sender, target: seat, subject: { type: "control", operation: "steer" } })))
+      .toBe(BRIDGE_NATS_REFUSAL.destinationClassRefused);
+    for (const operation of ["followUp", "steer"] as const) {
+      expect(gate.allow({ direction: "toFile", sender: moved, target, subject: { type: "control", operation } }).ok).toBe(true);
+    }
+    expect(gate.config.entries).toEqual(before);
+    expect(gate.config.entries.some(entry => entry.id === STRANGER)).toBe(false);
+  });
+
+  it("never grants dynamic ask/cancel or carried principal authority", () => {
+    const gate = fleetGate();
+    const sender = identity(gate.verifySender("file", STRANGER, liveFile(), natsView()));
+    const movedTarget = identity(gate.verifyTarget("nats", MOVED, natsView(), liveFile()));
+    expect(gate.allow({ direction: "toNats", sender, target: movedTarget, subject: { type: "control", operation: "followUp" },
+      principal: { id: "herdr:paul", binding: "herdr-client" } })).toMatchObject({ ok: true, principal: "strip" });
+    // Both static peers explicitly permit ask and cancel: only the dynamic root's grant can refuse.
+    const broad = fleetGate(true, { ...ALLOW, nats: ALLOW.nats.map(entry => entry.id === MOVED
+      ? { ...entry, send: ["followUp", "steer", "ask", "cancel"], receive: ["followUp", "steer", "ask", "cancel"] } : entry) });
+    const fileSender = identity(broad.verifySender("file", STRANGER, liveFile(), natsView()));
+    const fileTarget = identity(broad.verifyTarget("file", STRANGER, liveFile(), natsView()));
+    const remoteSender = identity(broad.verifySender("nats", MOVED, natsView(), liveFile(), "lead-v2"));
+    const remoteTarget = identity(broad.verifyTarget("nats", MOVED, natsView(), liveFile()));
+    for (const operation of ["ask", "cancel"] as const) {
+      expect(refusal(broad.allow({ direction: "toNats", sender: fileSender, target: remoteTarget, subject: { type: "control", operation } })))
+        .toBe(BRIDGE_NATS_REFUSAL.operationNotAllowed);
+      expect(refusal(broad.allow({ direction: "toFile", sender: remoteSender, target: fileTarget, subject: { type: "control", operation } })))
+        .toBe(BRIDGE_NATS_REFUSAL.operationNotAllowed);
+    }
+  });
+
+  it.each([
+    ["an empty entry", [], []],
+    ["a followUp-only entry", ["followUp"], ["followUp"]],
+  ])("keeps explicit file entries authoritative: %s", (_name, send, receive) => {
+    const gate = fleetGate(true, { ...ALLOW, file: [...ALLOW.file, { kind: "root", id: STRANGER, send, receive }] });
+    const sender = identity(gate.verifySender("file", STRANGER, liveFile(), natsView()));
+    const target = identity(gate.verifyTarget("file", STRANGER, liveFile(), natsView()));
+    const movedSender = identity(gate.verifySender("nats", MOVED, natsView(), liveFile(), "lead-v2"));
+    const movedTarget = identity(gate.verifyTarget("nats", MOVED, natsView(), liveFile()));
+    expect(sender.entry.send).toEqual(send);
+    expect(target.entry.receive).toEqual(receive);
+    expect(refusal(gate.allow({ direction: "toNats", sender, target: movedTarget, subject: { type: "control", operation: "steer" } })))
+      .toBe(BRIDGE_NATS_REFUSAL.operationNotAllowed);
+    expect(refusal(gate.allow({ direction: "toFile", sender: movedSender, target, subject: { type: "control", operation: "steer" } })))
+      .toBe(BRIDGE_NATS_REFUSAL.operationNotAllowed);
+    expect(gate.allow({ direction: "toNats", sender, target: movedTarget, subject: { type: "control", operation: "followUp" } }).ok)
+      .toBe(send.length > 0);
+  });
+
+  it.each([
+    ["no presence", []],
+    ["not live (expired host)", [record("file", { id: STRANGER, live: false })]],
+    ["an expired observation", [record("file", { id: STRANGER, observedAt: NOW - 15_001 })]],
+    ["this link's mirror", [record("file", { id: STRANGER, mirroredBy: LINK })]],
+    ["another link's mirror", [record("file", { id: STRANGER, mirroredBy: "other-link" })]],
+    ["an agent, not a main", [record("file", { id: STRANGER, kind: "agent" })]],
+    ["a main whose rootId differs", [record("file", { id: STRANGER, rootId: LEAD })]],
+  ])("does not turn %s into fleet-root authority (sender or target)", (_name, records) => {
+    const gate = fleetGate();
+    const file = view("file", records);
+    expect(gate.verifySender("file", STRANGER, file, natsView()).ok).toBe(false);
+    expect(gate.verifyTarget("file", STRANGER, file, natsView()).ok).toBe(false);
+  });
+
+  it("does not dynamically admit an unlisted id with ambiguous native or mirrored presence", () => {
+    const gate = fleetGate();
+    for (const file of [
+      view("file", [record("file", { id: STRANGER }), record("file", { id: STRANGER, ownerIncarnation: "inc-2" })]),
+      view("file", [record("file", { id: STRANGER }), record("file", { id: STRANGER, mirroredBy: LINK })]),
+    ]) {
+      expect(refusal(gate.verifySender("file", STRANGER, file, natsView()))).toBe(BRIDGE_NATS_REFUSAL.ambiguous);
+      expect(refusal(gate.verifyTarget("file", STRANGER, file, natsView()))).toBe(BRIDGE_NATS_REFUSAL.ambiguous);
+    }
+    const both = natsView([record("nats", { id: STRANGER, machine: "lead-v2" })]);
+    expect(refusal(gate.verifySender("file", STRANGER, liveFile(), both))).toBe(BRIDGE_NATS_REFUSAL.ambiguous);
+    expect(refusal(gate.verifyTarget("file", STRANGER, liveFile(), both))).toBe(BRIDGE_NATS_REFUSAL.ambiguous);
+  });
+
+  it("excludes unlisted actors, principal seats and keeper rotations, and roots native on NATS", () => {
+    const gate = fleetGate();
+    const actor = record("file", { id: "d".repeat(32), rootId: STRANGER, kind: "actor", name: "unlisted-worker" });
+    const file = fileView([record("file", { id: STRANGER }), actor, record("file", { id: KATE_ROTATION })]);
+    for (const id of [actor.id, KATE_ROTATION]) {
+      expect(refusal(gate.verifySender("file", id, file, natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+      expect(refusal(gate.verifyTarget("file", id, file, natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    }
+    // Remove every explicit entry: a live seat cannot silently become a dynamic file root.
+    const unlistedSeats = fleetGate(true, { file: [], nats: [] });
+    for (const id of [PAUL_SEAT, KATE_SEAT, KATE_ROTATION]) {
+      const live = view("file", [record("file", { id })]);
+      expect(refusal(unlistedSeats.verifySender("file", id, live, view("nats", [])))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+      expect(refusal(unlistedSeats.verifyTarget("file", id, live, view("nats", [])))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    }
+    const nats = natsView([record("nats", { id: STRANGER, machine: "lead-v2" })]);
+    expect(refusal(gate.verifySender("nats", STRANGER, nats, fileView(), "lead-v2"))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    expect(refusal(gate.verifyTarget("nats", STRANGER, nats, fileView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    // An explicit entry on NATS remains on NATS, even if a native file record now claims its id.
+    expect(refusal(gate.verifySender("file", MOVED, view("file", [record("file", { id: MOVED })]), view("nats", []))))
+      .toBe(BRIDGE_NATS_REFUSAL.sideMismatch);
+  });
+
+  it.each([`session:0000000A-0000-4000-8000-000000000099`, STRANGER.slice(8), `${STRANGER}\n`, "bridge:worker"])(
+    "refuses a noncanonical fleet root id %j", id => {
+      const file = view("file", [record("file", { id, kind: "main", rootId: id })]);
+      const gate = fleetGate();
+      expect(refusal(gate.verifySender("file", id, file, natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+      expect(refusal(gate.verifyTarget("file", id, file, natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    });
+});
+
+// Keep: a trust boundary. This exception is an exact actor + owner pin, not fleet-wide actor
+// authority. An ask's result travels on its ledger-bound ACK, never via an actor send grant.
+describe("BridgeNatsIdentity fileAskTargets", () => {
+  const askGate = (fileFleetRoots: boolean | undefined = true, rootId = LEAD, file: readonly unknown[] = []) =>
+    createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({
+      ...(fileFleetRoots === undefined ? {} : { fileFleetRoots }), fileAskTargets: [{ actorId: SUPERVISOR, rootId }], file,
+      nats: ALLOW.nats.map(entry => entry.id === KATE_SEAT ? { ...entry, send: ["followUp", "steer", "ask", "cancel"] } : entry),
+    }, { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => NOW });
+  const native = (actor: Partial<BridgeNatsPresenceRecord> = {}, owner: Partial<BridgeNatsPresenceRecord> = {}) =>
+    view("file", [record("file", { id: LEAD, ...owner }), record("file", { id: SUPERVISOR, ...actor })]);
+
+  it.each([undefined, false])("keeps a configured actor inactive when fileFleetRoots is %s", flag => {
+    const gate = flag === undefined ? createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({
+      fileAskTargets: [{ actorId: SUPERVISOR, rootId: LEAD }], nats: ALLOW.nats,
+    }, { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => NOW }) : askGate(flag);
+    expect(refusal(gate.verifyTarget("file", SUPERVISOR, native(), natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    expect(refusal(gate.verifySender("file", SUPERVISOR, native(), natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+  });
+
+  it("allows only RECEIVE ask for the exact native actor and owner, independent of its display name", () => {
+    const gate = askGate();
+    const file = native({ name: "renamed-without-changing-identity" });
+    const target = identity(gate.verifyTarget("file", SUPERVISOR, file, natsView()));
+    const seat = identity(gate.verifySender("nats", KATE_SEAT, natsView(), file, "kate-v2"));
+    expect(target).toMatchObject({ id: SUPERVISOR, kind: "actor", ownerIdentityId: LEAD,
+      entry: { side: "file", kind: "actor", send: [], receive: ["ask"] } });
+    expect(target.entry.principals ?? []).toEqual([]);
+    expect(Object.isFrozen(target.entry) && Object.isFrozen(target.entry.send) && Object.isFrozen(target.entry.receive)).toBe(true);
+    expect(gate.allow({ direction: "toFile", sender: seat, target, subject: { type: "control", operation: "ask" } }))
+      .toMatchObject({ ok: true, principal: "none" });
+    for (const operation of ["followUp", "steer", "cancel"] as const) {
+      expect(refusal(gate.allow({ direction: "toFile", sender: seat, target, subject: { type: "control", operation } })))
+        .toBe(BRIDGE_NATS_REFUSAL.operationNotAllowed);
+    }
+    // Verification may describe a receive-only identity, but can never authorize an initiated send.
+    const sender = gate.verifySender("file", SUPERVISOR, file, natsView());
+    if (sender.ok) {
+      expect(sender.identity.entry.send).toEqual([]);
+      const remote = identity(gate.verifyTarget("nats", MOVED, natsView(), file));
+      for (const operation of ["followUp", "steer", "ask", "cancel"] as const) {
+        expect(gate.allow({ direction: "toNats", sender: sender.identity, target: remote, subject: { type: "control", operation } }).ok).toBe(false);
+      }
+    }
+  });
+
+  it("does not admit a same-name actor, another owner, or inconsistent owner identity", () => {
+    const gate = askGate();
+    const other = record("file", { id: "e".repeat(32), name: "supervisor" });
+    const sameName = view("file", [record("file", { id: LEAD }), other]);
+    expect(refusal(gate.verifyTarget("file", other.id, sameName, natsView()))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    for (const actor of [
+      { rootId: STRANGER, ownerIdentityId: STRANGER, ownerHostId: STRANGER },
+      { ownerIdentityId: STRANGER },
+    ]) {
+      const file = view("file", [...native(actor).list!(), record("file", { id: STRANGER })]);
+      expect(gate.verifyTarget("file", SUPERVISOR, file, natsView()).ok).toBe(false);
+    }
+  });
+
+  it.each([
+    ["no actor presence", view("file", [record("file", { id: LEAD })])],
+    ["an unverified actor", native({ live: false })],
+    ["a stale actor", native({ observedAt: NOW - 15_001 })],
+    ["a mirrored actor", native({ mirroredBy: LINK })],
+    ["no owner presence", view("file", [record("file", { id: SUPERVISOR })])],
+    ["an unverified owner", native({}, { live: false })],
+    ["a stale owner", native({}, { observedAt: NOW - 15_001 })],
+    ["a mirrored owner", native({}, { mirroredBy: LINK })],
+    ["an owner that is not a main", native({}, { kind: "agent" })],
+  ])("refuses the configured ask target with %s", (_name, file) => {
+    expect(askGate().verifyTarget("file", SUPERVISOR, file, natsView()).ok).toBe(false);
+  });
+
+  it.each([PAUL_SEAT, KATE_ROTATION])("does not grant the exception to an actor owned by a principal-bound root %s", rootId => {
+    const file = view("file", [record("file", { id: rootId }), record("file", {
+      id: SUPERVISOR, rootId, ownerHostId: rootId, ownerIdentityId: rootId,
+    })]);
+    // Either config-time refusal or presence-time refusal is fail-closed; neither may issue authority.
+    let gate: BridgeNatsIdentity;
+    try { gate = askGate(true, rootId); } catch (error) { expect(error).toBeInstanceOf(BridgeNatsAllowListError); return; }
+    expect(gate.verifyTarget("file", SUPERVISOR, file, natsView()).ok).toBe(false);
+  });
+
+  it("leaves a separate explicit file actor's existing permissions unchanged", () => {
+    const explicitId = "e".repeat(32);
+    const gate = askGate(true, LEAD, [{ kind: "actor", rootId: LEAD, id: explicitId, name: "explicit",
+      send: ["followUp"], receive: ["steer"] }]);
+    const file = view("file", [...native().list!(), record("file", { id: explicitId, name: "explicit" })]);
+    const explicit = identity(gate.verifySender("file", explicitId, file, natsView()));
+    expect(explicit.entry).toMatchObject({ send: ["followUp"], receive: ["steer"] });
+    const moved = identity(gate.verifyTarget("nats", MOVED, natsView(), file));
+    expect(gate.allow({ direction: "toNats", sender: explicit, target: moved, subject: { type: "control", operation: "followUp" } }).ok).toBe(true);
   });
 });
 

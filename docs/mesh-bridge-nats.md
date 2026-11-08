@@ -31,20 +31,32 @@ model is in [bridge-nats-threat-model.md](bridge-nats-threat-model.md).
 
 ## What crosses (PR 1)
 
-Only identities named in the config's allow-list cross, and only the operations their destination class
-takes. The class comes from the allow entry (`kind`, `principal`, list), never from a message:
+Explicit allow-list entries cross only the operations their destination class takes. The optional
+`allow.fileFleetRoots` flag (default `false`) adds a fallback for otherwise-unlisted file-side canonical
+Main roots: a live, verified, native root that is not a principal's bound session is mirrored into NATS
+KV and may send and receive `followUp` and `steer`. Fallback commands carry no principal. While that flag
+is true, `allow.fileAskTargets` may additionally name exact native actor ids and their canonical owner
+roots. An otherwise-unlisted named actor may receive `ask` only when both it and its live, nonprincipal
+file-fleet root owner are verified; it cannot initiate sends, and other unlisted actors remain refused.
+An actor's explicit entry takes precedence and is never widened by either fallback. For explicit entries,
+the class comes from the allow entry (`kind`, `principal`, list), never from a message:
 
 | Destination | Takes |
 |---|---|
-| principal seat (a root entry with `principal`, either side) | `followUp`, `cancel` |
+| principal seat (a root entry with `principal`, either side) | receive `followUp`, `cancel` |
 | moved lead (a root entry in `allow.nats`) | `followUp`, `steer`, `ask` (and its answer), `cancel` |
-| hub root or actor (an entry in `allow.file`) | `followUp`, `steer`, `ask` (and its answer), `cancel` |
-| anything else (a NATS actor, an unlisted id) | nothing: refused before publish with a `BRIDGE_NATS_*` code |
+| hub root or actor (an explicit entry in `allow.file`) | `followUp`, `steer`, `ask` (and its answer), `cancel` |
+| otherwise-unlisted actor named by `allow.fileAskTargets` (only when `allow.fileFleetRoots` is true) | receive `ask` only; its reply is a ledger-bound ACK |
+| otherwise-unlisted eligible file-side Main root (only when `allow.fileFleetRoots` is true) | `followUp`, `steer` |
+| anything else (a NATS actor or an id not covered by an entry or fallback) | nothing: refused before publish with a `BRIDGE_NATS_*` code |
 
-`stop`, `setModel` and `setThinking` never cross. An ACK crosses only back to the verified requester of a
-command the link claimed. Addressed `fleet.work.*` and allow-listed `ops.owner` events on the hub for a
-NATS root become one keyed `followUp` to it, from `bridge:<link>`, when the entry lists the topic in
-`receiveTopics`.
+A principal seat remains capped at receive `followUp` and `cancel`; `steer` is refused, and `cancel` is
+the existing protocol housekeeping operation. An explicit `allow.nats` seat entry may list `ask` in
+`send`, permitting only the seat's outbound ask; its reply is a ledger-bound RPC ACK, not a new inbound
+ask or steer grant. The fallback does not change the seat receive cap. `stop`, `setModel` and
+`setThinking` never cross. An ACK crosses only back to the verified requester of a command the link
+claimed. Addressed `fleet.work.*` and allow-listed `ops.owner` events on the hub for a NATS root become
+one keyed `followUp` to it, from `bridge:<link>`, when the entry lists the topic in `receiveTopics`.
 
 Not in PR 1: commands between a work-host spoke and a NATS root through the hub relay, and NATS-side
 `fleet.work.<repo>.<n>` events to the hub factory (`nats.events`). Both are PR 2. `github.*` never
@@ -60,9 +72,10 @@ crosses.
   the mapping both ways and maps the owner's ACK back.
 - The source is acknowledged only after the destination's durable append. A redelivery after a crash or
   a lost ACK replays the recorded outcome; it never runs the command twice.
-- The allow-list is read once at start and never widened. A principal seat's id must equal that
-  principal's `orgInstance.fabricSession` in org.json, and an id that is a principal's bound session must
-  be declared as that seat; `start` refuses otherwise, before it opens anything.
+- The explicit allow-list, `allow.fileFleetRoots` and `allow.fileAskTargets` policy are fixed at start.
+  Neither fallback widens an explicit entry's `send` or `receive` lists. Any explicit entry for a
+  principal-bound session must declare the matching seat; neither fallback applies to principal-bound
+  sessions. `start` refuses a contradictory entry before it opens anything.
 
 ## Config file
 
@@ -91,6 +104,7 @@ at every level, so a misspelt field never falls back to a default.
     "operatorMachine": "fabric-ops"
   },
   "allow": {
+    "fileFleetRoots": false,
     "file": [
       { "kind": "root", "id": "session:00000000-0000-7000-8000-00000000000b", "principal": "Owner",
         "receive": ["followUp", "cancel"] },
@@ -124,10 +138,31 @@ at every level, so a misspelt field never falls back to a default.
 | `nats.org`, `custodyStream`, `livenessStream`, `pathBMachines`, `operatorMachine` | The org's Path B policy, as `mesh.nats` in `fabric.json`. They must match the scope the credential was minted with. |
 | `nats.events` | Default false. PR 2 (v2 → hub factory topics); needs the events grant and `org`. |
 | `nats.inboxLanes` | Default 8. |
-| `allow.file`, `allow.nats` | Who may cross; see below. |
+| `allow.file`, `allow.nats` | Explicit identities that may cross; see below. |
+| `allow.fileFleetRoots` | Optional boolean, default `false`. When `true`, otherwise-unlisted live, verified, native file-side canonical Main roots not bound to a principal session get fallback `send` and `receive` for `followUp` and `steer`, with no carried principal, and are mirrored to NATS KV. Explicit entries take precedence and are never widened; actors, unverified/stale/mirrored roots and principal seats do not qualify for this root fallback. Remove this field or set it to `false` and restart the link to restore allow-list-only behavior. |
+| `allow.fileAskTargets` | Optional `[{ "actorId": "<32-hex-id>", "rootId": "session:<lowercase uuid>" }]`, active only while `allow.fileFleetRoots` is `true`. Each `actorId` is the exact native 32-hex actor id, not a name; `rootId` is its canonical `session:<lowercase uuid>` owner root. Only a live, verified, native actor under a live, verified, nonprincipal file-fleet root may receive `ask`; it cannot initiate sends, and other unlisted actors remain refused. Explicit entries take precedence and are not widened. Clients pin the exact actor id via their environment (no default or name-discovery fallback); if it rotates, update this config and the client pin. |
 | `callTimeoutMs` | Deadline of each NATS-side call (default 30,000; 1,000 to 300,000). |
 | `directionStallAfterMs` | Optional safe integer in milliseconds, 60,000 to 3,600,000 (inclusive). Default 180,000, unchanged when absent. The watchdog closes a link whose pending work in either direction makes no cursor progress for this long, even if the other direction is healthy. Sampled every 15 seconds; idle or advancing directions do not count as stalled. For example, `"directionStallAfterMs": 300000` allows five minutes. |
 | `logLevel` | `info` (default) or `debug`. |
+
+For example, this `allow` section uses fictional ids to designate one ask-only file actor while letting
+a NATS seat send an ask; the seat still receives only `followUp` and `cancel`:
+
+```json
+{
+  "allow": {
+    "fileFleetRoots": true,
+    "fileAskTargets": [
+      { "actorId": "0123456789abcdef0123456789abcdef", "rootId": "session:00000000-0000-7000-8000-00000000000e" }
+    ],
+    "nats": [
+      { "kind": "root", "id": "session:00000000-0000-7000-8000-00000000000a", "principal": "Second",
+        "machine": "sandbox1", "send": ["followUp", "ask", "cancel"],
+        "receive": ["followUp", "cancel"] }
+    ]
+  }
+}
+```
 
 The NATS settings are taken from this file only. `PI_FABRIC_MESH_NATS` and `fabric.json` are never
 merged in: the link's machine identity comes from its own config.
@@ -137,7 +172,13 @@ merged in: the link's machine identity comes from its own config.
 `allow.file` lists identities native on the hub's file mesh; the link mirrors them into NATS KV, so v2
 can reach them and they may send to v2. `allow.nats` lists identities native on the broker; the link
 mirrors them into the hub's mesh, so the hub can reach them and they may send to the hub. An identity
-appears once, on one side.
+appears once, on one side. `allow.fileFleetRoots` is an optional fallback for otherwise-unlisted live,
+verified, native file-side canonical Main roots not bound to any principal session. It grants only
+`followUp` and `steer` in both directions, carries no principal, and mirrors those roots into NATS KV.
+Explicit entries take precedence without widening their configured operations; other actors, unverified or
+stale identities, mirrored roots and principal seats are excluded. While enabled, `allow.fileAskTargets`
+separately names exact native actors under live, nonprincipal file roots that may receive `ask` only;
+they cannot initiate sends.
 
 - A root: `{ "kind": "root", "id": "session:<lowercase uuid>" }`, with `principal` when it is that
   principal's org seat.

@@ -30,9 +30,10 @@ One process on Ryzen 1 joins two meshes:
 - **the org NATS broker**, through L2's `NatsCarrierSide` over L1's `BridgeNatsPort`, logged in as one
   Path B machine, `ryzen1-bridge`. Moved leads and moved principal seats (Kate's v2 Main first) live here.
 
-It mirrors allow-listed presence each way and carries control commands (followUp, steer, ask, cancel)
-and their ACKs. File identities appear on NATS as KV presence under `ryzen1-bridge`; NATS identities
-appear in the file mesh as mirror records with `remoteHost: <link>`.
+It mirrors explicit allow-listed presence each way and carries control commands (followUp, steer, ask,
+cancel) and their ACKs. When `allow.fileFleetRoots` is enabled, it also mirrors eligible file-side roots
+to NATS KV under `ryzen1-bridge`. NATS identities appear in the file mesh as mirror records with
+`remoteHost: <link>`.
 
 ## 2. Assets
 
@@ -43,13 +44,14 @@ appear in the file mesh as mirror records with `remoteHost: <link>`.
 | ACKs and ask answers | An ask answer is the target's output; delivered to the wrong requester it is a data leak. |
 | Message bodies in the ledger | The ledger keeps command bodies (for same-bytes resend) and ACK data. |
 | The `ryzen1-bridge` credential | The bridge speaks for every file identity it mirrors; the NATS side trusts that credential's presence. |
-| The allow-list and org.json | They decide who may cross and which ids are principal seats. |
+| Explicit allow entries, `allow.fileFleetRoots`, `allow.fileAskTargets` and org.json | They decide who may cross and which ids are principal-bound sessions. |
 
 ## 3. Who is trusted for what
 
 - **Ryzen 1 same-UID processes** are trusted as today: a native event's `from` on the file mesh is set
-  by the publishing host process (the existing same-UID tool boundary, #820 residual). The link adds no
-  new file-side authority; it only reads native presence and publishes as `MeshBridge` already does.
+  by the publishing host process (the existing same-UID tool boundary, #820 residual). The link still
+  derives file-side identities from native presence; when enabled, the R2 fallback only expands which
+  eligible roots it may mirror and carry.
 - **A NATS machine** is trusted for presence under its own KV prefix and for what it publishes from its
   own credential: the broker binds the last subject token of `fabric.in.<dst>.<host>.<kind>.<target>.<src>`
   to the publishing credential, and NATS receivers accept a sender only if its live presence is on that
@@ -91,42 +93,65 @@ L2 must call `verifySender` for every command and `verifyTarget` for its destina
 in both directions, and publish the crossing `from` as `bridgeNatsMeshIdentity(identity)`, never the
 event's own `from`.
 
-### R2. The allow-list is static, explicit and frozen
+### R2. Explicit allow entries and optional file-root fallback are fixed at start
 
-`parseBridgeNatsAllowSection` parses the link config's `allow` section once at start: root entries by
-exact canonical id (`session:<lowercase uuid>`), actor entries by owner root plus name (optional id pin),
-each in the list of its home side (`allow.file` or `allow.nats`). Unknown keys, duplicate identities, an
-identity on both lists, malformed ids (upper case, bare uuid, trailing newline), an `allow.nats` entry
-without a `machine` pin, and machine pins in the file list or on the bridge's own machine are refused.
-Every NATS identity is pinned to the machine it must be live on (integrator decision, threat T3). The result is deep-frozen; there is no add or
-remove API. L5's `loadNatsLinkConfig` refuses a config file that is a symlink, not ours (or root's), or
-group/other-writable.
+`parseBridgeNatsAllowSection` parses the link config's explicit `allow.file` and `allow.nats` entries once
+at start: root entries by exact canonical id (`session:<lowercase uuid>`), actor entries by owner root
+plus name (optional id pin), each in the list of its home side. Optional `allow.fileFleetRoots` is a
+boolean, default `false`, fixed with that config. When true, an otherwise-unlisted live, verified,
+native file-side canonical Main root (`rootId == id`, canonical `session:<lowercase uuid>`) that is not
+bound to a principal session gets fallback `send` and `receive` for `followUp` and `steer`, carries no
+principal, and is mirrored to NATS KV. Optional `allow.fileAskTargets` is active only while
+`allow.fileFleetRoots` is true: each `{ actorId, rootId }` names an exact native 32-hex actor id (not an
+actor name) and its canonical owner root. Only that live, verified, native actor under a live, verified,
+nonprincipal file-fleet root may receive `ask`; it cannot initiate sends. Other unlisted actors remain
+refused. Explicit entries take precedence and neither fallback widens an explicit entry's `send` or
+`receive` list. Actor ids are pinned exactly by clients through their environment, with no default or
+name-discovery fallback; an id rotation requires updating the config and client pin. Unverified or stale
+identities, mirrored roots, and principal-bound sessions never get fallback grants. Unknown keys,
+duplicate identities, an identity on both explicit lists, malformed ids (upper case, bare uuid, trailing
+newline), an `allow.nats` entry without a `machine` pin, and machine pins in the file list or on the
+bridge's own machine are refused. Every NATS identity is pinned to the machine it must be live on
+(integrator decision, threat T3). The result is deep-frozen; there is no add or remove API. L5's
+`loadNatsLinkConfig` refuses a config file that is a symlink, not ours (or root's), or group/other-writable.
+Remove `allow.fileFleetRoots` or set it to `false` and restart the link to re-enable allow-list-only
+behavior. Rule #1 relaxation; re-enable register smarty-dev#16876.
 
-### R3. Allow-list per destination class, enforced before publish
+### R3. Grants per destination class, enforced before publish
 
-The class comes from the allow-list entry (`kind` plus `principal`, and its list), never from the message
-(`bridgeNatsDestinationClass`, `BRIDGE_NATS_CLASS_RECEIVE`):
+For explicit entries, the class comes from the allow-list entry (`kind` plus `principal`, and its list),
+never from the message (`bridgeNatsDestinationClass`, `BRIDGE_NATS_CLASS_RECEIVE`). A fallback root is a
+non-seat file participant, but its fallback grant is limited to `followUp` and `steer`; a designated
+`allow.fileAskTargets` actor is a separate receive-only `ask` target:
 
 | Destination class | Allowed ops |
 |---|---|
-| principal seat (org.json-bound principal session) | followUp, cancel |
+| principal seat (org.json-bound principal session) | receive followUp, cancel; may send ask if explicit `allow.nats.send` lists it |
 | moved lead (allow-listed lead Main on v2) | followUp, steer, ask (and its answer), cancel |
-| Ryzen 1 root or actor (file side) | followUp, steer, ask (and its answer), cancel, ACK |
+| Ryzen 1 root or actor (explicit `allow.file` entry) | followUp, steer, ask (and its answer), cancel, ACK |
+| eligible fallback root (only when `allow.fileFleetRoots` is true) | followUp, steer |
+| otherwise-unlisted exact actor in `allow.fileAskTargets` (only when `allow.fileFleetRoots` is true) | receive ask only; reply is a ledger-bound ACK |
 | anything else | refused before publish, with a stable `BRIDGE_NATS_*` code |
 
 How the code reads this table:
 
 - `seat` = a root entry with `principal` (on either list). `movedLead` = a root on `allow.nats` without
-  `principal`. `fileParticipant` = a root or actor on `allow.file` without `principal`. `refused` = an
-  actor on `allow.nats`.
-- The cap is applied twice: at parse (an entry whose `receive` names an op outside its class is a config
-  error) and in `allow()` before the entry's own lists (`BRIDGE_NATS_DESTINATION_CLASS_REFUSED`). Inside
-  the class, the sender's `send` and the target's `receive` must both list the op
-  (`BRIDGE_NATS_OPERATION_NOT_ALLOWED`).
+  `principal`. `fileParticipant` = a root or actor on `allow.file` without `principal`, including an
+  eligible fallback root. An otherwise-unlisted `fileAskTargets` actor is a separate receive-only ask
+  target; `refused` is an actor on `allow.nats` or any other unlisted actor.
+- The seat receive cap is unchanged: `followUp` and `cancel` (with `cancel` as existing protocol
+  housekeeping); `steer` remains refused. An explicit seat entry may list `ask` in `send`, but this does
+  not change its receive cap. The fallback does not apply to seats.
+- Explicit entries are checked at parse so `receive` cannot exceed its class, and `allow()` enforces the
+  class cap before the entry's own lists (`BRIDGE_NATS_DESTINATION_CLASS_REFUSED`). The fallback root's
+  `send` and `receive` are limited to `followUp` and `steer`; an exact `fileAskTargets` actor may receive
+  only `ask` and cannot initiate sends. For either kind of grant, the sender's `send` and target's
+  `receive` must both permit the operation (`BRIDGE_NATS_OPERATION_NOT_ALLOWED`).
 - stop, setModel and setThinking never cross.
 - "ask (and its answer)": the answer travels in the ACK. An ACK is not a destination grant: it crosses
-  only back to the verified requester of a command the ledger claimed (R7), so a seat that sends a
-  followUp still receives its ACK.
+  only back to the verified requester of a command the ledger claimed (R7). A seat's explicit outbound
+  ask may receive its ledger-bound RPC ACK (`src/mesh/bridge-nats-carrier.ts` `#outboundAck`), not a new
+  inbound ask or steer grant; the seat's receive cap remains `followUp` and `cancel`.
 - A topic route (N3) arrives as a followUp, so its target's class must allow followUp.
 
 Test: "applies the destination class table from the entry alone".
@@ -148,9 +173,10 @@ A moved seat keeps its session id (handoff), so the smarty-dev pins still hold o
 ### R5. Principal authority is carried only when listed, otherwise stripped
 
 A command's `principal` (`{id, binding}`, from its envelope, never from data) crosses only if the
-sender's entry lists that principal id in `principals`; otherwise `allow()` returns `principal: "strip"`
-and L2 must publish without it. Stripping removes authority; it never adds any. A malformed principal is
-stripped. Topic routes never carry a principal.
+explicit sender entry lists that principal id in `principals`; otherwise `allow()` returns
+`principal: "strip"` and L2 must publish without it. A fallback identity has no principal list and never
+carries a principal. Stripping removes authority; it never adds any. A malformed principal is stripped.
+Topic routes never carry a principal.
 
 ### R6. commandId is mapped per hop
 
@@ -243,21 +269,21 @@ never waits for its timeout:
 | # | Threat | Mitigation | Residual |
 |---|---|---|---|
 | T1 | A message body or `from` names another identity | R1: lookup key only; identity rebuilt from presence | none known |
-| T2 | A NATS runtime publishes as a Ryzen 1 lead | The broker binds the source token; NATS receivers check presence machine == credential machine; Ryzen 1 identities live only under `ryzen1-bridge`; the gate refuses a NATS sender whose entry is on `allow.file` | none known |
-| T3 | A compromised NATS machine registers presence for a Ryzen 1 lead's or a seat's id under its own prefix | NATS receivers and the gate treat an id on two machines as ambiguous and refuse it; every `allow.nats` entry is pinned to its machine (required), so a seat or moved lead seen on any other machine is refused, even while the real one is offline | **Availability:** that machine can make the id unroutable on NATS. **Integrity while the bridge does not mirror a Ryzen 1 id** (the Ryzen 1 lead is offline): NATS receivers may accept the forged id as that lead; it still cannot cross to the file side (it is on the wrong list). This is a property of Path B presence today, not new here. |
-| T4 | The `ryzen1-bridge` credential is stolen | Standard template only; credential file 0600, ours (L5 preflight); the allow-list limits the honest link | **HIGH by design:** the holder can mint KV presence for any id under `ryzen1-bridge` and NATS receivers will accept commands from it. Filed as security-gap smarty-dev#16633: let NATS receivers bound which ids a bridge machine may present (core change, not in A'). |
+| T2 | A NATS runtime publishes as a Ryzen 1 lead | The broker binds the source token; NATS receivers check presence machine == credential machine; Ryzen 1 identities live only under `ryzen1-bridge`; R1 refuses a NATS sender for an identity native on the file side | none known |
+| T3 | A compromised NATS machine registers presence for a Ryzen 1 lead's or a seat's id under its own prefix | NATS receivers and the gate treat an id on two machines as ambiguous and refuse it; every `allow.nats` entry is pinned to its machine (required), so a seat or moved lead seen on any other machine is refused, even while the real one is offline | **Availability:** that machine can make the id unroutable on NATS. **Integrity while the bridge does not mirror a Ryzen 1 id** (the Ryzen 1 lead is offline): NATS receivers may accept the forged id as that lead; it still cannot cross to the file side because it is not a live, verified native file identity. The fallback does not verify NATS senders by matching ids. This is a property of Path B presence today, not new here. |
+| T4 | The `ryzen1-bridge` credential is stolen | Standard template only; credential file 0600, ours (L5 preflight); explicit entries and, when enabled, the narrow file-root fallback limit the honest link | **HIGH by design:** the holder can mint KV presence for any id under `ryzen1-bridge` and NATS receivers will accept commands from it. Filed as security-gap smarty-dev#16633: let NATS receivers bound which ids a bridge machine may present (core change, not in A'). |
 | T5 | A sender fishes another sender's ask answer by reusing its commandId | R6 mapping; ACK returned to the claimed `replyTo` | none known |
 | T6 | Duplicate delivery after a crash, an uncertain PubAck or a redelivery | R7 claim before publish, deterministic ids, same bytes, receiver seen claims, ledger `seen` for deliveries | A command past the 24 h horizon is no longer deduped; receivers refuse it as expired |
 | T7 | A forged or misrouted ACK | R7 `verifyAck` | none known |
 | T8 | Echo loops between the two mirrors | R9; R1 side checks | none known |
 | T9 | Principal authority smuggled across | R5 carry only when listed, else strip | An allow-list that lists a principal id for a sender trusts that sender with it |
 | T10 | steer, stop or setModel into a principal's org seat | R3 class cap (parse and before publish); R4 exact pins | none known |
-| T11 | The allow-list or org.json is edited by someone else | Owner and mode checks on both files; no runtime widening | Same-UID processes can edit them (the existing same-UID boundary) |
+| T11 | The allow settings or org.json are edited by someone else | Owner and mode checks on both files; the explicit entries and fallback flag are fixed at start | Same-UID processes can edit them (the existing same-UID boundary) |
 | T12 | Ledger disclosure or tampering | R11 modes and owner checks; checksums | Checksums detect damage, not a same-UID forger |
 | T13 | Ledger crash inconsistency | R11 fsync before visible, complete writes, namespace barriers, one-append tail cut, refusal on longer damage, fail-stop | A disk that loses fsync'd data is out of scope |
 | T14 | Stale presence authorizes traffic | 15 s freshness on observations and issued identities | Within 15 s a just-stopped Main can still be targeted; its owner refuses a stale incarnation |
 | T15 | Topic injection into a moved lead | R10 receiveTopics, followUp only, rate bounds, never control | A file publisher can post allowed topics to a root that asked for them (as today on the file mesh) |
-| T16 | Flooding across the link | Topic routes spend the file bridge's factory rate buckets (L2); past 1,000,000 live records the ledger refuses new claims and drops none | Control commands from an allow-listed sender have no new per-sender rate bound in PR 1 |
+| T16 | Flooding across the link | Topic routes spend the file bridge's factory rate buckets (L2); past 1,000,000 live records the ledger refuses new claims and drops none | Control commands from an explicitly allowed sender or fallback-eligible file root have no new per-sender rate bound in PR 1 |
 | T17 | The link answers in a mirrored owner's name | R12: only for a command it refused before any publish, with `notRun` and a `BRIDGE_NATS_*` code, no owner epoch, under the held fence on that owner, to a verified sender only | A link bug that refused after publishing would let the sender's resend deliver twice; L2's tests must show every refusal precedes the claim's publish |
 
 ## 6. Checklist for the pass

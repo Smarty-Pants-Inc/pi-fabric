@@ -37,7 +37,6 @@ const { MeshStore } = await import("../src/mesh/store.js");
 const { hostLeasePath, readHostLease, readHostLeases, writeHostLease } = await import("../src/topology/host-leases.js");
 const NOW = 1_800_000_000_000;
 const key = (kind: string, id: string) => `topology/${kind}/${createHash("sha256").update(id).digest("hex")}`;
-const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 const closers: Array<() => void> = [];
 afterEach(() => {
   for (const close of closers.splice(0).reverse()) close();
@@ -91,12 +90,15 @@ const fixture = async (backend: "file" | "sqlite" = "sqlite") => {
   for (const host of records) renew(host, now + 30_000);
   const directory = path.join(root, "host-leases");
   let listings = 0;
+  const listingSites: string[][] = [];
   const readdir = fs.readdirSync;
   vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
     if (String(file) === directory) {
       listings++;
-      if (observation.measure) observation.listingSites.push((new Error().stack ?? "").split("\n")
-        .filter(line => line.includes("/src/")).slice(0, 5).map(line => line.trim()));
+      const sites = (new Error().stack ?? "").split("\n").map(line => line.trim().replaceAll("\\", "/"))
+        .filter(line => line.includes("/src/")).slice(0, 5);
+      listingSites.push(sites);
+      if (observation.measure) observation.listingSites.push(sites);
     }
     return Reflect.apply(readdir, fs, [file, ...args]);
   }) as typeof fs.readdirSync);
@@ -122,7 +124,7 @@ const fixture = async (backend: "file" | "sqlite" = "sqlite") => {
   };
   return { root, store, side, native: native.hosts[0]!.record, second: second.hosts[0]!.record,
     badOwner: badOwner.hosts[0]!.record, relay: relay.hosts[0]!.record, owned: owned.hosts[0]!.record, child,
-    renew, compare, listings: () => listings, now: () => now, advance: (ms: number) => { now += ms; } };
+    renew, compare, listings: () => listings, listingSites, now: () => now, advance: (ms: number) => { now += ms; } };
 };
 
 describe("real StoreBridgeSide keyed lease consumers", () => {
@@ -156,23 +158,54 @@ describe("real StoreBridgeSide keyed lease consumers", () => {
 
   it("classifies real notification snapshots identically without listing after each renewal", async () => {
     const f = await fixture();
+    // The mocked notifier only registers callbacks; fixture setup precedes subscriptions and cannot enqueue events.
     const oracle: BridgeChange[] = [], keyed: BridgeChange[] = [], failures: Error[] = [];
+    const publicationGeneration = await import("../src/topology/publication-generation.js");
+    const stampSpy = vi.spyOn(publicationGeneration, "meshDirectoryStamp");
+    const listingInterval = () => ({ listingCount: f.listings(), siteCount: f.listingSites.length,
+      stampCallIndex: stampSpy.mock.calls.length });
+    const assertWindowsStampInterval = (before: ReturnType<typeof listingInterval>, label: string) => {
+      if (process.platform !== "win32") return;
+      const listingCount = f.listings() - before.listingCount;
+      const siteCount = f.listingSites.length - before.siteCount;
+      const sites = f.listingSites.slice(before.siteCount);
+      const hostLeaseStampCalls = stampSpy.mock.calls.slice(before.stampCallIndex)
+        .filter(([root, name]) => root === f.root && name === "host-leases").length;
+      expect(siteCount, `${label}: record a site for every lease listing`).toBe(listingCount);
+      expect(hostLeaseStampCalls, `${label}: exactly two host-leases stamp calls`).toBe(2);
+      expect(listingCount, `${label}: only host-leases stamp calls may enumerate`).toBe(hostLeaseStampCalls);
+      for (const site of sites) {
+        expect(site[0], `${label}: first production frame must be meshDirectoryStamp`).toMatch(
+          /meshDirectoryStamp.*\/src\/topology\/publication-generation\.ts:/);
+      }
+    };
     const beforeBaseline = f.listings();
+    const baselineInterval = listingInterval();
     closers.push(f.side.subscribeChanges(kind => keyed.push(kind), error => failures.push(error)));
-    expect(f.listings() - beforeBaseline).toBe(0);
+    if (process.platform === "win32") assertWindowsStampInterval(baselineInterval, "keyed subscription baseline");
+    else expect(f.listings() - beforeBaseline).toBe(0);
     observation.full = true;
     closers.push(f.side.subscribeChanges(kind => oracle.push(kind), error => failures.push(error)));
     observation.full = false;
     const callbacks = [...observation.notify.get(f.root)!];
+    const proofs = vi.spyOn(f.store, "stateUnchangedSince");
+    const capture = async (callback: (kind: BridgeChange) => void) => {
+      const before = proofs.mock.calls.length;
+      callback("presence");
+      await vi.waitFor(() => expect(proofs.mock.calls.length).toBeGreaterThan(before), { timeout: 2_000, interval: 10 });
+    };
     const check = async (expected: BridgeChange[]) => {
       const before = f.listings();
-      callbacks[0]!("presence");
-      await turn();
-      expect(f.listings() - before, "one notification capture must not enumerate leases").toBe(0);
+      const keyedInterval = listingInterval();
+      await capture(callbacks[0]!);
+      if (process.platform === "win32") assertWindowsStampInterval(keyedInterval, "keyed notification capture");
+      else expect(f.listings() - before, "one notification capture must not enumerate leases").toBe(0);
       observation.full = true;
-      callbacks[1]!("presence");
-      await turn();
-      observation.full = false;
+      try {
+        await capture(callbacks[1]!);
+      } finally {
+        observation.full = false;
+      }
       expect(keyed.splice(0)).toEqual(expected);
       expect(oracle.splice(0)).toEqual(expected);
       expect(failures).toEqual([]);

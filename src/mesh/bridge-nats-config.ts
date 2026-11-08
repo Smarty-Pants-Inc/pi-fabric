@@ -7,9 +7,9 @@
  * (bridge-nats-link.ts) takes the parsed `NatsLinkConfig`; `nats-link start|status|receipt` load it with
  * `loadNatsLinkConfig`.
  *
- * The allow-list is static: it is read once at start and never widened at run time. It only NAMES the
- * identities that may cross. It never proves one: a sender is still mapped only from the verified presence
- * of the side it came from (L1/L2/L3), never from a message body or from this file. The rules that need
+ * The allow policy is read once at start: explicit entries take precedence over the optional,
+ * default-off non-principal file-root fallback. It never proves an identity: a sender is still mapped
+ * only from verified presence of its source side (L1/L2/L3), never a message body or this file. The rules that need
  * org.json (a seat's id equals that principal's orgInstance.fabricSession) run at start, from `orgJson`.
  *
  * Import-light on purpose (node builtins and leaf modules): the CLI's status and receipt paths load it
@@ -64,7 +64,7 @@ export interface NatsLinkConfig {
     readonly inboxLanes: number;
   };
   /**
-   * Who may cross: the config's `allow: {file, nats}` as written (L3's BridgeNatsAllowSection), frozen, after
+   * Who may cross: the config's `allow: {file, nats, fileFleetRoots?, fileAskTargets?}` as written (L3's BridgeNatsAllowSection), frozen, after
    * L3's parseBridgeNatsAllowSection accepted it. `file` entries are native on the file mesh and mirrored into
    * NATS KV under nats.machine; `nats` entries are native on the broker and mirrored into the file mesh with
    * remoteHost = link. `natsLinkAllowListConfig` gives the normalized list for L3's gate.
@@ -426,6 +426,8 @@ export const describeNatsLinkConfig = (config: NatsLinkConfig): Record<string, u
     events: config.nats.events, credentials: config.nats.credentials, caFile: config.nats.caFile,
   },
   allow: {
+    ...(config.allow.fileFleetRoots !== undefined ? { fileFleetRoots: config.allow.fileFleetRoots } : {}),
+    ...(config.allow.fileAskTargets !== undefined ? { fileAskTargets: config.allow.fileAskTargets } : {}),
     file: natsLinkAllowListConfig(config).entries.filter((entry) => entry.side === "file").map(bridgeNatsAllowKey),
     nats: natsLinkAllowListConfig(config).entries.filter((entry) => entry.side === "nats").map(bridgeNatsAllowKey),
   },

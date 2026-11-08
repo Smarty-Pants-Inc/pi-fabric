@@ -311,12 +311,20 @@ export class AgentService {
         if (depth > this.#admission.maxDepth) throw new Error(`Fabric agent depth limit reached (${this.#admission.maxDepth})`);
         const id = previous?.record.id ?? crypto.randomUUID().replaceAll("-", "");
         const generation = (previous?.record.generation ?? 0) + 1;
-        // Continuations retain their host pin, even after route reorder/removal.
-        // Fresh keyed children choose before prepare so placement and execution agree.
+        // Resolve once before prepare; continuations retain live pins or fail over.
         let routeId = previous?.record.routeId;
-        if (!previous && request.routingKey !== undefined) {
-          if (!this.#stickyRoutes.length) throw new Error("routingKey requires configured stickyRoutes");
-          routeId = selectStickyRoute(request.routingKey, this.#stickyRoutes);
+        if (request.routingKey !== undefined) {
+          if (!previous && !this.#stickyRoutes.length) throw new Error("routingKey requires configured stickyRoutes");
+          const liveRoutes = this.#options.port.liveRoutes;
+          if (liveRoutes) {
+            const live = new Set(await liveRoutes.call(this.#options.port));
+            if (controller.signal.aborted || previous?.stopping) throw new Error("Agent admission aborted");
+            if (routeId === undefined || !live.has(routeId)) {
+              const candidates = this.#stickyRoutes.filter(id => live.has(id));
+              if (!candidates.length) throw new Error("No live sticky routes available");
+              routeId = selectStickyRoute(request.routingKey, candidates);
+            }
+          } else if (!previous) routeId = selectStickyRoute(request.routingKey, this.#stickyRoutes);
         }
         const route = routeId !== undefined ? {routeId} : {};
         const prepare = {id, generation, rootId: this.#options.rootId, parentId: callerId, depth, ...route, request: copy(request), signal: controller.signal};
@@ -329,7 +337,7 @@ export class AgentService {
         this.#admission.admit(depth);
         const now = Date.now();
         const record: AgentServiceRecord = previous ? {
-          ...previous.record, task: request.task, status: "queued", generation: previous.record.generation + 1,
+          ...previous.record, ...route, task: request.task, status: "queued", generation: previous.record.generation + 1,
           text: "", turns: 0, toolCalls: 0, updatedAt: now,
         } : {
           id, rootId: this.#options.rootId, parentId: callerId, depth, generation: 1, ...route,

@@ -13,7 +13,7 @@ export type AgentServiceStatus = AgentRunRecord["status"] | "paused";
 export type AgentServiceRecord = Omit<AgentRunRecord, "status" | "transport" | "cwd"> & {
   status: AgentServiceStatus; cwd?: string;
   rootId: string; parentId: string; depth: number; generation: number; checkpoint?: unknown;
-  /** Host-selected opaque topology agent/pair ID, pinned across continuations. */
+  /** Host-selected opaque topology agent/pair ID, pinned across continuations unless it fails over. */
   routeId?: string;
 };
 /** Model-facing records never carry opaque host checkpoints. */
@@ -38,6 +38,8 @@ export interface AgentExecutionResponse {
   text?: string; value?: unknown; error?: string; usage?: AgentUsage; checkpoint?: unknown; sessionId?: string;
 }
 export interface AgentExecutionPort {
+  /** Optional pre-prepare liveness snapshot for keyed children; dead pins may fail over. */
+  liveRoutes?(): readonly string[] | Promise<readonly string[]>;
   prepare?(request: AgentPrepareRequest): Promise<unknown>;
   execute(request: AgentExecutionRequest): Promise<AgentExecutionResponse>;
   resume?(request: AgentExecutionRequest): Promise<AgentExecutionResponse>;

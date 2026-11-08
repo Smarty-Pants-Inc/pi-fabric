@@ -47,7 +47,7 @@ const asStringRecord = (record: Record<string, unknown>): Record<string, string>
 };
 
 // smarty-dev#2340: payloads are literal strings. A value that is only a
-// placeholder token (`__CONTENT__`) or a single file reference (`@/path`,
+// placeholder token (`__CONTENT__` or exact `PLACEHOLDER`) or a single file reference (`@/path`,
 // `file:///path`) means the model expected the host to expand it; the program
 // would silently run against the token text instead. Ordinary text that merely
 // contains such a token, and the empty string, stay valid.
@@ -62,7 +62,7 @@ const PAYLOADS_LITERAL_ERROR =
 // Exact whole-value contract: no trimming, so padded or multi-line values are
 // ordinary text and pass through unchanged.
 const isPayloadPlaceholder = (value: string): boolean =>
-  PAYLOAD_PLACEHOLDER.test(value) || PAYLOAD_FILE_REFERENCE.test(value);
+  value === "PLACEHOLDER" || PAYLOAD_PLACEHOLDER.test(value) || PAYLOAD_FILE_REFERENCE.test(value);
 
 const assertLiteralPayloads = (payloads: Record<string, string>): Record<string, string> => {
   for (const [key, value] of Object.entries(payloads)) {

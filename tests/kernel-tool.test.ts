@@ -238,6 +238,7 @@ describe("exclusive kernel tool surface", () => {
     const literal = "payloads are literal: read the file with a native tool first and pass its content";
     for (const args of [
       { code: "return 1", payloads: { spec: "@/tmp/spec.md" } },
+      { code: "return 1", payloads: { spec: "PLACEHOLDER" } },
       { code: "return 1", payloads: '{"spec":"__SPEC__"}' },
       { code: "return 1", strings: { spec: "file:///tmp/spec.md" } },
     ]) {

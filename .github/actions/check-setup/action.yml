@@ -47,6 +47,8 @@ runs:
       # Every Linux shard keeps the exact qualified 2.14.7 broker on PATH.
       if: runner.os == 'Linux'
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: bash scripts/install-pinned-nats-server.sh
     - name: Download gated build
       if: inputs.dist-artifact != ''

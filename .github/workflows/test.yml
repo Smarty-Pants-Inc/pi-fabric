@@ -23,8 +23,11 @@ jobs:
       - uses: ./.github/actions/check-setup
       - name: Install pinned Bend proof compiler
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.36/bend-2.0.36-linux-x64.tar.gz
+          gh release download -R bendlang/bend v2.0.36 -p bend-2.0.36-linux-x64.tar.gz -D "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/bend-2.0.36-linux-x64.tar.gz" "$RUNNER_TEMP/bend.tar.gz"
           echo "02089dc0eed0fd5fd6d73c74cc9cffcb2c6638dd3b02ae83f7b8cc57fbe381ba  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/bend/bin" >> "$GITHUB_PATH"
@@ -368,14 +371,14 @@ jobs:
       - name: Install pinned NATS server
         # The same pinned download as the JetStream event-log job (feat/nats-event-log).
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version=2.14.7
           archive="nats-server-v${version}-linux-amd64.tar.gz"
-          release="https://github.com/nats-io/nats-server/releases/download/v${version}"
           stage="$RUNNER_TEMP/nats-release"
           mkdir -p "$stage"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/SHA256SUMS" "$release/SHA256SUMS"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$archive" "$release/$archive"
+          gh release download -R nats-io/nats-server "v${version}" -p SHA256SUMS -p "$archive" -D "$stage"
           (
             cd "$stage"
             awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
@@ -553,14 +556,14 @@ jobs:
       - name: Install pinned NATS server
         # The same pinned download as the JetStream event-log job (feat/nats-event-log).
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version=2.14.7
           archive="nats-server-v${version}-linux-amd64.tar.gz"
-          release="https://github.com/nats-io/nats-server/releases/download/v${version}"
           stage="$RUNNER_TEMP/nats-release"
           mkdir -p "$stage"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/SHA256SUMS" "$release/SHA256SUMS"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$archive" "$release/$archive"
+          gh release download -R nats-io/nats-server "v${version}" -p SHA256SUMS -p "$archive" -D "$stage"
           (
             cd "$stage"
             awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -

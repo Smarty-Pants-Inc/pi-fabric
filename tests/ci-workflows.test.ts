@@ -68,6 +68,10 @@ function expandedStepsWithOrigins({ steps = [] }: Job, localActions: string[] = 
 const expandedSteps = (job: Job): Step[] => expandedStepsWithOrigins(job).map(({ step }) => step);
 const acceptance = (os: string) => workflow().jobs[`${os}-acceptance`] as Job;
 
+function curlsGitHubReleaseDownload(source: string): boolean {
+  return /\bcurl\b/i.test(source) && /github\.com\/[^\s"'`]*\/releases\/download(?:\/|\b)/i.test(source);
+}
+
 const i9JobId = "windows-i9";
 const i9WorkflowFile = "windows-i9.yml";
 const i9If = "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')";
@@ -286,13 +290,34 @@ describe("CI Node runtime prerequisites", () => {
     const gate = steps.find((step) => step.name === "Session-channel real-broker acceptance");
     expect(install?.if).toBe("runner.os == 'Linux'");
     expect(install?.run).toBe("bash scripts/install-pinned-nats-server.sh");
+    expect(install?.env?.GH_TOKEN).toBe("${{ github.token }}");
     const installer = fs.readFileSync(new URL("scripts/install-pinned-nats-server.sh", root), "utf8");
     expect(installer).toContain("version=2.14.7");
     expect(installer).toContain("e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2");
-    expect(installer).toContain("https://github.com/nats-io/nats-server/releases/download/v${version}");
+    expect(installer).toContain("gh release download");
     expect(gate?.if).toBe("runner.os == 'Linux'");
     expect(gate?.env).toEqual({ PI_FABRIC_REQUIRE_NATS: "1", NATS_EXPECTED_SERVER_VERSION: "2.14.7" });
     expect(gate?.run).toBe("bunx vitest run --retry=0 tests/nats-session-channel.test.ts");
+  });
+
+  it("uses authenticated gh for GitHub release assets and never curls a release URL", () => {
+    const steps = Object.entries(workflowInventory()).flatMap(([file, config]) =>
+      Object.entries(config.jobs).flatMap(([job, definition]) => expandedStepsWithOrigins(definition).map(({ step }) => ({
+        location: `${file}:${job}:${step.name ?? step.uses ?? "unnamed"}`,
+        step,
+      }))),
+    );
+    const releaseDownloads = steps.filter(({ step }) => /\bgh\s+release\s+download\b/i.test(step.run ?? ""));
+    expect(releaseDownloads.length).toBeGreaterThan(0);
+    for (const { location, step } of releaseDownloads) {
+      expect(step.env?.GH_TOKEN, `${location} must pass the GitHub token`).toBe("${{ github.token }}");
+    }
+
+    const curlDownloads = steps.filter(({ step }) => curlsGitHubReleaseDownload(step.run ?? "")).map(({ location }) => location);
+    const installer = fs.readFileSync(new URL("scripts/install-pinned-nats-server.sh", root), "utf8");
+    if (curlsGitHubReleaseDownload(installer)) curlDownloads.push("scripts/install-pinned-nats-server.sh");
+    expect(curlDownloads).toEqual([]);
+    expect(installer).toMatch(/\bgh\s+release\s+download\b/i);
   });
 
   // Deliberately pinned jobs retain their own Node versions.

@@ -8,6 +8,8 @@ import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorAlarmKey } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { readRunStopIntent } from "../src/agents/archive-custody.js";
+import { slotAdmissionFor } from "../src/actors/slot-admission.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { AgentTransportHandle } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -29,7 +31,9 @@ const until = async (check: () => boolean, label: string, ms = 5_000) => {
   }
 };
 
-async function setup({ blockMonitor = true, retentionSweepMs }: { blockMonitor?: boolean; retentionSweepMs?: number } = {}) {
+async function setup({ blockMonitor = true, retentionSweepMs, canManageActor }: {
+  blockMonitor?: boolean; retentionSweepMs?: number; canManageActor?: (id: string) => boolean;
+} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-dead-reconcile-"));
   const realNow = Date.now.bind(Date);
   let skew = 0;
@@ -50,7 +54,8 @@ async function setup({ blockMonitor = true, retentionSweepMs }: { blockMonitor?:
         notices.push(message.text);
         if (triggerTurn) triggeredNotices.push(message.text);
       }
-    }, { actorRoot: path.join(root, "actors"), persistent: true, meshRetentionSweepPath: false,
+    }, { actorRoot: path.join(root, "actors"), persistent: true, meshRetentionSweepPath: false, removalRetryMs: 1,
+      ...(canManageActor ? { canManageActor } : {}),
       ...(retentionSweepMs !== undefined ? { retentionSweepMs } : {}) });
   const launch = ProcessTransport.prototype.launch;
   const handles: AgentTransportHandle[] = [];
@@ -252,6 +257,102 @@ describe("native exit diagnostics stay out of model-facing activity (#1695)", ()
 });
 
 describe("bounded dead actor worker reconciliation (#17191)", () => {
+  // Keep: #19308's accepted removal wedges behind a stranded native monitor.
+  // Worker death is real; neither a status hint nor elapsed runtime can discharge custody.
+  it.each([false, true])("settles a young pending removal through its original finalizer (ownership revoked %s)", async revoked => {
+    let owns = true;
+    const s = await setup({ canManageActor: () => owns });
+    const first = await s.start();
+    const directory = s.agents.runDirectory(first.runId)!;
+    expect(await s.actors.remove(s.actor.id, { wait: false, dropQueued: true })).toMatchObject({ removed: true, pending: expect.any(String) });
+    const receipt = readRunStopIntent(directory);
+    expect(receipt).toMatchObject({ reason: "explicit", path: "actors.remove", by: { id: s.actor.rootId } });
+    let settled = false;
+    const removal = s.actors.removalSettled(s.actor.id)!;
+    void removal.then(() => { settled = true; });
+    const stop = s.blockStop();
+    owns = !revoked;
+    try {
+      process.kill(first.worker.pid, "SIGKILL");
+      await s.handles[0]!.closed;
+      s.atExitAge(5_001);
+      expect(Date.now() - s.actors.status(s.actor.id).inFlightRun!.startedAt).toBeLessThan(30_000);
+      await s.pulse();
+      await until(() => stop.calls.mock.calls.length === 1, "removal native join without the ordinary runtime threshold", 1_500);
+      expect(settled).toBe(false);
+      expect(s.actors.status(s.actor.id).inFlightRun?.id).toBe(first.runId);
+      expect(readRunStopIntent(directory)).toEqual(receipt);
+      stop.release();
+      await until(() => settled, "removal finalized through the original serial drain", 3_000);
+      await removal;
+      expect(s.actors.pendingRemovals()).toEqual([]);
+      expect(s.actors.inFlightCount()).toBe(0);
+      expect(s.handles).toHaveLength(1); // neither the abandoned item nor queued NEXT is replayed
+      expect(readRunStopIntent(directory)).toEqual(receipt);
+      expect(JSON.parse(fs.readFileSync(first.statusFile, "utf8"))).toMatchObject({
+        status: "failed", error: expect.stringContaining("proven gone"),
+      });
+      s.resume();
+      await s.pulse();
+      expect(s.handles).toHaveLength(1);
+    } finally { owns = true; stop.release(); }
+  }, 15_000);
+
+  it("settles the revoked protected drain without retiring a slot whose archive custody is still pending", async () => {
+    let owned = true;
+    const s = await setup({ canManageActor: () => owned });
+    const first = await s.start();
+    const directory = s.agents.runDirectory(first.runId)!;
+    const slots = slotAdmissionFor(s.mesh);
+    // Drive the manager revocation/cleanup branch after a native launch;
+    // slot-ledger admission is a separate trust boundary, not forged here.
+    vi.spyOn(slots, "requiresEnforcement").mockImplementation(topics => topics.includes("github.demo"));
+    const revoke = vi.spyOn(slots, "beginRemoval").mockResolvedValue(undefined);
+    const retire = vi.spyOn(slots, "retire").mockResolvedValue(undefined);
+    await s.actors.remove(s.actor.id, { wait: false, dropQueued: true });
+    const receipt = readRunStopIntent(directory);
+    owned = false;
+    process.kill(first.worker.pid, "SIGKILL");
+    await s.handles[0]!.closed;
+    s.atExitAge(5_001);
+    await s.pulse();
+    await until(() => s.actors.inFlightCount() === 0, "protected native drain finalized");
+    await until(() => s.actors.pendingRemovals().some(row => row.state.includes("not proven settled")), "protected cleanup retained");
+    expect(s.actors.pendingRemovals()).toEqual([expect.objectContaining({
+      id: s.actor.id, name: s.actor.name,
+      state: expect.stringContaining(`Protected actor execution ${first.runId} is not proven settled; cleanup retained`),
+    })]);
+    expect(s.actors.pendingRemovals()[0]!.state).toContain("protected slot topics: github.demo");
+    expect(s.agents.status(first.runId)).toMatchObject({ status: "failed", error: expect.stringContaining("proven gone") });
+    expect(readRunStopIntent(directory)).toEqual(receipt);
+    expect(revoke).toHaveBeenCalledTimes(1);
+    expect(retire).not.toHaveBeenCalled();
+    expect(s.handles).toHaveLength(1);
+  });
+
+  it.each(["live", "unverified", "young-exit"] as const)("does not finalize a pending removal from %s worker evidence", async evidence => {
+    const s = await setup();
+    const first = await s.start();
+    await s.actors.remove(s.actor.id, { wait: false, dropQueued: true });
+    const receipt = readRunStopIntent(s.agents.runDirectory(first.runId)!);
+    let settled = false;
+    void s.actors.removalSettled(s.actor.id)!.then(() => { settled = true; });
+    const stop = s.blockStop();
+    if (evidence !== "live") {
+      process.kill(first.worker.pid, "SIGKILL");
+      await s.handles[0]!.closed;
+      if (evidence === "unverified") s.handles[0]!.nativeExit = () => undefined;
+      else s.atExitAge(5_000);
+    }
+    if (evidence !== "young-exit") s.atBound();
+    await s.pulse(); await s.pulse();
+    expect(settled).toBe(false);
+    expect(stop.calls).not.toHaveBeenCalled();
+    expect(s.actors.status(s.actor.id)).toMatchObject({ status: "stopped", inFlightRun: { id: first.runId } });
+    expect(readRunStopIntent(s.agents.runDirectory(first.runId)!)).toEqual(receipt);
+    expect(s.handles).toHaveLength(1);
+  });
+
   it.each([undefined, 0, 5_000])("legacy sweep does not wake Main after genuine same-ID completion held behind its alarm claim (exit age %s)", async age => {
     const s = await legacySweepSetup();
     const run = s.agents.run.bind(s.agents);

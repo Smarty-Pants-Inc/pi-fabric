@@ -344,8 +344,9 @@ export class ResidentHost {
   #scheduleTimer: NodeJS.Timeout | undefined;
   #scheduleWakeAt: number | undefined;
   #pollingRequests = false;
-  // Boundary commands retain response custody without occupying serial admission.
+  // Keyed requests retain exchange custody independently of their admission boundary.
   readonly #boundaryRequests = new Map<string, Promise<void>>();
+  readonly #actorAdmissions = new Map<string, Promise<void>>();
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
@@ -1700,6 +1701,34 @@ export class ResidentHost {
     }
   }
 
+  /** Same workqueue key for every accepted id/name/prefix alias; lookup grants no authority. */
+  #actorRequestKeys(command: ResidentCommand | undefined, entry: string): string[] | undefined {
+    if (!command || ![RESIDENT_HOST_FORMAT, RESIDENT_ACTOR_COMMAND_FORMAT, RESIDENT_EXPIRING_COMMAND_FORMAT].includes(command.format) ||
+        command.rootId !== this.config.rootId || `${command.requestId}.json` !== entry || !isResidentCommandOperation(command.operation)) return undefined;
+    if (command.operation === "createActor") {
+      if (typeof command.request?.name !== "string") return undefined;
+      return [`actor-name:${command.request.name.trim()}`,
+        ...(typeof command.idempotencyKey === "string" ? [`actor-create:${command.idempotencyKey}`] : [])];
+    }
+    if (command.operation === "spawnBound" || command.operation === "foreground" || command.operation === "cleanup" ||
+        command.operation === "releaseChange" || command.operation === "releaseDrain" || command.operation === "actors" || command.operation === "slotStatus") return undefined;
+    const id = String(command.id);
+    try {
+      const actor = this.actors.status(id);
+      const keys = [`actor-id:${actor.id}`];
+      try {
+        if (this.actors.status(actor.name).id === actor.id) keys.push(`actor-name:${actor.name}`);
+      } catch {
+        // The canonical ID remains usable when a name is ambiguous or unavailable.
+      }
+      return keys;
+    } catch {
+      // Unknown names may target a creation still preparing. Real dispatch retains
+      // its own exact lookup, caller, ownership and commit/abandonment checks.
+      return [`actor-id:${id}`, `actor-name:${id}`];
+    }
+  }
+
   async #pollRequests(): Promise<void> {
     if (!this.#ready || this.#pollingRequests || this.#closed || this.#idleExitRequested) return;
     if (this.#staged || this.#handover || this.#drain) { await this.#advanceRelease(); return; }
@@ -1707,7 +1736,8 @@ export class ResidentHost {
     try {
       let entries: string[];
       try {
-        entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json"));
+        entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json") &&
+          !this.#boundaryRequests.has(path.join(this.#processingPath, entry)));
       } catch {
         return;
       }
@@ -1718,30 +1748,40 @@ export class ResidentHost {
         const processing = path.join(this.#processingPath, entry);
         // Never overwrite an admitted exchange while its response is still pending.
         if (this.#boundaryRequests.has(processing)) continue;
-        try {
-          fs.renameSync(source, processing);
-        } catch {
+        const command = readJson<ResidentCommand>(source);
+        const keys = this.#actorRequestKeys(command, entry);
+        if (!keys) {
+          // Release is still a GLOBAL poll barrier, including queued preparations
+          // and future batches. Boundary-admitted resets/stops need not settle.
+          if (command?.operation === "releaseChange" || command?.operation === "releaseDrain") {
+            await Promise.all(this.#actorAdmissions.values());
+          }
+          try { fs.renameSync(source, processing); } catch { continue; }
+          await this.#processRequest(processing);
           continue;
         }
+        const previous = Promise.all(keys.map(key => this.#actorAdmissions.get(key)));
         let releaseAdmission!: () => void;
-        let boundary = false;
         const admitted = new Promise<void>(resolve => { releaseAdmission = resolve; });
-        const response = this.#processRequest(processing, () => {
-          // ActorManager installed its commit fence and boundary waiter (or stop
-          // intent) synchronously. Only settlement/publication may now run aside.
-          boundary = true;
-          releaseAdmission();
+        for (const key of keys) this.#actorAdmissions.set(key, admitted);
+        const response = previous.then(async () => {
+          // Keep queued files in requests until their key is available, just as
+          // serial pickup did. An abandoned caller may already have removed one.
+          try { fs.renameSync(source, processing); } catch { return; }
+          await this.#processRequest(processing, releaseAdmission);
         });
-        await Promise.race([response, admitted]);
-        if (boundary) {
-          this.#boundaryRequests.set(processing, response);
-          // Shutdown/handover retains custody until the terminal response is durable.
-          this.#trackPublication(response);
-          void response.finally(() => {
-            this.#boundaryRequests.delete(processing);
-            this.#scheduleIdleCheck();
-          }).catch(() => undefined);
-        }
+        this.#boundaryRequests.set(processing, response);
+        this.#trackPublication(response);
+        void response.finally(() => {
+          // A normal setter owns its key through the durable response. A manager
+          // boundary releases it earlier, allowing e.g. stop to cancel reset.
+          releaseAdmission();
+          for (const key of keys) {
+            if (this.#actorAdmissions.get(key) === admitted) this.#actorAdmissions.delete(key);
+          }
+          this.#boundaryRequests.delete(processing);
+          this.#scheduleIdleCheck();
+        }).catch(() => undefined);
       }
     } finally {
       this.#pollingRequests = false;
@@ -2760,6 +2800,7 @@ export class ResidentHost {
       ) {
         throw new Error("Invalid Fabric residency request");
       }
+      if (this.#closed || this.#idleExitRequested || this.#staged || this.#handover || this.#drain) throw new Error(HOST_CLOSING_RETRY);
       assertResidentRequestNotExpired(this.config.residencyRoot, requestId, command.format);
       // Validate the runtime JSON discriminant before any actor lookup/mutation.
       if (!isResidentCommandOperation(command.operation)) {

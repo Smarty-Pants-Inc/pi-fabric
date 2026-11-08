@@ -5,6 +5,7 @@ import { expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { slotAdmissionFor } from "../src/actors/slot-admission.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -206,6 +207,131 @@ it.each(["Main", "proxy"] as const)("%s bounded reset wait preserves a committed
     spy.mockRestore(); await f.close();
   }
 }, 15_000);
+
+it.each(["Main", "proxy"] as const)("%s reset deadline returns known cancellation and removes intent before late run settlement", async kind => {
+  const f = await fixture();
+  let entered!: () => void; let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const originalRun = f.host.agents.run.bind(f.host.agents);
+  const runSpy = vi.spyOn(f.host.agents, "run").mockImplementation(async (request, signal, ...rest) => {
+    entered(); await gate;
+    return originalRun(request, signal, ...rest);
+  });
+  const originalReset = f.host.actors.resetSession.bind(f.host.actors);
+  const resetSpy = vi.spyOn(f.host.actors, "resetSession").mockImplementation((id, options) =>
+    originalReset(id, { ...(options ?? {}), timeoutMs: 100 }));
+  let runSettled = false;
+  const run = f.host.actors.ask(f.actor.id, "held reset deadline").then(value => { runSettled = true; return { value }; },
+    error => { runSettled = true; return { error }; });
+  try {
+    await started;
+    const file = f.actor.sessionFile!;
+    const originalBytes = fs.readFileSync(file);
+    const dir = path.dirname(file);
+    const backupsBefore = fs.readdirSync(dir).filter(name => name.endsWith(".bak")).sort();
+    const proxy = new ResidentActorClient(f.config.meshRoot, f.config.rootId, 5_000);
+    const reset = (kind === "Main"
+      ? f.provider.invoke("resetSession", { id: f.actor.id }, f.context)
+      : proxy.setActor({ operation: "resetSession", id: f.actor.id }, undefined, { identity: f.identity, hostId: f.identity.id }))
+      .then(value => ({ value }), error => ({ error }));
+    await waitFor(() => decisions(f.config.residencyRoot).some(entry => entry.operation === "resetSession" && entry.state === "committed"));
+    const decision = decisions(f.config.residencyRoot).find(entry => entry.operation === "resetSession")!;
+    expect(await promptly(reset)).toMatchObject({ error: { name: "ActorSessionResetCancelledError", code: "ACTOR_SESSION_RESET_CANCELLED",
+      id: f.actor.id, requestId: decision.requestId } });
+    expect(runSettled).toBe(false);
+    expect(fs.readFileSync(file)).toEqual(originalBytes);
+    expect(fs.readdirSync(dir).filter(name => name.endsWith(".bak")).sort()).toEqual(backupsBefore);
+    expect(fs.existsSync(path.join(f.config.residencyRoot, "acknowledgements", `${decision.requestId}.json`))).toBe(true);
+    expect(fs.readdirSync(path.join(f.config.residencyRoot, "processing"))).toEqual([]);
+    expect(fs.readdirSync(path.join(f.config.residencyRoot, "responses"))).toEqual([]);
+
+    release();
+    expect(await promptly(run)).not.toHaveProperty("error");
+    const lateRunBytes = fs.readFileSync(file);
+    expect(lateRunBytes.subarray(0, originalBytes.length)).toEqual(originalBytes);
+    expect(fs.readdirSync(dir).filter(name => name.endsWith(".bak")).sort()).toEqual(backupsBefore);
+    expect(decisions(f.config.residencyRoot).find(entry => entry.requestId === decision.requestId)).toEqual(decision);
+
+    const onTimeReset = kind === "Main"
+      ? f.provider.invoke("resetSession", { id: f.actor.id }, f.context)
+      : proxy.setActor({ operation: "resetSession", id: f.actor.id }, undefined, { identity: f.identity, hostId: f.identity.id });
+    expect(await promptly(onTimeReset)).toMatchObject({ id: f.actor.id });
+    await waitFor(() => decisions(f.config.residencyRoot).filter(entry => entry.operation === "resetSession" && entry.state === "committed").length === 2);
+    const backupsAfter = fs.readdirSync(dir).filter(name => name.endsWith(".bak")).sort();
+    expect(backupsAfter).toHaveLength(backupsBefore.length + 1);
+    const addedBackup = backupsAfter.find(name => !backupsBefore.includes(name))!;
+    expect(fs.readFileSync(path.join(dir, addedBackup))).toEqual(lateRunBytes);
+    expect(JSON.parse(fs.readFileSync(file, "utf8").split("\n")[0]!).id)
+      .not.toBe(JSON.parse(originalBytes.toString("utf8").split("\n")[0]!).id);
+    expect(fs.readdirSync(path.join(f.config.residencyRoot, "processing"))).toEqual([]);
+    expect(fs.readdirSync(path.join(f.config.residencyRoot, "responses"))).toEqual([]);
+  } finally {
+    release();
+    await run.catch(() => undefined);
+    const actor = f.host.actors.status(f.actor.id);
+    if (actor.inFlightRun?.id) await f.host.agents.stop(actor.inFlightRun.id);
+    await f.host.actors.stop(f.actor.id, undefined, true);
+    resetSpy.mockRestore(); runSpy.mockRestore(); await f.close();
+  }
+}, 15_000);
+
+it("keeps public resident operations serviceable while projected protected-slot cleanup custody is pending", async () => {
+  const f = await fixture();
+  let restoreMocks = () => {};
+  try {
+    const protectedActor = await f.host.actors.create({ name: "protected cleanup", instructions: "Keep cleanup custody", residency: "durable",
+      model: "fixture/visible", tools: [], topics: ["github.demo"] });
+    await f.host.actors.ask(protectedActor.id, "create a retained archive source");
+    const archiveRunId = f.host.actors.status(protectedActor.id).lastRunId!;
+    expect(f.host.agents.actorArchiveSources(protectedActor.id, protectedActor.sessionFile!).has(archiveRunId)).toBe(true);
+
+    // Project protected-topic manager custody only; never forge native slot authority.
+    const slots = slotAdmissionFor(f.host.mesh);
+    const requiresEnforcement = vi.spyOn(slots, "requiresEnforcement").mockImplementation(topics => topics.includes("github.demo"));
+    const beginRemoval = vi.spyOn(slots, "beginRemoval").mockResolvedValue(undefined);
+    const retire = vi.spyOn(slots, "retire").mockResolvedValue(undefined);
+    const realRetentionCustodyVeto = f.host.agents.retentionCustodyVeto.bind(f.host.agents);
+    const retentionCustodyVeto = vi.spyOn(f.host.agents, "retentionCustodyVeto").mockImplementation(id =>
+      id === archiveRunId ? true : realRetentionCustodyVeto(id));
+    restoreMocks = () => { retentionCustodyVeto.mockRestore(); retire.mockRestore(); beginRemoval.mockRestore(); requiresEnforcement.mockRestore(); };
+
+    const removed = await promptly(f.provider.invoke("remove", { id: protectedActor.id }, f.context));
+    expect(removed).toMatchObject({ removed: true, cleaned: false, pending: expect.stringContaining("not proven settled") });
+    const removeDecision = decisions(f.config.residencyRoot).find(entry => entry.operation === "removeActor" && entry.id === protectedActor.id);
+    expect(removeDecision).toMatchObject({ state: "committed", id: protectedActor.id });
+    expect(beginRemoval).toHaveBeenCalled();
+    expect(retire).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(f.config.actorRoot, protectedActor.id))).toBe(true);
+
+    const localDiagnostic = f.host.actors.cleanupObligation(protectedActor.id)!;
+    expect(localDiagnostic.removal?.state).toContain(`Protected actor execution ${archiveRunId} is not proven settled`);
+    expect(localDiagnostic.removal?.state).toContain("protected slot topics: github.demo");
+
+    const created = await promptly(f.provider.invoke("create", { name: "unrelated during cleanup", instructions: "Still serviceable.",
+      residency: "durable", tools: [] }, f.context)) as { id: string };
+    const createDecision = decisions(f.config.residencyRoot).find(entry => entry.operation === "createActor" && entry.id === created.id);
+    expect(createDecision).toMatchObject({ state: "committed", id: created.id });
+    expect(fs.existsSync(path.join(f.config.residencyRoot, "acknowledgements", `${createDecision!.requestId}.json`))).toBe(true);
+    expect(f.host.actors.cleanupObligation(protectedActor.id)?.removal?.state).toContain("not proven settled");
+
+    expect(await promptly(f.provider.invoke("stop", { id: created.id }, f.context))).toMatchObject({ id: created.id, status: "stopped" });
+    expect(f.host.actors.cleanupObligation(protectedActor.id)?.removal?.state).toContain("protected slot topics: github.demo");
+    expect(retire).not.toHaveBeenCalled();
+    expect(requiresEnforcement).toHaveBeenCalled();
+
+    // Revocation removes actor lookup; read the host's real pending-removal projection instead.
+    await waitFor(() => f.client.hostStateNote().includes(protectedActor.id));
+    const publicDiagnostic = f.client.hostStateNote();
+    expect(publicDiagnostic).toContain(protectedActor.name);
+    expect(publicDiagnostic).toContain(protectedActor.id);
+    expect(publicDiagnostic).toContain(`Protected actor execution ${archiveRunId} is not proven settled`);
+    expect(publicDiagnostic).toContain("protected slot topics: github.demo");
+    expect(retire).not.toHaveBeenCalled();
+  } finally {
+    try { await f.close(); } finally { restoreMocks(); }
+  }
+});
 
 it("public discovery advertises direct repair rather than a stop prerequisite", async () => {
   const f = await fixture();

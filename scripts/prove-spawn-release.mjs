@@ -51,8 +51,13 @@ fs.writeFileSync(otherHook, `import fs from 'node:fs'; export default function()
 const select = dir => fs.writeFileSync(settingsFile, JSON.stringify({ packages: [dir], extensions: [otherHook, callerHook, ...(dir === parent ? [] : [rejectedCheckout])], defaultProjectTrust: "always", enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false } }));
 select(parent);
 fs.writeFileSync(path.join(profile, "fabric.json"), JSON.stringify({ autoReload: false, mcp: { enabled: false }, mesh: { enabled: false }, agents: { nice: 19, retainRuns: true, sessionExport: false, notifyOnComplete: false, timeoutMs: 45000 }, executor: { kernel: "typescript" } }));
-let pendingCall;
 const server = http.createServer((request, response) => {
+  if (request.method === "GET" && request.url === "/v1/models") {
+    emit({ type: "provider_request", method: request.method, url: request.url });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ object: "list", data: [{ id: "main", object: "model" }, { id: "child", object: "model" }] }));
+    return;
+  }
   let body = ""; request.on("data", chunk => { body += chunk; }); request.on("end", () => {
     const data = JSON.parse(body);
     emit({ type: "provider_request", model: data.model, messages: data.messages.length });
@@ -69,68 +74,91 @@ let main;
 let mainClosed;
 const waiters = [];
 const records = [];
+let pendingCall;
+const warnings = [];
 const waitFor = (predicate, timeout = 60000) => {
   const known = records.find(predicate); if (known) return Promise.resolve(known);
   return new Promise((resolve, reject) => { const entry = { predicate, resolve: row => { clearTimeout(timer); resolve(row); } }; const timer = setTimeout(() => { waiters.splice(waiters.indexOf(entry), 1); reject(new Error("Native Main observation timed out")); }, timeout); waiters.push(entry); });
+};
+const launchMain = async explicitFabric => {
+  const args = [sdk, "--mode", "rpc", "--no-session", "--model", "release-proof/main", ...(explicitFabric ? ["-e", path.join(parent, "dist/index.js")] : []), "-e", callerHook];
+  const env = { ...process.env, PI_CODING_AGENT_DIR: profile, PI_OFFLINE: "1", PI_FABRIC_PI_BINARY: sdk, PI_FABRIC_RUN_ROOT: path.join(root, "runs") };
+  // Strip ambient pins so profile selection and the explicit -e case stay distinct and deterministic.
+  delete env.SMARTY_FABRIC_PIN;
+  const child = spawn(process.execPath, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+  main = child;
+  mainClosed = new Promise(resolve => child.on("close", (code, signal) => { emit({ type: "main_closed", code, signal }); resolve(); }));
+  let buffer = "";
+  child.stdout.on("data", data => { buffer += data; while (buffer.includes("\n")) { const pos = buffer.indexOf("\n"); const line = buffer.slice(0, pos); buffer = buffer.slice(pos + 1); let row; try { row = JSON.parse(line); } catch { emit({ type: "main_stdout", line }); continue; } emit({ type: "native_main_event", event: row }); records.push(row); for (const waiter of [...waiters]) if (waiter.predicate(row)) { waiters.splice(waiters.indexOf(waiter), 1); waiter.resolve(row); } } });
+  child.stderr.on("data", data => { const text = data.toString(); emit({ type: "main_stderr", text }); for (const line of text.split("\n")) if (line.includes("Installed Fabric release")) warnings.push(line); });
+  const readyId = `ready-${child.pid}`;
+  child.stdin.write(JSON.stringify({ id: readyId, type: "get_state" }) + "\n");
+  await waitFor(row => row.type === "response" && row.id === readyId);
+  return fs.readFileSync(markerFile, "utf8").trim().split("\n").map(JSON.parse);
+};
+const runPhase = async ({ phase, activated, extensions, expected }) => {
+  select(activated); emit({ type: "activated_selector", phase, settings: JSON.parse(fs.readFileSync(settingsFile, "utf8")), stillRunningMain: main.pid });
+  const resultFile = path.join(root, phase + "-result.json");
+  const before = records.length; const warnsBefore = warnings.length;
+  pendingCall = { code: `const handle = await agents.spawn({task: "Native release proof ${phase}", model: "release-proof/child", transport: "process", extensions: ${extensions}, tools: []}); const result = await agents.wait({id: handle.id, timeoutMs: 45000}); await pi.write({path: π.resultFile, text: JSON.stringify({handle, result})}); return {handle, result};`, payloads: { resultFile }, resultFormat: "json" };
+  emit({ type: "main_tool_command", phase, ...pendingCall });
+  main.stdin.write(JSON.stringify({ id: phase, type: "prompt", message: "Native Main release proof " + phase }) + "\n");
+  await waitFor(row => records.indexOf(row) >= before && row.type === "agent_end");
+  assert(fs.existsSync(resultFile), `Fabric tool did not produce ${phase} result`);
+  const value = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+  assert.equal(value.result.status, "completed", value.result.error);
+  assert.equal(value.handle.fabricRelease, expected); assert.equal(value.result.fabricRelease, expected);
+  const run = path.dirname(value.result.logFile);
+  const status = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8")); assert.equal(status.fabricRelease, expected);
+  const origins = fs.readFileSync(markerFile, "utf8").trim().split("\n").map(JSON.parse);
+  const worker = origins.find(row => row.kind === "worker" && row.pid === Number(value.result.sessionId));
+  assert(worker, "No child-worker-origin evidence");
+  assert.equal(fileURLToPath(worker.module), path.join(expected, "dist/worker.js"));
+  assert.equal(worker.argv[1], path.join(expected, "dist/worker.js"));
+  assert.equal(worker.marker, path.basename(expected));
+  assert.equal(worker.argv[worker.argv.indexOf("--fabric-release") + 1], expected);
+  const loaded = origins.filter(row => row.kind === "extension" && row.runDir === run);
+  if (extensions) { assert(loaded.length > 0); assert(loaded.every(row => fileURLToPath(row.module) === path.join(expected, "dist/index.js"))); assert(origins.some(row => row.type === "other_resource" && row.runDir === run)); assert(origins.some(row => row.type === "project_resource" && row.runDir === run), "Authorized project hook in real checkout ancestry must load"); assert(origins.some(row => row.type === "caller_resource" && row.runDir === run), "Authorized caller hook in real checkout ancestry must load"); }
+  else assert.equal(loaded.length, 0);
+  fs.cpSync(run, path.join(out, "native-" + phase + "-run"), { recursive: true });
+  // Native RPC redirects extension stdout to stderr before it owns stdout.
+  const printed = fs.readFileSync(value.result.logFile, "utf8").trim().split("\n").map(JSON.parse).flatMap(row => {
+    if (row.type === "release_origin") return [row];
+    if (row.type !== "worker_stderr") return [];
+    return row.text.trim().split("\n").flatMap(line => { try { const mark = JSON.parse(line); return mark.type === "release_origin" ? [mark] : []; } catch { return []; } });
+  });
+  if (extensions) assert(printed.some(row => row.kind === "extension" && row.marker === path.basename(expected) && fileURLToPath(row.module) === path.join(expected, "dist/index.js") && row.argv.includes(path.join(expected, "dist/index.js"))), "Child must print its actual selected extension path, argv and marker");
+  assert.equal(warnings.length - warnsBefore, phase === "incompatible" ? 1 : 0);
+  if (phase === "incompatible") { assert(warnings[warnsBefore].includes(activated)); assert(warnings[warnsBefore].includes(expected)); assert(warnings[warnsBefore].includes("worker protocol")); }
+  assert(!origins.some(row => row.kind === "extension" && row.marker === "activated-incompatible-C"));
+  assert(!origins.some(row => row.type === "rejected_checkout_fabric"), "Rejected Fabric checkout entrypoint must never execute");
+  emit({ type: "phase_pass", phase, oldMainPid: main.pid, activated, expected, handle: value.handle, result: value.result, onDisk: status, workerOrigin: worker, loadedExtensions: loaded, authorizedCheckoutHooks: origins.filter(row => ["project_resource", "caller_resource"].includes(row.type) && row.runDir === run), childPrintedMarkers: printed, warnings: warnings.slice(warnsBefore) });
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) { try { process.kill(Number(value.result.sessionId), 0); } catch { break; } await new Promise(resolve => setTimeout(resolve, 50)); }
+  assert.throws(() => process.kill(Number(value.result.sessionId), 0), "Worker must be joined before handing evidence back");
 };
 try {
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const model = id => ({ id, name: id, reasoning: false, input: ["text"], contextWindow: 64000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
   fs.writeFileSync(path.join(profile, "models.json"), JSON.stringify({ providers: { "release-proof": { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKey: "offline-only", api: "openai-completions", models: [model("main"), model("child")] } } }));
   emit({ type: "command", command: `PI_FABRIC_PROOF_PI=${JSON.stringify(sdk)} nice -n 19 node scripts/prove-spawn-release.mjs`, head: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim(), sdk, parent, selected, incompatible, checkout, cwd, checkoutSource: "git archive HEAD", instrumentation: "Exact built dist copies, appended origin-print markers only; Main autoReload disabled" });
-  main = spawn(process.execPath, [sdk, "--mode", "rpc", "--no-session", "--model", "release-proof/main", "-e", path.join(parent, "dist/index.js"), "-e", callerHook], { cwd, env: { ...process.env, PI_CODING_AGENT_DIR: profile, PI_OFFLINE: "1", PI_FABRIC_PI_BINARY: sdk, PI_FABRIC_RUN_ROOT: path.join(root, "runs") }, stdio: ["pipe", "pipe", "pipe"] });
-  mainClosed = new Promise(resolve => main.on("close", (code, signal) => { emit({ type: "main_closed", code, signal }); resolve(); }));
-  let buffer = "";
-  main.stdout.on("data", data => { buffer += data; while (buffer.includes("\n")) { const pos = buffer.indexOf("\n"); const line = buffer.slice(0, pos); buffer = buffer.slice(pos + 1); let row; try { row = JSON.parse(line); } catch { emit({ type: "main_stdout", line }); continue; } emit({ type: "native_main_event", event: row }); records.push(row); for (const waiter of [...waiters]) if (waiter.predicate(row)) { waiters.splice(waiters.indexOf(waiter), 1); waiter.resolve(row); } } });
-  const warnings = [];
-  main.stderr.on("data", data => { const text = data.toString(); emit({ type: "main_stderr", text }); for (const line of text.split("\n")) if (line.includes("Installed Fabric release")) warnings.push(line); });
-  main.stdin.write(JSON.stringify({ id: "ready", type: "get_state" }) + "\n");
-  await waitFor(row => row.type === "response" && row.id === "ready");
-  const initial = fs.readFileSync(markerFile, "utf8").trim().split("\n").map(JSON.parse);
+  const initial = await launchMain(false);
   assert(initial.some(row => row.kind === "extension" && row.marker === "old-main-A" && row.pid === main.pid));
-  emit({ type: "old_main_loaded", pid: main.pid, origins: initial });
+  emit({ type: "old_main_loaded", pid: main.pid, origins: initial, fabricExplicit: false });
   for (const [phase, activated, extensions, expected] of [["compatible", selected, true, selected], ["incompatible", incompatible, true, parent], ["extensions-false", selected, false, selected]]) {
-    select(activated); emit({ type: "activated_selector", phase, settings: JSON.parse(fs.readFileSync(settingsFile, "utf8")), stillRunningMain: main.pid });
-    const resultFile = path.join(root, phase + "-result.json");
-    const before = records.length; const warnsBefore = warnings.length;
-    pendingCall = { code: `const handle = await agents.spawn({task: "Native release proof ${phase}", model: "release-proof/child", transport: "process", extensions: ${extensions}, tools: []}); const result = await agents.wait({id: handle.id, timeoutMs: 45000}); await pi.write({path: π.resultFile, text: JSON.stringify({handle, result})}); return {handle, result};`, payloads: { resultFile }, resultFormat: "json" };
-    emit({ type: "main_tool_command", phase, ...pendingCall });
-    main.stdin.write(JSON.stringify({ id: phase, type: "prompt", message: "Native Main release proof " + phase }) + "\n");
-    await waitFor(row => records.indexOf(row) >= before && row.type === "agent_end");
-    assert(fs.existsSync(resultFile), `Fabric tool did not produce ${phase} result`);
-    const value = JSON.parse(fs.readFileSync(resultFile, "utf8"));
-    assert.equal(value.result.status, "completed", value.result.error);
-    assert.equal(value.handle.fabricRelease, expected); assert.equal(value.result.fabricRelease, expected);
-    const run = path.dirname(value.result.logFile);
-    const status = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8")); assert.equal(status.fabricRelease, expected);
-    const origins = fs.readFileSync(markerFile, "utf8").trim().split("\n").map(JSON.parse);
-    const worker = origins.find(row => row.kind === "worker" && row.pid === Number(value.result.sessionId));
-    assert(worker, "No child-worker-origin evidence");
-    assert.equal(fileURLToPath(worker.module), path.join(expected, "dist/worker.js"));
-    assert.equal(worker.argv[1], path.join(expected, "dist/worker.js"));
-    assert.equal(worker.marker, path.basename(expected));
-    assert.equal(worker.argv[worker.argv.indexOf("--fabric-release") + 1], expected);
-    const loaded = origins.filter(row => row.kind === "extension" && row.runDir === run);
-    if (extensions) { assert(loaded.length > 0); assert(loaded.every(row => fileURLToPath(row.module) === path.join(expected, "dist/index.js"))); assert(origins.some(row => row.type === "other_resource" && row.runDir === run)); assert(origins.some(row => row.type === "project_resource" && row.runDir === run), "Authorized project hook in real checkout ancestry must load"); assert(origins.some(row => row.type === "caller_resource" && row.runDir === run), "Authorized caller hook in real checkout ancestry must load"); }
-    else assert.equal(loaded.length, 0);
-    fs.cpSync(run, path.join(out, "native-" + phase + "-run"), { recursive: true });
-    // Native RPC redirects extension stdout to stderr before it owns stdout.
-    const printed = fs.readFileSync(value.result.logFile, "utf8").trim().split("\n").map(JSON.parse).flatMap(row => {
-      if (row.type === "release_origin") return [row];
-      if (row.type !== "worker_stderr") return [];
-      return row.text.trim().split("\n").flatMap(line => { try { const mark = JSON.parse(line); return mark.type === "release_origin" ? [mark] : []; } catch { return []; } });
-    });
-    if (extensions) assert(printed.some(row => row.kind === "extension" && row.marker === path.basename(expected) && fileURLToPath(row.module) === path.join(expected, "dist/index.js") && row.argv.includes(path.join(expected, "dist/index.js"))), "Child must print its actual selected extension path, argv and marker");
-    assert.equal(warnings.length - warnsBefore, phase === "incompatible" ? 1 : 0);
-    if (phase === "incompatible") { assert(warnings[warnsBefore].includes(activated)); assert(warnings[warnsBefore].includes(expected)); assert(warnings[warnsBefore].includes("worker protocol")); }
-    assert(!origins.some(row => row.kind === "extension" && row.marker === "activated-incompatible-C"));
-    assert(!origins.some(row => row.type === "rejected_checkout_fabric"), "Rejected Fabric checkout entrypoint must never execute");
-    emit({ type: "phase_pass", phase, oldMainPid: main.pid, activated, expected, handle: value.handle, result: value.result, onDisk: status, workerOrigin: worker, loadedExtensions: loaded, authorizedCheckoutHooks: origins.filter(row => ["project_resource", "caller_resource"].includes(row.type) && row.runDir === run), childPrintedMarkers: printed, warnings: warnings.slice(warnsBefore) });
-    const deadline = Date.now() + 10000;
-    while (Date.now() < deadline) { try { process.kill(Number(value.result.sessionId), 0); } catch { break; } await new Promise(resolve => setTimeout(resolve, 50)); }
-    assert.throws(() => process.kill(Number(value.result.sessionId), 0), "Worker must be joined before handing evidence back");
+    await runPhase({ phase, activated, extensions, expected });
   }
-  emit({ type: "proof_pass", phases: 3, realPiMain: true, realPiChildren: true, credentials: "none; isolated offline loopback provider" });
+  // Preserve the profile-selected counterexample, then show an explicitly loaded Main stays on A.
+  main.kill("SIGTERM"); await mainClosed;
+  select(parent);
+  const pinnedInitial = await launchMain(true);
+  const pinnedOrigin = pinnedInitial.find(row => row.kind === "extension" && row.marker === "old-main-A" && row.pid === main.pid);
+  assert(pinnedOrigin, "Explicit Main did not load its parent release");
+  assert.equal(fileURLToPath(pinnedOrigin.module), path.join(parent, "dist/index.js"));
+  assert(pinnedOrigin.argv.includes(path.join(parent, "dist/index.js")), "Explicit parent entrypoint must appear in Main argv");
+  emit({ type: "pinned_main_loaded", pid: main.pid, origins: pinnedInitial, fabricExplicit: true, fabricRelease: parent });
+  await runPhase({ phase: "pinned-compatible", activated: selected, extensions: true, expected: parent });
+  emit({ type: "proof_pass", phases: 4, unpinnedProfileSelection: true, explicitlyLoadedMainPinnedToParent: true, realPiMain: true, realPiChildren: true, credentials: "none; isolated offline loopback provider" });
   console.log(JSON.stringify({ passed: true, transcript }));
 } finally {
   if (main && main.exitCode === null && main.signalCode === null) main.kill("SIGTERM");

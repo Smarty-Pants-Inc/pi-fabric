@@ -1715,7 +1715,13 @@ export class ResidentHost {
     const id = String(command.id);
     try {
       const actor = this.actors.status(id);
-      return [`actor-id:${actor.id}`, `actor-name:${actor.name}`];
+      const keys = [`actor-id:${actor.id}`];
+      try {
+        if (this.actors.status(actor.name).id === actor.id) keys.push(`actor-name:${actor.name}`);
+      } catch {
+        // The canonical ID remains usable when a name is ambiguous or unavailable.
+      }
+      return keys;
     } catch {
       // Unknown names may target a creation still preparing. Real dispatch retains
       // its own exact lookup, caller, ownership and commit/abandonment checks.

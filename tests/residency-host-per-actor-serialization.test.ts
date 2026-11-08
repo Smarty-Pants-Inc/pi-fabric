@@ -17,11 +17,11 @@ const deferred = () => {
   const promise = new Promise<void>(done => { resolve = done; });
   return { promise, resolve };
 };
-const promptly = async <T>(promise: Promise<T>): Promise<T> => {
+const promptly = async <T>(promise: Promise<T>, timeoutMs = 1_500): Promise<T> => {
   let timer!: ReturnType<typeof setTimeout>;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Unrelated actor request blocked behind another actor's mutation")), 1_500);
+      timer = setTimeout(() => reject(new Error("Unrelated actor request blocked behind another actor's mutation")), timeoutMs);
     })]);
   } finally { clearTimeout(timer); }
 };
@@ -130,6 +130,89 @@ describe("resident per-actor admission serialization", () => {
       }
     } finally { release.resolve(); await f.close(); }
   });
+
+  it("lets a same-name successor mutate by canonical ID while a removed predecessor mutation is held", async () => {
+    const f = await fixture({ getAvailable: () => [{ provider: "fixture", id: "visible" }] });
+    const runEntered = deferred(), releaseRun = deferred();
+    const predecessorMutationEntered = deferred(), releasePredecessorMutation = deferred();
+    let predecessor: Awaited<ReturnType<typeof f.host.actors.create>> | undefined;
+    let runSettled = false;
+    let predecessorMutationHeld = false;
+    let predecessorMutationSettled = false;
+    let successorMutationSettled = false;
+    let run: Promise<unknown> | undefined;
+    let predecessorMutation: Promise<unknown> | undefined;
+    let successorMutation: Promise<unknown> | undefined;
+    vi.spyOn(f.host.agents, "run").mockImplementation(async () => {
+      runEntered.resolve();
+      await releaseRun.promise;
+      throw new Error("Held activation released");
+    });
+    try {
+      predecessor = await f.host.actors.create({ name: "replacement", instructions: "predecessor", model: "fixture/visible", residency: "durable" });
+      run = f.observe(f.host.actors.ask(predecessor.id, "held activation").finally(() => { runSettled = true; }));
+      await promptly(runEntered.promise);
+
+      const removed = await promptly(f.observe(f.client.removeActor(predecessor.id)));
+      expect(removed).toMatchObject({ removed: true, pending: expect.any(String) });
+      expect(runSettled).toBe(false);
+      const successor = await f.observe(f.client.createActor({ name: predecessor.name, instructions: "successor", residency: "durable" }));
+      expect(successor.id).not.toBe(predecessor.id);
+
+      const setInstructions = f.host.actors.setInstructions.bind(f.host.actors);
+      const setterSpy = vi.spyOn(f.host.actors, "setInstructions").mockImplementation(async (...args) => {
+        if (args[0] === predecessor!.id) {
+          predecessorMutationHeld = true;
+          predecessorMutationEntered.resolve();
+          await releasePredecessorMutation.promise;
+          predecessorMutationHeld = false;
+        }
+        return setInstructions(...args);
+      });
+      predecessorMutation = f.observe(f.client.setActor({ operation: "setInstructions", id: predecessor.id,
+        instructions: "held predecessor mutation", replace: true }, undefined, f.caller)
+        .finally(() => { predecessorMutationSettled = true; }));
+      await promptly(predecessorMutationEntered.promise);
+      expect(setterSpy).toHaveBeenCalledWith(predecessor.id, "held predecessor mutation", expect.any(Function));
+      expect(predecessorMutationHeld).toBe(true);
+      expect(predecessorMutationSettled).toBe(false);
+
+      successorMutation = f.observe(f.client.setActor({ operation: "setInstructions", id: successor.id,
+        instructions: "successor update", replace: true }, undefined, f.caller)
+        .finally(() => { successorMutationSettled = true; }));
+      const updated = await promptly(successorMutation, 800);
+      expect(updated.id).toBe(successor.id);
+      expect(f.host.actors.instructions(successor.id)).toBe("successor update");
+      expect(successorMutationSettled).toBe(true);
+      expect(predecessorMutationHeld).toBe(true);
+      expect(predecessorMutationSettled).toBe(false);
+      expect(runSettled).toBe(false);
+
+      releasePredecessorMutation.resolve();
+      await predecessorMutation;
+      expect(predecessorMutationSettled).toBe(true);
+      expect(f.host.actors.instructions(predecessor.id)).toBe("held predecessor mutation");
+
+      releaseRun.resolve();
+      await run.catch(() => undefined);
+      const removal = f.host.actors.removalSettled(predecessor.id);
+      if (removal) await removal;
+      expect(f.host.actors.status(successor.id).id).toBe(successor.id);
+    } finally {
+      releasePredecessorMutation.resolve();
+      releaseRun.resolve();
+      await Promise.all([
+        run?.catch(() => undefined),
+        predecessorMutation?.catch(() => undefined),
+        successorMutation?.catch(() => undefined),
+      ]);
+      if (predecessor) {
+        const removal = f.host.actors.removalSettled(predecessor.id);
+        if (removal) await removal.catch(() => undefined);
+      }
+      await f.close();
+    }
+  }, 15_000);
 
   it("keeps whole-host reads before an unrelated durable create independent of a held setter", async () => {
     const f = await fixture();

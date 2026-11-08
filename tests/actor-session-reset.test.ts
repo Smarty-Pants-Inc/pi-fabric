@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, ACTOR_SESSION_RESET_TIMEOUT_MS } from "../src/actors/manager.js";
 import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -360,6 +360,124 @@ describe("actor session rotation safety (smarty-dev#2847)", () => {
 });
 
 describe("actor session reset (smarty-dev#1439)", () => {
+  // Keep: #19308's bounded resident exchange and session trace safety. Expiry
+  // must cancel the queued intent, not just race a rejection against a late archive.
+  it("rejects a pending reset by its deadline and never rotates when the held run later finishes", async () => {
+    const { actors, runs, hold } = setup();
+    const actor = await actors.create({ name: "bounded-reset", instructions: "Work." });
+    await actors.ask(actor.id, "first");
+    const header = sessionHeader(actor.sessionFile!);
+    const release = hold();
+    const active = actors.ask(actor.id, "held append");
+    await waitFor(() => runs.length === 2);
+    let outcome: unknown;
+    const reset = actors.resetSession(actor.id, { timeoutMs: 40 }).then(
+      info => { outcome = info; return info; }, error => { outcome = error; return error; });
+    try {
+      await waitFor(() => outcome !== undefined, 500);
+      expect(outcome).toMatchObject({ name: "ActorSessionResetCancelledError", code: "ACTOR_SESSION_RESET_CANCELLED", id: actor.id });
+      expect((outcome as Error).message).toMatch(/timed out.*40/);
+      expect(backups(actor.sessionFile!)).toEqual([]);
+      expect(sessionHeader(actor.sessionFile!)).toEqual(header);
+    } finally { release(); await active; await reset; }
+    await waitFor(() => actors.inFlightCount() === 0);
+    await actors.ask(actor.id, "next activation after timeout");
+    expect(runs[2]!.prior.some(line => line.includes("held append"))).toBe(true);
+    expect(backups(actor.sessionFile!)).toEqual([]);
+    expect(sessionHeader(actor.sessionFile!)).toEqual(header);
+    expect(resets(actors, actor.id)).toEqual([]);
+  });
+
+  it("expires a reset at the boundary even when its deadline callback has not run yet", async () => {
+    const { actors, runs, hold } = setup();
+    const actor = await actors.create({ name: "boundary-expired-reset", instructions: "Work." });
+    await actors.ask(actor.id, "first");
+    const header = sessionHeader(actor.sessionFile!);
+    const release = hold();
+    const active = actors.ask(actor.id, "held append");
+    await waitFor(() => runs.length === 2);
+    const timeoutMs = ACTOR_SESSION_RESET_TIMEOUT_MS;
+    expect(timeoutMs).toBeGreaterThan(0);
+    expect(timeoutMs).toBeLessThan(30_000); // both resident clients' default exchange
+    const reset = actors.resetSession(actor.id).catch(error => error);
+    // Delay only the timer dispatch, not the deadline's clock. The native run
+    // can settle and reach the serial boundary before JS dispatches the timer.
+    const realNow = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + timeoutMs);
+    try {
+      release();
+      await active;
+      expect(await reset).toMatchObject({ name: "ActorSessionResetCancelledError", code: "ACTOR_SESSION_RESET_CANCELLED", id: actor.id });
+      expect(backups(actor.sessionFile!)).toEqual([]);
+      expect(sessionHeader(actor.sessionFile!)).toEqual(header);
+      expect(resets(actors, actor.id)).toEqual([]);
+    } finally { clock.mockRestore(); release(); await active; await reset; }
+  });
+
+  it("does not cancel a reset already archived at the boundary while presence waits beyond its pending deadline", async () => {
+    const { actors, runs, hold, mesh } = setup();
+    const actor = await actors.create({ name: "reset-handed-off", instructions: "Work." });
+    await actors.ask(actor.id, "seed session");
+    const releaseRun = hold();
+    const pending = actors.ask(actor.id, "finish before the reset deadline");
+    await waitFor(() => runs.length === 2);
+    const deadline = 12_346;
+    const realSetTimeout = globalThis.setTimeout;
+    let timer: ReturnType<typeof setTimeout> | number | undefined;
+    let expire: (() => void) | undefined;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+      const value = realSetTimeout(callback, ms, ...args);
+      if (ms === deadline) { timer = value; expire = callback; }
+      return value;
+    }) as typeof setTimeout);
+    let releasePresence!: () => void;
+    const gate = new Promise<void>(resolve => { releasePresence = resolve; });
+    let gated = false;
+    const put = mesh.put.bind(mesh);
+    vi.spyOn(mesh, "put").mockImplementation(async request => {
+      if (!gated && request.key === `actors/test/${actor.id}` && resets(actors, actor.id).length === 1) {
+        gated = true;
+        await gate;
+      }
+      return put(request);
+    });
+    let settled = false;
+    const reset = actors.resetSession(actor.id, { timeoutMs: deadline }).catch(error => error);
+    void reset.then(() => { settled = true; });
+    try {
+      releaseRun();
+      await waitFor(() => gated);
+      expect(backups(actor.sessionFile!)).toHaveLength(1);
+      expect(expire).toBeTypeOf("function");
+      clearTimeout(timer);
+      expire!(); // dispatch the pending deadline while post-archive presence is held
+      await new Promise(resolve => realSetTimeout(resolve, 0));
+      expect(settled).toBe(false); // cannot claim "cancelled/no reset" after the archive committed
+      releasePresence();
+      await expect(reset).resolves.toMatchObject({ id: actor.id });
+      expect(resets(actors, actor.id)).toHaveLength(1);
+    } finally { releaseRun(); releasePresence(); await pending; await reset; }
+  });
+
+  it("cancels only the expired reset waiter and still commits a later live request once", async () => {
+    const { actors, runs, hold } = setup();
+    const actor = await actors.create({ name: "independent-reset-deadlines", instructions: "Work." });
+    await actors.ask(actor.id, "first");
+    const release = hold();
+    const active = actors.ask(actor.id, "held append");
+    await waitFor(() => runs.length === 2);
+    let expired: unknown;
+    const first = actors.resetSession(actor.id, { timeoutMs: 40 }).catch(error => { expired = error; return error; });
+    const second = actors.resetSession(actor.id, { timeoutMs: 5_000 });
+    try {
+      await waitFor(() => expired !== undefined, 500);
+      expect(expired).toMatchObject({ code: "ACTOR_SESSION_RESET_CANCELLED" });
+    } finally { release(); await active; await first; await second; }
+    expect(await second).toMatchObject({ id: actor.id });
+    expect(backups(actor.sessionFile!)).toHaveLength(1);
+    expect(resets(actors, actor.id)).toHaveLength(1);
+  });
+
   it("resets an idle actor: the next run has no prior context and keeps the definition and mailbox", async () => {
     const { actors, runs } = setup();
     const actor = await actors.create({ name: "keeper", instructions: "Remember words.", topics: ["words"] });

@@ -295,11 +295,15 @@ export const residentHostStateNote = (residencyRoot: string, now = Date.now()): 
   const notes: string[] = [];
   try {
     const value = JSON.parse(fs.readFileSync(residentRemovalsPath(residencyRoot), "utf8")) as {
-      removals?: Array<{ name?: unknown; id?: unknown; runId?: unknown; runStartedAt?: unknown; requestedAt?: unknown }>;
+      removals?: Array<{ name?: unknown; id?: unknown; state?: unknown; runId?: unknown; runStartedAt?: unknown; requestedAt?: unknown }>;
     };
     for (const removal of value.removals ?? []) {
       if (typeof removal.id !== "string") continue;
       const label = typeof removal.name === "string" ? `${removal.name} (${removal.id})` : removal.id;
+      if (typeof removal.state === "string") {
+        notes.push(`removal of ${label}: ${removal.state}`);
+        continue;
+      }
       const since = typeof removal.runStartedAt === "number" ? removal.runStartedAt
         : typeof removal.requestedAt === "number" ? removal.requestedAt : now;
       notes.push(typeof removal.runId === "string"

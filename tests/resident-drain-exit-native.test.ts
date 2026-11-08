@@ -114,8 +114,21 @@ process.on("message", async request => {
       client = makeClient(desired, targetRelease);
       client.syncPiModels();
       const adopted = await client.ensureHost();
+      // This fixture isolates the legacy/manual Main workflow; the separate
+      // release-switch regression covers current automatic Main startup.
+      const ownerPath = path.join(config.residencyRoot, "owner.json");
+      const ownerBytes = fs.readFileSync(ownerPath, "utf8");
+      const legacyOwner = JSON.parse(ownerBytes);
+      delete legacyOwner.drain;
       let deferred;
-      try { await client.reconcileRelease(); } catch (error) { deferred = String(error); }
+      try {
+        fs.writeFileSync(ownerPath, JSON.stringify(legacyOwner));
+        await client.reconcileRelease();
+      } catch (error) {
+        deferred = String(error);
+      } finally {
+        fs.writeFileSync(ownerPath, ownerBytes);
+      }
       client.start();
       const beforeLaunch = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "config.json"), "utf8"));
       fs.writeFileSync(path.join(config.cwd, "ordinary-launch-request.json"), JSON.stringify({ beforeLaunch, adopted, deferred,

@@ -94,12 +94,19 @@ fs.rmSync = function(file, options) {
       await until(() => !!readHandoverJson<ResidentHostOwner>(ownerPath));
       const owner = readHandoverJson<ResidentHostOwner>(ownerPath)!;
       expect(owner.handover?.launcher.pid).toBe(launcher.pid);
+      expect(owner.drain?.abi).toBe("fabric-resident-drain-1");
+      expect(owner.commands).toContain("releaseDrain");
       const actor = await clientA.createActor({ name: "preserved-actor", instructions: "Reply", residency: "durable", tools: [], responseMode: "text", delivery: "mailbox" });
       await control.request(clientA.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS", ownerIncarnation: await liveControlOwnerIncarnation(participants, actor.id) }, clientA.hostId);
       await until(() => !!participants.get(actor.id, Date.now(), { fresh: true })?.actorRun);
       const queued = await control.request(clientA.hostId, actor.id, "followUp", { message: "queued-before-intent", ownerIncarnation: await liveControlOwnerIncarnation(participants, actor.id) }, clientA.hostId);
       expect(queued.acknowledged).toBe(true);
       process.execPath = bundled; vi.stubEnv("PI_FABRIC_NODE_BINARY", successorRuntime);
+      // Keep this pre-exit suite on the legacy staged path; the release-switch
+      // regression separately exercises the current cooperative-drain advertisement.
+      const legacyOwner = { ...owner, commands: owner.commands?.filter(command => command !== "releaseDrain") };
+      delete legacyOwner.drain;
+      fs.writeFileSync(ownerPath, JSON.stringify(legacyOwner));
       if (mode === 'crash-at-first-publication') {
         const releaseRequest = clientB.reconcileRelease().catch(error => error);
         await until(() => fs.existsSync(crashReceipt));

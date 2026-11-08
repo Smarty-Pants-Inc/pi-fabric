@@ -1,17 +1,24 @@
 # Cooperative resident drain
 
+**Adopt first:** graceful shutdown followed by the existing lease-fenced, single-owner
+restart is the supported Main release-switch path. Kubernetes `preStop` and
+systemd `ExecStop` are established shutdown examples, but external service-manager
+integration is unnecessary here: the existing in-process endpoint supplies
+bounded checkpoint and exit.
+
 Without `--exit`, `fabric-resident-drain` negotiates a **reversible hold and
 checkpoint** with a compatible loaded resident. A healthy operation holds
 admission, lets accepted work finish naturally, checkpoints and reads back
 custody, then resumes the same old resident. It returns nonzero JSON
-`containment-unavailable`: complete attempt containment and automatic handover
-remain disabled. This default behavior does not stop actors or the host.
+`containment-unavailable`: complete attempt containment and the staged
+`releaseChange` handover remain disabled. The separate Main stop-then-start path
+is described below. This default CLI behavior does not stop actors or the host.
 
-`--exit` is a separate, manual operator action: an idle compatible resident
-checkpoints, keeps admission held and closes gracefully. Success attests only
-that exact old host's stopped exit, not complete attempt containment or a serving
-target. Neither mode launches a target, signals processes, terminally stops an
-actor or removes a custody marker.
+`fabric-resident-drain --exit` is a separate, explicit CLI action: an idle
+compatible resident checkpoints, keeps admission held and closes gracefully.
+Success attests only that exact old host's stopped exit, not complete attempt
+containment or a serving target. Neither CLI mode launches a target, signals
+processes, terminally stops an actor or removes a custody marker.
 
 Legacy or uncertain roots retain the read-only preflight: they refuse without
 request dispatch or changes to resident files. New source cannot retrofit the
@@ -39,7 +46,41 @@ It never creates a Main attestation or starts a host to satisfy these checks.
 A finite timeout resumes A without aborting accepted work; unreadable or
 uncorrelated terminal evidence reports `needs-operator`, not successful service.
 
-## Manual exit and ordinary recovery
+## Main graceful stop-then-start
+
+When a Main starts on B and sees a live, compatible resident A for the same root,
+it uses the existing in-process `releaseDrain(exit:true)` endpoint. This is a
+stop-then-start restart, not the staged `releaseChange` handover. The Main retries
+only correlated, read-only precommit busy refusals; A remains serving while
+accepted requests and actor work finish naturally. Other refusals, missing or
+uncorrelated evidence, and postcommit uncertainty are not retryable.
+
+The Main proceeds only after it verifies the exact durable
+`phase:"exited", outcome:"exited"` receipt with admission held and checkpoint
+read-back, the host-written `reason:"stopped"` record for A's exact generation,
+observation that A's original PID/birth has exited, and release of A's host
+lease. It then calls ordinary
+`ensureHost` on B (joining a normal concurrent B launch if one already exists)
+and checks that the serving owner uses B's release. Queues and traces remain
+retained; this path uses no actor terminal stop, external signal, new state or
+protocol, or staged rollback.
+
+This covers Main-initiated switches. This Main's ordinary file requests wait
+behind reconciliation. An independent CLI/proxy writer racing the committed
+drain can instead leave A held with `needs-operator`; it is diagnosed, not
+retried or followed by a competing launch. The diagnosis names the recovery
+command and requires rechecking A's exact PID/birth before an operator acts.
+Queues and traces remain retained in that case.
+
+A host without cooperative-drain support remains diagnosed and serving; this
+path does not forcibly stop it. `fabric-resident-drain --exit` behavior is
+unchanged: CLI success proves only A's stopped exit, not that B launched or
+serves.
+
+## Manual CLI exit and ordinary recovery
+
+The following is the explicit CLI workflow for a manual-only Main integration;
+current Main startup normally performs the automatic path above.
 
 1. Retain both releases and arrange a maintenance window. Reload the **active
    owning Main onto B** through its normal runtime path while it adopts the
@@ -74,12 +115,14 @@ After `--exit` holds admission, a checkpoint/close failure or deadline reports
 competing launch. This differs from the default reversible drain's timeout.
 
 A separately launched successor does not invalidate proof that A stopped; it
-also does not turn this CLI's success into a B-readiness attestation. A manual
-exit is **not** automatic A-to-B handover, rollback, or proof that every escaped
-helper belonging to an old attempt exited. Those automatic paths remain disabled.
+also does not turn this CLI's success into a B-readiness attestation. This CLI
+does not perform automatic A-to-B handover, rollback, or prove that every escaped
+helper belonging to an old attempt exited. The staged `releaseChange` handover
+and complete attempt-containment fallback remain disabled; the supported Main
+stop-then-start path is separate and is described above.
 
-The native regression covers both a refused in-flight inference request and an
-allowed idle exit with nonempty project/session actor queues. It reloads the
+The native manual-workflow regression covers both a refused in-flight inference
+request and an allowed idle exit with nonempty project/session actor queues. It reloads the
 real client onto B before exit, leaves its normal watchdog active, then uses the
 ordinary launch path and checks the same IDs, topics and original queue entries
 before those inputs execute exactly once. It checks no intervening A relaunch.
@@ -87,7 +130,10 @@ before those inputs execute exactly once. It checks no intervening A relaunch.
 ## Deployment shutdown patterns
 
 Established deployment practice is to stop new ingress before graceful shutdown
-and provide a finite budget for accepted work and checkpoints. These orchestration
+and provide a finite budget for accepted work and checkpoints. An external hook is
+not required for a Main restart: the existing in-process endpoint already supplies
+bounded checkpoint and exit. Kubernetes `preStop` and systemd `ExecStop` are
+established examples when an external service manager coordinates shutdown; these
 settings are not substitutes for a resident admission/exit receipt:
 
 - **Kubernetes:** make the workload unready using its readiness gate, then use a
@@ -131,8 +177,10 @@ These legacy operations are not substitutes for cooperative PREPARE:
 Persistent host close retains committed actor queues better than terminal stop,
 but an external quiet-state scan followed by shutdown can race a new admission.
 A clean direct-child exit or empty process group cannot prove an escaped helper
-has exited. These are the same boundaries that keep automatic release following
-disabled; this command does not bypass them.
+has exited. These are among the reasons staged `releaseChange` handover and
+complete attempt-containment fallback remain disabled; the supported Main
+stop-then-start path instead uses the cooperative endpoint, exact A exit evidence
+and ordinary `ensureHost`.
 
 ## Read-back and rollback
 
@@ -150,15 +198,17 @@ Native regressions check the same serving owner, unchanged accepted retry eviden
 and exactly-once work completion after resume; concurrent input stays behind its
 cursor while held.
 
-Do not launch the old release as a rollback while any target may still execute.
-A future cooperative drain may roll back only after it proves target startup
-admitted no work **and** the complete target attempt exited. After target work
-admission, a read-back failure needs an operator; it cannot authorize a competing
-old resident.
+Do not launch the old release as a rollback while any staged target may still
+execute. A future staged rollback may be considered only after it proves target
+startup admitted no work **and** the complete target attempt exited. After target
+work admission, a read-back failure needs an operator; it cannot authorize a
+competing old resident.
 
-The remaining automatic-handover dependency is complete attempt-owned containment
-and exit receipts. The frozen containment interface defaults to refusal. A real
-adapter must run in launcher custody with its retained native handles; neither
+Complete attempt-owned containment and exit receipts remain required for staged
+`releaseChange` handover and fallback; they are not prerequisites for the
+separate Main stop-then-start path described above. The frozen containment
+interface defaults to refusal. A real adapter must run in launcher custody with
+its retained native handles; neither
 the CLI nor the endpoint reopens a scope path from `owner.json`. The launcher alone
 writes the immutable `attempt-launch-<attemptId>.json` beside `owner.json`, before
 releasing the host. Its full receipt must match the launch environment and native

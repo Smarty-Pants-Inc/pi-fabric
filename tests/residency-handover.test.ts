@@ -87,6 +87,16 @@ async function fixture(protocolOnly = true) {
   const idle = vi.fn();
   const host = new ResidentHost(previous.config, idle, undefined, { launcher, spec: previous });
   await host.start();
+  // These staged-plan cases model a releaseChange-only old owner; the separate
+  // release-switch regression covers cooperative drain, and successor/fallback
+  // hosts below keep their real current advertisements.
+  const ownerPath = path.join(config.residencyRoot, "owner.json");
+  const owner = readHandoverJson<ResidentHostOwner>(ownerPath)!;
+  expect(owner.drain?.abi).toBe("fabric-resident-drain-1");
+  expect(owner.commands).toContain("releaseDrain");
+  const legacyOwner = { ...owner, commands: owner.commands?.filter(command => command !== "releaseDrain") };
+  delete legacyOwner.drain;
+  fs.writeFileSync(ownerPath, JSON.stringify(legacyOwner));
   const client = new ResidencyClient({ config: target.config, mesh, participants,
     hostPath: path.join(b, "dist/residency/launcher.js"), mainAgent: { id: identity.id, local: true } as FabricMainAgentTarget });
   const state = () => readHandoverJson<ResidentHandoverState>(handoverPath(config.residencyRoot));

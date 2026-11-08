@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readResidentIdleExit, residentIdleExitPath } from "./idle-exit.js";
-import { readResidentGenerationError } from "./generation-exit.js";
+import { readResidentGenerationError, readResidentGenerationExit } from "./generation-exit.js";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest, FabricActorRequeueResult } from "../actors/types.js";
 import { FabricActorQueuedWorkError } from "../actors/types.js";
@@ -29,8 +29,9 @@ import { readJsonlPage } from "../log-tail.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { sealResidentLaunchBinaries } from "./launch-config.js";
 import {
-  RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
-  mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
+  RESIDENT_HANDOVER_ABI, HANDOVER_DRAIN_MS, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
+  mainGenerationPath, mainGenerationCurrent, exactResidentProcess, assertHandoverTopology, readHandoverJson,
+  type ResidentMainGeneration, type ResidentHandoverState, type ResidentLaunchSpec,
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
@@ -268,6 +269,10 @@ export class ResidencyClient {
   #generationRecorded = false;
   readonly #releaseAbort = new AbortController();
   readonly #releaseOwners = new Set<string>();
+  #releasePass: Promise<void> | undefined;
+  // A dispatched exit may have committed even without a response. Only a
+  // correlated precommit refusal or fully observed graceful exit clears this.
+  #releaseExitPending = false;
   // A committed rename ends ownership of that source pathname, even when a
   // later move/receipt fails. Keep the original TMPDIR binding before moving run.
   // Retain only a route admitted from canonical metadata before dispatch. A
@@ -356,6 +361,7 @@ export class ResidencyClient {
     // Await the owned pass itself, not a timer polling its state. Real async file
     // I/O can settle while the caller's clock (e.g. fake timers) is stopped.
     await this.#deliveryPass?.catch(() => undefined);
+    await this.#releasePass?.catch(() => undefined);
     await this.#startingHost?.catch(() => undefined);
     // A failed verification retains its owned handle so close can retry, or surface
     // the cleanup failure instead of silently reporting an aborted start as settled.
@@ -428,7 +434,9 @@ export class ResidencyClient {
 
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
+    if (this.#releaseExitPending) throw new Error("Resident graceful exit is unsettled; retain its receipt for operator inspection, do not start a duplicate");
     await this.#stopStartingLauncher();
+    if (this.#releaseExitPending) throw new Error("Resident graceful exit is unsettled; do not start or adopt its generation");
     this.#refreshPiModels();
     this.#persistConfig();
     const existing = this.#readyOwner();
@@ -455,7 +463,8 @@ export class ResidencyClient {
       await delay(STATUS_POLL_MS);
     }
     // Recheck after the attachment wait: the old launcher may have entered
-    // destructive watchdog custody while we still saw its live owner.
+    // destructive watchdog custody or a cooperative exit while we saw its owner.
+    if (this.#closed || this.#releaseExitPending) throw new Error("Resident startup lost authority during graceful exit or client close");
     assertNoWatchdogCustody(this.options.config.residencyRoot);
     // This explicit business startup, not a launcher recovery loop, revokes the idle stop.
     fs.rmSync(residentIdleExitPath(this.options.config.residencyRoot), { force: true });
@@ -526,8 +535,16 @@ export class ResidencyClient {
     throw new Error(`${launcherExited ? "Launcher exited while starting" : `Timed out after ${budget}ms starting`} Fabric resident host ${this.hostId}. ${diagnostics}`);
   }
 
-  /** Host-only Main lifecycle hook; not a guest-selected release path. */
+  /** Host-only Main lifecycle hook; concurrent startup/watchdog calls share one pass. */
   async reconcileRelease(): Promise<void> {
+    if (this.#releasePass) return this.#releasePass;
+    const pending = this.#reconcileRelease();
+    this.#releasePass = pending;
+    try { await pending; }
+    finally { if (this.#releasePass === pending) this.#releasePass = undefined; }
+  }
+
+  async #reconcileRelease(): Promise<void> {
     if (this.#closed || !this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId) return;
     const owner = this.#liveOwner();
     const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
@@ -547,7 +564,8 @@ export class ResidencyClient {
     if (!owner || handoverActive(state) || this.#releaseOwners.has(owner.token)) return;
     this.#releaseOwners.add(owner.token);
     if (owner.releaseRoot === releaseRoot) return;
-    if (owner.handover?.abi !== RESIDENT_HANDOVER_ABI || !owner.commands?.includes("releaseChange")) {
+    if (owner.handover?.abi !== RESIDENT_HANDOVER_ABI ||
+        (!owner.commands?.includes("releaseChange") && !(owner.drain?.abi === "fabric-resident-drain-1" && owner.commands?.includes("releaseDrain")))) {
       this.#deferRelease(new Error("Legacy resident host/launcher has no release custody protocol; installer drain required")); return;
     }
     this.#refreshPiModels();
@@ -556,10 +574,147 @@ export class ResidencyClient {
     const runtime = await resolveScriptRuntime({ execPath: process.execPath });
     const target = residentLaunchSpec(this.options.config, path.join(path.dirname(this.#hostPath), "pi-entry.js"), runtime);
     if (readHandoverJson(handoverOutcomePath(this.options.config.residencyRoot, target))) return;
+    if (owner.drain?.abi === "fabric-resident-drain-1" && owner.commands?.includes("releaseDrain") && owner.requestFence === 1) {
+      await this.#drainRelease(owner, main, target,
+        { identity: { id: self.id, name: self.name, kind: "main", sessionId: main.sessionId }, hostId: self.ownerHostId });
+      return;
+    }
+    // Legacy releaseChange remains fail-closed in A; do not retrofit staged
+    // attempt containment or change the semantics of unsupported live owners.
+    if (this.#closed || !mainGenerationCurrent(this.options.config.residencyRoot, main)) throw new ResidentActorAuthorizationError("Obsolete Main release intent");
     await this.#command({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "releaseChange",
       requestId: randomUUID(), rootId: main.rootId, createdAt: Date.now(), main, target,
       caller: { identity: { id: self.id, name: self.name, kind: "main", sessionId: main.sessionId }, hostId: self.ownerHostId },
     }, this.#releaseAbort.signal);
+  }
+
+  async #drainRelease(owner: ResidentHostOwner, main: ResidentMainGeneration, target: ResidentLaunchSpec, caller: ResidentActorCaller): Promise<void> {
+    // Reuse A's existing cooperative exit and the existing request exchange;
+    // this is an ordinary B launch after proven shutdown, not staged handover.
+    const { ResidentActorClient } = await import("./actor-client.js");
+    const { RESIDENT_DRAIN_ABI, readResidentDrainReceipt, sameDrainOwner, sameDrainLauncher } = await import("./drain.js");
+    const { hostLeasePath, hostLeasePredecessor } = await import("../topology/host-leases.js");
+    const root = this.options.config.residencyRoot;
+    if (!owner.releaseRoot || !owner.configDigest || !owner.processStartTime || !owner.handover ||
+        !exactResidentProcess({ pid: owner.pid, processStartTime: owner.processStartTime }) || !exactResidentProcess(owner.handover.launcher)) {
+      throw new Error("Resident graceful exit requires an exact live owner and launcher generation; retain A");
+    }
+    const loaded = readHandoverJson<ResidentHostConfig>(path.join(root, `launch-${owner.configDigest}.json`));
+    if (!loaded) throw new Error("Resident immutable loaded launch snapshot is unavailable; retain A");
+    const previous = residentLaunchSpec(loaded, owner.handover.launcher.entry, owner.handover.launcher.runtime);
+    if (previous.digest !== owner.configDigest || previous.releaseRoot !== owner.releaseRoot) throw new Error("Resident loaded launch snapshot changed; retain A");
+    assertHandoverTopology(previous, target);
+    const previousLease = hostLeasePredecessor(this.options.config.meshRoot, owner.hostId);
+    const expected = { releaseRoot: previous.releaseRoot, configDigest: previous.digest,
+      owner: { pid: owner.pid, processStartTime: owner.processStartTime, token: owner.token, hostId: owner.hostId },
+      launcher: owner.handover.launcher };
+    const sameOwner = (current: ResidentHostOwner): boolean => sameDrainOwner(current as typeof expected.owner, expected.owner) &&
+      current.releaseRoot === expected.releaseRoot && current.configDigest === expected.configDigest &&
+      current.fabricExtensionPath === previous.config.fabricExtensionPath && current.handover?.abi === RESIDENT_HANDOVER_ABI &&
+      sameDrainLauncher(current.handover.launcher, expected.launcher);
+    const assertMain = (): void => {
+      if (this.#closed || this.#releaseAbort.signal.aborted || !mainGenerationCurrent(root, main)) {
+        throw new ResidentActorAuthorizationError("Obsolete owning Main graceful-exit intent");
+      }
+    };
+    assertMain();
+    // A concurrent native wake must select B too once A relinquishes its root.
+    this.#persistConfig();
+    const deadline = Date.now() + HANDOVER_WAIT_MS;
+    while (Date.now() < deadline) {
+      assertMain();
+      const current = this.#liveOwner();
+      if (!current || !sameOwner(current) || !exactResidentProcess(expected.launcher)) throw new Error("Resident generation changed before graceful exit; retain A");
+      const started = Date.now();
+      const timeoutMs = Math.min(HANDOVER_DRAIN_MS, deadline - started);
+      const requestTimeoutMs = Math.min(this.options.commandTimeoutMs ?? COMMAND_TIMEOUT_MS, timeoutMs);
+      this.#releaseExitPending = true;
+      const response = await new ResidentActorClient(this.options.config.meshRoot, main.rootId, requestTimeoutMs)
+        .releaseDrain({ caller, main, target, expected, timeoutMs, exit: true }, this.#releaseAbort.signal);
+      assertMain();
+      const initial = response.drain;
+      if (!initial || initial.abi !== RESIDENT_DRAIN_ABI || initial.rootId !== main.rootId ||
+          !sameDrainOwner(initial.owner, expected.owner) || !sameDrainLauncher(initial.launcher, expected.launcher) ||
+          JSON.stringify(initial.previous) !== JSON.stringify(previous) || JSON.stringify(initial.target) !== JSON.stringify(target) ||
+          JSON.stringify(initial.main) !== JSON.stringify(main) || !Number.isSafeInteger(initial.at) || initial.at < started || initial.at > Date.now() ||
+          !Number.isSafeInteger(initial.deadlineAt) || initial.deadlineAt < started || initial.deadlineAt > started + requestTimeoutMs + timeoutMs) {
+        throw new Error("Resident graceful-exit response is not correlated to this owner, launch and Main");
+      }
+      const decision = readResidentRequestDecision(root, response.requestId);
+      if (!response.ok && initial.terminal === true && initial.phase === "refused" && initial.outcome === "refused" && !initial.admissionHeld) {
+        if (decision?.state === "committed") throw new Error("Resident drain refusal conflicts with a committed request; do not retry");
+        const serving = this.#liveOwner();
+        if (!serving || !sameOwner(serving)) throw new Error("Resident owner changed during graceful-exit refusal");
+        this.#releaseExitPending = false;
+        // These are read-only preflight refusals: A keeps serving accepted work.
+        // No other response, missing reply or postcommit receipt is retryable.
+        if (!["DRAIN_EXIT_REQUESTS_BUSY", "DRAIN_EXIT_OUTBOX_DEBT", "DRAIN_EXIT_ACTORS_BUSY", "DRAIN_EXIT_WORKERS_BUSY"].includes(initial.code)) {
+          throw new Error(`Resident graceful exit refused (${initial.code}): ${initial.reason}`);
+        }
+        await sleepUnlessAborted(STATUS_POLL_MS, this.#releaseAbort.signal);
+        continue;
+      }
+      if (!response.ok || initial.terminal === true || initial.phase !== "held" || initial.outcome !== "held" || initial.admissionHeld !== true ||
+          decision?.state !== "committed" || decision.operation !== "releaseDrain" || decision.id !== initial.id || decision.ownerHostId !== owner.hostId) {
+        throw new Error("Resident graceful exit has no correlated held admission boundary");
+      }
+      const exitDeadline = Math.min(deadline, initial.deadlineAt + STATUS_POLL_MS);
+      while (Date.now() <= exitDeadline) {
+        assertMain();
+        const current = readHandoverJson<ResidentHostOwner>(this.#ownerPath);
+        const desiredSuccessor = current && current.token !== owner.token && current.releaseRoot === target.releaseRoot &&
+          current.configDigest === target.digest && current.fabricExtensionPath === target.config.fabricExtensionPath &&
+          current.processStartTime !== undefined && exactResidentProcess({ pid: current.pid, processStartTime: current.processStartTime });
+        if (current && !sameOwner(current) && !desiredSuccessor) throw new Error("Resident owner changed during graceful exit; no successor launch authorized");
+        const durable = readResidentDrainReceipt(root, initial.id, initial);
+        if (durable) {
+          if (!Number.isSafeInteger(durable.at) || durable.at < initial.at || durable.at > Date.now()) throw new Error("Resident graceful-exit receipt sequence changed");
+          if (durable.phase === "exited" && durable.outcome === "exited" && durable.terminal === true &&
+              durable.admissionHeld === true && durable.checkpointReadback === true && durable.resumedAt === undefined) {
+            const stopped = readResidentGenerationExit(root, owner.token);
+            if (stopped?.writer === "host" && stopped.reason === "stopped" && stopped.pid === owner.pid &&
+                Number.isSafeInteger(stopped.at) && stopped.at >= started && stopped.at <= Date.now() && stopped.diagnostic === undefined &&
+                (stopped.code === undefined || stopped.code === 0) && (stopped.signal === undefined || stopped.signal === null) &&
+                !residentProcessAlive(owner.pid, owner.processStartTime)) {
+              // A native wake can win the ordinary B launch before we observe
+              // A's process exit. A ready, birth-bound B plus a new lease UUID
+              // proves old lease release too; join ensureHost instead of racing it.
+              const lease = hostLeasePredecessor(this.options.config.meshRoot, owner.hostId);
+              const leaseReleased = !current
+                ? fs.lstatSync(hostLeasePath(this.options.config.meshRoot, owner.hostId), { throwIfNoEntry: false }) === undefined
+                : desiredSuccessor && this.#readyOwner()?.token === current.token && !!previousLease?.incarnationToken &&
+                  !!lease?.incarnationToken && lease.incarnationToken !== previousLease.incarnationToken &&
+                  lease.id === owner.hostId && lease.rootId === main.rootId && lease.identityId === owner.hostId && lease.expiresAt > Date.now();
+              if (!leaseReleased) {
+                await sleepUnlessAborted(STATUS_POLL_MS, this.#releaseAbort.signal);
+                continue;
+              }
+              assertMain();
+              this.#releaseExitPending = false;
+              const successor = await this.ensureHost();
+              assertMain();
+              if (successor.releaseRoot !== target.releaseRoot || successor.configDigest !== target.digest) throw new Error("Resident successor is not serving the desired release/config");
+              return;
+            }
+          } else if (durable.terminal === true) {
+            throw new Error(`Resident graceful exit is unsettled (${durable.code}): ${durable.reason}` +
+              (durable.phase === "needs-operator" && durable.admissionHeld
+                ? ` A remains held; do not retry the drain or start a successor. The held endpoint cannot consume another request.` +
+                  ` With the root owner's permission, recheck owner.json and the live Linux process both match expected old PID ${expected.owner.pid}` +
+                  ` and birth (processStartTime) ${expected.owner.processStartTime}; if either differs, stop.` +
+                  ` Only after those checks run \`kill -TERM -- ${expected.owner.pid}\`, wait for that exact process to exit, then reload the owning Main on the desired release.`
+                : ""));
+          }
+        }
+        await sleepUnlessAborted(STATUS_POLL_MS, this.#releaseAbort.signal);
+      }
+      throw new Error("Resident graceful-exit deadline elapsed without correlated exit, process death and lease release; inspect its durable receipt");
+    }
+    // This loop can end only before dispatch or after a correlated precommit
+    // busy refusal. Let the existing watchdog owner deadline/events retry after
+    // long accepted work settles; never clear the token on postcommit doubt.
+    this.#releaseOwners.delete(owner.token);
+    throw new Error("Resident remained busy through the bounded release deadline; A was left serving");
   }
 
   #deferRelease(error: unknown): void {
@@ -1034,6 +1189,15 @@ export class ResidencyClient {
   }
 
   async #command(command: ResidentCommand, signal?: AbortSignal, onDispatched?: () => void, cleanupOwner?: ResidentHostOwner): Promise<ResidentCommandResponse> {
+    // A's existing exit drain treats a new file request as postcommit doubt.
+    // Queue this Main's ordinary publications behind reconciliation; already
+    // published requests are covered by A's read-only busy preflight. The legacy
+    // releaseChange fallback itself owns the pass and must not await itself.
+    if (command.operation !== "releaseChange") {
+      await this.#releasePass;
+      throwIfAborted(signal);
+      if (this.#closed || this.#releaseExitPending) throw new Error("Resident graceful exit is unsettled or its Main closed; no request was dispatched");
+    }
     const owner = this.#liveOwner();
     if (!owner) throw new Error("Root resident host is not live");
     if (cleanupOwner && (owner.token !== cleanupOwner.token || owner.pid !== cleanupOwner.pid ||
@@ -1365,10 +1529,13 @@ export class ResidencyClient {
     const live = this.#liveOwner();
     if (live) {
       this.#watchdogDeadline = this.#ownerDeadline(live);
-      if (!this.#readyOwner()) return;
+      if (this.#releaseExitPending || !this.#readyOwner()) return;
       void this.reconcileRelease().catch((error) => this.#deferRelease(error));
       return;
     }
+    // A committed graceful exit belongs to its receipt observer, even when A's
+    // owner publication is already gone. Doubt never becomes crash recovery.
+    if (this.#releaseExitPending) return;
     // Launcher custody: handover.json/owner.json notifications or the 60 s deadline.
     if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) {
       this.#watchdogDeadline = Date.now() + ADOPTED_OWNER_DEADLINE_MS;

@@ -1,44 +1,70 @@
 # Resident release negotiation (#2615)
 
-A live Main chooses the release it loaded; only its **existing detached
-launcher** may own an irreversible handover. This is not a new daemon, fleet
-scanner or installer migration.
+A live Main chooses the release it loaded. The existing detached launcher may
+own a staged irreversible `releaseChange` handover; the supported cooperative
+Main stop-then-start path instead uses the existing in-process drain endpoint
+and ordinary lease-fenced `ensureHost`. This is not a new daemon, fleet scanner
+or installer migration.
 
-## Current policy: defer before A exits
+## Current staged policy: defer before A exits
 
-Automatic release following is **disabled**, including on protocol-capable Linux
-hosts. The current launcher samples ancestry but has no attempt-owned membership
-boundary or complete exit receipts. Therefore it cannot safely promise A recovery
-after an ordinary failed B or Main loss during B startup. A protocol ABI and a
-free `host.lock` are not sufficient recovery capability.
+Staged `releaseChange` handover and its fallback are **disabled**, including on
+protocol-capable Linux hosts. The launcher samples ancestry but has no
+attempt-owned membership boundary or complete exit receipts, so it cannot safely
+promise A recovery after failed B or Main loss during staged B startup. A protocol
+ABI and a free `host.lock` are not sufficient recovery capability. This does not
+disable the separate Main stop-then-start path below: it requires exact A exit
+proof before ordinary B launch and makes no staged A-fallback promise.
 
-`assertAutomaticReleaseRecovery()` is an unconditional, non-configurable gate:
+For staged `releaseChange`, `assertAutomaticReleaseRecovery()` is an
+unconditional, non-configurable gate:
 
-- A records the authorized target intent and synchronously cancels it **before
-  pausing its backlog, yielding to the launcher, accepting custody or exiting**.
+- Under staged `releaseChange`, A records the authorized target intent and
+  synchronously cancels it **before pausing its backlog, yielding to the
+  launcher, accepting custody or exiting**.
   The original A owner, admitted runs, actor identities and acknowledged queued
   inputs continue serving. Main shutdown/reload cannot turn deferral into outage.
-- The launcher independently cancels a custody request under its transaction
-  lock, before the positive custody CAS/receipt, target-attempt suppression or
-  B spawn. A observes that cancellation and resumes a reversible prepare.
+- The launcher independently cancels a staged custody request under its
+  transaction lock, before the positive custody CAS/receipt, target-attempt
+  suppression or B spawn. A observes that cancellation and resumes a reversible
+  prepare.
 - There is no environment/configuration opt-in. Tests of the retained staged
   transaction primitives explicitly mock the recovery assertion; these are not
-  evidence that automatic release following is enabled or accepted.
+  evidence that staged release following is enabled or accepted.
 
-This replaces round 2's post-B `blocked` scope cut. We do **not** accept loss of
-service on healthy storage with usable A, claim complete descendant cleanup, or
-claim the old failed-B recovery matrix applies to this head. B failure and Main
-loss *after B spawn* are unreachable on this policy: no B attempt is authorized.
-There is no implemented installer drain/exit-proof command that can safely move
-an already-loaded legacy resident. The [`fabric-resident-drain` command](resident-drain.md)
-now exposes a preserving resident-owned hold/checkpoint on compatible loaded
-hosts. It settles accepted work naturally, reads back custody, then resumes the
-same A with nonzero `containment-unavailable`. Legacy hosts still refuse without
-effects. The endpoint supplies no complete attempt exit or rollback authority.
-Do not substitute actor stop (it cancels accepted queues), launcher exit, or an
-empty process group for that missing proof.
+This replaces round 2's post-B `blocked` scope cut for staged B attempts. We do
+**not** accept service loss on healthy storage with usable A, claim complete
+descendant cleanup, or claim the old failed-B recovery matrix applies. B failure
+and Main loss *after B spawn* remain unreachable on the staged path because no
+staged B attempt is authorized.
 
-Launcher shutdown tracks its directly spawned child through native process exit.
+## Supported Main graceful stop-then-start
+
+When a Main starts on B and sees a live, compatible resident A for the same root,
+it uses the existing `releaseDrain(exit:true)` endpoint. The Main retries only
+correlated, read-only precommit busy refusals, leaving A serving while accepted
+work finishes naturally; missing or uncorrelated evidence and postcommit
+uncertainty are not retried. After the exact durable
+`phase:"exited", outcome:"exited"` receipt confirms checkpoint read-back with
+admission held, the host has written `reason:"stopped"` for A's exact generation,
+A's process birth is gone, and A's host lease is released, Main uses ordinary
+`ensureHost` on B and checks that B's release is serving. Queues and traces are
+retained. No actor terminal stop, external signal, new state or protocol, or
+staged rollback is involved.
+
+This covers Main-initiated switches, with this Main's ordinary file commands
+queued behind reconciliation. An independent CLI/proxy writer racing the
+committed drain can leave A held with `needs-operator`; Main diagnoses it with
+an explicit operator recovery command. It does not retry or launch a competitor. Queues and traces remain retained. This independent-writer case is
+outside the automatic path.
+
+Old residents lacking cooperative drain remain diagnosed and serving; Main does
+not force-stop them. The [`fabric-resident-drain` CLI](resident-drain.md) default
+mode still holds/checkpoints then resumes A with `containment-unavailable`; its
+`--exit` success proves only A's stopped exit, not a B launch or serving release.
+
+For staged launcher cleanup, shutdown tracks its directly spawned child
+through native process exit.
 A missing Linux birth observation cannot suppress native TERM/KILL, and inherited
 pipes cannot substitute for an exit receipt. Repeated shutdown signals share one
 cleanup pass; the finalizer joins observed cleanup even after the direct child
@@ -74,7 +100,7 @@ crash containment remain part of #3103's boundary work.
    correlated Pi RPC response, without inference. Terminal publication uncertainty
    retains the owned generation and does not cut possibly admitted business
    work. `host.reloaded` publication uncertainty never ungates or replays business
-   work. None of these primitives supplies containment or enables automatic B.
+   work. None of these primitives supplies containment or enables a staged B attempt.
 
 ## External transport scope cut (security round 2 F1)
 
@@ -110,13 +136,14 @@ fail-closed. No retry-reset interface is added.
 
 ## Follow-up issues for the repository owner (not filed by this task)
 
-**Contain resident release attempts and restore automatic Main release following
-(#2615 follow-up).** Establish membership before any child can escape (for example,
-a delegated cgroup), retain a supervisor until every member has a checked exit
-receipt, then prove one coherent A fallback after failed B and Main death during
-B startup, with the same actor IDs, acknowledged queued IDs and no overlapping
-service. Remove the unconditional gate only with independent security review and
-real native-Pi published A/B acceptance. Until then A remains stale-but-served.
+**Complete staged release handover and A-fallback recovery (#2615 follow-up).**
+Establish membership before any child can escape (for example, a delegated
+cgroup), retain a supervisor until every member has a checked exit receipt, then
+prove one coherent A fallback after failed staged B startup and Main death, with
+the same actor IDs, acknowledged queued IDs and no overlapping service. Remove
+the unconditional gate only with independent security review and real native-Pi
+published A/B acceptance. Until then staged B attempts remain disabled; where
+cooperative stop-then-start is unavailable, A remains stale-but-served.
 
 **Add checked tmux/screen worker exit receipts.** Distinguish definitive absence
 from CLI/socket failure; bound and cancel every query; persist enough identity

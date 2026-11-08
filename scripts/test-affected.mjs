@@ -195,7 +195,18 @@ if (argv.includes("--dry-run")) {
   process.exit(0);
 }
 try {
-  for (const [, args] of runs) execFileSync("bunx", args, { stdio: "inherit" });
+  for (const [phase, args] of runs) {
+    const shardIndex = Number(shard?.split("/")[0]);
+    if (phase === "direct" && shardIndex > direct.length) {
+      console.log(`shard ${shard}: no selected tests`);
+      if (reportDir) fs.writeFileSync(path.resolve(reportDir, "direct.json"), JSON.stringify({
+        success: true, numTotalTests: 0, numPassedTests: 0, numFailedTests: 0,
+        numPendingTests: 0, numTodoTests: 0, testResults: [],
+      }, null, 2) + "\n");
+      continue;
+    }
+    execFileSync("bunx", args, { stdio: "inherit" });
+  }
 } catch {
   process.exit(1);
 }

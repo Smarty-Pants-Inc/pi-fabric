@@ -181,7 +181,7 @@ describe("resident per-actor admission serialization", () => {
         instructions: "successor update", replace: true }, undefined, f.caller)
         .finally(() => { successorMutationSettled = true; }));
       const updated = await promptly(successorMutation, 800);
-      expect(updated.id).toBe(successor.id);
+      expect(updated).toMatchObject({ id: successor.id });
       expect(f.host.actors.instructions(successor.id)).toBe("successor update");
       expect(successorMutationSettled).toBe(true);
       expect(predecessorMutationHeld).toBe(true);

@@ -5,6 +5,10 @@ inputs:
     description: Platform-specific dist archive produced by the gates job
     required: false
     default: ''
+  runner-environment:
+    description: Expected value of the runner's actual RUNNER_ENVIRONMENT
+    required: false
+    default: github-hosted
 runs:
   using: composite
   steps:
@@ -15,13 +19,15 @@ runs:
     - uses: actions/setup-python@v5
       with:
         python-version: '3.14'
-    - name: Require GitHub-hosted test admission
-      # Do not spoof RUNNER_ENVIRONMENT or the parent-admission marker. The
-      # hosted-only guard inherits GitHub's real markers in every test job.
+    - name: Require expected test runner environment
+      # Compare the actual runner value without spoofing RUNNER_ENVIRONMENT or
+      # the parent-admission marker; hosted-only guards keep GitHub's real markers.
       shell: bash
+      env:
+        EXPECTED_RUNNER_ENVIRONMENT: ${{ inputs.runner-environment }}
       run: |
         test "$GITHUB_ACTIONS" = true
-        test "$RUNNER_ENVIRONMENT" = github-hosted
+        test "$RUNNER_ENVIRONMENT" = "$EXPECTED_RUNNER_ENVIRONMENT"
         test -d "$RUNNER_TEMP"
     - name: Install runtime prerequisites
       # Provision rg instead of letting Pi download it ad hoc in nested tests.

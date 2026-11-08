@@ -81,6 +81,35 @@ model routing or scheduler. The reservation does **not** govern
 `topology.dispatch` durable spawn or actor mailboxes; neither actor admission nor
 `maxStarts` receives a separate P0 budget.
 
+### Hosted AgentService: optional topology stop
+
+A host may supply `topology.stop({ callerId, id, signal? })` returning
+`Promise<FabricActorInfo | AgentSessionRecord>`. The service calls it only when
+the ID is not the authenticated caller's own direct child. Without the callback,
+the existing `Unknown direct child agent` refusal remains. A failed own-child
+stop never falls back to topology.
+
+Actor-manager hosts return the actual native `FabricActorInfo`.
+Pi-Durable Conversation hosts return their existing `AgentSessionRecord`;
+the service preserves either native shape without inventing fields.
+
+`service.stop(callerId, id, signal?)` and `client.stop(id, signal?)` return
+`Promise<AgentPublicRecord | FabricActorInfo | AgentSessionRecord>`. Hosted
+provider arguments are only `{ id }`; cancellation travels separately as an
+`AbortSignal`, forwarded by the client and handler to the topology callback.
+There are no guest-selectable wait or queue/archive options. Direct-child stop
+retains its existing cancellation, generation, route and cleanup behavior,
+including waiting for its execution-port acknowledgment and cleanup before
+returning the public child record.
+
+The host owns target resolution, native stop routing and acknowledgment. Guests
+cannot supply `callerId`, routes or other host fields. Caller authority is
+checked before the callback and again after its acknowledgment. The service
+awaits the callback, propagates host refusals unchanged, and deep-clones the
+native return record without projecting it onto a child-record shape. A callback
+acknowledgment is **not** proof that a remote worker has terminated; the host must
+establish the native lifecycle evidence it requires.
+
 ### Background completion inbox
 
 `agents.spawn` returns immediately; independent work can continue without polling. With `agents.notifyOnComplete` enabled (the default), a concise UI notice appears when a detached run finishes. Full outcomes remain in agent activity and logs. Unread results are batched into Main's context after the current assistant turn's entire tool batch, without waiting for its final answer. If Main is idle, unread results wake it once.

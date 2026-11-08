@@ -112,6 +112,7 @@ describe("prepareFabricExecArguments", () => {
   describe("rejects payloads-only placeholders", () => {
     const literal = "payloads are literal: read the file with a native tool first and pass its content";
     it.each([
+      ["PLACEHOLDER"],
       ["__CONTENT__"],
       ["__FILE_BODY__"],
       ["@/tmp/body.md"],
@@ -140,6 +141,8 @@ describe("prepareFabricExecArguments", () => {
         url: "fetch file:///tmp/x then stop",
         twoTokens: "@/a @/b",
         lower: "__content__",
+        lowerPlaceholder: "placeholder",
+        placeholderProse: "see PLACEHOLDER below",
         dunder: "__init__.py",
         scoped: "@scope/pkg",
         relative: "file:relative",

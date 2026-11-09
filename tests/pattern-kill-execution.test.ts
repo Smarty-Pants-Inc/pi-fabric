@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { killsByPattern, wipesTmp } from "../src/core/pattern-kill.js";
+
+beforeEach(() => vi.stubEnv("SMARTY_ALPHA", "0"));
+afterEach(() => vi.unstubAllEnvs());
 
 // Scanner DATA only: never execute these commands or create destructive fixtures.
 const signalActions = [

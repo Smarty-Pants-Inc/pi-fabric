@@ -1255,20 +1255,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   pi.on("tool_call", (event, context) =>
     fabricToolLifecycle.toolCall(event, context));
 
-  // smarty-dev#854: a foreground wait over the limit blocks this session from steers and asks.
-  // smarty-dev#774: a kill by name pattern kills other owners' processes on a shared host. Every
-  // session that loads Fabric (Mains, task agents, actors) runs this, and fabric_exec's pi.bash
-  // emits the same tool_call.
-  let shellGuards: Promise<[typeof import("./core/pattern-kill.js"), typeof import("./guards/foreground-wait.js")]> | undefined;
+  // Every session that loads Fabric checks the current bash policy on each call, including
+  // fabric_exec's pi.bash. Cache only the lazy module load, never the selected policy mode.
+  let shellGuards: Promise<typeof import("./guards/bash-guard-policy.js")> | undefined;
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return undefined;
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
-    const [{ killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp }, { foregroundWaitRefusal }] =
-      await (shellGuards ??= Promise.all([import("./core/pattern-kill.js"), import("./guards/foreground-wait.js")]));
-    if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
-    if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
-    const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
+    const { bashGuardRefusal } = await (shellGuards ??= import("./guards/bash-guard-policy.js"));
+    const reason = await bashGuardRefusal(command, typeof timeout === "number" ? timeout : undefined);
     if (reason) return { block: true, reason };
     // smarty-dev#2184, #6137: judged on the caller's own command and timeout above, so the injected
     // defaults (total cap, idle watchdog) never unblock a wait.

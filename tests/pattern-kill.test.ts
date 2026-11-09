@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { killsByPattern, PATTERN_KILL_REASON } from "../src/core/pattern-kill.js";
+
+beforeEach(() => vi.stubEnv("SMARTY_ALPHA", "0"));
+afterEach(() => vi.unstubAllEnvs());
 
 // smarty-dev#774: the three real incidents verbatim, then the forms the rule refuses and the
 // reads and recorded-PID kills it must still allow.

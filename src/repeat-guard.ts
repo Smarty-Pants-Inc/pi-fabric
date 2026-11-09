@@ -1,3 +1,5 @@
+import { alphaModeEnabled } from "./guards/alpha-mode.js";
+
 /**
  * Degenerate-loop breaker for fabric_exec. Identical guest code back-to-back
  * is how lower-tier models burn a session (2026-09-15: 220x `bash echo noop`
@@ -9,7 +11,9 @@ export const FABRIC_REPEAT_WARN = 3;
 export const FABRIC_REPEAT_BLOCK = 6;
 
 export const fabricRepeatWarnText = (count: number, blockAt: number): string =>
-  `[circuit-breaker] identical fabric_exec code has now run ${count} times in a row; at ${blockAt} identical runs will be blocked. Change the approach or finish your turn.`;
+  alphaModeEnabled()
+    ? `[circuit-breaker] identical fabric_exec code has now run ${count} times in a row; warn-only under alpha mode, so identical runs are not blocked. Change the approach or finish your turn.`
+    : `[circuit-breaker] identical fabric_exec code has now run ${count} times in a row; at ${blockAt} identical runs will be blocked. Change the approach or finish your turn.`;
 
 export const fabricRepeatBlockText = (count: number): string =>
   `Circuit breaker: this exact fabric_exec code has now executed ${count} times in a row and was blocked. Re-running identical code adds no information. Summarize what you already know and finish your turn; if the call is genuinely required, change the code materially.`;
@@ -21,13 +25,13 @@ export class FabricRepeatGuard {
   constructor(
     /** Consecutive identical executions that start producing a warning. */
     readonly warnAt: number,
-    /** Consecutive identical executions that get blocked outright. */
+    /** Consecutive identical executions that get blocked outside alpha mode. */
     readonly blockAt: number,
   ) {}
 
   observe(code: string): { count: number; blocked: boolean; warn: boolean } {
     this.#count = code === this.#code ? this.#count + 1 : 1;
     this.#code = code;
-    return { count: this.#count, blocked: this.#count >= this.blockAt, warn: this.#count >= this.warnAt };
+    return { count: this.#count, blocked: !alphaModeEnabled() && this.#count >= this.blockAt, warn: this.#count >= this.warnAt };
   }
 }

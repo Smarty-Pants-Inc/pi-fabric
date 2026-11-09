@@ -122,6 +122,7 @@ const lazyEntryPoints = [
   "src/core/provider-operations.ts",
   "src/core/model-served.ts",
   "src/core/auto-approval-classifier-impl.ts",
+  "src/guards/bash-guard-policy.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
@@ -226,7 +227,7 @@ const hostPolicyConstants = {
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
-  // Both facades only re-export host metadata. Resolve to their implementation
+  // Resolve re-export-only facades directly to their implementations
   // so empty facade-only chunks do not consume startup graph slots.
   plugins: [{
     name: "host-metadata-facades",
@@ -234,7 +235,7 @@ const result = await build({
       pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
         path: resolve("src/host-compatibility.ts"),
       }));
-      pluginBuild.onResolve({ filter: /\/diagnostics\.js$/ }, () => ({
+      pluginBuild.onResolve({ filter: /\/(?:diagnostics|alpha-mode)\.js$/ }, () => ({
         path: resolve("src/core/agent-dir.ts"),
       }));
     },

@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import fs, { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,15 @@ export const resolveAgentDir = (envDir = process.env[ENV_AGENT_DIR]): string => 
   if (envDir) return expandEnvDir(envDir);
   return path.join(homedir(), CONFIG_DIR_NAME, "agent");
 };
+
+// Keep this live settings check in the existing core chunk to avoid another eager startup chunk.
+/** Only an explicit zero, with no disable file, opts out of alpha mode. */
+export function alphaModeEnabled(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  const disabled = existsSync(path.join(homedir(), ".config/smarty/bash-guard.disabled"));
+  return env.SMARTY_ALPHA !== "0" || disabled;
+}
 
 // Shared with self-reload and the release census. Kept in this existing cheap core module so
 // code splitting does not create an additional eager startup chunk for release selectors.

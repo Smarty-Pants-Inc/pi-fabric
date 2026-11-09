@@ -1355,7 +1355,8 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     return { gate: await import("../src/mesh/state-gate.js"), calls };
   };
 
-  it("default warns and startup reaches the actual opener; ENFORCE=1 refuses in the same process; unset and 0 restore startup", async () => {
+  it.each(["0", "1"])("default warns and startup reaches the actual opener; ENFORCE=1 refuses in the same process; unset and 0 restore startup (SMARTY_ALPHA=%s)", async enabled => {
+    vi.stubEnv("SMARTY_ALPHA", enabled);
     const finding = "C:\\x grants S-1-1-0 write, delete or permission rights (mask 0x1301bf)";
     const { gate, calls } = await loadGate(finding);
     const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");

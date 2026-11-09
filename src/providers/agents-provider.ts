@@ -1,5 +1,6 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause } from "../fabric-provenance.js";
 import { diagnostics } from "../core/diagnostics.js";
+import { alphaModeEnabled } from "../guards/alpha-mode.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
@@ -109,7 +110,6 @@ import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { mainExecutionCeilingAbortReason, recordResidentOutcome, registerCancellationEffect, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
 import {
-  AGENT_WAIT_MAX_MS,
   AgentWaitBoundError,
   mainAgentWaitBound,
   agentWaitBound,
@@ -1088,10 +1088,15 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         // smarty-dev#2119: an interactive Main waits at most 60 s, and the bound is a normal result.
         const main = isInteractiveMain(context.extensionContext);
+        const pendingAtBound = main || alphaModeEnabled();
         const timeoutMs = main
           ? mainAgentWaitBound(args.timeoutMs, context.mainDeadlineAt)
-          : agentWaitBound(args.timeoutMs, AGENT_WAIT_MAX_MS);
-        const atBound = (record: object) => this.#mainWaitAtBound(record, timeoutMs);
+          : agentWaitBound(args.timeoutMs);
+        const atBound = (record: object) => main ? this.#mainWaitAtBound(record, timeoutMs) : {
+          ...record,
+          waitTimedOut: true,
+          note: `Still running after ${describeWaitBound(timeoutMs)}; only the wait ended. The run continues and its result remains available through agents.status or agents.wait.`,
+        };
         if (this.residency?.hasAgent(id)) {
           const status = this.residency.statusAgent(id);
           context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
@@ -1103,7 +1108,7 @@ export class AgentsProvider implements FabricProvider {
             return await this.residency.waitAgent(id, signal, context.deferResultConsumption);
           } catch (error) {
             if (!bound.aborted || context.signal?.aborted) throw error;
-            if (main) return atBound(this.residency.statusAgent(id));
+            if (pendingAtBound) return atBound(this.residency.statusAgent(id));
             throw new AgentWaitBoundError(
               `agents.wait: durable agent ${status.name} is still running after ${describeWaitBound(timeoutMs)}. ` +
                 "It continues, and its result arrives as a completion message: end the turn now.",
@@ -1119,10 +1124,12 @@ export class AgentsProvider implements FabricProvider {
             id,
             context,
             this.agentToolPreviewEnabled,
-            { timeoutMs, ...(main && context.signal ? { signal: context.signal } : {}), ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
+            { timeoutMs, ...(context.signal ? { signal: context.signal } : {}), ...(context.deferResultConsumption ? { deferConsumption: context.deferResultConsumption } : {}) },
           );
         } catch (error) {
-          if (!main || !(error instanceof AgentWaitBoundError)) throw error;
+          // The manager throws before consumption. Convert here, not inside the progress wrapper:
+          // an early/queued live handle need not have terminal-result usage or toolCalls.
+          if (!pendingAtBound || context.signal?.aborted || !(error instanceof AgentWaitBoundError)) throw error;
           return atBound(this.manager.status(id));
         }
       }

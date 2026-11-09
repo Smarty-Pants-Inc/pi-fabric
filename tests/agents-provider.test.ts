@@ -3970,8 +3970,14 @@ describe("AgentsProvider runner support", () => {
   });
 
   // smarty-dev#2119: an interactive Main's wait is capped at 60 s and the bound is a normal result.
-  it("returns the live status at the bound in an interactive Main; a task agent's wait still throws", async () => {
+  it("returns the live status at the bound in an interactive Main; an alpha-OFF task agent's wait still throws", async () => {
     const { provider, mainAgent } = setup();
+    // Isolate the live flag reader; never touch the user's disable file.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "provider-wait-off-"));
+    roots.push(home);
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    vi.stubEnv("SMARTY_ALPHA", "0");
     const mainContext = (mode: string) => ({
       ...context,
       extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "test" } } as unknown as ExtensionContext,

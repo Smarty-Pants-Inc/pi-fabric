@@ -2,12 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import type { FabricMeshConfig } from "../config.js";
 import { alphaModeEnabled } from "../guards/alpha-mode.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { isInside, readWritePolicy, type FabricWritePolicy } from "./write-guard.js";
 
 export { readWritePolicy, type FabricWritePolicy };
 
 const MAX_WRITABLE_ROOTS = 32;
 const MAX_ROOT_CHARS = 4_096;
+let alphaShellInheritanceWarningLogged = false;
 
 /**
  * Carry the resolved parent's carrier into a local task child, even when the child
@@ -138,9 +140,9 @@ export const assertDefaultTaskWriteRoots = (runRoot: string, roots: readonly str
 
 /**
  * Effective child policy: explicit request narrowed by the caller's own
- * PI_FABRIC_WRITE_POLICY. Alpha permits an explicit unrestricted opt-out.
- * Otherwise a confined caller cannot drop readOnly, enable an unconfined shell,
- * or name roots outside its own; an empty request inherits.
+ * PI_FABRIC_WRITE_POLICY. Alpha permits an explicit unrestricted opt-out and
+ * shell escalation. Otherwise a confined caller cannot drop readOnly, enable
+ * an unconfined shell, or name roots outside its own; an empty request inherits.
  */
 export const resolveChildWritePolicy = (
   request: AgentWritePolicyRequest,
@@ -158,7 +160,11 @@ export const resolveChildWritePolicy = (
   }
   const shell = request.shell ?? parent?.shell ?? "deny";
   if (parent?.shell === "deny" && shell === "unconfined") {
-    throw new Error('A shell-confined agent cannot launch a child with shell: "unconfined"');
+    if (!alphaModeEnabled()) throw new Error('A shell-confined agent cannot launch a child with shell: "unconfined"');
+    if (!alphaShellInheritanceWarningLogged) {
+      alphaShellInheritanceWarningLogged = true;
+      diagnostics.warn("src/agents/child-env.ts", "[pi-fabric] FABRIC_ALPHA_SHELL_INHERITANCE_BYPASS: alpha mode permits a child with an unconfined shell despite inherited shell-deny metadata; read-only and writable-root inheritance checks remain in place.");
+    }
   }
   if (readOnly) return { readOnly, writableRoots: [], shell };
   const realCwd = fs.realpathSync(cwd);

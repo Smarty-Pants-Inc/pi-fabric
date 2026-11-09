@@ -1,5 +1,6 @@
 import { AgentAdmission, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, waitForAgent, type AgentLifecycleState } from "./lifecycle.js";
 import { agentWaitBound, describeWaitBound } from "./wait-bound.js";
+import { alphaModeEnabled } from "../guards/alpha-mode.js";
 import { validateAgentResult } from "./result.js";
 import { normalizeAgentServiceRequest } from "./service-schema.js";
 import type { AgentAuthorityBoundary, AgentPublicRecord, AgentControlRequest, AgentExecutionEvent, AgentExecutionResponse, AgentServiceCapabilities, AgentServiceEvent, AgentServiceOptions, AgentServiceRecord, AgentServiceRequest, AgentSessionRecord, AgentServiceSnapshot } from "./service-types.js";
@@ -82,16 +83,20 @@ export class AgentService {
   }
 
   /**
-   * Waits for a direct child, bounded by timeoutMs (default and at most 5 min; smarty-dev#854).
-   * At the bound only the wait ends: the child keeps running and its result stays available.
+   * Waits for a direct child, defaulting to 5 min (#854). Alpha honors explicit non-Main
+   * timeouts and returns live status at the bound; OFF keeps the cap/error. Hosted callers
+   * have no interactive Main context. Cancellation ends only the observation, not the child.
    */
   async wait(callerId: string, id: string, signal?: AbortSignal, timeoutMs?: number): Promise<AgentPublicRecord> {
+    const pendingAtBound = alphaModeEnabled();
     const bound = agentWaitBound(timeoutMs);
     const timer = AbortSignal.timeout(bound);
     try {
       return await this.#waitFor(callerId, id, signal ? AbortSignal.any([signal, timer]) : timer);
     } catch (error) {
       if (!timer.aborted || signal?.aborted) throw error;
+      // status rechecks trusted caller authority and filters private host/checkpoint fields.
+      if (pendingAtBound) return this.status(callerId, id);
       const entry = this.#child(callerId, id);
       throw new Error(
         `agents.wait: ${entry.record.name} is still running after ${describeWaitBound(bound)}. It continues: ` +

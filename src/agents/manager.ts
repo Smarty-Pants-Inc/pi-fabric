@@ -210,6 +210,7 @@ import {
 } from "./constants.js";
 const NESTED_SNAPSHOT_POLL_MS = 500;
 const TRANSPORT_EXIT_GRACE_MS = 1_000;
+let alphaNativeExecutorWarningLogged = false;
 /** smarty-dev#9855: a standing held-permit alarm repeats this often. */
 const ADMISSION_REALARM_MS = 6 * 60 * 60 * 1_000;
 /** pi-fabric#939 round 4: a failed recovered-answer save retries after 1, 2, 4, 8 and 16 s (5 tries). */
@@ -2845,9 +2846,15 @@ export class AgentManager {
       ((kernel === "python" && pythonRuntime === "cpython") ||
         (kernel === "typescript" && /^(node|bun)-process$/.test(this.#executorRuntime?.() ?? "")))
     ) {
-      throw new Error(
-        'A confined agent cannot use a native Fabric executor (CPython, node-process, bun-process); use QuickJS/Monty or shell: "unconfined"',
-      );
+      if (!alphaModeEnabled()) {
+        throw new Error(
+          'A confined agent cannot use a native Fabric executor (CPython, node-process, bun-process); use QuickJS/Monty or shell: "unconfined"',
+        );
+      }
+      if (!alphaNativeExecutorWarningLogged) {
+        alphaNativeExecutorWarningLogged = true;
+        diagnostics.warn("src/agents/manager.ts", "[pi-fabric] FABRIC_ALPHA_NATIVE_EXECUTOR_ADMISSION_BYPASS: alpha mode permits a native Fabric executor despite shell-deny metadata; OS restrictions remain independent.");
+      }
     }
     const worktreeSetup = request.worktree ? request.worktreeSetup ?? this.config.worktree?.setup : undefined;
     if (worktreeSetup !== undefined && (typeof worktreeSetup !== "string" || worktreeSetup.length > 8_192)) {
@@ -3184,7 +3191,7 @@ export class AgentManager {
         }
         if (writePolicy && alphaModeEnabled()) {
           auditWritePolicy("write_policy.alpha_native_unconfined",
-            "Retained write policy is metadata for native write/edit in alpha, not enforced confinement; mode is rechecked on each call. Shell policy and OS restrictions remain independent.", writePolicy);
+            "Retained write policy is metadata for native write/edit and shell in alpha, not enforced confinement; mode is rechecked on each call. OS restrictions remain independent.", writePolicy);
         }
         const onWritePolicyDisposition = writePolicyDispositionAudit(logFile, id, runner, writePolicy);
         const parentSessionId = this.#sessionId?.();
@@ -4508,8 +4515,10 @@ export class AgentManager {
   /**
    * Waits for a run's result and consumes it. With timeoutMs, a run still going at the bound is
    * detached instead (smarty-dev#854): it continues, nothing is consumed, and its result arrives
-   * as a completion message. An optional signal cancels only this observation (Main's
+   * as a completion message. An optional signal cancels only this observation (the caller's
    * program deadline / Escape), detaches the run, and leaves its result unconsumed.
+   * Timeout normalization and alpha pending/live responses belong at the provider boundary;
+   * this result-only primitive keeps its bound sentinel so progress never sees a partial handle.
    * Unbounded public observation of an unobservable cancelled registration may
    * reject without settling its lifecycle or consuming a result.
    */
@@ -4648,7 +4657,7 @@ export class AgentManager {
     let timer: NodeJS.Timeout | undefined;
     let abort: (() => void) | undefined;
     const bound = new Promise<never>((_resolve, reject) => {
-      // Interactive Main owns the observation, not the child. Ending its program
+      // Every caller owns its observation, not the child. Ending its program
       // must also end the wait without consuming a later detached completion.
       abort = () => {
         this.#detach(managed, "caller stopped waiting; the run continues");

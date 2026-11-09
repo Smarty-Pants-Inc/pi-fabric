@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import childProcess from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentService, createAgentServiceClient, createAgentServiceHandler, createAgentsProvider, type AgentExecutionPort, type AgentExecutionRequest, type AgentExecutionResponse, type AgentServiceEvent } from "../src/agents.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 
@@ -37,6 +39,14 @@ afterEach(async () => {vi.restoreAllMocks(); await Promise.allSettled(services.s
 
 // smarty-dev#854, review/astra F3 on #71: the hosted provider has its own wait path.
 describe("hosted agents.wait bound", () => {
+  beforeEach(() => {
+    // Legacy OFF behavior must not depend on a user's bash-guard.disabled file.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "hosted-wait-off-"));
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    vi.stubEnv("SMARTY_ALPHA", "0");
+  });
+  afterEach(() => vi.unstubAllEnvs());
   const held = () => {
     const entered = deferred<AgentExecutionRequest>();
     const result = deferred<AgentExecutionResponse>();

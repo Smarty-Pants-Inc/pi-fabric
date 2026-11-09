@@ -51,6 +51,8 @@ const fixtures = [
   assert.equal(typeof hook, "function");
   return { policy: expected, call: (toolName, input) => hook({ toolName, input }, { cwd }) };
 });
+const warnings = [];
+console.warn = (...args) => warnings.push(args.join(' '));
 const stages = [];
 const check = (stage, alpha) => {
   for (const { policy, call } of fixtures) {
@@ -63,8 +65,9 @@ const check = (stage, alpha) => {
       if (!policy.readOnly) assert.equal(call(tool, { path: inside }), undefined);
     }
     for (const tool of ["bash", "powershell"]) {
-      assert.deepEqual(call(tool, { command: "true" }), { block: true,
+      assert.deepEqual(call(tool, { command: "true" }), alpha ? undefined : { block: true,
         reason: "Fabric write policy refuses " + tool + ': shell commands cannot be confined; the parent must request shell: "unconfined"' });
+      if (alpha) assert.equal(warnings.length, 1);
     }
     assert.equal(call("read", { path: outside }), undefined);
   }
@@ -80,7 +83,9 @@ fs.writeFileSync(disabled, "");
 check("live-file-override", true);
 fs.unlinkSync(disabled);
 check("strict-after-file-removal", false);
-console.log(JSON.stringify({ policies: fixtures.length, stages }));
+assert.equal(warnings.length, 1);
+assert.match(warnings[0], /FABRIC_ALPHA_SHELL_CONFINEMENT_BYPASS/);
+console.log(JSON.stringify({ policies: fixtures.length, stages, shellWarnings: warnings.length }));
 `;
   const child = spawnSync(process.execPath, ["--input-type=module", "--eval", probe], {
     cwd,
@@ -93,7 +98,7 @@ console.log(JSON.stringify({ policies: fixtures.length, stages }));
   });
   expect(child.error, child.stderr).toBeUndefined();
   expect(child.status, child.stderr).toBe(0);
-  expect(JSON.parse(child.stdout.trim())).toEqual({ policies: 3, stages: [
+  expect(JSON.parse(child.stdout.trim())).toEqual({ policies: 3, shellWarnings: 1, stages: [
     "strict-at-import", "default-alpha", "strict-again", "live-file-override", "strict-after-file-removal",
   ] });
 });

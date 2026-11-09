@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -20,6 +20,9 @@ import { MeshStore } from "../src/mesh/store.js";
 import { parseWorkerOptions } from "../src/worker/options.js";
 
 describe("actor bash timeout (smarty-dev#2184)", () => {
+  beforeEach(() => vi.stubEnv("SMARTY_ALPHA", "0"));
+  afterEach(() => vi.unstubAllEnvs());
+
   const actor = { PI_FABRIC_ACTOR_ID: "actor:a" };
 
   it("gives an actor run's bash call without a timeout the 600 s default", () => {
@@ -231,9 +234,29 @@ describe("actor bashTimeoutSeconds plumbing (smarty-dev#2184)", () => {
 });
 
 describe("Fabric bash tool_call hook in an actor run (smarty-dev#2184)", () => {
-  afterEach(() => vi.unstubAllEnvs());
+  const shutdowns: Array<() => unknown> = [];
+  let home: string;
+  let disableFile: string;
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-bash-policy-"));
+    disableFile = path.join(home, ".config", "smarty", "bash-guard.disabled");
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    vi.stubEnv("SMARTY_ALPHA", "0");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
+    vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", undefined);
+    vi.stubEnv("PI_FABRIC_BASH_IDLE_S", undefined);
+    vi.stubEnv("PI_FABRIC_FIXTURE", undefined);
+  });
+  afterEach(async () => {
+    try { for (const shutdown of shutdowns.splice(0)) await shutdown(); }
+    finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 
-  const bashCall = async (input: Record<string, unknown>) => {
+  const registerBashHandler = async () => {
     const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
     const pi = {
       events: { emit: vi.fn(), on: vi.fn(() => () => undefined) },
@@ -244,14 +267,18 @@ describe("Fabric bash tool_call hook in an actor run (smarty-dev#2184)", () => {
       registerCommand: vi.fn(), registerMessageRenderer: vi.fn(), registerTool: vi.fn(), setActiveTools: vi.fn(),
     } as unknown as ExtensionAPI;
     await piFabric(pi);
-    const event = { type: "tool_call", toolName: "bash", toolCallId: "call-1", input };
-    const results: unknown[] = [];
-    for (const handler of handlers.get("tool_call") ?? []) {
-      try { results.push(await handler(event, { cwd: process.cwd(), hasUI: false })); } catch { /* other hooks need a live session */ }
-    }
-    for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown();
-    return { input, blocked: results.some((result) => (result as { block?: boolean } | undefined)?.block) };
+    shutdowns.push(...(handlers.get("session_shutdown") ?? []));
+    return async (input: Record<string, unknown>, toolName = "bash") => {
+      const event = { type: "tool_call", toolName, toolCallId: "call-1", input };
+      let refusal: { block: true; reason: string } | undefined;
+      for (const handler of handlers.get("tool_call") ?? []) {
+        const result = await handler(event, { cwd: process.cwd(), hasUI: false }) as { block: true; reason: string } | undefined;
+        if (result?.block) { refusal = result; break; }
+      }
+      return { input, blocked: refusal !== undefined, refusal };
+    };
   };
+  const bashCall = async (input: Record<string, unknown>) => (await registerBashHandler())(input);
 
   it("sets the default timeout on an actor's bash call and keeps refusing long foreground waits", async () => {
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor:a");
@@ -299,6 +326,129 @@ describe("Fabric bash tool_call hook in an actor run (smarty-dev#2184)", () => {
     } else {
       expect(String(explicit.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
     }
+  });
+
+  // These are tool-call inputs only; no shell command in this table is executed.
+  const narrowBlocks = [
+    "pkill -f worker",
+    "killall node",
+    "kill $(pgrep -f worker)",
+    "pgrep -f worker | xargs kill",
+    "rm -rf /tmp/tmp.*",
+    "rm -rf /tmp",
+    "rm -rf /var/tmp/*",
+    "rm -rf /var/tmp",
+  ];
+  const narrowPasses = [
+    "sleep 900",
+    "while true; do sleep 5; done",
+    "kill 4242",
+    'kill "$(cat .local/server.pid)"',
+    "pgrep -fl worker",
+    "rm -rf /tmp/tmp.AbC123",
+    "rm -rf /tmp/tmp.AbC123/*.json",
+    'rm -rf "/tmp/tmp.*"',
+    'rm -rf "$D"',
+    'rm -rf "$TMPDIR/.."',
+    'P=$(pgrep -f worker); kill "$P"',
+    "bash -c 'pkill -f worker'",
+    "printf '%s\\n' 'pkill -f worker; rm -rf /tmp/*'",
+    "rg 'pkill|killall|rm -rf /tmp' docs/",
+    "ls # pkill -f worker; rm -rf /tmp/*",
+    "cat <<'EOF'\npkill -f worker\nrm -rf /tmp/*\nsleep 900\nEOF",
+  ];
+
+  it.each([undefined, "1"])("uses the narrow policy for alpha=%s through the real registered handlers", async (alpha) => {
+    vi.stubEnv("SMARTY_ALPHA", alpha);
+    const call = await registerBashHandler();
+    for (const command of narrowPasses) {
+      const result = await call({ command });
+      expect(result.refusal, command).toBeUndefined();
+      expect(result.input, command).toEqual({ command });
+    }
+    for (const command of narrowBlocks) {
+      const result = await call({ command });
+      expect(result.refusal, command).toMatchObject({ block: true, reason: expect.any(String) });
+      expect(result.input, command).toEqual({ command });
+    }
+  });
+
+  it("rechecks mode and disable-file changes on the same handler, not at registration", async () => {
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    const call = await registerBashHandler();
+    const wait = async (blocked: boolean) => {
+      const result = await call({ command: "sleep 900" });
+      expect(result.blocked).toBe(blocked);
+      if (blocked) expect(result.refusal?.reason).toContain("foreground wait");
+    };
+    vi.stubEnv("SMARTY_ALPHA", "0");
+    await wait(true);
+    vi.stubEnv("SMARTY_ALPHA", undefined);
+    await wait(false);
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    await wait(false);
+    vi.stubEnv("SMARTY_ALPHA", "0");
+    await wait(true);
+    fs.mkdirSync(path.dirname(disableFile), { recursive: true });
+    fs.writeFileSync(disableFile, "");
+    await wait(false);
+    for (const command of narrowPasses) expect((await call({ command })).blocked, command).toBe(false);
+    for (const command of narrowBlocks) expect((await call({ command })).blocked, command).toBe(true);
+    fs.rmSync(disableFile);
+    await wait(true);
+  });
+
+  it("keeps full-policy refusal ordering and never injects defaults into refused calls", async () => {
+    vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "180");
+    const { PATTERN_KILL_REASON, TMP_WIPE_REASON } = await import("../src/core/pattern-kill.js");
+    const call = await registerBashHandler();
+    for (const [command, reason] of [
+      ["pkill -f worker; rm -rf /tmp/*; sleep 900", PATTERN_KILL_REASON],
+      ["rm -rf /tmp/*; sleep 900", TMP_WIPE_REASON],
+      ["sleep 900", expect.stringContaining("foreground wait")],
+      ["while true; do sleep 5; done", expect.stringContaining("unbounded wait")],
+    ] as const) {
+      const input = { command };
+      expect(await call(input)).toMatchObject({ refusal: { block: true, reason } });
+      expect(input).toEqual({ command });
+      expect(Object.getOwnPropertySymbols(input)).toEqual([]);
+    }
+    expect((await call({ command: "while true; do sleep 5; done", timeout: 5 })).blocked).toBe(false);
+  });
+
+  it.each([
+    { alpha: undefined, disabled: false },
+    { alpha: "1", disabled: false },
+    { alpha: "0", disabled: true },
+  ])("keeps actor/task defaults after narrow-policy admission ($alpha, disabled=$disabled)", async ({ alpha, disabled }) => {
+    vi.stubEnv("SMARTY_ALPHA", alpha);
+    if (disabled) {
+      fs.mkdirSync(path.dirname(disableFile), { recursive: true });
+      fs.writeFileSync(disableFile, "");
+    }
+    const call = await registerBashHandler();
+    for (const actorId of ["actor:a", undefined]) {
+      vi.stubEnv("PI_FABRIC_ACTOR_ID", actorId);
+      vi.stubEnv("PI_FABRIC_BASH_IDLE_S", actorId ? undefined : "180");
+      for (const timeout of [undefined, 5]) {
+        const result = await call({ command: "sleep 900", ...(timeout === undefined ? {} : { timeout }) });
+        expect(result.refusal).toBeUndefined();
+        expect(result.input.timeout).toBe(timeout ?? 600);
+        if (process.platform === "win32") {
+          expect(result.input.command).toBe("sleep 900");
+        } else {
+          expect(String(result.input.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+          expect(result.input.command).toContain("\nsleep 900\n");
+        }
+      }
+      for (const detached of [{ background: true }, { monitor: { delivery: "wake" } }]) {
+        expect(await call({ command: "sleep 900", ...detached })).toMatchObject({
+          blocked: false, input: { command: "sleep 900", ...detached, timeout: 600 },
+        });
+      }
+    }
+    expect((await call({ path: "unused" }, "read")).input).toEqual({ path: "unused" });
+    expect((await call({ command: 42 })).input).toEqual({ command: 42 });
   });
 });
 

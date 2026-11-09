@@ -219,12 +219,14 @@ describe("exclusive kernel tool surface", () => {
 
   // smarty-dev#2340: every runtime (QuickJS, node process, Monty, CPython) receives
   // payloads only through execute(), so the shared validation must reject before dispatch.
+  // 11-09 incident regression: twice a model wrote a file, then sent literal "see file"
+  // as π.org / π.msg to agents.followUp instead of reading the file and passing its content.
   it.each([
     ["typescript", "cpython", "quickjs"],
     ["typescript", "cpython", "node-process"],
     ["python", "monty", undefined],
     ["python", "cpython", undefined],
-  ] as const)("rejects placeholder payloads before %s/%s/%s runtime execution", async (kernel, pythonRuntime, runtime) => {
+  ] as const)("rejects placeholder and see-file payloads before %s/%s/%s runtime execution", async (kernel, pythonRuntime, runtime) => {
     const execute = vi.fn(async () => ({ success: true, output: "ran" }));
     const state = {
       bootstrapped: true,
@@ -245,7 +247,61 @@ describe("exclusive kernel tool surface", () => {
       expect(() => tool.prepareArguments!(args)).toThrow(literal);
       await expect(tool.execute("call", args as never, undefined, undefined, {} as never)).rejects.toThrow(/"spec".*payloads are literal/s);
     }
+
+    const incidents = [
+      {
+        key: "org",
+        args: {
+          code: 'await agents.followUp({ id: "agent-id", message: π.org });',
+          payloads: { org: "see file" },
+        },
+      },
+      {
+        key: "msg",
+        args: {
+          code: 'await agents.followUp({ id: "agent-id", message: π.msg });',
+          payloads: { msg: "see file" },
+        },
+      },
+    ] as const;
+    for (const { key, args } of incidents) {
+      expect(() => tool.prepareArguments!(args)).toThrow(literal);
+      expect(() => tool.prepareArguments!(args)).toThrow(`payload ${JSON.stringify(key)}`);
+      const rejection = await tool.execute("incident-call", args as never, undefined, undefined, {} as never).then(
+        () => undefined,
+        (error: unknown) => error instanceof Error ? error : new Error(String(error)),
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      expect(rejection?.message).toContain(`payload ${JSON.stringify(key)}`);
+      expect(rejection?.message).toContain(literal);
+    }
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      key: "org",
+      args: {
+        code: 'await agents.followUp({ id: "agent-id", message: π.org });',
+        payloads: { org: "see file" },
+      },
+    },
+    {
+      key: "msg",
+      args: {
+        code: 'await agents.followUp({ id: "agent-id", message: π.msg });',
+        payloads: { msg: "see file" },
+      },
+    },
+  ])("keeps $key see-file payloads renderable in the unvalidated streaming preview", ({ args }) => {
+    const tool = toolFor("typescript");
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+    const context = {
+      args, state: {}, invalidate: vi.fn(), toolCallId: "see-file-preview", cwd: process.cwd(),
+      executionStarted: false, argsComplete: false, isPartial: true, expanded: true,
+      showImages: false, isError: false,
+    };
+    expect(() => tool.renderCall!(args as never, theme, context as never).render(120)).not.toThrow();
   });
 
   it("keeps the original session artifact writer when shutdown removes the runtime during execute", async () => {

@@ -90,6 +90,7 @@ commands_restrictions:
           - sender = smarty-fleet-write-leads[bot]
           - sender = smarty-fleet-write-lanes[bot]
           - sender = smarty-fleet-write-versehq[bot]
+          - sender = smarty-poc-org[bot]
   # The same allowance for `requeue` (smarty-dev#7327): without it Mergify refuses a fleet bot's requeue
   # ('Command disallowed'), and a dequeued PR sits until someone notices (k3#958, ~18.5 h on 10-08).
   requeue:
@@ -100,6 +101,7 @@ commands_restrictions:
           - sender = smarty-fleet-write-leads[bot]
           - sender = smarty-fleet-write-lanes[bot]
           - sender = smarty-fleet-write-versehq[bot]
+          - sender = smarty-poc-org[bot]
   # smarty-land's emergency dequeue posts as the actor that queued, the write App bot on the fleet host.
   dequeue:
     conditions:
@@ -109,6 +111,7 @@ commands_restrictions:
           - sender = smarty-fleet-write-leads[bot]
           - sender = smarty-fleet-write-lanes[bot]
           - sender = smarty-fleet-write-versehq[bot]
+          - sender = smarty-poc-org[bot]
   # The stuck-work check's R4 posts one `@mergifyio refresh` per head as the write App (smarty-dev#868);
   # without this Mergify answers "Command disallowed" (#251 F278).
   refresh:
@@ -119,3 +122,4 @@ commands_restrictions:
           - sender = smarty-fleet-write-leads[bot]
           - sender = smarty-fleet-write-lanes[bot]
           - sender = smarty-fleet-write-versehq[bot]
+          - sender = smarty-poc-org[bot]

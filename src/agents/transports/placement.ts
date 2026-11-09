@@ -6,20 +6,37 @@ import { writeJsonAtomic } from "../../core/atomic-write.js";
 import { executeFile } from "./process-utils.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { taskAgentEnvironment } from "../task-environment.js";
-import { normalizeAgentRequires, RequiredInputMissingError } from "../input-validation.js";
+import { AgentInputError, normalizeAgentRequires, RequiredInputMissingError } from "../input-validation.js";
 import { preflightFleetPlacement } from "./placement-preflight.js";
 export { placementLocalPathReason, selectFleetPlacement } from "./placement-preflight.js";
 
 interface Receipt { rc: number | string; text: string; stderr?: string }
 
-/** The fleet launcher returns rc=3 and a concrete PREFLIGHT_REFUSED receipt when a --require path is absent on target. */
-const requiredInputRefusal = (error: unknown, requires: readonly string[] | undefined): string | undefined => {
+/** Only rc=3 plus an exact launcher refusal proves non-launch; acceptance contradicts that proof. */
+const placementRefusal = (error: unknown, requires: readonly string[] | undefined): AgentInputError | undefined => {
   const value = error as { code?: unknown; stdout?: unknown; stderr?: unknown };
-  if (value.code !== 3 && value.code !== "3" || !requires?.length) return undefined;
+  if (value.code !== 3 && value.code !== "3") return undefined;
   const output = [value.stdout, value.stderr].filter((part): part is string => typeof part === "string").join("\n");
-  const line = output.split(/\r?\n/u).find(entry => entry.startsWith("PREFLIGHT_REFUSED: "));
+  const lines = output.split(/\r?\n/u);
+  if (lines.some(line => /^RYZEN2_TASK_ACCEPTED(?:\s|$)/u.test(line))) return undefined;
+  // Accept both deployed and new pre-reservation receipts, before interpreting
+  // legacy path receipts: a generic reason may itself start with a declared path.
+  for (const line of lines) {
+    if (!line.endsWith("; no task started")) continue;
+    const refused = line.match(/^(?:smarty-task-ryzen2: REFUSED(?: host=[A-Za-z0-9][A-Za-z0-9._-]*)?: |PREFLIGHT_REFUSED: )(.+); no task started$/u);
+    if (!refused || !refused[1]!.trim()) continue;
+    const index = requires?.findIndex(file => refused[1] === `missing input ${file}`) ?? -1;
+    if (index < 0) return new AgentInputError("placement", line);
+    const failure = new RequiredInputMissingError(requires![index]!, index);
+    failure.message = line;
+    return failure;
+  }
+  // Keep target-side PREFLIGHT_REFUSED: <declared path>[: diagnostic] support.
+  // Reason-form receipts must never fall through to this legacy path parser.
+  const line = lines.find(entry => entry.startsWith("PREFLIGHT_REFUSED: ") && !entry.endsWith("; no task started"));
   if (!line) return undefined;
-  return requires.find(file => line === `PREFLIGHT_REFUSED: ${file}` || line.startsWith(`PREFLIGHT_REFUSED: ${file}:`));
+  const index = requires?.findIndex(file => line === `PREFLIGHT_REFUSED: ${file}` || line.startsWith(`PREFLIGHT_REFUSED: ${file}:`)) ?? -1;
+  return index >= 0 ? new RequiredInputMissingError(requires![index]!, index) : undefined;
 };
 
 const render = (template: string, values: Record<string, string>): string => template.replace(/\{([a-zA-Z]+)\}/g, (_match, key: string) => {
@@ -187,11 +204,8 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--require", file]), true)).stdout; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw Object.assign(error as Error, { launchOutcome: "unlaunched" });
-      const missing = requiredInputRefusal(error, requires);
-      if (missing !== undefined) {
-        const index = requires?.indexOf(missing);
-        throw new RequiredInputMissingError(missing, index !== undefined && index >= 0 ? index : undefined);
-      }
+      const refusal = placementRefusal(error, requires);
+      if (refusal) throw refusal;
       debt = `Placement launch outcome unknown: ${String(error)}`;
       request.onUnconfirmedExit?.(debt);
       save("failed", "", debt, undefined, String((error as { stderr?: string }).stderr ?? ""));

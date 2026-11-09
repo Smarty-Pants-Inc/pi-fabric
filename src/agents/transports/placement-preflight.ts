@@ -7,6 +7,7 @@ import type { AgentTransportLaunch } from "../types.js";
 import { agentPlacementProbe } from "../placement-config.js";
 import { AgentInputError, RequiredInputMissingError } from "../input-validation.js";
 import { taskAgentEnvironment } from "../task-environment.js";
+import { alphaModeEnabled } from "../../guards/alpha-mode.js";
 
 const containsPath = (root: string, file: string): boolean => {
   const relative = path.relative(root, file);
@@ -166,8 +167,10 @@ export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: st
 
 export interface FleetPlacementPreflight { host: string; command: string[]; environment: NodeJS.ProcessEnv }
 
-/** No launcher runs here. Only the admitted host gets strict, bounded read-only
- * input checks. Generic launchers without a picker retain their existing protocol.
+/** No launcher runs here. Outside alpha, only the admitted host gets strict,
+ * bounded read-only input checks. Alpha leaves input admission to the launcher;
+ * host selection/pinning and cancellation still apply in either mode.
+ * Generic launchers without a picker retain their existing protocol.
  */
 export const preflightFleetPlacement = async (request: AgentTransportLaunch, config: AgentPlacementConfig, command: string[], task: string, environment: NodeJS.ProcessEnv, preflightDeadline?: number, selectedHost?: string): Promise<FleetPlacementPreflight | undefined> => {
   let host = selectedHost ?? "auto";
@@ -184,48 +187,53 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     const alias = config.sshAliases?.[host];
     if (!alias || !Object.hasOwn(config.sshAliases!, host) || !hostName.test(alias)) throw new Error("host has no trusted placement sshAliases entry");
     const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
-    const optionValue = (flag: string): string => {
-      const index = command.slice(0, end).indexOf(flag);
-      return index < 0 ? "" : command[index + 1] ?? "";
-    };
-    const targetCwd = optionValue("--cwd");
-    const project = optionValue("--src") || targetCwd;
-    const requires = request.requires ?? [];
-    const pairs: [string, string][] = [];
-    if (targetCwd) pairs.push([targetCwd, targetCwd]);
-    let guard = ":";
-    if (root) {
-      // Reuse installed literal-path/corpus inference, not another prompt scanner.
-      const source = path.join(root, "setup/factory/task-preflight.py");
-      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || need === "corpus")], deadline, environment, request.signal, task);
-      const fields = admitted.stdout.split("\0");
-      if (fields.at(-1) === "") fields.pop();
-      const guards = Number(fields[3]);
-      if (admitted.code !== 0 || fields.length < 4 || !/^\d+$/u.test(fields[3]!) || !Number.isSafeInteger(guards) || guards > fields.length - 4 || (fields.length - 4 - guards) % 2) throw new Error(`Installed task admission failed: ${admitted.stderr.trim()}`);
-      if (fields[0] || fields[1]) throw new Error(fields[0] || `needs ${fields[1]}: ${fields[2]}`);
-      for (let index = 4 + guards; index < fields.length; index += 2) pairs.push([fields[index]!, fields[index + 1]!]);
-      guard = ["python3", "-I", "-c", fs.readFileSync(source, "utf8"), "--probe", "--root", project, "--workspace", targetCwd, ...fields.slice(4, 4 + guards)].map(quote).join(" ");
-    } else {
-      // Explicit injected/custom protocol: honor declared literal inputs only.
-      pairs.push(...requires.map(file => [file, file] as [string, string]));
-    }
-    if (pairs.some(pair => pair.some(file => !path.posix.isAbsolute(file) || file.includes("\0")))) throw new Error("Invalid literal path admission receipt");
-    const checks = pairs.map(([literal, alternative], index) => `test -e ${quote(literal)} || test -e ${quote(alternative)} || { printf 'PREFLIGHT_MISSING ${index}\\n'; exit 3; }`).join("; ");
-    const remote = `timeout 3 sh -c ${quote(`${guard} || exit $?; ${checks || ":"}`)}`;
-    const probed = await query("ssh", ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "KnownHostsCommand=none", "-o", "ConnectionAttempts=1", "-o", "ConnectTimeout=2", "-o", "ControlMaster=no", "-o", "ControlPath=none", alias, remote], deadline, environment, request.signal);
-    if (probed.code !== 0) {
-      const missing = probed.stdout.match(/^PREFLIGHT_MISSING (\d+)$/mu);
-      const absent = missing ? pairs[Number(missing[1])]?.[0] : undefined;
-      if (absent !== undefined) {
-        const index = requires.indexOf(absent);
-        if (index >= 0) {
-          const error = new RequiredInputMissingError(absent, index);
-          error.message = failure(host, `missing path ${absent}`).message;
-          throw error;
-        }
-        throw new Error(`missing path ${absent}`);
+    // Read the live process setting/file per operation, not the launch env snapshot.
+    // Skip only Fabric's input-denial/probe layer; the launcher still gets the
+    // original task and literal --require arguments and may enforce its own policy.
+    if (!alphaModeEnabled()) {
+      const optionValue = (flag: string): string => {
+        const index = command.slice(0, end).indexOf(flag);
+        return index < 0 ? "" : command[index + 1] ?? "";
+      };
+      const targetCwd = optionValue("--cwd");
+      const project = optionValue("--src") || targetCwd;
+      const requires = request.requires ?? [];
+      const pairs: [string, string][] = [];
+      if (targetCwd) pairs.push([targetCwd, targetCwd]);
+      let guard = ":";
+      if (root) {
+        // Reuse installed literal-path/corpus inference, not another prompt scanner.
+        const source = path.join(root, "setup/factory/task-preflight.py");
+        const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || need === "corpus")], deadline, environment, request.signal, task);
+        const fields = admitted.stdout.split("\0");
+        if (fields.at(-1) === "") fields.pop();
+        const guards = Number(fields[3]);
+        if (admitted.code !== 0 || fields.length < 4 || !/^\d+$/u.test(fields[3]!) || !Number.isSafeInteger(guards) || guards > fields.length - 4 || (fields.length - 4 - guards) % 2) throw new Error(`Installed task admission failed: ${admitted.stderr.trim()}`);
+        if (fields[0] || fields[1]) throw new Error(fields[0] || `needs ${fields[1]}: ${fields[2]}`);
+        for (let index = 4 + guards; index < fields.length; index += 2) pairs.push([fields[index]!, fields[index + 1]!]);
+        guard = ["python3", "-I", "-c", fs.readFileSync(source, "utf8"), "--probe", "--root", project, "--workspace", targetCwd, ...fields.slice(4, 4 + guards)].map(quote).join(" ");
+      } else {
+        // Explicit injected/custom protocol: honor declared literal inputs only.
+        pairs.push(...requires.map(file => [file, file] as [string, string]));
       }
-      throw new Error(`Read-only SSH preflight failed: ${probed.stdout.trim() || probed.stderr.trim() || `exit ${probed.code}`}`);
+      if (pairs.some(pair => pair.some(file => !path.posix.isAbsolute(file) || file.includes("\0")))) throw new Error("Invalid literal path admission receipt");
+      const checks = pairs.map(([literal, alternative], index) => `test -e ${quote(literal)} || test -e ${quote(alternative)} || { printf 'PREFLIGHT_MISSING ${index}\\n'; exit 3; }`).join("; ");
+      const remote = `timeout 3 sh -c ${quote(`${guard} || exit $?; ${checks || ":"}`)}`;
+      const probed = await query("ssh", ["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "KnownHostsCommand=none", "-o", "ConnectionAttempts=1", "-o", "ConnectTimeout=2", "-o", "ControlMaster=no", "-o", "ControlPath=none", alias, remote], deadline, environment, request.signal);
+      if (probed.code !== 0) {
+        const missing = probed.stdout.match(/^PREFLIGHT_MISSING (\d+)$/mu);
+        const absent = missing ? pairs[Number(missing[1])]?.[0] : undefined;
+        if (absent !== undefined) {
+          const index = requires.indexOf(absent);
+          if (index >= 0) {
+            const error = new RequiredInputMissingError(absent, index);
+            error.message = failure(host, `missing path ${absent}`).message;
+            throw error;
+          }
+          throw new Error(`missing path ${absent}`);
+        }
+        throw new Error(`Read-only SSH preflight failed: ${probed.stdout.trim() || probed.stderr.trim() || `exit ${probed.code}`}`);
+      }
     }
     const pinned = [...command];
     const slot = hostSlot(pinned);

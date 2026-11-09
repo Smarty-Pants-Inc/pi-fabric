@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -16,6 +16,7 @@ import fabricWriteGuard, { bootstrapScratchRoot, writePolicyDenial } from "../sr
 
 const cleanups: string[] = [];
 const managers: AgentManager[] = [];
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
@@ -147,7 +148,8 @@ import { spawnSync } from 'node:child_process';
 const args = new Map();
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i], process.argv[i + 1]);
 // As worker.ts does: --tmpdir and --write-policy become the child's TMPDIR and PI_FABRIC_WRITE_POLICY.
-const env = { PATH: process.env.PATH, HOME: process.env.HOME, USER: process.env.USER, SMARTY_ROLE_PI_BINARY: ${JSON.stringify(probe)},
+const env = { PATH: process.env.PATH, HOME: process.env.HOME, USER: process.env.USER, SMARTY_ALPHA: process.env.SMARTY_ALPHA,
+  SMARTY_ROLE_PI_BINARY: ${JSON.stringify(probe)},
   PI_FABRIC_WRITE_POLICY: args.get('--write-policy'), PI_FABRIC_ACTOR_ID: args.get('--actor-id') ?? '',
   TMPDIR: args.get('--tmpdir'), TMP: args.get('--tmpdir'), TEMP: args.get('--tmpdir') };
 const child = spawnSync(${JSON.stringify(shim)}, ['-p', 'probe'], { cwd: args.get('--cwd'), env, encoding: 'utf8' });

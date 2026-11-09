@@ -152,6 +152,7 @@ describe("durable native RPC worker", () => {
   it("preserves real write confinement through the SDK tool_call hook", async () => {
     const guard = path.resolve("src/agents/write-guard.ts");
     const host = await worker("guard", ["--tools", "write", "-e", guard], {
+      SMARTY_ALPHA: "0",
       PI_FABRIC_WRITE_POLICY: JSON.stringify({ readOnly: true, writableRoots: [], shell: "deny" }),
     });
     try {

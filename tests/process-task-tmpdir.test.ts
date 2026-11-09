@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -10,6 +10,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 // os.tmpdir()/mkdtemp and >50KiB spills must work without widening the grant.
 // Fixtures remain for inspection.
 const managers: AgentManager[] = [];
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();

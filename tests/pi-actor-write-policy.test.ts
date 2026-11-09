@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRequest } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -14,6 +14,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // write guard, with a tiny local worker. All files stay in fresh test-owned temp;
 // no worktrees, native Pi, unguarded deletion, or inherited fleet state is needed.
 const managers: AgentManager[] = [];
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
@@ -26,6 +27,7 @@ const fixture = (executorRuntime?: string) => {
   const worker = path.join(root, "worker.mjs");
   fs.writeFileSync(worker, `import fs from 'node:fs'; import path from 'node:path';
 import {readWritePolicy,writePolicyDenial} from ${JSON.stringify(pathToFileURL(path.resolve("src/agents/write-guard.ts")).href)};
+process.env.SMARTY_ALPHA='0';
 const args=new Map();for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]);
 const policy=readWritePolicy(args.get('--write-policy')),tmpdir=args.get('--tmpdir'),cwd=args.get('--cwd');
 const probes=[];

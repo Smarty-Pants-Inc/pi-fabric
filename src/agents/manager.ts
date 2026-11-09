@@ -1,5 +1,6 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { diagnostics } from "../core/diagnostics.js";
+import { alphaModeEnabled } from "../guards/alpha-mode.js";
 import { detachedPreview } from "../core/preview.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -2807,7 +2808,7 @@ export class AgentManager {
     if (applyActorWritePolicy && request.writableRoots?.length) {
       throw new Error("Pi actors cannot request writableRoots; only private run scratch is writable");
     }
-    if (request.writePolicy === "unrestricted" && this.#parentWritePolicy) {
+    if (request.writePolicy === "unrestricted" && this.#parentWritePolicy && !alphaModeEnabled()) {
       throw new Error("A write-confined agent cannot launch an unrestricted child");
     }
     const defaultTaskWritePolicy = !hostedAdapter && (transport === "auto" || transport === "process") &&
@@ -2830,7 +2831,7 @@ export class AgentManager {
     const actorShell = request.shell ?? this.#parentWritePolicy?.shell ??
       (requestsWritePolicy(request) ? "deny" : "unconfined");
     const confined = applyActorWritePolicy || applyTaskWriteDefault ||
-      (requestsWritePolicy(request) && request.writePolicy !== "unrestricted") || this.#parentWritePolicy !== undefined;
+      (request.writePolicy !== "unrestricted" && (requestsWritePolicy(request) || this.#parentWritePolicy !== undefined));
     if (confined && !capabilities.writePolicy) {
       throw new Error(
         BUILT_IN_RUNNER_IDS.has(runner)
@@ -3180,6 +3181,10 @@ export class AgentManager {
             `smarty-dev#11705: cwd ${defaultWriteScopeOverlap.writableRoot} contains host-owned run root ${defaultWriteScopeOverlap.runRoot}; no implicit write scope is imposed on this layout (accepted residual smarty-dev#11308).`);
         } else if (defaultTaskWritePolicy && !applyTaskWriteDefault) {
           auditWritePolicy("write_policy.unsupported", `${runnerAdapter.label} does not enforce task write roots; launch remains unrestricted.`);
+        }
+        if (writePolicy && alphaModeEnabled()) {
+          auditWritePolicy("write_policy.alpha_native_unconfined",
+            "Retained write policy is metadata for native write/edit in alpha, not enforced confinement; mode is rechecked on each call. Shell policy and OS restrictions remain independent.", writePolicy);
         }
         const onWritePolicyDisposition = writePolicyDispositionAudit(logFile, id, runner, writePolicy);
         const parentSessionId = this.#sessionId?.();
@@ -3788,8 +3793,21 @@ export class AgentManager {
         if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
           await this.#worktrees.cleanup(id, true).catch(() => false);
         }
-        // smarty-dev#15878: a confirmed non-launch never used its short TMPDIR; an unknown launch keeps it above.
-        if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
+        // Immediate, proven task non-launches have no worker record to settle.
+        // Retain their prepared bytes outside the active root, including owned
+        // TMPDIR. Actors and queued failures keep their separate archive custody.
+        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome === "unlaunched" &&
+          !request.actorId && !transportLaunchReturned && !this.#runs.has(id) && !this.#queued.has(id)) {
+          if (!runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
+            try {
+              // A failed route save must keep its source available for retry.
+              routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" });
+              await this.#removeRunTree(runDirectory, id, shortTmpdir);
+            } catch (archiveError) {
+              diagnostics.warn("src/agents/manager.ts", `[pi-fabric] Pre-worker rollback archive failed for ${id}: ${String(archiveError)}; original launch failure: ${String(error)}`);
+            }
+          }
+        } else if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
           ownedShortTmpdir(shortTmpdir)) await removeTree(shortTmpdir).catch(() => undefined);
         throw error;
       }

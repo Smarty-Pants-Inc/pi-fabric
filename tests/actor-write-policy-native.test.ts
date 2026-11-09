@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { findExecutable } from "../src/agents/transports/process-utils.js";
 import { ActorManager } from "../src/actors/manager.js";
@@ -10,6 +10,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 
 const cleanups: Array<() => Promise<unknown> | void> = [];
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   try { for (const close of cleanups.splice(0).reverse()) await close(); }
   finally { vi.unstubAllEnvs(); }

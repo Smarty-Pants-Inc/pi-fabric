@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
@@ -11,6 +11,7 @@ import { writePolicyDenial } from "../src/agents/write-guard.js";
 // Trust-boundary regression: production manager -> compiled worker -> execution child.
 // Only the model binary is replaced. No broker, credentials or external writes.
 const managers: AgentManager[] = [];
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();

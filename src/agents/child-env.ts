@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { FabricMeshConfig } from "../config.js";
+import { alphaModeEnabled } from "../guards/alpha-mode.js";
 import { isInside, readWritePolicy, type FabricWritePolicy } from "./write-guard.js";
 
 export { readWritePolicy, type FabricWritePolicy };
@@ -68,7 +69,7 @@ export const readAgentLineage = (
 };
 
 export interface AgentWritePolicyRequest {
-  /** Explicitly opt out of the task default; never escapes an inherited policy. */
+  /** Explicitly opt out of the task default; escapes inherited policy only in alpha. */
   writePolicy?: "unrestricted";
   readOnly?: boolean;
   writableRoots?: string[];
@@ -137,8 +138,9 @@ export const assertDefaultTaskWriteRoots = (runRoot: string, roots: readonly str
 
 /**
  * Effective child policy: explicit request narrowed by the caller's own
- * PI_FABRIC_WRITE_POLICY. A confined caller cannot drop readOnly, enable an
- * unconfined shell, or name roots outside its own; an empty request inherits.
+ * PI_FABRIC_WRITE_POLICY. Alpha permits an explicit unrestricted opt-out.
+ * Otherwise a confined caller cannot drop readOnly, enable an unconfined shell,
+ * or name roots outside its own; an empty request inherits.
  */
 export const resolveChildWritePolicy = (
   request: AgentWritePolicyRequest,
@@ -146,7 +148,7 @@ export const resolveChildWritePolicy = (
   cwd: string,
 ): FabricWritePolicy | undefined => {
   if (request.writePolicy === "unrestricted") {
-    if (parent) throw new Error("A write-confined agent cannot launch an unrestricted child");
+    if (parent && !alphaModeEnabled()) throw new Error("A write-confined agent cannot launch an unrestricted child");
     return undefined;
   }
   if (!requestsWritePolicy(request)) return parent;

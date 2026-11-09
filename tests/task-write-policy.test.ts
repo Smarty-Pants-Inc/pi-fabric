@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { checkWritePolicyRequest, resolveChildWritePolicy } from "../src/agents/child-env.js";
 import { completionRecipientFromRun } from "../src/agents/completion-journal.js";
@@ -17,9 +17,12 @@ import { writePolicyDenial } from "../src/agents/write-guard.js";
 import { canRemoveTerminalRun, FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, pruneActorRunArchives, sweepTempRunRoots } from "../src/storage/retention.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 
 // All fixtures are below this test's own TMPDIR. Retention uses recorded deletions locally (#11199).
 const managers: AgentManager[] = [];
+// Legacy enforcement coverage; fleet isolation supplies a private home without a disable marker.
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
@@ -36,6 +39,7 @@ const fixture = (placement = false, overlap?: "option" | "environment" | "equal"
   // The launch fixture uses the production guard and records real allowed writes/refused attempts.
   fs.writeFileSync(worker, `import fs from 'node:fs'; import path from 'node:path';
 import { readWritePolicy, writePolicyDenial } from ${JSON.stringify(pathToFileURL(path.resolve("src/agents/write-guard.ts")).href)};
+process.env.SMARTY_ALPHA = '0';
 const args = new Map(); for (let i=2;i<process.argv.length;i+=2) args.set(process.argv[i],process.argv[i+1]);
 const policy = readWritePolicy(args.get('--write-policy'));
 const cwd = args.get('--cwd'), tmpdir = args.get('--tmpdir');
@@ -353,6 +357,69 @@ describe("local process task write default", () => {
     expect(() => resolveChildWritePolicy({ writePolicy: "unrestricted" }, policy, allowed)).toThrow(/unrestricted child/);
   });
 
+  // Trust-boundary regression (#1913): use the real proof launcher, but record native
+  // input rather than loading Fabric or allowing any model-directed shared write.
+  it.skipIf(process.platform !== "linux").each(["0", "1", undefined])("forwards only the defined alpha switch (%s) to native and keeps the refused probe private", { timeout: 30_000 }, alpha => {
+    const f = fixture();
+    const tmp = path.join(f.root, "proof-tmp"), fabric = path.join(f.root, "fabric");
+    fs.mkdirSync(tmp);
+    fs.mkdirSync(path.join(fabric, "dist"), { recursive: true });
+    for (const name of ["index.js", "worker.js"]) fs.writeFileSync(path.join(fabric, "dist", name), "");
+    const recording = path.join(f.root, "native-recording.json"), native = path.join(f.root, "record-native.mjs");
+    fs.writeFileSync(native, `import assert from 'node:assert/strict'; import fs from 'node:fs'; import path from 'node:path';
+process.stdin.resume(); process.stdin.once('end', () => process.exit(0));
+process.stdin.once('data', async () => {
+  const run = path.join(process.env.PI_FABRIC_RUN_ROOT, 'recorded-default');
+  fs.mkdirSync(run); fs.mkdirSync(path.join(run, 'tmp'));
+  fs.writeFileSync(path.join(run, 'task.txt'), 'SCOPE_PROBE:default');
+  for (const name of ['completion-recipient.json', 'status.json', 'events.jsonl']) fs.writeFileSync(path.join(run, name), '{}');
+  const models = JSON.parse(fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR, 'models.json'), 'utf8'));
+  const response = await fetch(models.providers['task-write-proof'].baseUrl + '/chat/completions', {
+    method: 'POST', body: JSON.stringify({model:'child', messages:[{role:'user', content:'SCOPE_PROBE:default'}]})
+  });
+  const calls = (await response.text()).split('\\n').filter(line => line.startsWith('data: {'))
+    .flatMap(line => JSON.parse(line.slice(6)).choices[0].delta.tool_calls ?? [])
+    .map(call => ({name:call.function.name, args:JSON.parse(call.function.arguments)}));
+  const probe = calls.find(call => call.name === 'write' && call.args.content === 'MUST_BE_REFUSED').args.path;
+  fs.writeFileSync(${JSON.stringify(recording)}, JSON.stringify({env:process.env, cwd:process.cwd(), calls, probe}));
+  // Even the broken fixed-target implementation cannot make this fake touch shared state.
+  const scratch = path.dirname(process.env.PI_FABRIC_RUN_ROOT);
+  assert.equal(path.dirname(probe), scratch);
+  if (process.env.SMARTY_ALPHA !== '0') fs.writeFileSync(probe, 'ALPHA_PROBE_ALLOWED');
+  process.stdout.write(JSON.stringify({type:'agent_settled'}) + '\\n');
+});`);
+    const proof = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", fabric,
+      "--workspace", f.cwd, "--evidence-dir", path.join(f.cwd, "proof"), "--pi-binary", native], {
+      encoding: "utf8", timeout: 25_000, env: {
+        PATH: process.env.PATH ?? "", HOME: f.root, TMPDIR: tmp,
+        SMARTY_ROLE: "fixture-role", SMARTY_PROOF_PRIVATE: "fixture-private", OPENAI_API_KEY: "fixture-not-a-credential",
+        ...(alpha === undefined ? {} : { SMARTY_ALPHA: alpha }),
+      },
+    });
+    // A recording native is not a successful enforcement proof: strict end/result
+    // assertions must still reject its incomplete protocol, and custody must close.
+    expect(proof.status, proof.stderr).toBe(1);
+    expect(proof.stderr).toContain("AssertionError");
+    expect(proof.stderr).toContain("OWNED_NATIVE_EXIT:");
+    const record = JSON.parse(fs.readFileSync(recording, "utf8"));
+    expect(record.env.SMARTY_ALPHA).toBe(alpha);
+    expect(Object.keys(record.env).filter(key => key.startsWith("SMARTY_"))).toEqual(alpha === undefined ? [] : ["SMARTY_ALPHA"]);
+    expect(record.env.OPENAI_API_KEY).toBeUndefined();
+    const scratch = path.dirname(record.env.PI_FABRIC_RUN_ROOT);
+    expect(path.dirname(scratch)).toBe(tmp);
+    expect(record.env.HOME).toBe(path.join(scratch, "home"));
+    expect(record.cwd).toBe(path.join(scratch, "root"));
+    expect(record.env.TMPDIR).toBe(path.join(scratch, "tmp"));
+    expect(path.dirname(record.probe)).toBe(scratch);
+    for (const root of [f.cwd, record.cwd, record.env.TMPDIR, path.join(record.env.PI_FABRIC_RUN_ROOT, "recorded-default", "tmp")]) {
+      expect(path.relative(root, record.probe)).toMatch(/^\.\.(?:[/\\\\]|$)/);
+    }
+    expect(record.calls.filter((call: { name: string }) => ["write", "edit"].includes(call.name))
+      .every((call: { args: { path: string } }) => call.args.path !== "/tmp/fv2-writescope-probe")).toBe(true);
+    if (alpha === "0") expect(fs.existsSync(record.probe)).toBe(false);
+    else expect(fs.readFileSync(record.probe, "utf8")).toBe("ALPHA_PROBE_ALLOWED");
+  });
+
   it.skipIf(process.platform === "win32" || !fs.existsSync("dist/worker.js"))("runs the native proof with shell metacharacters in TMPDIR without interpreting them", { timeout: 220_000 }, () => {
     const f = fixture();
     const tmp = path.join(f.root, "quote' space $(printf injected > SCOPE_INJECTION_MARKER)-`printf backtick > SCOPE_BACKTICK_MARKER`");
@@ -361,7 +428,7 @@ describe("local process task write default", () => {
     const proof = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
       "--workspace", f.cwd, "--evidence-dir", evidence,
       "--pi-binary", path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js")], {
-      encoding: "utf8", timeout: 210_000, env: { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp },
+      encoding: "utf8", timeout: 210_000, env: { ...process.env, SMARTY_ALPHA: "0", TMPDIR: tmp, TMP: tmp, TEMP: tmp },
     });
     expect(proof.status, proof.stderr).toBe(0);
     expect(JSON.parse(fs.readFileSync(path.join(evidence, "summary.json"), "utf8"))).toMatchObject({ passed: true, parentNativeExit: 0 });
@@ -379,7 +446,7 @@ describe("local process task write default", () => {
     if (location === "ancestor") fs.mkdirSync(path.join(destination, "nested"));
     const evidence = path.join(parent, "proof");
     const processResult = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
-      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8" });
+      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8", env: { ...process.env, SMARTY_ALPHA: "0" } });
     expect(processResult.status).not.toBe(0);
     expect(processResult.stderr).toContain("Evidence path must not contain symlinked components");
     expect(fs.existsSync(evidence)).toBe(false);
@@ -405,12 +472,16 @@ fs.openSync = function(file, ...args) {
 process.stderr.write('first artifact\\n'); setTimeout(() => process.stderr.write('second artifact\\n'), 100);`);
     const processResult = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
       "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", native], {
-      encoding: "utf8", timeout: 25_000, env: { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}` },
+      encoding: "utf8", timeout: 25_000, env: { ...process.env, SMARTY_ALPHA: "0", NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}` },
     });
     expect(processResult.status).toBe(1);
     expect(processResult.stderr).toContain("Evidence path changed after creation");
     expect(fs.readdirSync(outside)).toEqual([]);
-    expect(fs.readFileSync(path.join(parked, "proof", "parent-stderr.log"), "utf8")).toBe("first artifact\n");
+    // Locally the inherited guard's admission notice is the earliest native stderr
+    // chunk, before the fake's first artifact; hosted admission emits no notice.
+    const firstNativeStderrChunk = isHostedOnlyAllowed(process.env) ? "first artifact\n" :
+      "hosted-only (outside-temp deletion reporting): push and let CI run it\n";
+    expect(fs.readFileSync(path.join(parked, "proof", "parent-stderr.log"), "utf8")).toBe(firstNativeStderrChunk);
     expect(fs.existsSync(path.join(parked, "proof", "failure.json"))).toBe(false);
   });
 
@@ -418,7 +489,7 @@ process.stderr.write('first artifact\\n'); setTimeout(() => process.stderr.write
     const f = fixture();
     const evidence = path.join(f.root, "proof");
     const processResult = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
-      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8" });
+      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8", env: { ...process.env, SMARTY_ALPHA: "0" } });
     expect(processResult.status).not.toBe(0);
     expect(processResult.stderr).toContain("Evidence writes must be inside the assigned worktree");
     expect(fs.existsSync(evidence)).toBe(false);

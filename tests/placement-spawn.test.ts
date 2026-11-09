@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG, type FabricAgentConfig } from "../src/config.js";
 import { AgentManager, type AgentTaskPresence } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -293,8 +293,10 @@ const expectFixtureRequests = (fixture: PlacementApiFixture, runId: string, bind
   ]);
 };
 
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe.skipIf(process.platform === "win32" || typeof process.getuid !== "function" || !fs.constants.O_NOFOLLOW)("Placement spawn boundary", () => {

@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { foregroundWaitRefusal, foregroundWaitSeconds } from "../src/guards/foreground-wait.js";
+
+beforeEach(() => vi.stubEnv("SMARTY_ALPHA", "0"));
+afterEach(() => vi.unstubAllEnvs());
 
 // smarty-dev#854: the waits seen live, and what must still run.
 describe("foreground wait guard", () => {

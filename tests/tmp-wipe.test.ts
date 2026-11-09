@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { killsByPattern, TMP_WIPE_REASON, wipesTmp } from "../src/core/pattern-kill.js";
+
+beforeEach(() => vi.stubEnv("SMARTY_ALPHA", "0"));
+afterEach(() => vi.unstubAllEnvs());
 
 // smarty-dev#1998: two fleet-wide /tmp wipes on 2026-09-29, then the forms the rule refuses and
 // the deletes of an agent's own exact paths it must still allow.

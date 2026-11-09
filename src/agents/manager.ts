@@ -3793,8 +3793,21 @@ export class AgentManager {
         if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
           await this.#worktrees.cleanup(id, true).catch(() => false);
         }
-        // smarty-dev#15878: a confirmed non-launch never used its short TMPDIR; an unknown launch keeps it above.
-        if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
+        // Immediate, proven task non-launches have no worker record to settle.
+        // Retain their prepared bytes outside the active root, including owned
+        // TMPDIR. Actors and queued failures keep their separate archive custody.
+        if ((error as { launchOutcome?: string } | undefined)?.launchOutcome === "unlaunched" &&
+          !request.actorId && !transportLaunchReturned && !this.#runs.has(id) && !this.#queued.has(id)) {
+          if (!runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
+            try {
+              // A failed route save must keep its source available for retry.
+              routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" });
+              await this.#removeRunTree(runDirectory, id, shortTmpdir);
+            } catch (archiveError) {
+              diagnostics.warn("src/agents/manager.ts", `[pi-fabric] Pre-worker rollback archive failed for ${id}: ${String(archiveError)}; original launch failure: ${String(error)}`);
+            }
+          }
+        } else if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
           ownedShortTmpdir(shortTmpdir)) await removeTree(shortTmpdir).catch(() => undefined);
         throw error;
       }

@@ -79,6 +79,8 @@ function setup(inherited = false, entry = workerPath, runner: "pi" | "pi-durable
   }));
   for (const key of ["PI_FABRIC_DEPTH", "PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID",
     "PI_FABRIC_WRITE_POLICY", "PI_FABRIC_TOOL_ALLOWLIST", "PI_FABRIC_SCOPE", "PI_FABRIC_LINEAGE"]) vi.stubEnv(key, undefined);
+  // Keep strict write-refusal assertions strict in both this parent and inherited Pi worker/bootstrap.
+  vi.stubEnv("SMARTY_ALPHA", "0");
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
   vi.stubEnv("DURABLE_TEST_FAUX_MODULE", import.meta.resolve("@earendil-works/pi-ai/providers/faux"));
   vi.stubEnv("DURABLE_TEST_FILE", path.join(cwd, "fixture.txt"));

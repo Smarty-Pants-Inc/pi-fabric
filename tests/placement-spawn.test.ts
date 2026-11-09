@@ -204,12 +204,14 @@ const isolatedEnvironmentKeys = [
   "PI_FABRIC_IDENTITY_ID", "PI_FABRIC_MAIN_AGENT_ID", "PI_FABRIC_SESSION_ID",
   "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN",
   "PI_FABRIC_PROJECT_ROOT", "PI_FABRIC_RUN_ROOT", "PI_FABRIC_TMPDIR", "PI_FABRIC_MESH_ROOT",
-  "PI_FABRIC_WRITE_POLICY", "PI_FABRIC_LINEAGE", "SMARTY_ORG",
+  "PI_FABRIC_WRITE_POLICY", "PI_FABRIC_LINEAGE", "SMARTY_ORG", "SMARTY_ALPHA",
 ] as const;
 
 const isolatePlacementEnvironment = (): (() => void) => {
   const previous = new Map(isolatedEnvironmentKeys.map(key => [key, process.env[key]]));
   for (const key of isolatedEnvironmentKeys) delete process.env[key];
+  // Placement refusal/boundary fixtures run in strict mode; task workers inherit this pin.
+  process.env.SMARTY_ALPHA = "0";
   return () => {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];

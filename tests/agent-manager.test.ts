@@ -136,6 +136,7 @@ const trustedExceptionFixturePaths = new Set<string>();
 const realAdmitModelException = AgentManager.prototype.admitModelException;
 let restoreAdmissionFixture: (() => void) | undefined;
 beforeEach(() => {
+  vi.stubEnv("SMARTY_ALPHA", "0");
   trustedExceptionFixturePaths.clear();
   trustedExceptionFixturePaths.add(legacyExceptionPath);
   const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
@@ -252,6 +253,7 @@ afterEach(async () => {
   }
   retainedFixtureRoots.clear();
   custodyMoves.splice(0);
+  vi.unstubAllEnvs();
 });
 
 const expectUnconfirmedClose = async (manager: AgentManager) => {

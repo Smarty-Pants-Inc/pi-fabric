@@ -30,6 +30,7 @@ const createManager = (retainRuns = true, options: ConstructorParameters<typeof 
   return { manager, directory };
 };
 beforeEach(() => {
+  vi.stubEnv("SMARTY_ALPHA", "0");
   deletionRequests.length = 0;
   vi.spyOn(fs, "rmSync").mockImplementation(file => { deletionRequests.push(String(file)); });
   vi.spyOn(fs, "unlinkSync").mockImplementation(file => { deletionRequests.push(String(file)); });
@@ -42,6 +43,7 @@ afterEach(async () => {
   for (const release of releases.splice(0)) release();
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   // Deliberately leave private fixture roots for the hosted environment owner.
 });
 

@@ -6,7 +6,7 @@ import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import {
-  alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
+  alarmForeignHolder, MeshIncarnationPendingError, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
   readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
 } from "../core/atomic-write.js";
 
@@ -49,8 +49,12 @@ export const meshCustodyMode = (value = process.env.PI_FABRIC_MESH_CUSTODY_LOCK)
 export interface MeshCustodyStore {
   readonly root: string;
   exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T>;
+  /** Mark short inner acquisitions as tries, including their preparation and diagnostic semantics. */
+  withTryLock?<T>(operation: () => Promise<T>, timeoutMs?: number): Promise<T>;
   /** The active MeshStore.withTryLock budget, if any: custody honours it like the mesh lock. */
   readonly tryLockBudgetMs?: number | undefined;
+  /** The configured mesh wait also bounds custody's default overall acquisition budget. */
+  readonly lockTimeoutMs?: number;
   /** The mesh lock protocol; custody records follow it (protocol 3 names the holder's PID namespace). */
   readonly lockProtocol?: 1 | 2 | 3;
 }
@@ -299,16 +303,45 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
 
 /**
  * Runs a synchronous file-custody operation under the custody lock and, in "dual" mode, also
- * under the mesh lock (custody first). `timeoutMs` bounds each acquisition; an active
- * withTryLock budget bounds the custody acquisition too.
+ * under the mesh lock (custody first). `timeoutMs` and an active withTryLock budget bound
+ * the whole acquisition, including retries. A busy inner mesh gets only a short attempt;
+ * custody is released before backoff and reacquired before trying mesh again.
  */
 export const withMeshCustody = async <T>(mesh: MeshCustodyStore, operation: () => T, timeoutMs?: number): Promise<T> => {
-  const budget = Math.min(timeoutMs ?? CUSTODY_LOCK_TIMEOUT_MS, mesh.tryLockBudgetMs ?? Number.POSITIVE_INFINITY);
-  const release = await acquireMeshCustodyLock(mesh.root, budget, { lockProtocol: mesh.lockProtocol ?? 1 });
-  try {
-    if (meshCustodyMode() === "own") return operation();
-    return await (timeoutMs === undefined ? mesh.exclusive(operation) : mesh.exclusive(operation, timeoutMs));
-  } finally {
-    release();
+  const budget = Math.max(0, Math.min(timeoutMs ?? Math.min(CUSTODY_LOCK_TIMEOUT_MS, mesh.lockTimeoutMs ?? Number.POSITIVE_INFINITY),
+    mesh.tryLockBudgetMs ?? Number.POSITIVE_INFINITY));
+  const deadline = performance.now() + budget;
+  const remaining = (): number => Math.max(0, deadline - performance.now());
+  for (;;) {
+    let entered = false;
+    try {
+      const release = await acquireMeshCustodyLock(mesh.root, remaining(), { lockProtocol: mesh.lockProtocol ?? 1 });
+      try {
+        const run = (): T => {
+          // Preserve an uncontended zero-budget try, but never enter late after a positive wait.
+          if (budget > 0 && remaining() === 0) {
+            throw new MeshLockTimeoutError(" (custody acquisition budget exhausted)", 1, 0);
+          }
+          entered = true;
+          return operation();
+        };
+        if (meshCustodyMode() === "own") return run();
+        // Zero also bypasses FIFO directory scans: a nonzero timer cannot bound synchronous
+        // queue setup on a slow filesystem while custody is held. Retry waits happen outside custody.
+        return await (mesh.withTryLock
+          ? mesh.withTryLock(() => mesh.exclusive(run, 0), 0)
+          : mesh.exclusive(run, 0));
+      } finally {
+        release();
+      }
+    } catch (error) {
+      // The callback may itself throw a lock-shaped error: it is never replayable. Foreign
+      // holders and all other non-contention failures retain their original surfaced error.
+      if (entered || error instanceof MeshLockForeignHolderError ||
+        !(error instanceof MeshLockTimeoutError || error instanceof MeshIncarnationPendingError) ||
+        ("retryable" in error && error.retryable === false) || remaining() === 0) throw error;
+      await delay(Math.min(remaining(), 5 + Math.floor(Math.random() * 20)));
+      if (remaining() === 0) throw error;
+    }
   }
 };

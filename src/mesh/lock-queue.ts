@@ -155,20 +155,22 @@ export class MeshLockTicket {
     const file = path.join(this.#directory, name);
     try {
       const stat = fs.lstatSync(file);
-      if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) {
+      const alive = pidAlive(name);
+      if (alive && Date.now() - stat.mtimeMs <= this.#staleMs) {
         this.#predecessorMtimeMs = stat.mtimeMs;
         this.#predecessorStat = stat;
         return true;
       }
       this.#predecessorStat = undefined;
-      // A canonical holder retains its advisory receipt even if its event loop has been stalled past staleMs. The
-      // receipt can be reconsidered once the sole exclusion fence is gone; until then, fail closed and wait.
-      if (this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return true;
+      // A live canonical holder retains its advisory receipt even if stalled past staleMs. A proven-dead receipt
+      // cannot resume: remove only that advisory file so the new head can reach the unchanged canonical recovery
+      // checks. Otherwise a dead holder's receipt and .lock keep each other waiting until stalled-head fallback.
+      if (alive && this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return true;
       // A receipt is a regular file (main unlinked it; an unlink never removes a directory): anything else is kept and
       // waited on, never handed to a recursive removal. verifiedRemove's `.retention-graveyard-*` never matches TICKET.
       if (!stat.isFile()) return true;
       if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", fallback: () => {
-        if (this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return false;
+        if (alive && this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return false;
         fs.unlinkSync(file);
         return true;
       } }).removed) {

@@ -112,7 +112,7 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   `hello`; unversioned old clients still receive a v1-compatible reply from new agents, without
   unsolicited frames unless requested. The reported version is pinned for that transport. This is a
   transitional host-by-host rollout path, to remove after the fleet-wide install under
-  https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7886.
+  [smarty-dev#7886](../REFERENCES.md#source-20).
   A rewritten log invalidates the offset generation and reconciles by sequence (from the archive
   when available) before returning to byte tails.
 - The mirrored-lease alarm still reuses the existing `host-leases/<host-hash>.json` observation

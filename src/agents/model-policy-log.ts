@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import modelExceptionOwner from "../../config/model-exception-owner.json" with { type: "json" };
 import { isFabricThinking, thinkingRank, type FabricThinking } from "../thinking.js";
 
 /** Model identifiers or a known Claude-capable native backend, not substrings. */
@@ -73,12 +74,16 @@ export class FabricModelExceptionDeniedError extends Error {
   }
 }
 
-const REF_PATTERN = /^smarty-pants-inc\/([a-z0-9._-]+)#([1-9]\d*)$/i;
-const canonicalRef = (repo: string, number: string): string => `Smarty-Pants-Inc/${repo.toLowerCase()}#${number}`;
+// This fixed legacy admission policy is separate from opaque Ask-ID provenance.
+const policyOwner = modelExceptionOwner.owner;
+const escapedOwner = policyOwner.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const REF_PATTERN = new RegExp(`^${escapedOwner}/([a-z0-9._-]+)#([1-9]\\d*)$`, "i");
+const ISSUE_PATH_PATTERN = new RegExp(`^/${escapedOwner}/([a-z0-9._-]+)/issues/([1-9]\\d*)/?$`, "i");
+const canonicalRef = (repo: string, number: string): string => `${policyOwner}/${repo.toLowerCase()}#${number}`;
 
 /**
- * Canonical `Smarty-Pants-Inc/<repo>#N` references in order. Bare `#N` means
- * smarty-dev; foreign owner refs and arbitrary URL fragments never grant.
+ * Canonical `<configured policy owner>/<repo>#N` references in order. Bare `#N`
+ * means smarty-dev; foreign owner refs and arbitrary URL fragments never grant.
  */
 export function canonicalIssueReferences(reason: unknown): string[] {
   if (typeof reason !== "string") return [];
@@ -88,14 +93,14 @@ export function canonicalIssueReferences(reason: unknown): string[] {
     let ref: string | undefined;
     if (match[2]) {
       const parts = (match[1] ?? "smarty-dev").split("/");
-      if (parts.length === 1 || parts[0]!.toLowerCase() === "smarty-pants-inc") {
+      if (parts.length === 1 || parts[0]!.toLowerCase() === policyOwner.toLowerCase()) {
         ref = canonicalRef(parts.at(-1)!, match[2]);
       }
     } else {
       const candidate = match[0].replace(/[.,;:)\]}]+$/, "");
       try {
         const url = new URL(candidate);
-        const issue = /^\/smarty-pants-inc\/([a-z0-9._-]+)\/issues\/([1-9]\d*)\/?$/i.exec(url.pathname);
+        const issue = ISSUE_PATH_PATTERN.exec(url.pathname);
         if (url.protocol === "https:" && url.hostname.toLowerCase() === "github.com" && !url.username && !url.password && !url.port && issue) {
           ref = canonicalRef(issue[1]!, issue[2]!);
         }
@@ -184,7 +189,7 @@ const validEntry = (value: unknown): value is ModelExceptionEntry => {
   const issue = REF_PATTERN.exec(entry.issue as string)!;
   try {
     const url = new URL(entry.reason_url as string);
-    const linked = /^\/smarty-pants-inc\/([a-z0-9._-]+)\/issues\/([1-9]\d*)\/?$/i.exec(url.pathname);
+    const linked = ISSUE_PATH_PATTERN.exec(url.pathname);
     if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com" ||
         url.username || url.password || url.port || !linked ||
         canonicalRef(linked[1]!, linked[2]!) !== canonicalRef(issue[1]!, issue[2]!)) return false;

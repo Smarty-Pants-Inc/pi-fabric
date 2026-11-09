@@ -7,7 +7,7 @@ independent early warning. Native tools outside Fabric, `user_bash`, direct
 are **not** covered. This is a filesystem safety boundary, not a hostile-code or
 whole-session sandbox. `enforce` applies to the Bash route only: actor/task launches,
 process transports and executor runtimes are not Landlock-enforced. Non-Bash
-enforcement is tracked in [smarty-dev#7935](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7935).
+enforcement is tracked in [smarty-dev#7935](../REFERENCES.md#source-7).
 Reserved `PI_FABRIC_LANDLOCK_*` controls are scrubbed at those child-launch
 boundaries; environment scrubbing is not kernel confinement.
 

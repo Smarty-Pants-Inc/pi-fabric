@@ -39,8 +39,8 @@ Measured: the challenger's local nats-server 2.14.7 ACL probe (static password, 
 ## Round 2 answers (Amendment B, 10-13, #958)
 
 Basis: the full texts of two #958 reviews (staged copy read by this writer) and the lead's decisions on them:
-Astra, https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152830182 (one P1), and security,
-https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152848625 (`SECURITY_REVIEW: FAIL`; P1, P1, P2).
+Astra, [review comment](../../REFERENCES.md#source-9) (one P1), and security,
+[security comment](../../REFERENCES.md#source-10) (`SECURITY_REVIEW: FAIL`; P1, P1, P2).
 The lead's decisions match all four findings; no extra finding is claimed. B5 is a lead clarification, not a review
 finding. Section 10 has the detail. Docs only: nothing is implemented, tested or measured.
 
@@ -74,7 +74,7 @@ finding. Section 10 has the detail. Docs only: nothing is implemented, tested or
 
 ## Round 3 answers (Amendment C, 10-13, #958)
 
-Basis: Astra round 2, https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6154244752 (five P1s), and
+Basis: Astra round 2, [review comment](../../REFERENCES.md#source-11) (five P1s), and
 the lead's decisions on it. Section 11 has the detail. Docs only: nothing is implemented, tested or measured.
 
 - **Partition revocation (P1) ADOPT.** Every user JWT has `exp` at most 1 h after it is signed; the node itself closes a
@@ -405,7 +405,7 @@ prerequisite"); monitoring from Ryzen 1 on 8222. No test server binds a non-loop
 | T17 `nats-auth-partition-expiry` | `{nodes: 3, replicas: 3}`, test lifetime 120 s, renewal every 30 s (the same code with short values). An R3 stream has no quorum on a minority node (2.4), so the access observed is what the node itself serves: a test-only R1 stream `FABRIC_MESH_<test hex>` placed on node C (bound to U and W by their `mesh:` tag), and `$SYS.REQ.USER.INFO`, which C answers locally. U, W and X are raw nats.js clients with creds (no Fabric cutoff), so the server's own expiry is what is observed; Fabric's `exp − 5 min` cutoff is T19's. Users U and W connect to node C, X to node A. Cut C's routes (6222) while its client port stays reachable. `revoke U`: `partial`, naming C. Through U's real client on C: before `exp`, U's `USER.INFO`, its publish to that stream's `.state` and its `$JS.API.STREAM.MSG.GET` on it succeed (the window); at U's `exp` plus at most 30 s, C closes U's connection with `User Authentication Expired`, those three calls fail, a reconnect to C with that JWT is refused, and no renewal for U arrives. Control: C also closes W at its `exp` (no renewal crosses the partition); X on A keeps access over 3 renewals; after the routes heal W renews and U stays refused on every node (11.1) |
 | T18 `nats-auth-breakglass-approval` | each case exits 2 and mints nothing: no `--approval`; unknown item; item not answered or answered `ignore`; answered by a person other than Paul; answered over 24 h ago; item already reserved; org, stream or config SHA-256 differs (one byte changed in `--config`); mint run from a session whose principal is Paul (a command-line name is ignored); no `--audit`; the audit comment is on another issue, by another author, created before Paul's answer, or lacks the item id or the SHA-256. Two concurrent mints with one item: exactly one mints. A crash injected after the reservation and before the signature: the item stays reserved, no credential exists, a retry is refused. Positive: everything matches: one 1 h user; the mint record holds the comment snapshot (id, author, `created_at`, body SHA-256); after an edit or deletion of that comment the runbook's audit check reports the mismatch (11.3) |
 | T19 `nats-auth-renewal` | a renewed JWT has the same `sub`, name, tags and permissions, a later `iat` and `exp`, and `exp − iat` at most 3660 s; a JWT for another key, from a key outside the account, with other permissions, an older `iat` (a replay of an earlier valid JWT), `exp − iat` over 3660 s (slice 1's 7-day form included), or `exp` over 1 h 90 s ahead is ignored; a `revoke` that runs while the renewal job is signing: no JWT for the revoked key is signed after R, and every JWT signed for it is refused by an up node after the push; the client reconnects once in the last 20 min and continues; with the job stopped (test lifetime 10 min), Fabric fails closed at `exp − 5 min` and the node closes at `exp`; a revoked user gets no renewal; a principal's 1Password `jwt` field is updated and its seed field is not touched (11.1) |
-| T20 `nats-auth-custody-handoff` | the issuer grants a `custody:<agent key>` tag only to the unique current engine: (a) first placement grants one tag to one engine; (b) a second engine that asks for the same agent while the first is live or its termination is unconfirmed gets no tag, and its CAS write to `$KV.FABRIC_CUSTODY.owner.<agent key>` gets `Permissions Violation`; (c) after the #8639 confirmed-termination handoff the successor gets the tag and the predecessor's custodian user is revoked, so its write is refused; (d) an unconfirmed termination (timeout, unknown) grants nothing. The handoff proof is smarty-dev#8639's own acceptance test (https://github.com/Smarty-Pants-Inc/smarty-dev/issues/8639) (G-12, 11.2) |
+| T20 `nats-auth-custody-handoff` | the issuer grants a `custody:<agent key>` tag only to the unique current engine: (a) first placement grants one tag to one engine; (b) a second engine that asks for the same agent while the first is live or its termination is unconfirmed gets no tag, and its CAS write to `$KV.FABRIC_CUSTODY.owner.<agent key>` gets `Permissions Violation`; (c) after the #8639 confirmed-termination handoff the successor gets the tag and the predecessor's custodian user is revoked, so its write is refused; (d) an unconfirmed termination (timeout, unknown) grants nothing. The handoff proof is smarty-dev#8639's own acceptance test ([smarty-dev#8639](../../REFERENCES.md#source-12)) (G-12, 11.2) |
 
 ## 7. The reader-proof gap (smarty-dev#9834)
 
@@ -617,8 +617,8 @@ attach is its own authentication, not NATS.
 ## 10. Amendment B (10-13, #958 round 2): update deny, break-glass, same-UID gap, durable revoke, per-key rotation, SYS-only user
 
 Docs only: nothing in this section is implemented, tested or measured. Basis: the full Astra review
-(https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152830182) and security review
-(https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152848625), and the lead's decisions on them;
+([review comment](../../REFERENCES.md#source-9)) and security review
+([security comment](../../REFERENCES.md#source-10)), and the lead's decisions on them;
 10.5 and 10.6 are a lead clarification. No finding beyond those is claimed. It does not change the auth model, the
 key custody model, the credential cutoff (C6) or the revocation policy, except as stated. A delta design review and
 security review of the frozen text follow; this note does not claim them.
@@ -657,7 +657,7 @@ security review of the frozen text follow; this note does not claim them.
 ### 10.2 Same-UID seed exposure: accepted security gap (security P1)
 
 - ACCEPTED as a security gap, accepted by org's delegate (chief-of-staff), smarty-dev#11465 comment 6154729908
-  (https://github.com/Smarty-Pants-Inc/smarty-dev/issues/11465#issuecomment-6154729908). All fleet agents under one UID on
+  ([smarty-dev#11465 comment](../../REFERENCES.md#source-13)). All fleet agents under one UID on
   one host are one trust domain. That is already true for the file mesh, registries and session files.
 - Per-launch creds give network authentication, org isolation and root binding (1.1, 1.4). They do not isolate a
   launch from another same-UID process on the same host, and this note no longer treats them as that.
@@ -754,7 +754,7 @@ security review of the frozen text follow; this note does not claim them.
 ## 11. Amendment C (10-13, #958 round 3): bounded partition revocation, custody names, break-glass approval, claim-record trust anchor
 
 Docs only: nothing in this section is implemented, tested or measured. Basis: Astra round 2
-(https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6154244752) and the lead's decisions on it.
+([review comment](../../REFERENCES.md#source-11)) and the lead's decisions on it.
 Its same-UID finding is answered in 10.2 (org's delegate acceptance), not here. Source reads are cited with their
 time; NATS built-ins come first (user JWT `exp`, account `revocations`, KV CAS), bespoke parts are named.
 

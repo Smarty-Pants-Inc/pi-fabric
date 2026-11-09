@@ -17,7 +17,7 @@ follow-up quota refusal, Fabric makes one attempt with the original text and kee
 the sender-side notice. When the marker cannot fit under a route's limit, the
 send wins: the recipient gets the original text and only the sender gets the
 notice. Org accepted this exact near-limit exception on pi-fabric#179
-([comment 5911395961](https://github.com/Smarty-Pants-Inc/pi-fabric/pull/179#issuecomment-5911395961))
+([comment 5911395961](../REFERENCES.md#source-29))
 with two conditions: the sender's notice explicitly adds
 `(recipient marker omitted: message at the route size limit)`, and each successful
 unmarked delivery writes one structured `recipient-marker-omitted` line with its
@@ -121,7 +121,7 @@ transformations of tool output cannot supply a stronger provenance guarantee.
 The deeper existence resolver remains in the readonly-reviewed
 `smarty-pants/bin/smarty-status` `unresolved` implementation: it checks local git
 objects/org mirrors and GitHub commits/comment IDs. No such lookup is added to
-Fabric's send path (Smarty-Pants-Inc/smarty-dev#1612, #2175).
+Fabric's send path (smarty-dev#1612, #2175).
 
 ## Verification
 

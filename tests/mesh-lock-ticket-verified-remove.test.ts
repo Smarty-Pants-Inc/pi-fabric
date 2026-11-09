@@ -144,7 +144,8 @@ linuxIt("lock queue: an unchanged dead receipt is removed with its judged stat (
   } finally { ticket.close(); }
 });
 
-// PR1412: plain tickets must reclaim through the real off-Linux fallback, while an opted-in canonical holder stays protected.
+// Plain tickets and proven-dead predecessors reclaim through the real off-Linux fallback. Live-aged canonical
+// holders stay protected; advisory cleanup of a dead receipt never authorizes removal of the canonical lock.
 it.each([
   { kind: "dead", canonical: false },
   { kind: "stale", canonical: false },
@@ -155,7 +156,10 @@ it.each([
   const root = path.join(dir, "mesh-fallback");
   fs.mkdirSync(root, { mode: 0o700 });
   const lock = path.join(root, ".lock");
-  if (canonical) fs.mkdirSync(lock, { mode: 0o700 });
+  if (canonical) {
+    fs.mkdirSync(lock, { mode: 0o700 });
+    fs.writeFileSync(path.join(lock, "owner"), REPLACEMENT);
+  }
   const queue = meshLockQueueDirectory(root);
   fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
   const pid = kind === "dead" ? 999999999 : process.pid;
@@ -170,7 +174,7 @@ it.each([
   const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
   Object.defineProperty(process, "platform", { value: "darwin" });
   try {
-    if (canonical) {
+    if (canonical && kind === "stale") {
       expect(ticket.mayContend()).toBe(false);
       expect(fs.existsSync(receipt)).toBe(true);
       expect(calls).toEqual([]);
@@ -182,6 +186,7 @@ it.each([
     expect(fs.existsSync(receipt)).toBe(false);
     expect(primitive.filter(call => call.target === receipt)).toEqual([{ op: "unlink", target: receipt }]);
     expect(calls).toEqual([{ target: receipt, ino, removed: true }]);
+    if (canonical && kind === "dead") expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(REPLACEMENT);
   } finally {
     Object.defineProperty(process, "platform", platform);
     ticket.close();
@@ -211,7 +216,7 @@ linuxIt("lock queue: a stalled canonical head is reaped through judged verifiedR
   }
 });
 
-linuxIt("lock queue: an existing canonical holder keeps even a dead head receipt", () => {
+linuxIt("lock queue: a dead head receipt is reaped without changing an existing canonical holder", () => {
   const root = path.join(dir, "mesh-holder");
   fs.mkdirSync(root, { mode: 0o700 });
   const canonical = path.join(root, ".lock");
@@ -221,11 +226,18 @@ linuxIt("lock queue: an existing canonical holder keeps even a dead head receipt
   fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
   const headReceipt = path.join(queue, `${"0".repeat(24)}-999999999-${randomUUID()}`);
   fs.writeFileSync(headReceipt, "", { mode: 0o600 });
+  const ino = fs.lstatSync(headReceipt).ino;
+  const canonicalIno = fs.lstatSync(canonical).ino;
+  const owner = fs.readFileSync(path.join(canonical, "owner"), "utf8");
   const follower = new MeshLockTicket(root, randomUUID(), 5_000, { stalledHeadBypassLock: canonical });
   try {
-    expect(follower.mayContend()).toBe(false);
-    expect(calls).toEqual([]);
-    expect(fs.existsSync(headReceipt)).toBe(true);
+    expect(follower.mayContend()).toBe(true);
+    expect(follower.queued).toBe(true); // promoted, not barging through the stalled-head escape
+    expect(calls).toEqual([{ target: headReceipt, ino, removed: true }]);
+    expect(fs.existsSync(headReceipt)).toBe(false);
+    expect(fs.lstatSync(canonical).ino).toBe(canonicalIno);
+    expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
+    expect(primitive.filter(call => call.target === canonical)).toEqual([]);
   } finally { follower.close(); }
 });
 

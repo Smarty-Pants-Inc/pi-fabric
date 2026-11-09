@@ -144,7 +144,8 @@ describe("mesh lock stats recorder", () => {
       expect(minute.operations?.[timing.operation]).toMatchObject(refusal);
       expect(minute.phases?.[timing.operation]?.[timing.phase]).toMatchObject(refusal);
       expect(minute.classes.bridge).toMatchObject({ tries: 1 });
-      expect(summarizeLockStats(root, readLockStats(root), { minutes: 3, now: Date.now() + 120_000 }).phases)
+      expect(summarizeLockStats(root, readLockStats(root), { minutes: 3, now: Date.now() + 120_000 }).phases
+        .filter(row => row.operation === timing.operation && row.phase === timing.phase))
         .toMatchObject([{ operation: timing.operation, phase: timing.phase, fenceRefusals: 1,
           fenceRefusalHolders: [{ pid: holderPid ?? null, comm, n: 1 }] }]);
     } finally {

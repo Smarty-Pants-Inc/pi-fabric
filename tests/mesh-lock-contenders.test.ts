@@ -52,11 +52,25 @@ type Report = { pid: number; claimed: Claim[]; published: { key: string; id: str
   conflicts: string[]; waits: number[]; timeout: null | { phase: string; key: string; code: string; name: string } };
 
 function childResultSucceeded(code: number | null, stderr: string): boolean {
-  return code === 0 && stderr.replace(/^\[pi-fabric\] FABRIC_MESH_STATE_ACL_ADVISORY: [^\r\n]*(?:\r?\n|$)/gm, "") === "";
+  return code === 0 && stderr
+    .replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "")
+    .replace(/^\[pi-fabric\] FABRIC_MESH_STATE_ACL_ADVISORY: [^\r\n]*(?:\r?\n|$)/gm, "") === "";
 }
 
-it("child result gate ignores only mesh ACL advisory lines", () => {
+it("child result gate ignores only mesh ACL advisory lines and the exact deletion guard announcement", () => {
   const advisory = "[pi-fabric] FABRIC_MESH_STATE_ACL_ADVISORY: ";
+  const guard = "hosted-only (outside-temp deletion reporting): push and let CI run it";
+  expect(childResultSucceeded(0, guard + "\n")).toBe(true);
+  expect(childResultSucceeded(0, guard + "\r\n")).toBe(true);
+  expect(childResultSucceeded(0, guard + "\n" + advisory + "read-only state\n")).toBe(true);
+  expect(childResultSucceeded(0, advisory + "read-only state\n" + guard + "\n")).toBe(true);
+  expect(childResultSucceeded(0, guard + "\nother diagnostic\n")).toBe(false);
+  expect(childResultSucceeded(0, guard + "\n \t\n")).toBe(false);
+  expect(childResultSucceeded(0, "other " + guard + "\n")).toBe(false);
+  expect(childResultSucceeded(0, guard + " other\n")).toBe(false);
+  expect(childResultSucceeded(0, guard)).toBe(false);
+  expect(childResultSucceeded(1, guard + "\n")).toBe(false);
+  expect(childResultSucceeded(null, guard + "\n")).toBe(false);
   expect(childResultSucceeded(0, advisory + "read-only state\n")).toBe(true);
   expect(childResultSucceeded(0, advisory + "one\r\n" + advisory + "two")).toBe(true);
   expect(childResultSucceeded(0, advisory + "read-only state\nother diagnostic")).toBe(false);
@@ -190,7 +204,7 @@ it("FILE FIFO real 1s regression: 20 processes each commit 100 exclusive acquisi
         child.once("error", reject);
         child.once("close", code => {
           try {
-            if (code !== 0 || stderr) throw new Error("child " + index + " exit " + code + ": " + stderr + stdout);
+            if (!childResultSucceeded(code, stderr)) throw new Error("child " + index + " exit " + code + ": " + stderr + stdout);
             resolve(JSON.parse(stdout.trim().split("\n").at(-1)!));
           } catch (error) { reject(error); }
         });

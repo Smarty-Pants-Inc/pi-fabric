@@ -16,7 +16,7 @@ import { runBridge } from "../src/mesh-bridge.js";
 // Keep: smarty-dev#12036's two indistinguishable zero-attempt producers, plus the RPC trust boundary.
 // Recorded-call fixtures only: no real lock acquisition, staging cleanup, census removal or teardown deletion.
 const records = vi.hoisted(() => ({
-  stats: { failed: vi.fn(), acquired: vi.fn() },
+  stats: { failed: vi.fn(), acquired: vi.fn(), phase: vi.fn() },
   events: { waitTimeout: vi.fn(), held: vi.fn() },
   ticket: vi.fn(),
   spawn: vi.fn(() => { throw new Error("unexpected transport spawn"); }),

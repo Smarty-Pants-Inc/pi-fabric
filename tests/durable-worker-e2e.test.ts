@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { build } from "esbuild";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -15,6 +15,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-durable-e2e-"));
 const workerPath = path.join(root, "build", "worker.js");
 const managers: AgentManager[] = [];
 let sequence = 0;
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 beforeAll(async () => {
   fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
   fs.writeFileSync(path.join(root, "package.json"), '{"type":"module"}');

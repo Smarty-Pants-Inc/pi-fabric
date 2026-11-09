@@ -78,7 +78,12 @@ const json = (file, value) => {
   if (path.dirname(file) === evidence) writeEvidence(path.basename(file), content);
   else fs.writeFileSync(file, content);
 };
-const forbidden = "/tmp/fv2-writescope-probe"; // Explicit assignment's refused real write target; never delete it.
+// A failed alpha run may write this probe: keep it in retained proof-owned scratch,
+// beside (not inside) the native cwd, child TMPDIR, or assigned workspace.
+const forbidden = path.join(scratch, "refused-write.txt");
+const forbiddenRelative = path.relative(workspace, forbidden);
+assert(forbiddenRelative === ".." || forbiddenRelative.startsWith(`..${path.sep}`) || path.isAbsolute(forbiddenRelative),
+  "Refused target must be outside the assigned workspace");
 assert(!fs.existsSync(forbidden), "Refused target already exists; do not touch an existing fixture");
 const outside = path.join(scratch, "outside-task.txt");
 const shellOutside = path.join(scratch, "native-shell-outside-task.txt");
@@ -306,6 +311,7 @@ try {
   json(path.join(agent, "settings.json"), { enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false }, extensions: [], packages: [] });
   json(path.join(agent, "fabric.json"), { configVersion: 4, fullCodeMode: false, autoReload: false, executor: { kernel: "typescript", timeoutMs: guard, maxTimeoutMs: guard, resultFormat: "json", landlock: { mode: "off" } }, agents: { enabled: true, runner: "pi", transport: "process", timeoutMs: guard, maxDepth: 2, maxConcurrent: 2, extensions: false, retainRuns: true, sessionExport: false, notifyOnComplete: false, deniedModels: [], modelPolicy: { requireReason: [] } }, mesh: { enabled: true, root: path.join(scratch, "mesh"), announce: true, actorScope: "session" }, capture: { enabled: false }, mcp: { enabled: false }, jev: { enabled: false }, prewalk: { enabled: false }, ui: { enabled: false }, compaction: { engine: "pi" }, approvals: { read: "allow", write: "allow", execute: "allow", network: "allow", agent: "allow" } });
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PI_|SMARTY_|HERDR_|ORG_|OPENAI_|ANTHROPIC_|GOOGLE_|GEMINI_|OPENROUTER_|TYPESAFE_|AWS_|AZURE_|AI_GATEWAY_|OTEL_|SENTRY_)/.test(key)));
+  if (process.env.SMARTY_ALPHA !== undefined) env.SMARTY_ALPHA = process.env.SMARTY_ALPHA;
   Object.assign(env, { NODE_OPTIONS: `${env.NODE_OPTIONS ?? ""} --import=${JSON.stringify(pathToFileURL(spawnTracker).href)}`, HOME: path.join(scratch, "home"), XDG_CONFIG_HOME: path.join(scratch, "home/.config"), XDG_DATA_HOME: path.join(scratch, "home/.local/share"), XDG_CACHE_HOME: path.join(scratch, "home/.cache"), TMPDIR: path.join(scratch, "tmp"), TASK_WRITE_SCOPE_SHELL_OUTSIDE: shellOutside, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_FABRIC_PI_BINARY: nativePi, PI_FABRIC_PROJECT_ROOT: rootCwd, PI_FABRIC_MESH_ROOT: path.join(scratch, "mesh"), PI_FABRIC_RUN_ROOT: runs, PI_FABRIC_AGENT_DIR: path.join(scratch, "exports") });
   let launcher = nativePi;
   if (nativeCgroup) {

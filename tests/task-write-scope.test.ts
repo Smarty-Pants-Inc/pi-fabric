@@ -1,16 +1,18 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import fabricWriteGuard, { writePolicyDenial } from "../src/agents/write-guard.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 
 const saved = process.env.PI_FABRIC_WRITE_POLICY;
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(() => {
   if (saved === undefined) delete process.env.PI_FABRIC_WRITE_POLICY;
   else process.env.PI_FABRIC_WRITE_POLICY = saved;
+  vi.unstubAllEnvs();
 });
 const fixture = () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "task-write-scope-")));

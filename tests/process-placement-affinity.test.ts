@@ -2,20 +2,28 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import { preflightFleetPlacement, placementLocalPathReason } from "../src/agents/transports/placement-preflight.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
-import { AgentInputError } from "../src/agents/input-validation.js";
+import { AgentInputError, RequiredInputMissingError } from "../src/agents/input-validation.js";
+import * as processUtils from "../src/agents/transports/process-utils.js";
 
 const roots: string[] = [];
+beforeEach(() => {
+  // Preserve the original strict regressions without consulting real user config.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-home-")); roots.push(home);
+  vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+  vi.spyOn(os, "homedir").mockReturnValue(home);
+  vi.stubEnv("SMARTY_ALPHA", "0");
+});
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function fixture(options: { candidates?: string[]; pickerExit?: number; pickerDelaySeconds?: number; sshExit?: number; executeRemote?: boolean } = {}) {
+function fixture(options: { candidates?: string[]; pickerExit?: number; pickerDelaySeconds?: number; sshExit?: number; executeRemote?: boolean; denied?: string; needs?: string; probeExit?: number } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-affinity-")); roots.push(base);
   // The test runner allocates outside /srv/scratch; caller TMPDIR is private, not the portable workspace.
   const callerTmp = path.join(base, "caller-tmp"); fs.mkdirSync(callerTmp);
@@ -24,18 +32,24 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; pickerDe
   const mkdir = (file: string) => fs.mkdirSync(path.dirname(file), { recursive: true });
   const write = (file: string, text: string) => { mkdir(file); fs.writeFileSync(file, text); };
   write(path.join(root, "setup/factory/task-preflight.py"), [
-    "import sys",
+    "import os, sys",
     "args = sys.argv",
-    "if '--probe' in args: sys.exit(0)",
+    "with open(os.environ['ADMISSION_CALLS'], 'a') as calls: calls.write('probe\\n' if '--probe' in args else 'admit\\n')",
+    `if '--probe' in args: sys.exit(${options.probeExit ?? 0})`,
     "sys.stdin.read()",
     "count_at = args.index('--admit') + 3",
     "requires = int(args[count_at])",
     "paths = args[count_at + 1:count_at + 1 + requires]",
-    "sys.stdout.write('\\0'.join(['', '', '', '0'] + [p for file in paths for p in [file, file]]) + '\\0')",
+    `sys.stdout.write('\\0'.join([${JSON.stringify(options.denied ?? "")}, ${JSON.stringify(options.needs ?? "")}, 'fixture policy', '0'] + [p for file in paths for p in [file, file]]) + '\\0')`,
   ].join("\n"));
   const bin = path.join(root, "bin"); fs.mkdirSync(bin, { recursive: true });
   const fleet = path.join(bin, "smarty-task-ryzen2");
-  write(fleet, "#!/bin/sh\nprintf 'called\\n' >> \"$LAUNCH_CALLS\"\nprintf 'RYZEN2_TASK_ACCEPTED affinity on ryzen2\\n'\n"); fs.chmodSync(fleet, 0o700);
+  write(fleet, [
+    "#!/bin/sh", 'printf \'called\\n\' >> "$LAUNCH_CALLS"', 'printf \'%s\\0\' "$@" > "$LAUNCH_ARGV"',
+    'while [ "$#" -gt 0 ]; do', '  [ "$1" = "--" ] && break',
+    '  if [ "$1" = "--host" ]; then host="$2"; break; fi', '  shift', "done",
+    'printf \'RYZEN2_TASK_ACCEPTED affinity on %s\\n\' "$host"', "",
+  ].join("\n")); fs.chmodSync(fleet, 0o700);
   const picker = path.join(base, "smarty-pick-host-fixture");
   write(picker, `#!/bin/sh\nprintf 'called\\n' >> "$PICKER_CALLS"\n${options.pickerDelaySeconds ? `sleep ${options.pickerDelaySeconds}\n` : ""}printf '%s\\n' "$CANDIDATES"\nprintf 'eligible0=1 eligible1=1\\n' >&2\nexit "${options.pickerExit ?? 0}"\n`); fs.chmodSync(picker, 0o700);
   const pathBin = path.join(base, "path"); fs.mkdirSync(pathBin);
@@ -49,22 +63,23 @@ function fixture(options: { candidates?: string[]; pickerExit?: number; pickerDe
   const config = normalizeFabricConfig({ agents: { placement: {
     default: "remote", command: [fleet, "--host", "auto", "--cwd", cwd, "--", "task"],
     resultDirectory: path.join(base, "results", "{id}"), cancelCommand: ["true"], commandTimeoutMs: 1_000,
-    sshAliases: { intel1: "intel1-agent", ryzen2: "r2-agent", ryzen3: "r3-agent", qs32729: "qs32729-agent" }, sharedMounts: [cwd], pickerCommand: [picker],
+    sshAliases: { intel1: "intel1-agent", ryzen2: "r2-agent", ryzen3: "r3-agent", qs32729: "qs32729-agent", "worker-a": "worker-a-agent" }, sharedMounts: [cwd], pickerCommand: [picker],
   } } }).agents.placement!;
   const env = {
     ...process.env, PATH: `${pathBin}:${process.env.PATH}`,
     CANDIDATES: (options.candidates ?? ["ryzen2", "ryzen3"]).join("\n"),
     SSH_CALLS: path.join(base, "ssh-calls"), PICKER_CALLS: path.join(base, "picker-calls"), LAUNCH_CALLS: path.join(base, "launch-calls"),
+    ADMISSION_CALLS: path.join(base, "admission-calls"), LAUNCH_ARGV: path.join(base, "launch-argv"),
   };
   const request = (cwdPath = cwd, needs: string[] = [], withRequires = true): AgentTransportLaunch => ({
     id: "affinity", name: "affinity", cwd: cwdPath, workerPath: "unused", workerArguments: [], needs,
     ...(withRequires ? { requires: [path.join(base, "target-only", "corpus.dat")] } : {}),
   });
-  return { base, root, cwd, callerTmp, config, env, request, picker, sshCalls: env.SSH_CALLS, pickerCalls: env.PICKER_CALLS, launchCalls: env.LAUNCH_CALLS };
+  return { base, root, cwd, callerTmp, config, env, request, picker, sshCalls: env.SSH_CALLS, pickerCalls: env.PICKER_CALLS, launchCalls: env.LAUNCH_CALLS, admissionCalls: env.ADMISSION_CALLS, launchArgv: env.LAUNCH_ARGV };
 }
 
 function localWorkerRequest(f: ReturnType<typeof fixture>, cwd = f.cwd) {
-  for (const key of ["PATH", "CANDIDATES", "SSH_CALLS", "PICKER_CALLS", "LAUNCH_CALLS"] as const) vi.stubEnv(key, f.env[key]);
+  for (const key of ["PATH", "CANDIDATES", "SSH_CALLS", "PICKER_CALLS", "LAUNCH_CALLS", "ADMISSION_CALLS", "LAUNCH_ARGV"] as const) vi.stubEnv(key, f.env[key]);
   const runDir = path.join(f.base, "run"); fs.mkdirSync(runDir);
   const taskFile = path.join(runDir, "task.txt"); fs.writeFileSync(taskFile, "portable task");
   const marker = path.join(runDir, "local-worker.txt");
@@ -77,8 +92,176 @@ function localWorkerRequest(f: ReturnType<typeof fixture>, cwd = f.cwd) {
   return { request, marker, events };
 }
 
+function remoteResult(f: ReturnType<typeof fixture>) {
+  const directory = path.join(f.base, "results", "affinity"); fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, "rc"), "0"); fs.writeFileSync(path.join(directory, "result.md"), "REMOTE");
+}
+
 // The installed fleet protocol is POSIX-only; Windows has no /usr/bin/python3 or shell launcher.
 describe.skipIf(process.platform === "win32")("installed fleet placement affinity preflight", () => {
+  // Trust boundary: exercise the actual transport and launcher argv, not just the mode helper.
+  it.each([undefined, "1", "other", ""])("alpha=%s forwards home, dot-share and missing remote inputs unchanged without an input probe or local spawn", async mode => {
+    const f = fixture({ candidates: ["worker-a"], denied: "fixture home input denied", sshExit: 3 });
+    const local = localWorkerRequest(f);
+    const start = vi.spyOn(processUtils, "spawnDetached");
+    const homeFile = path.join(os.homedir(), "input file.txt"); fs.writeFileSync(homeFile, "fixture");
+    const share = path.join(os.homedir(), ".local", "share", "fixture-data"); fs.mkdirSync(share, { recursive: true });
+    const shareFile = path.join(share, "data.txt"); fs.writeFileSync(shareFile, "fixture");
+    const alias = path.join(os.homedir(), "input-alias"); fs.symlinkSync(share, alias, "dir");
+    const missing = path.join(f.base, "remote-only", "missing ' {host} ; $(literal)");
+    const requires = [homeFile, share, shareFile, alias, path.join(alias, "data.txt"), missing];
+    const task = `Read ${homeFile} and ${shareFile}\nKeep literal 'quotes', $HOME and {host}; missing input: ${missing}`;
+    fs.writeFileSync(local.request.workerArguments[1]!, task);
+    const request = { ...local.request, requires };
+    const config = { ...f.config, command: f.config.command.map(entry => entry === "task" ? "{task}" : entry) };
+    remoteResult(f);
+    vi.stubEnv("SMARTY_ALPHA", mode);
+    const handle = await new ProcessTransport(undefined, config).launch(request);
+    expect(handle.sessionId).toBe("placement:affinity");
+    expect(await handle.isAlive()).toBe(false);
+    expect(fs.readFileSync(f.launchArgv, "utf8").split("\0").slice(0, -1)).toEqual([
+      "--host", "worker-a", "--cwd", f.cwd, ...requires.flatMap(file => ["--require", file]), "--", task,
+    ]);
+    expect(request.requires).toEqual(requires);
+    expect(start).not.toHaveBeenCalled();
+    expect(fs.existsSync(local.marker)).toBe(false);
+    expect(fs.existsSync(missing)).toBe(false);
+    expect(fs.readFileSync(local.events, "utf8")).not.toContain('"type":"placement.local"');
+    for (const file of [f.pickerCalls, f.launchCalls]) expect(fs.readFileSync(file, "utf8")).toBe("called\n");
+    for (const file of [f.admissionCalls, f.sshCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it.each(["required-refusal", "nonzero", "mismatched-receipt"] as const)("alpha leaves external launcher %s authoritative without a local retry", async outcome => {
+    const f = fixture({ candidates: ["worker-a"], denied: "adapter-only refusal" });
+    const local = localWorkerRequest(f);
+    const start = vi.spyOn(processUtils, "spawnDetached");
+    const missing = path.join(f.base, "remote-only", "missing");
+    vi.stubEnv("REFUSED_INPUT", missing);
+    fs.writeFileSync(f.config.command[0]!, [
+      "#!/bin/sh", 'printf \'called\\n\' >> "$LAUNCH_CALLS"', 'printf \'%s\\0\' "$@" > "$LAUNCH_ARGV"',
+      outcome === "required-refusal" ? 'printf \'PREFLIGHT_REFUSED: %s: unavailable on target\\n\' "$REFUSED_INPUT"'
+        : outcome === "nonzero" ? "printf 'factory-owned refusal\\n' >&2"
+        : "printf 'RYZEN2_TASK_ACCEPTED affinity on worker-b\\n'",
+      `exit ${outcome === "mismatched-receipt" ? 0 : 3}`, "",
+    ].join("\n"));
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    const debt = vi.fn();
+    const pending = new ProcessTransport(undefined, f.config).launch({ ...local.request, requires: [missing], onUnconfirmedExit: debt });
+    if (outcome === "required-refusal") {
+      await expect(pending).rejects.toBeInstanceOf(RequiredInputMissingError);
+      await expect(pending).rejects.toMatchObject({ path: missing, index: 0, launchOutcome: "unlaunched" });
+      expect(debt).not.toHaveBeenCalled();
+    } else {
+      const handle = await pending;
+      expect(handle.lostContact?.()).toContain("Placement launch outcome unknown");
+      expect(debt).toHaveBeenCalledOnce();
+      expect(await handle.isAlive()).toBe(false);
+      expect(fs.readFileSync(local.events, "utf8")).toContain('"type":"placement.launch_unknown"');
+    }
+    expect(fs.readFileSync(f.launchArgv, "utf8").split("\0").slice(0, -1)).toEqual([
+      "--host", "worker-a", "--cwd", f.cwd, "--require", missing, "--", "task",
+    ]);
+    expect(fs.readFileSync(f.launchCalls, "utf8")).toBe("called\n");
+    for (const file of [f.admissionCalls, f.sshCalls, local.marker]) expect(fs.existsSync(file)).toBe(false);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("uses live env and disable-file changes on consecutive operations of the same transport", async () => {
+    const f = fixture({ candidates: ["worker-a"], denied: "fixture input denied" });
+    const local = localWorkerRequest(f);
+    const start = vi.spyOn(processUtils, "spawnDetached");
+    const missing = path.join(f.base, "remote-only", "missing");
+    const request = { ...local.request, requires: [missing] };
+    const transport = new ProcessTransport(undefined, f.config);
+    remoteResult(f);
+    const marker = path.join(os.homedir(), ".config", "smarty", "bash-guard.disabled");
+    for (const step of ["alpha", "strict", "file", "restored", "other"] as const) {
+      vi.stubEnv("SMARTY_ALPHA", step === "alpha" ? "1" : step === "other" ? "other" : "0");
+      if (step === "file") { fs.mkdirSync(path.dirname(marker), { recursive: true }); fs.writeFileSync(marker, ""); }
+      if (step === "restored") fs.unlinkSync(marker);
+      if (step === "strict" || step === "restored") {
+        await expect(transport.launch(request)).rejects.toMatchObject({ field: "placement", launchOutcome: "unlaunched" });
+      } else {
+        const handle = await transport.launch(request);
+        expect(await handle.isAlive()).toBe(false);
+        expect(fs.readFileSync(f.launchArgv, "utf8").split("\0").slice(0, -1)).toEqual([
+          "--host", "worker-a", "--cwd", f.cwd, "--require", missing, "--", "task",
+        ]);
+      }
+    }
+    expect(fs.readFileSync(f.admissionCalls, "utf8")).toBe("admit\nadmit\n");
+    expect(fs.readFileSync(f.launchCalls, "utf8")).toBe("called\ncalled\ncalled\n");
+    expect(fs.readFileSync(f.pickerCalls, "utf8")).toBe("called\n".repeat(5));
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
+    expect(fs.existsSync(local.marker)).toBe(false);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("reads the current process mode rather than the supplied launcher environment snapshot", async () => {
+    const f = fixture({ candidates: ["worker-a"], denied: "fixture input denied" });
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    const prepared = await preflightFleetPlacement(f.request(), f.config, f.config.command, "task", { ...f.env, SMARTY_ALPHA: "0" });
+    expect(prepared?.host).toBe("worker-a");
+    expect(fs.existsSync(f.admissionCalls)).toBe(false);
+    vi.stubEnv("SMARTY_ALPHA", "0");
+    await expect(preflightFleetPlacement(f.request(), f.config, f.config.command, "task", { ...f.env, SMARTY_ALPHA: "1" })).rejects.toThrow("fixture input denied");
+    expect(fs.readFileSync(f.admissionCalls, "utf8")).toBe("admit\n");
+    expect(fs.existsSync(f.sshCalls)).toBe(false);
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+  });
+
+  it.each([
+    { kind: "denied", denied: "fixture home input denied", message: "fixture home input denied", ssh: false },
+    { kind: "needs", needs: "corpus", message: "needs corpus", ssh: false },
+    { kind: "probe", probeExit: 3, message: "Read-only SSH preflight failed", ssh: true },
+    { kind: "missing", message: "missing path", ssh: true },
+  ])("strict zero retains $kind input refusal before any launcher or local spawn", async options => {
+    const f = fixture({ ...options, candidates: ["worker-a"], executeRemote: true });
+    const local = localWorkerRequest(f);
+    const start = vi.spyOn(processUtils, "spawnDetached");
+    const homeInput = path.join(os.homedir(), ".local", "share", "strict-input.txt");
+    fs.mkdirSync(path.dirname(homeInput), { recursive: true }); fs.writeFileSync(homeInput, "fixture");
+    const request = { ...local.request, requires: [...f.request().requires!, homeInput] };
+    const pending = new ProcessTransport(undefined, f.config).launch(request);
+    await expect(pending).rejects.toBeInstanceOf(options.kind === "missing" ? RequiredInputMissingError : AgentInputError);
+    await expect(pending).rejects.toMatchObject({ launchOutcome: "unlaunched" });
+    await expect(pending).rejects.toThrow(options.message);
+    expect(fs.readFileSync(f.admissionCalls, "utf8")).toBe(options.ssh ? "admit\nprobe\n" : "admit\n");
+    expect(fs.existsSync(f.sshCalls)).toBe(options.ssh);
+    expect(fs.existsSync(f.launchCalls)).toBe(false);
+    expect(fs.existsSync(local.marker)).toBe(false);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancelled", "deadline"] as const)("alpha still refuses %s after host selection without probing or launching", async reason => {
+    const f = fixture({ candidates: ["worker-a"] });
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    const controller = new AbortController();
+    if (reason === "cancelled") controller.abort();
+    await expect(preflightFleetPlacement({ ...f.request(), signal: controller.signal }, f.config, f.config.command, "task", f.env,
+      reason === "deadline" ? Date.now() - 1 : undefined, "worker-a")).rejects.toThrow("Preflight cancelled or deadline expired");
+    for (const file of [f.admissionCalls, f.sshCalls, f.launchCalls, f.pickerCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("alpha preserves a preselected host and adds a missing host pin without rerunning the picker", async () => {
+    const f = fixture({ candidates: [] });
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    const command = [f.config.command[0]!, "--cwd", f.cwd, "--", "task"];
+    const prepared = await preflightFleetPlacement(f.request(), f.config, command, "task", f.env, undefined, "worker-a");
+    expect(prepared).toEqual({ host: "worker-a", command: [command[0], "--cwd", f.cwd, "--host", "worker-a", "--", "task"], environment: f.env });
+    expect(command).toEqual([f.config.command[0], "--cwd", f.cwd, "--", "task"]);
+    for (const file of [f.admissionCalls, f.sshCalls, f.launchCalls, f.pickerCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("alpha keeps picker eligibility and trusted host aliases in force", async () => {
+    const f = fixture({ candidates: ["worker-a"] });
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    const command = [...f.config.command]; command[command.indexOf("--host") + 1] = "worker-b";
+    await expect(preflightFleetPlacement(f.request(), f.config, command, "task", f.env)).rejects.toThrow("not picker-eligible");
+    await expect(preflightFleetPlacement(f.request(), { ...f.config, sshAliases: {} }, f.config.command, "task", f.env, undefined, "worker-a")).rejects.toThrow("trusted placement sshAliases");
+    for (const file of [f.admissionCalls, f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
+  });
+
   it("pins an automatic launch to the first actually eligible picker result", async () => {
     const f = fixture({ candidates: ["intel1", "ryzen2"] });
     const result = await preflightFleetPlacement(f.request(), f.config, f.config.command, "task", f.env);

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
@@ -61,8 +61,10 @@ type Report = { inherited: string; exported: string | null; verdict: { block?: b
 
 const managers: AgentManager[] = [];
 const cleanups: string[] = [];
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
+  vi.unstubAllEnvs();
   for (const directory of cleanups.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
@@ -110,7 +112,7 @@ describe.skipIf(process.platform === "win32")("a child run's short TMPDIR under 
     const nested = path.join(run, "tmp");
     fs.mkdirSync(nested, { mode: 0o700 });
     const direct = spawnSync(process.execPath, [path.join(fixtures, "direct.mjs")], { encoding: "utf8", cwd,
-      env: { ...process.env, TMPDIR: nested, TMP: nested, TEMP: nested } });
+      env: { ...process.env, SMARTY_ALPHA: "0", TMPDIR: nested, TMP: nested, TEMP: nested } });
     expect(direct.status, direct.stderr).toBe(0);
     const old = JSON.parse(direct.stdout.trim().split("\n").at(-1)!) as Report;
     expect(old.verdict?.block).toBe(true);

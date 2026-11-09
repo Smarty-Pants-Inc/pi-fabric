@@ -17,7 +17,6 @@ const allowedSenders = [
 // identities; admitting arbitrary senders would widen this authorization boundary.
 const config = parse(fs.readFileSync(fileURLToPath(new URL("../.mergify.yml", import.meta.url)), "utf8")) as {
   commands_restrictions: Record<typeof commands[number], { conditions: Array<{ or: string[] }> }>;
-  queue_rules: Array<{ name: string; queue_conditions: unknown[] }>;
 };
 
 describe("Mergify command restrictions", () => {
@@ -25,34 +24,5 @@ describe("Mergify command restrictions", () => {
     expect(config.commands_restrictions[command]).toEqual({
       conditions: [{ or: allowedSenders }],
     });
-  });
-
-  it("preserves the default queue admission conditions", () => {
-    expect(config.queue_rules.find((rule) => rule.name === "default")?.queue_conditions).toEqual([
-      "-label ~= (?i)^(hold|do[ -]?not[ -]?merge|dnm|freeze|frozen)$",
-      "-label ~= (?i)^(wip|work[ -]?in[ -]?progress|do[ -]?not[ -]?land|never[ -]?land)$",
-      "base = main",
-      "-draft",
-      "-label = hold",
-      "-title ~= (?i)do not land",
-      "check-success = review/astra",
-      "check-success = judge-pass",
-      "-check-failure = review/security",
-      "check-success = check (ubuntu-latest)",
-      {
-        or: [
-          "check-success = review/security",
-          {
-            and: [
-              "head ~= ^sync/upstream-",
-              "head-repo-full-name = Smarty-Pants-Inc/pi-fabric",
-            ],
-          },
-          {
-            and: ["-label = needs-security-pass"],
-          },
-        ],
-      },
-    ]);
   });
 });

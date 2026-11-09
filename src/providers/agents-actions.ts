@@ -288,7 +288,7 @@ const waitSchema = {
   type: "object",
   properties: {
     id: { type: "string" },
-    timeoutMs: { type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min: a foreground wait over the bash guard's limit blocks steers (smarty-dev#854). In an interactive Main, clamped to 60 s, and the bound returns the live status with waitTimedOut: true (smarty-dev#2119)` },
+    timeoutMs: { type: "number", minimum: 1_000, description: `Observation timeout in milliseconds. Non-Main waits default to ${AGENT_WAIT_MAX_MS / 60_000} min. With alpha enabled, explicit non-Main waits may exceed 5 min; bound expiry returns live status (waitTimedOut: true). With alpha disabled, non-Main waits are capped at 5 min and expiry throws. Alpha defaults ON when SMARTY_ALPHA is unset; disabled only with exact SMARTY_ALPHA=0 and no ~/.config/smarty/bash-guard.disabled marker; the marker overrides 0. Interactive native Main retains its 60 s bound and execution-deadline reserve in both modes, returning live status (waitTimedOut: true). At the observation bound the child keeps running and its result remains pending. Caller cancellation and execution deadlines remain active. Only a terminal result is consumed, acknowledging completion and suppressing its notification; a pending return does not acknowledge completion or suppress its notification.` },
   },
   required: ["id"],
   additionalProperties: false,
@@ -344,14 +344,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "wait",
-    description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification. Bounded by timeoutMs (default and at most 5 min): a child still running then keeps running, the wait throws, and its result arrives as a completion message after the turn",
+    description: "Wait for a previously spawned child agent. Non-Main waits default to 5 min. With alpha enabled, explicit non-Main waits may exceed 5 min; bound expiry returns live status (waitTimedOut: true). With alpha disabled, non-Main waits are capped at 5 min and expiry throws. Alpha defaults ON when SMARTY_ALPHA is unset; disabled only with exact SMARTY_ALPHA=0 and no ~/.config/smarty/bash-guard.disabled marker; the marker overrides 0. Interactive native Main retains its 60 s bound and execution-deadline reserve in both modes, returning live status (waitTimedOut: true). At the observation bound the child keeps running and its result remains pending. Caller cancellation and execution deadlines remain active. Only a terminal result is consumed, acknowledging completion and suppressing its notification; a pending return does not acknowledge completion or suppress its notification.",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: waitSchema,
     risk: "read",
   },
   {
     name: "join",
-    description: "Alias for agents.wait: wait for a previously spawned child agent with the same bound, progress and completion-notification behavior",
+    description: "Alias for agents.wait: wait for a previously spawned child agent. Non-Main waits default to 5 min. With alpha enabled, explicit non-Main waits may exceed 5 min; bound expiry returns live status (waitTimedOut: true). With alpha disabled, non-Main waits are capped at 5 min and expiry throws. Alpha defaults ON when SMARTY_ALPHA is unset; disabled only with exact SMARTY_ALPHA=0 and no ~/.config/smarty/bash-guard.disabled marker; the marker overrides 0. Interactive native Main retains its 60 s bound and execution-deadline reserve in both modes, returning live status (waitTimedOut: true). At the observation bound the child keeps running and its result remains pending. Caller cancellation and execution deadlines remain active. Only a terminal result is consumed, acknowledging completion and suppressing its notification; a pending return does not acknowledge completion or suppress its notification.",
     effect: { kind: "emission", ordering: "commutative", resources: ["agents.completions"] },
     inputSchema: waitSchema,
     risk: "read",

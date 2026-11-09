@@ -34,7 +34,11 @@ export function agentServiceDescriptors(capabilities: AgentServiceCapabilities =
   const descriptors: FabricActionDescriptor[] = [
     {...run, description: "Run one host-authorized Pi child and wait for its result or pause", inputSchema: runSchema},
     {...native("spawn"), description: "Admit one host-authorized Pi child, or residency durable for an independent host worker", inputSchema: spawnSchema},
-    ...["wait", "join"].map((name) => ({...native(name), inputSchema: object({id, timeoutMs: {type: "number", minimum: 1_000, description: `Clamped to ${AGENT_WAIT_MAX_MS / 60_000} min`}}, ["id"])})),
+    ...["wait", "join"].map((name) => ({
+      ...native(name),
+      description: `${name === "join" ? "Alias for agents.wait: " : ""}Wait for a host-authorized child. Hosted waits default to 5 min. With alpha enabled, explicit waits may exceed 5 min; bound expiry returns live status. With alpha disabled, waits are capped at 5 min and expiry throws. Alpha defaults ON when SMARTY_ALPHA is unset; disabled only with exact SMARTY_ALPHA=0 and no ~/.config/smarty/bash-guard.disabled marker; the marker overrides 0. Hosted calls do not infer an interactive Main or apply its 60 s cap. At the observation bound the child keeps running and its result remains pending. Caller cancellation and execution deadlines remain active. Only a terminal result is consumed; a pending return does not consume a result.`,
+      inputSchema: object({id, timeoutMs: {type: "number", minimum: 1_000, description: `Observation timeout in milliseconds. Hosted waits default to ${AGENT_WAIT_MAX_MS / 60_000} min. With alpha enabled, explicit waits may exceed 5 min; bound expiry returns live status. With alpha disabled, waits are capped at 5 min and expiry throws. Alpha defaults ON when SMARTY_ALPHA is unset; disabled only with exact SMARTY_ALPHA=0 and no ~/.config/smarty/bash-guard.disabled marker; the marker overrides 0. Hosted calls do not infer an interactive Main or apply its 60 s cap. At the observation bound the child keeps running and its result remains pending. Caller cancellation and execution deadlines remain active. Only a terminal result is consumed; a pending return does not consume a result.`}}, ["id"]),
+    })),
     ...["status", "stop"].map((name) => ({...native(name), inputSchema: object({id}, ["id"])})),
     {...native("list"), description: "List only the authenticated caller's direct children", inputSchema: object({})},
   ];

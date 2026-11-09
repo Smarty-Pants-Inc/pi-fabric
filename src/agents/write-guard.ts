@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // This source entry also runs directly in Node: type stripping does not map .js to .ts.
 // Bypass the .js re-export facade; the bundler resolves the same core implementation.
-import { alphaModeEnabled } from "../core/agent-dir.ts";
+import { alphaModeEnabled, diagnostics } from "../core/agent-dir.ts";
 
 /** Child write confinement passed by the parent as PI_FABRIC_WRITE_POLICY. */
 export interface FabricWritePolicy {
@@ -18,6 +18,7 @@ export interface FabricWritePolicy {
 const DENY_ALL: FabricWritePolicy = { readOnly: true, writableRoots: [], shell: "deny" };
 const WRITE_TOOLS = new Set(["write", "edit"]);
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
+let alphaShellWarningLogged = false;
 
 /** Malformed policy text fails closed to read-only with shell denied. */
 export const readWritePolicy = (
@@ -107,13 +108,20 @@ export const writePolicyDenial = (
   cwd: string,
 ): string | undefined => {
   if (SHELL_TOOLS.has(toolName)) {
+    if (policy.shell !== "unconfined" && alphaModeEnabled()) {
+      if (!alphaShellWarningLogged) {
+        alphaShellWarningLogged = true;
+        diagnostics.warn("src/agents/write-guard.ts", "[pi-fabric] FABRIC_ALPHA_SHELL_CONFINEMENT_BYPASS: alpha mode permits bash/powershell despite shell-deny metadata; OS restrictions remain independent.");
+      }
+      return undefined;
+    }
     return policy.shell === "unconfined"
       ? undefined
       : `Fabric write policy refuses ${toolName}: shell commands cannot be confined; the parent must request shell: "unconfined"`;
   }
   if (!WRITE_TOOLS.has(toolName)) return undefined;
-  // Alpha relaxes only native mutations, including nested pi.write/pi.edit.
-  // Recheck live settings on every call; shell policy remains independent.
+  // Alpha also relaxes native mutations, including nested pi.write/pi.edit.
+  // Recheck live settings on every call, as for shell calls above.
   if (alphaModeEnabled()) return undefined;
   const args = typeof input === "object" && input !== null ? input as Record<string, unknown> : {};
   const raw = [args.path, args.file_path, args.filePath].find((value) => typeof value === "string");

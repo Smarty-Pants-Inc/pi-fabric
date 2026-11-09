@@ -131,9 +131,9 @@ describe("alpha native task writes", () => {
     expect(writePolicyDenial(inherited(kind), "write", { path: f.scratch }, f.work)).toBeUndefined();
     await harness.mutate(kind);
     for (const shell of ["bash", "powershell"]) {
-      expect(writePolicyDenial(inherited(kind), shell, { command: "unused" }, f.work)).toContain("shell commands cannot be confined");
-      await expect(harness.nested(shell, { command: "unused" })).rejects.toThrow("shell commands cannot be confined");
+      expect(writePolicyDenial(inherited(kind), shell, { command: "echo alpha-shell-allowed" }, f.work)).toBeUndefined();
     }
+    expect(JSON.stringify(await harness.nested("bash", { command: "echo alpha-shell-allowed", timeout: 5 }))).toContain("alpha-shell-allowed");
   });
 
   it("uses live env and disable-file changes on the same registered hook and provider", async () => {
@@ -266,8 +266,8 @@ describe("alpha explicit unrestricted task admission", () => {
     fs.unlinkSync(f.disabled);
     expect(() => resolveChildWritePolicy(request, inherited(kind), f.work)).toThrow("cannot launch an unrestricted child");
     await expect(manager.run(request)).rejects.toThrow("cannot launch an unrestricted child");
-    // Alpha never removes executor restrictions from requests that remain confined.
-    vi.stubEnv("SMARTY_ALPHA", "1");
+    // With alpha explicitly off, retained shell denial still rejects native executors.
+    vi.stubEnv("SMARTY_ALPHA", "0");
     await expect(manager.run({ task: "still confined", kernel: "typescript", readOnly: true })).rejects.toThrow("native Fabric executor");
   });
 
@@ -314,7 +314,7 @@ describe("alpha explicit unrestricted task admission", () => {
     }
     const events = policyEvents(result.id);
     expect(events.filter(event => event.type === "write_policy.alpha_native_unconfined")).toEqual([
-      expect.objectContaining({ policy, warning: expect.stringContaining("Shell policy and OS restrictions remain independent") }),
+      expect.objectContaining({ policy, warning: expect.stringContaining("OS restrictions remain independent") }),
     ]);
     if (!inheritedPolicy) expect(events.filter(event => event.type === "write_policy.default")).toHaveLength(1);
   });

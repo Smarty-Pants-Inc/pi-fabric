@@ -83,7 +83,7 @@ it.each(["file", "sqlite"] as const)("16 real %s-state contenders preserve CAS c
     const reports = Array.from({ length: 16 }, (_, index) => {
       const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", CHILD,
         pathToFileURL(module).href, root, stateBackend, "writer-" + index], { stdio: ["pipe", "pipe", "pipe"], timeout: 45000,
-        env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: stateBackend, PI_FABRIC_LOCK_STATS: "1", PI_CODING_AGENT_DIR: scratch } });
+        env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: stateBackend, PI_FABRIC_LOCK_STATS: "1", PI_CODING_AGENT_DIR: scratch, SMARTY_ALPHA: "0" } });
       children.push(child);
       let stdout = "", stderr = "";
       ready.push(new Promise<void>((resolve, reject) => {
@@ -177,7 +177,7 @@ it("FILE FIFO real 1s regression: 20 processes each commit 100 exclusive acquisi
     const reports = Array.from({ length: 20 }, (_, index) => {
       const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", FILE_FIFO_REAL_1S_CHILD,
         pathToFileURL(module).href, root, "writer-" + index], { stdio: ["pipe", "pipe", "pipe"], timeout: 45000, killSignal: "SIGKILL",
-        env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "file", PI_CODING_AGENT_DIR: scratch } });
+        env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "file", PI_CODING_AGENT_DIR: scratch, SMARTY_ALPHA: "0" } });
       children.push(child);
       let stdout = "", stderr = "";
       ready.push(new Promise<number>((resolve, reject) => {

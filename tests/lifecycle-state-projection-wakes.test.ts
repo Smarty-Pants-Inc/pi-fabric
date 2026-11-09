@@ -230,7 +230,7 @@ process.stdout.write("committed\\n");
 const runChild = (root: string, key: string, value: unknown): Promise<{ code: number | null; stdout: string; stderr: string }> =>
   new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", SQLITE_CHILD, root, key, JSON.stringify(value)],
-      { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+      { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "", SMARTY_ALPHA: "0" } });
     let stdout = ""; let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });

@@ -171,4 +171,60 @@ describe("prepareFabricExecArguments", () => {
       expect(() => resolveFabricExecPayloads({ payloads: { body: "__READ__" } })).toThrow(/"body"/);
     });
   });
+
+  describe("rejects exact see-file payloads", () => {
+    const phrases = [
+      "see file",
+      "see the file",
+      "see attached",
+      "see attachment",
+      "attached",
+      "file attached",
+      "see above file",
+      "in file",
+    ] as const;
+    const mixedCase = (value: string) =>
+      value.split("").map((character, index) => index % 2 === 0
+        ? character.toUpperCase()
+        : character.toLowerCase()).join("");
+    const literal = "payloads are literal: read the file with a native tool first and pass its content";
+
+    it.each(phrases)("rejects whole-value %j after trimming only surrounding punctuation/whitespace", (phrase) => {
+      const variants = [phrase, mixedCase(phrase), `“${mixedCase(phrase)}”`, ` \t[${mixedCase(phrase)}]!?\r\n`];
+      for (const value of variants) {
+        const payloads = { keep: "unchanged", body: value };
+        const forms: Array<{ code: string; payloads?: unknown; strings?: unknown }> = [
+          { code: "return π.body;", payloads },
+          { code: "return π.body;", payloads: JSON.stringify(payloads) },
+          { code: "return π.body;", strings: payloads },
+          { code: "return π.body;", strings: JSON.stringify(payloads) },
+        ];
+        for (const form of forms) {
+          expect(() => prepareFabricExecArguments(form)).toThrow(literal);
+          expect(() => prepareFabricExecArguments(form)).toThrow(/"body"/);
+          expect(() => prepareFabricExecArguments(form, "python")).toThrow(literal);
+          expect(() => resolveFabricExecPayloads(form)).toThrow(literal);
+          expect(() => resolveFabricExecPayloads(form)).toThrow(/"body"/);
+        }
+      }
+    });
+
+    it.each(phrases)("preserves ordinary prose containing %j and does not normalize its interior", (phrase) => {
+      const punctuated = phrase.includes(" ") ? phrase.replace(" ", ",") : phrase;
+      const extraInteriorSpace = phrase.includes(" ") ? phrase.replace(" ", "  ") : phrase;
+      const values = [
+        `Context before “${phrase}”`,
+        `“${phrase}” appears in this sentence`,
+        ...(phrase.includes(" ") ? [punctuated, extraInteriorSpace] : []),
+        `The words “${punctuated}” are discussed here`,
+        `The words “${extraInteriorSpace}” are discussed here`,
+      ];
+      for (const value of values) {
+        const payloads = { body: value };
+        const input = { code: "return π.body;", payloads };
+        expect(prepareFabricExecArguments(input)).toBe(input);
+        expect(resolveFabricExecPayloads({ payloads })).toBe(payloads);
+      }
+    });
+  });
 });

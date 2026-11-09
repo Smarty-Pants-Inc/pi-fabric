@@ -59,10 +59,26 @@ const PAYLOAD_FILE_REFERENCE = /^(?:@\/|file:\/\/)\S*$/;
 const PAYLOADS_LITERAL_ERROR =
   "payloads are literal: read the file with a native tool first and pass its content";
 
-// Exact whole-value contract: no trimming, so padded or multi-line values are
-// ordinary text and pass through unchanged.
-const isPayloadPlaceholder = (value: string): boolean =>
-  value === "PLACEHOLDER" || PAYLOAD_PLACEHOLDER.test(value) || PAYLOAD_FILE_REFERENCE.test(value);
+// Legacy placeholder tokens and file references remain exact and untrimmed, so
+// padded or multi-line forms keep their existing behavior. Only the added
+// see-file stubs ignore surrounding whitespace and Unicode punctuation; symbols
+// and every interior character remain significant.
+const SEE_FILE_PAYLOAD_STUBS = new Set([
+  "see file",
+  "see the file",
+  "see attached",
+  "see attachment",
+  "attached",
+  "file attached",
+  "see above file",
+  "in file",
+]);
+
+const isPayloadPlaceholder = (value: string): boolean => {
+  if (value === "PLACEHOLDER" || PAYLOAD_PLACEHOLDER.test(value) || PAYLOAD_FILE_REFERENCE.test(value)) return true;
+  const stub = value.replace(/^[\s\p{P}]+|[\s\p{P}]+$/gu, "").toLowerCase();
+  return SEE_FILE_PAYLOAD_STUBS.has(stub);
+};
 
 const assertLiteralPayloads = (payloads: Record<string, string>): Record<string, string> => {
   for (const [key, value] of Object.entries(payloads)) {

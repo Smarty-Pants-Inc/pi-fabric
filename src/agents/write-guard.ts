@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+// This source entry also runs directly in Node: type stripping does not map .js to .ts.
+// Bypass the .js re-export facade; the bundler resolves the same core implementation.
+import { alphaModeEnabled } from "../core/agent-dir.ts";
 
 /** Child write confinement passed by the parent as PI_FABRIC_WRITE_POLICY. */
 export interface FabricWritePolicy {
@@ -109,6 +112,9 @@ export const writePolicyDenial = (
       : `Fabric write policy refuses ${toolName}: shell commands cannot be confined; the parent must request shell: "unconfined"`;
   }
   if (!WRITE_TOOLS.has(toolName)) return undefined;
+  // Alpha relaxes only native mutations, including nested pi.write/pi.edit.
+  // Recheck live settings on every call; shell policy remains independent.
+  if (alphaModeEnabled()) return undefined;
   const args = typeof input === "object" && input !== null ? input as Record<string, unknown> : {};
   const raw = [args.path, args.file_path, args.filePath].find((value) => typeof value === "string");
   // An unconfined shell can already write the bootstrap scratch; this lets write/edit reach it too (smarty-dev#15856).

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
@@ -19,6 +19,13 @@ import { liveAgentPlacement, probeAgentPlacement } from "../src/agents/placement
 import type { InheritedSessionPin } from "../src/agents/session-pins.js";
 
 const roots: string[] = [], managers: AgentManager[] = [];
+beforeEach(() => {
+  // Existing placement failures remain strict, independent of the invoking shell or user marker.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-placement-home-")); roots.push(home);
+  vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+  vi.spyOn(os, "homedir").mockReturnValue(home);
+  vi.stubEnv("SMARTY_ALPHA", "0");
+});
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.restoreAllMocks();
@@ -437,7 +444,8 @@ describe("host process task placement", () => {
     const record=JSON.parse(fs.readFileSync(path.join(f.root,"direct/status.json"),"utf8"));
     expect(record.status).toBe("timed_out"); expect(h.lostContact?.()).toContain("exit unconfirmed");
   });
-  it("does not launch or audit remote work when final authority is revoked", async () => {
+  it.each(["0", "1"])("alpha=%s does not launch or audit remote work when final authority is revoked", async mode => {
+    vi.stubEnv("SMARTY_ALPHA", mode);
     const f=fixture(); const req=launch(f,"x"); req.authorize=()=>false;
     await expect(new ProcessTransport(undefined,f.config.placement).launch(req)).rejects.toThrow("authorized");
     expect(fs.existsSync(f.results)).toBe(false);
@@ -450,7 +458,8 @@ describe("host process task placement", () => {
     expect(events.filter(line=>line.type==="placement.local")).toEqual([expect.objectContaining({reason:expect.stringContaining("placement-probe-failed:")})]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
-  it("does not invent a local retry when an executable disappears after a successful startup probe", async () => {
+  it.each(["0", "1"])("alpha=%s does not invent a local retry when an executable disappears after a successful startup probe", async mode => {
+    vi.stubEnv("SMARTY_ALPHA", mode);
     const f=fixture(); const launcher=path.join(f.root,process.platform==="win32"?"removed.exe":"removed");
     fs.writeFileSync(launcher,"never execute",{mode:0o700}); f.config.placement.command=[launcher,"{id}"];
     expect(probeAgentPlacement(f.config.placement,f.root).reason).toBeUndefined(); fs.unlinkSync(launcher);
@@ -540,7 +549,8 @@ describe("host process task placement", () => {
     }
     expect(fs.existsSync(f.results)).toBe(false);
   });
-  it("retains unknown remote exit debt rather than claiming cancellation proves exit", async () => {
+  it.each(["0", "1"])("alpha=%s retains unknown remote exit debt rather than claiming cancellation proves exit", async mode => {
+    vi.stubEnv("SMARTY_ALPHA", mode);
     const f=fixture(); f.config.placement.cancelCommand=[process.execPath,f.launcher,"unconfirmed",f.results,"{id}"];
     const req=launch(f,"pending"); const h=await new ProcessTransport(undefined,f.config.placement).launch(req);
     await h.stop();
@@ -549,7 +559,8 @@ describe("host process task placement", () => {
     expect(await h.isAlive()).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(f.root,"direct/status.json"),"utf8")).status).toBe("stopped");
   });
-  it("surfaces the documented target --require refusal as a typed missing-input error", async () => {
+  it.each(["0", "1"])("alpha=%s surfaces the launcher's target --require refusal as a typed missing-input error", async mode => {
+    vi.stubEnv("SMARTY_ALPHA", mode);
     const f = fixture();
     const missing = path.join(f.root, "target-only", "missing");
     const req = launch(f, "require-refused"); req.requires = [missing];
@@ -560,7 +571,8 @@ describe("host process task placement", () => {
     });
     expect(fs.existsSync(path.join(f.root, "direct", "status.json"))).toBe(false);
   });
-  it.each(["reject","malformed"])("reports %s launch uncertainty, no local fallback", async task => {
+  it.each(["0", "1"].flatMap(mode => ["reject", "malformed"].map(task => ({ mode, task }))))("alpha=$mode reports $task launch uncertainty, no local fallback", async ({ mode, task }) => {
+    vi.stubEnv("SMARTY_ALPHA", mode);
     const f=fixture(); const result=await f.manager.run({task,transport:"process"});
     expect(result.status).toBe("failed"); expect(result.error).toContain("unknown");
     expect(fs.existsSync(path.join(f.manager.runDirectory(result.id)!,"unresolved-worker.json"))).toBe(true);

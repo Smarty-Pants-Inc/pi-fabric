@@ -33,6 +33,7 @@ const trustedExceptionFixturePaths = new Set<string>();
 const realAdmitModelException = AgentManager.prototype.admitModelException;
 let restoreAdmissionFixture: (() => void) | undefined;
 beforeEach(() => {
+  vi.stubEnv("SMARTY_ALPHA", "0");
   trustedExceptionFixturePaths.clear();
   const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
     const file = this.config.modelExceptionsPath;

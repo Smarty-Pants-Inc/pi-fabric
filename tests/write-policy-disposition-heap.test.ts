@@ -60,7 +60,7 @@ const probe = async (variant: "negative" | "fixed"): Promise<Receipt> => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), ROOT_PREFIX));
   try {
     const result = await execute("node", ["--expose-gc", "--max-old-space-size=4096", "--input-type=module", "-e", childProgram,
-      root, variant, FIXED, UNSAFE], { cwd: process.cwd(), timeout: 90_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
+      root, variant, FIXED, UNSAFE], { cwd: process.cwd(), env: { ...process.env, SMARTY_ALPHA: "0" }, timeout: 90_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
     // Receipts precede assertions, including the intentionally leaking control.
     process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);

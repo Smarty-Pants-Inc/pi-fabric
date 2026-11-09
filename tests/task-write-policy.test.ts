@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { checkWritePolicyRequest, resolveChildWritePolicy } from "../src/agents/child-env.js";
 import { completionRecipientFromRun } from "../src/agents/completion-journal.js";
@@ -20,6 +20,8 @@ import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-
 
 // All fixtures are below this test's own TMPDIR. Retention uses recorded deletions locally (#11199).
 const managers: AgentManager[] = [];
+// Legacy enforcement coverage; fleet isolation supplies a private home without a disable marker.
+beforeEach(() => { vi.stubEnv("SMARTY_ALPHA", "0"); });
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
@@ -36,6 +38,7 @@ const fixture = (placement = false, overlap?: "option" | "environment" | "equal"
   // The launch fixture uses the production guard and records real allowed writes/refused attempts.
   fs.writeFileSync(worker, `import fs from 'node:fs'; import path from 'node:path';
 import { readWritePolicy, writePolicyDenial } from ${JSON.stringify(pathToFileURL(path.resolve("src/agents/write-guard.ts")).href)};
+process.env.SMARTY_ALPHA = '0';
 const args = new Map(); for (let i=2;i<process.argv.length;i+=2) args.set(process.argv[i],process.argv[i+1]);
 const policy = readWritePolicy(args.get('--write-policy'));
 const cwd = args.get('--cwd'), tmpdir = args.get('--tmpdir');
@@ -361,7 +364,7 @@ describe("local process task write default", () => {
     const proof = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
       "--workspace", f.cwd, "--evidence-dir", evidence,
       "--pi-binary", path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js")], {
-      encoding: "utf8", timeout: 210_000, env: { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp },
+      encoding: "utf8", timeout: 210_000, env: { ...process.env, SMARTY_ALPHA: "0", TMPDIR: tmp, TMP: tmp, TEMP: tmp },
     });
     expect(proof.status, proof.stderr).toBe(0);
     expect(JSON.parse(fs.readFileSync(path.join(evidence, "summary.json"), "utf8"))).toMatchObject({ passed: true, parentNativeExit: 0 });
@@ -379,7 +382,7 @@ describe("local process task write default", () => {
     if (location === "ancestor") fs.mkdirSync(path.join(destination, "nested"));
     const evidence = path.join(parent, "proof");
     const processResult = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
-      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8" });
+      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8", env: { ...process.env, SMARTY_ALPHA: "0" } });
     expect(processResult.status).not.toBe(0);
     expect(processResult.stderr).toContain("Evidence path must not contain symlinked components");
     expect(fs.existsSync(evidence)).toBe(false);
@@ -405,7 +408,7 @@ fs.openSync = function(file, ...args) {
 process.stderr.write('first artifact\\n'); setTimeout(() => process.stderr.write('second artifact\\n'), 100);`);
     const processResult = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
       "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", native], {
-      encoding: "utf8", timeout: 25_000, env: { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}` },
+      encoding: "utf8", timeout: 25_000, env: { ...process.env, SMARTY_ALPHA: "0", NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}` },
     });
     expect(processResult.status).toBe(1);
     expect(processResult.stderr).toContain("Evidence path changed after creation");
@@ -418,7 +421,7 @@ process.stderr.write('first artifact\\n'); setTimeout(() => process.stderr.write
     const f = fixture();
     const evidence = path.join(f.root, "proof");
     const processResult = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
-      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8" });
+      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", process.execPath], { encoding: "utf8", env: { ...process.env, SMARTY_ALPHA: "0" } });
     expect(processResult.status).not.toBe(0);
     expect(processResult.stderr).toContain("Evidence writes must be inside the assigned worktree");
     expect(fs.existsSync(evidence)).toBe(false);

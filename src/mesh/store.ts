@@ -1141,6 +1141,9 @@ export class MeshStore {
     try { return await operation(); } finally { release(); }
   }
 
+  /** The configured default mesh acquisition timeout. */
+  get lockTimeoutMs(): number { return this.#lock.lockTimeoutMs; }
+
   /** The active withTryLock budget in this async context, if any. */
   get tryLockBudgetMs(): number | undefined {
     const scope = this.#lock.tryLockScope.getStore();

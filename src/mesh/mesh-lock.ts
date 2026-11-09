@@ -462,6 +462,13 @@ export class MeshLock {
       initial.expiresAt = performance.now() + 2 * waitMs;
     }
     const { ticket, deadline } = admission;
+    // Fresh-ticket setup (including native identity preparation and ticket creation) precedes
+    // the relative budget; retained tickets keep their original deadline. Split request-to-custody
+    // time through the existing phase recorder only;
+    // the aggregate wait/hold counters below keep their original boundaries.
+    const admissionReadyAt = lockStats ? performance.now() : 0;
+    let canonicalWaitAt = -1;
+    let waitEndedAt = -1;
     let retain = false;
     let operationEntered = false;
     let operationFailure: { error: unknown } | undefined;
@@ -493,7 +500,13 @@ export class MeshLock {
         await pending;
         waited = true;
       };
+      const queueExpired = (): MeshLockQueueExpiredError => {
+        // Refusal bookkeeping closes the ticket and may append an event. Neither is admission wait.
+        if (lockStats) waitEndedAt = performance.now();
+        return admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+      };
       const timeout = (): MeshLockTimeoutError => {
+        if (lockStats && lockHeldAt < 0 && waitEndedAt < 0) waitEndedAt = performance.now();
         // Keep a foreign-holder refusal typed even when the deadline is crossed during a wait.
         if (blocked.verdict) {
           const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
@@ -508,7 +521,7 @@ export class MeshLock {
         const mayContend = ticket.mayContend();
         if (retainedTiming && !lifetime?.admission?.ticket.queued) finishRetainedOffLock(retainedTiming);
         if (initial && (performance.now() > initial.expiresAt! || Date.now() > deadline)) {
-          if (!mayContend || (attempts === 0 && ticket.queued)) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          if (!mayContend || (attempts === 0 && ticket.queued)) throw queueExpired();
           throw timeout();
         }
         if (!mayContend) {
@@ -519,15 +532,18 @@ export class MeshLock {
           }
           // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
           // retry code, but report this zero-acquisition refusal separately from real lock contention.
-          throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          throw queueExpired();
         }
         const attemptAt = Date.now();
         // Both waits can spend the budget in setup or resume late, even on a release signal.
         // Keep the initial eligible probe; once we have waited, timer expiry is not admission.
         if (waited && (waitSetupExpired || budgetSpent)) {
-          if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
+          if (attempts === 0 && ticket.queued) throw queueExpired();
           throw timeout();
         }
+        // Eligibility alone is not an attempt: an expired queued waiter above never enters
+        // canonical acquisition. Once entered, include all retries, stale checks and waits.
+        if (lockStats && canonicalWaitAt < 0) canonicalWaitAt = performance.now();
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
         attempts += 1;
         lastAttemptAt = attemptAt;
@@ -629,6 +645,7 @@ export class MeshLock {
         if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
+      if (lockStats && lockHeldAt < 0 && waitEndedAt < 0) waitEndedAt = performance.now();
       if (initial) {
         // A native release throw must not mask the certified fence refusal or its count.
         const fenceRefusal = operationFailure ? operationFailure.error : error;
@@ -659,6 +676,18 @@ export class MeshLock {
         if (initial) initial.consumed = true;
         ticket.close();
         if (initial && retainedTiming) finishRetainedOffLock(retainedTiming);
+      }
+      // Record after ordinary ticket cleanup (or the explicit retention decision), so bookkeeping
+      // does not postpone a normal follower's eligibility. These are wait durations in existing buckets, not
+      // additional lock holds. Untagged callers still expose the split, grouped by caller class.
+      if (lockStats) {
+        const operationName = timing?.operation ?? `mesh-lock-${lockClass.toLowerCase().replaceAll("/", "-")}`;
+        const endedAt = lockHeldAt >= 0 ? lockHeldAt : waitEndedAt;
+        const admissionEndedAt = canonicalWaitAt >= 0 ? canonicalWaitAt : endedAt;
+        lockStats.phase(this.root, lockClass, operationName, "mesh-lock-setup", Math.max(0, admissionReadyAt - lockWaitStart));
+        lockStats.phase(this.root, lockClass, operationName, "mesh-lock-admission", Math.max(0, admissionEndedAt - admissionReadyAt));
+        // No sample, rather than a zero-length sample, identifies zero canonical attempts.
+        if (canonicalWaitAt >= 0) lockStats.phase(this.root, lockClass, operationName, "mesh-lock-acquire", Math.max(0, endedAt - canonicalWaitAt));
       }
       // Recorded after the release attempt; only a confirmed release may retain advisory admission.
       if (holdMs >= 0) {

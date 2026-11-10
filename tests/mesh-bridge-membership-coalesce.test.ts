@@ -1,3 +1,4 @@
+// CONTROL for pi-fabric#1926 dequeue attribution (BASE 1c714721). Do not land.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";

@@ -8,17 +8,19 @@ import { afterEach, expect, it } from "vitest";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
-import { FAIRNESS_MAX_ATTEMPTS, fairnessAttemptLine, runFairnessAttempts } from "./fixtures/mesh-ingress-fairness-attempts.js";
+import { FAIRNESS_MAX_ATTEMPTS, fairnessAttemptLine, measureFairnessContention, realContentionPresent,
+  runFairnessAttempts, type CanonicalAcquisition, type FairnessContention } from "./fixtures/mesh-ingress-fairness-attempts.js";
 
 // Ingress starvation regression probe. The target is a real held toLocal publication through
 // MeshBridge -> StoreBridgeSide -> MeshStore -> EventLog, with real SQLite state.db.
 // Only the competing publishers use transact's real append capability to add a brief,
 // deterministic hold after each real event append while they own the canonical .lock.
 // No lock admission or publication result is stubbed.
-// A measured aggregate hold share outside 50–70% means the host did not produce the intended
-// contention, so that attempt decides nothing: it is reported as an invalid attempt, fully torn
-// down, and replaced by a fresh scenario, three attempts at most per test attempt. The first
-// scenario inside the band decides that test attempt; inherited CI runner retries may rerun the whole case.
+// Admission requires repeated actual canonical acquisitions with concurrent FIFO waiters during
+// the ingress observation window, not a hold-time percentage or configured publisher count.
+// Insufficient contention alone permits a fresh scenario (three at most); the first sufficiently
+// contended scenario decides. Hold share remains diagnostic. All other failures are final within
+// this controller; inherited CI runner retries may rerun the whole case.
 const TEST_LOCK_TIMEOUT_MS = 500;
 const EXPECTED_RETAINED_TOTAL_MS = TEST_LOCK_TIMEOUT_MS * 2;
 const CONTENDER_PROCESSES = 3;
@@ -36,7 +38,9 @@ const FORMER_CASE_BUDGET_MS = 30_000;
 const WORKER_PUBLICATIONS = CONTENDER_PROCESSES * PUBLISHERS_PER_PROCESS * CONCURRENT_PER_PUBLISHER * PUBLISHER_ROUNDS;
 
 const CONTENDER = `
-const { MeshStore } = await import(process.argv[1]);
+const { MeshStore, meshLockQueueDirectory } = await import(process.argv[1]);
+const fs = await import("node:fs");
+const path = await import("node:path");
 const [root, writer, recipient, lanesText, perBatchText, roundsText, holdText] = process.argv.slice(2);
 const lanes = Number(lanesText), perBatch = Number(perBatchText), rounds = Number(roundsText), holdMs = Number(holdText);
 const store = new MeshStore(root, 65536, 1000, { stateBackend: "sqlite", lockTimeoutMs: 5000 });
@@ -46,17 +50,24 @@ process.stdout.write("READY\\n");
 await gate;
 process.stdin.pause();
 const intervals = [];
+const queueDirectory = meshLockQueueDirectory(root);
 try {
   await Promise.all(Array.from({ length: lanes }, async (_, lane) => {
     const identity = { id: "contention:" + writer + ":" + lane, name: "contender-" + writer + "-" + lane, kind: "agent" };
     for (let round = 0; round < rounds; round++) {
       const pending = Array.from({ length: perBatch }, (_, index) => store.transact(append => {
         const began = process.hrtime.bigint();
+        // Read existing canonical admission metadata only: the holder retains its own receipt.
+        // This callback owns .lock; every other matching receipt is another pending acquirer.
+        const [ownerToken, ownerPid] = fs.readFileSync(path.join(root, ".lock", "owner"), "utf8").split("\\n");
+        if (Number(ownerPid) !== process.pid || !ownerToken) throw new Error("contender lacks canonical ownership");
+        const concurrentWaiters = fs.readdirSync(queueDirectory).filter(name =>
+          /^\\d{24}-\\d+-[a-f0-9-]+$/.test(name) && !name.endsWith("-" + ownerToken)).length;
         append({ topic: "fleet.work.hold", kind: "ask", from: identity, to: recipient,
           text: writer + ":" + lane + ":" + round + ":" + index });
         Atomics.wait(sleepCell, 0, 0, holdMs);
         const ended = process.hrtime.bigint();
-        intervals.push({ began: began.toString(), ended: ended.toString() });
+        intervals.push({ began: began.toString(), ended: ended.toString(), concurrentWaiters });
       }));
       await Promise.all(pending);
     }
@@ -93,10 +104,11 @@ type ChildState = {
   stdout: () => string;
   stderr: () => string;
 };
-type HoldInterval = { began: string; ended: string };
+type HoldInterval = CanonicalAcquisition;
 type ScenarioObservation = {
   result: Record<string, unknown>;
   heldPct: number;
+  contention: FairnessContention;
   progressAtMs: number | undefined;
   intervals: HoldInterval[];
   sqliteBusyBegins: number;
@@ -252,10 +264,10 @@ async function runScenario(): Promise<ScenarioObservation> {
 
   // All publishers open real SQLite-backed MeshStores and wait at a start barrier. Each of 12
   // concurrent publisher loops appends real events repeatedly, holding canonical .lock for 14 ms
-  // after each append. Their 168 finite operations yield roughly 2.4 s of lock holds in a 4 s
-  // measured scenario: the intended 50–70% aggregate share, with a >500 ms queue ahead at retries.
+  // after each append. Record actual acquisitions and other canonical FIFO receipts at each one;
+  // neither 168 configured operations nor a particular lock duty cycle proves real contention.
   const bundle = path.join(scratch, "contender.mjs");
-  buildSync({ stdin: { contents: 'export { MeshStore } from "./src/mesh/store.ts";', resolveDir: process.cwd() },
+  buildSync({ stdin: { contents: 'export { MeshStore } from "./src/mesh/store.ts"; export { meshLockQueueDirectory } from "./src/mesh/lock-queue.ts";', resolveDir: process.cwd() },
     bundle: true, platform: "node", format: "esm", outfile: bundle });
   const workerEnv = { ...process.env, PI_CODING_AGENT_DIR: scratch, PI_FABRIC_MESH_CHECKPOINT_LOG: "off", PI_FABRIC_LOCK_STATS: "0" };
   const contenderStates = Array.from({ length: CONTENDER_PROCESSES }, (_, index) => startChild(process.execPath,
@@ -369,6 +381,7 @@ async function runScenario(): Promise<ScenarioObservation> {
   const elapsedScenarioMs = performance.now() - scenarioStartedPerf;
   const intervals = workerOutcomes.flat();
   const measuredShare = holdShare(intervals, scenarioStartedAt, SCENARIO_WINDOW_MS);
+  const contention = measureFairnessContention(intervals, scenarioStartedAt, OBSERVATION_WINDOW_MS);
   const progressWithinWindow = progressAtMs !== undefined && progressAtMs <= OBSERVATION_WINDOW_MS;
   const result = {
     baseHead: "f872f5ed39f586bccacf774df3b32690944433b4",
@@ -380,6 +393,7 @@ async function runScenario(): Promise<ScenarioObservation> {
     contention: { processes: CONTENDER_PROCESSES, publisherLoops: CONTENDER_PROCESSES * PUBLISHERS_PER_PROCESS,
       realPublications: intervals.length, perAppendHoldMs: CONTENDER_HOLD_MS,
       measuredCanonicalLockHeldMs: measuredShare.heldMs, measuredAggregateHeldSharePct: measuredShare.heldPct,
+      ...contention, contentionWindowMs: OBSERVATION_WINDOW_MS,
       scenarioWindowMs: SCENARIO_WINDOW_MS, elapsedScenarioMs: +elapsedScenarioMs.toFixed(1) },
     sqlite: { initialRealWriterHeldUntilBusy: true, busyBeginRefusals: sqliteBusyBegins, intermittentCommittedWrites: sqliteWrites },
     ordinaryPublisherLatencyMs: { count: ordinaryResults.length, p50: +ordinaryP50.toFixed(1), max: +ordinaryMax.toFixed(1),
@@ -387,21 +401,22 @@ async function runScenario(): Promise<ScenarioObservation> {
       startedAtMs: +(ordinaryStarted - busyAt).toFixed(1) },
     bridgeBusyLogs: bridgeLogs.length,
   };
-  return { result, heldPct: measuredShare.heldPct, progressAtMs, intervals, sqliteBusyBegins, sqliteWrites,
+  return { result, heldPct: measuredShare.heldPct, contention, progressAtMs, intervals, sqliteBusyBegins, sqliteWrites,
     meshBridge: bridge, runner };
 }
 
-// Windows exceeds this fixture's 50–70% hold-share precondition; native calibration is not yet verified.
+// Windows native contention calibration is not yet verified; retain the existing platform skip.
 // The 90 s timeout is the WHOLE-CASE runner timeout: 3 x the former 30 s case budget. There is no
 // per-attempt timer and no hard 30 s per-attempt ceiling; the existing scenario and step deadlines are
 // unchanged. Runner retries inherit vitest.config.cts: 2 when CI=true, otherwise 0. A runner retry can
-// repeat the whole case, including a deciding progress failure. Within each test attempt, only an invalid
-// hold share permits the controller to replace a scenario; the first valid scenario still decides.
+// repeat the whole case, including a deciding progress failure. Within each test attempt, only
+// insufficient measured contention permits a fresh scenario; the first valid scenario still decides.
 it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress through real publisher contention",
   { timeout: FORMER_CASE_BUDGET_MS * FAIRNESS_MAX_ATTEMPTS }, async () => {
     await runFairnessAttempts<ScenarioObservation>({
       run: runScenario,
       heldPct: observation => observation.heldPct,
+      contention: observation => observation.contention,
       report: (record, invalid) => console.log(fairnessAttemptLine(record, invalid, record.observation.result)),
       verify: async ({ meshBridge, runner, intervals, sqliteBusyBegins, sqliteWrites }) => {
         restoreExec?.();
@@ -416,11 +431,9 @@ it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress 
         expect(sqliteWrites).toBe(SQLITE_WRITER_ROUNDS);
       },
       cleanup: cleanupScenario,
-      decide: ({ heldPct, observation: { progressAtMs } }) => {
-        expect(heldPct, "production-shaped publishers must hold canonical .lock for 50–70% of the measured scenario")
-          .toBeGreaterThanOrEqual(50);
-        expect(heldPct, "production-shaped publishers must hold canonical .lock for 50–70% of the measured scenario")
-          .toBeLessThanOrEqual(70);
+      decide: ({ contention, observation: { progressAtMs } }) => {
+        expect(realContentionPresent(contention), "repeated canonical acquisitions must have real concurrent waiters")
+          .toBe(true);
         expect(progressAtMs ?? Number.POSITIVE_INFINITY,
           `toLocal ingress must have a durable destination event and cursor checkpoint within ${OBSERVATION_WINDOW_MS} ms`)
           .toBeLessThanOrEqual(OBSERVATION_WINDOW_MS);

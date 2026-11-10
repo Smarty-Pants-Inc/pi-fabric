@@ -4,8 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MeshSnapshotRetriesExhaustedError } from "../src/core/atomic-write.js";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
-import { MeshBridge, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
+import { BridgeOwnershipError, MeshBridge, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -305,7 +306,12 @@ it.each(["native-takeover", "same-owner-renewal"] as const)("rechecks ownership 
     const result = await within(publishing, "queued ownership admission");
     if (change === "native-takeover") {
       expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.error.message).toContain("no longer bound");
+      // POSIX detects the native's new participant file before consulting the prepared entries.
+      // Windows uses participant custody without a directory stamp and reaches ownership directly.
+      if (!result.ok) expect(result.error).toBeInstanceOf(process.platform === "win32"
+        ? BridgeOwnershipError : MeshSnapshotRetriesExhaustedError);
+      // A fresh off-lock snapshot must still reject the native, never recover this as a renewal.
+      await expect(f.publish([f.event(change)], false)).rejects.toBeInstanceOf(BridgeOwnershipError);
       expect(liveText(f.root)).toBe("");
     } else {
       expect(result.ok).toBe(true);

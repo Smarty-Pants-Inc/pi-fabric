@@ -854,7 +854,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
     .diagnosticsTo(line => logDiagnostic("src/topology/participant-directory.ts", line))
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
-  readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
+  readonly #notifications = new MeshBackgroundQueue("participant refusal/reap")
+    .diagnosticsOncePerOutageTo(line => logDiagnostic("src/topology/participant-directory.ts", line));
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #isolatedSources = new Set<ParticipantSnapshotSource>();
   readonly #sourceNames = new Map<ParticipantSnapshotSource, string>();

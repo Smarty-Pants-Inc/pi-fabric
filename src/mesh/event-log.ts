@@ -3,7 +3,7 @@ import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable, namespaceKey } from "../core/atomic-write.js";
 import { meshEventsNotDurable } from "./not-durable.js";
 import { FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -13,6 +13,7 @@ import type { LockTimingContext } from "./commit-stats.js";
 import { jsonClone } from "./state-file.js";
 import { RecoveryReader, type RecoveryHint, type RecoveryReadCost } from "./recovery-reader.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { logDiagnostic } from "../core/diagnostics.js";
 import { prepareKeyedPublishNamespace, prepareReceiptNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
@@ -123,6 +124,7 @@ const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_DEDUPE_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_DEDUPE_RECEIPTS = 100_000;
+const DEDUPE_PRUNE_MAX_VICTIMS = 32;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 /** First read of the live log's last line (see #readLastEventSequence). */
@@ -188,6 +190,36 @@ interface AfterUnlock {
   /** Keyed publication: the receipt namespace prepared before `.lock` (fresh leaf barriers inside). */
   namespace?: ReceiptNamespace | undefined;
 }
+
+interface DedupeReceiptCandidate {
+  file: string;
+  stat: fs.Stats;
+  createdAt: number;
+  sequence: number;
+  key: string;
+}
+
+/** Prepared outside .lock; one instance belongs to one synchronous append hold. */
+interface EventLogMaintenance {
+  quiescent: boolean;
+  refreshPending: boolean;
+  stamp: string;
+  sequence: number;
+  keys: Set<string>;
+  pending: Set<string>;
+  /** First-judged identities survive preparatory refreshes; undefined permanently refuses this key. */
+  victims: Map<string, fs.Stats | undefined>;
+  candidates: DedupeReceiptCandidate[];
+  freshCandidates: DedupeReceiptCandidate[];
+  candidateIndex: number;
+  retired: DedupeReceiptCandidate[];
+  compacted: boolean;
+  pruneAttempts: number;
+  pruneMore: boolean;
+}
+
+class DedupeScanChanged extends Error {}
+class DedupePendingRefresh extends DedupeScanChanged {}
 
 // One live-log barrier per root, shared by every confirmation queued before it STARTS. A
 // later append enqueues a new barrier, even while an earlier one is running (pi-fabric#550).
@@ -262,6 +294,7 @@ export class EventLog {
   } | undefined;
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
   #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
+  #receiptCleanupFailed = false;
   #outbox: { scope: string; committed: () => void; validate?: (event: MeshEvent) => void } | undefined;
 
   /** Host-only. Configure before opening any producers; detaching the transport never discards rows. */
@@ -727,17 +760,12 @@ export class EventLog {
   }
 
   /** Under the mesh lock, settle all intents before a rewrite can invalidate byte offsets. */
-  #settleDedupeIntents(archive?: MeshArchive): void {
-    const directory = path.join(this.root, "event-receipts");
-    let names: string[];
-    try { names = fs.readdirSync(directory); }
-    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
-    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
-      this.#settleDedupeIntent(path.join(directory, name), undefined, archive);
-    }
+  #settleDedupeIntents(maintenance: EventLogMaintenance, archive?: MeshArchive): void {
+    for (const file of maintenance.pending) this.#settleDedupeIntent(file, undefined, archive);
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock, prefixScope?: KeyedPublishPrefix): () => MeshEvent {
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock, prefixScope?: KeyedPublishPrefix,
+    maintenance?: EventLogMaintenance): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     if (input.dedupeFingerprint !== undefined &&
@@ -825,6 +853,7 @@ export class EventLog {
         if (prior) {
           consumeInitialMeshLockAdmission(this.root);
           this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
+          if (batch) this.#rememberBatchReceipt(maintenance!, prior, receiptPath!, intentPath!);
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
           // A single publish confirms the visible receipt and unlinks after release.
           if (after) {
@@ -864,6 +893,7 @@ export class EventLog {
         const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after, input.dedupeFingerprint);
         if (prior) {
           this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
+          if (batch) this.#rememberBatchReceipt(maintenance!, prior, receiptPath!, intentPath!);
           return prior;
         }
       }
@@ -877,6 +907,22 @@ export class EventLog {
       // Only a new single archived keyed append gets this publish's proof. Recovery above,
       // batch, prior receipts and changed off-lock archive selection retain their defaults.
       let publishNamespace: ReturnType<KeyedPublishPrefix["forArchive"]>;
+      // Admission precedes caller callbacks: a bounded retirement pass may need to
+      // release and refresh its scan before any publication effect can be replayed.
+      if (intentPath) {
+        const key = path.basename(receiptPath!, ".json");
+        if (!maintenance!.keys.has(key)) {
+          if (this.#pruneDedupeReceipts(maintenance!, 1) >= this.#maxDedupeReceipts) {
+            if (maintenance!.pruneMore) throw new DedupeScanChanged();
+            // A pending -> settled finalizer does not reserve another sequence and
+            // directory timestamps can repeat. Refresh protected-only capacity once
+            // outside custody before reporting a pending-intent-full refusal.
+            if (maintenance!.refreshPending && maintenance!.pending.size) throw new DedupePendingRefresh();
+            throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
+          }
+          maintenance!.keys.add(key);
+        }
+      }
       const append = (): { event: MeshEvent; line: string; bytes: number } => {
         // Unknown admission/data/outbox errors and possible partial appends must never replay.
         consumeInitialMeshLockAdmission(this.root);
@@ -912,11 +958,6 @@ export class EventLog {
           throw new Error(`Mesh event exceeds ${maxEventBytes} bytes`);
         }
         this.#outbox?.validate?.(event);
-        // One slot per key, including unresolved intents. Admission must fail closed BEFORE
-        // reserving a sequence or appending (failed compaction cannot grow pending files).
-        if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
-          throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
-        }
         // Match and bound the wake set before touching the live/archive event. Overflow
         // remains a durable pending nudge for the next delivery, never a post-append throw.
         // A failed append can leave only a harmless nudge; actor cursors still own delivery.
@@ -941,6 +982,7 @@ export class EventLog {
             dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
             ...(archive ? { archiveDir: archive.dir } : {}),
           } satisfies MeshDedupeIntent), { durable: true, ...(after?.namespace ? { syncDirectory: receiptDirectoryBarrier(after.namespace) } : {}) });
+          maintenance!.pending.add(intentPath);
         }
         const outbox = this.#outbox;
         if (outbox) {
@@ -984,11 +1026,12 @@ export class EventLog {
         const syncDirectory = after?.namespace && receiptDirectoryBarrier(after.namespace);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true, ...(syncDirectory ? { syncDirectory } : {}) });
         if (intentPath) this.#removeDedupeIntent(intentPath, syncDirectory);
+        if (batch) this.#rememberBatchReceipt(maintenance!, event, receiptPath, intentPath!);
       }
       if (batch) batch.bytes = bytes + 1;
       else {
         // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
-        this.#compactEventLog();
+        this.#compactEventLog(maintenance!);
         if (input.durable && !receiptPath) {
           // Unkeyed durable publish: the live-log barrier runs after release (group commit).
           if (after) after.finish = () => this.#confirmEventsAfterRelease();
@@ -1003,9 +1046,9 @@ export class EventLog {
    * Host-internal: appends one unkeyed event under a `.lock` the caller already holds
    * (schedule release, MeshStore.transact). Keyed (dedupe) publication keeps publish().
    */
-  appendLocked(input: MeshPublishInput): MeshEvent {
+  appendLocked(input: MeshPublishInput, maintenance: EventLogMaintenance): MeshEvent {
     if (input.dedupeKey) throw new Error("appendLocked does not take a dedupe key");
-    return this.#preparePublish(this.#capturePublication(input))();
+    return this.#preparePublish(this.#capturePublication(input), undefined, undefined, undefined, maintenance)();
   }
 
   async publish(input: MeshPublishInput): Promise<MeshEvent> {
@@ -1018,8 +1061,13 @@ export class EventLog {
     let event: MeshEvent;
     for (;;) {
       try {
-        event = await withInitialMeshLockAcquisition(this.root, () =>
-          this.#lock.withLock(this.#preparePublish(input, undefined, after, preparation?.prefixScope), undefined, "publish"));
+        event = await this.withMaintenance(maintenance => {
+          const commit = this.#preparePublish(input, undefined, after, preparation?.prefixScope, maintenance);
+          return withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => {
+            this.validateMaintenance(maintenance);
+            return commit();
+          }, undefined, "publish"));
+        }, input.dedupeKey ? 1 : 0);
         break;
       }
       catch (error) {
@@ -1056,13 +1104,15 @@ export class EventLog {
       const committed: AfterUnlock[] = [];
       let events: MeshEvent[];
       try {
-        const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number }; after: AfterUnlock }> = [];
-        for (const input of inputs) {
-          const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = { namespace };
-          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
-          catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
-        }
-        events = await withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => {
+        events = await this.withMaintenance(maintenance => {
+          const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number }; after: AfterUnlock }> = [];
+          for (const input of inputs) {
+            const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = { namespace };
+            try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after, undefined, maintenance), outcome, after }); }
+            catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
+          }
+          return withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => {
+          this.validateMaintenance(maintenance);
           const started = performance.now();
           const events: MeshEvent[] = [];
           let bytes = 0;
@@ -1084,9 +1134,10 @@ export class EventLog {
             }
           }
           // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
-          this.#compactEventLog();
+          this.#compactEventLog(maintenance);
           return events;
         }, undefined, "bridge", false, timing));
+        }, inputs.filter(input => input.dedupeKey).length);
       } catch (error) {
         // A hold that failed after committing a prefix never retries; its committed receipts
         // still finish (best effort: an intent left behind recovers like a death after append).
@@ -1702,56 +1753,264 @@ export class EventLog {
     };
   }
 
-  /** Under .lock: reserve capacity before append, or expire receipts during compaction.
-   * One key consumes one slot even while both receipt and pending intent are present.
-   * This listing is authoritative admission/retention state, not an advisory cache. An
-   * off-lock snapshot could miss another writer's new key or pending intent, admitting
-   * over capacity or evicting protected evidence. Legacy writers publish no generation
-   * fence for validating that snapshot, so keep the scan serialized with their writes. */
-  #pruneDedupeReceipts(reserve = 0): number {
+  #dedupeDirectoryStamp(): string {
     const directory = path.join(this.root, "event-receipts");
-    let names: string[];
-    try { names = fs.readdirSync(directory); }
-    catch (error) { if (errorCode(error) === "ENOENT") return 0; throw error; }
-    const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json$/.test(name))
-      .map(name => name.slice(0, -".pending.json".length)));
-    const receipts = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
-    let count = new Set([...pending, ...receipts.map(name => name.slice(0, -".json".length))]).size;
-    const initialCount = count;
-    const limit = this.#maxDedupeReceipts - reserve;
-    // TTL remains maintenance-driven below capacity; no receipt payload reads are needed.
-    if (reserve && count <= limit) return count;
-    const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
-      const file = path.join(directory, name);
-      // The judged receipt's identity, captured before its age is read (smarty-dev#8907).
-      const stat = fs.lstatSync(file);
-      const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
-      if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
-          typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) ||
-          !Number.isFinite(event.createdAt)) {
-        throw new Error("Invalid event publication receipt");
-      }
-      return { file, stat, createdAt: event.createdAt, sequence: event.sequence };
-    });
-    candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
-    const now = Date.now();
     try {
-      for (const receipt of candidates) {
-        if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= limit) break;
-        // A replaced or refreshed receipt is refused and still counts: admission fails closed.
-        // File-only (main's non-recursive rmSync); the names above are exact hex patterns, so verifiedRemove's
-        // `.retention-graveyard-<pid>` directory (and a refused entry left inside it) is never enumerated or counted.
-        if (receipt.stat.isFile() && verifiedRemove(receipt.file, receipt.stat, { deleter: "meshDedupeReceiptPrune",
-          fallback: () => { fs.rmSync(receipt.file, { force: true }); return true; } }).removed) count--;
-      }
-    } finally {
-      // Persist removals once per pass, including any completed before a later unlink failed.
-      if (count < initialCount) syncPathNamespace(directory);
-    }
-    return count;
+      const stat = fs.statSync(directory, { bigint: true });
+      return `${namespaceKey(directory)}:${stat.mode}:${stat.uid}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch (error) { if (errorCode(error) === "ENOENT") return "absent"; throw error; }
   }
 
-  #compactEventLog(): void {
+  #sameReceipt(left: fs.Stats, right: fs.Stats): boolean {
+    return left.isFile() === right.isFile() && left.isSymbolicLink() === right.isSymbolicLink() &&
+      left.dev === right.dev && left.ino === right.ino && left.uid === right.uid && left.mode === right.mode &&
+      left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+  }
+
+  /** All enumeration, payload parsing and candidate stat work happens before acquisition.
+   * Bracket the scan with the namespace and reservation counter, including legacy writers.
+   * Receipt finalization moves a key between pending/settled without adding another slot. */
+  #scanDedupeReceipts(reserve: number, expire = false,
+    victims = new Map<string, fs.Stats | undefined>()): EventLogMaintenance {
+    this.#retryRetiredReceipts();
+    const directory = path.join(this.root, "event-receipts");
+    const sequence = this.#readSequence();
+    const quiescent = !fs.existsSync(this.#lock.lockPath);
+    const stamp = this.#dedupeDirectoryStamp();
+    let names: string[];
+    try { names = fs.readdirSync(directory); }
+    catch (error) { if (errorCode(error) !== "ENOENT") throw error; names = []; }
+    const pendingNames = names.filter(name => /^[a-f0-9]{64}\.pending\.json$/.test(name));
+    const pendingKeys = new Set(pendingNames.map(name => name.slice(0, -".pending.json".length)));
+    const receipts = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+    const keys = new Set([...pendingKeys, ...receipts.map(name => name.slice(0, -".json".length))]);
+    const candidates: DedupeReceiptCandidate[] = [];
+    const closedOwner = (stat: fs.Stats): boolean => process.platform !== "linux" ||
+      (typeof process.geteuid === "function" && stat.uid === process.geteuid() && (stat.mode & 0o022) === 0);
+    const parent = names.length ? fs.lstatSync(directory) : undefined;
+    const canRetire = !parent || (parent.isDirectory() && closedOwner(parent));
+    if (expire || (reserve > 0 && keys.size + reserve > this.#maxDedupeReceipts)) {
+      for (const name of receipts) {
+        const key = name.slice(0, -".json".length);
+        if (pendingKeys.has(key)) {
+          if (victims.has(key)) victims.set(key, undefined);
+          continue;
+        }
+        if (victims.has(key) && !victims.get(key)) continue;
+        const file = path.join(directory, name);
+        try {
+          const stat = fs.lstatSync(file);
+          const judged = victims.get(key);
+          if (judged && !this.#sameReceipt(judged, stat)) { victims.set(key, undefined); continue; }
+          victims.set(key, stat);
+          const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
+          if (!this.#sameReceipt(stat, fs.lstatSync(file))) { victims.set(key, undefined); continue; }
+          if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
+              typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) || !Number.isFinite(event.createdAt)) {
+            throw new Error("Invalid event publication receipt");
+          }
+          // Match verifiedRemove's non-following, closed-owner prerequisite before
+          // giving the canonical name up. Refused evidence still occupies its slot.
+          if (canRetire && stat.isFile() && closedOwner(stat)) {
+            candidates.push({ file, stat, createdAt: event.createdAt, sequence: event.sequence, key });
+          }
+        } catch (error) {
+          if (errorCode(error) === "ENOENT") { victims.set(key, undefined); throw new DedupeScanChanged(); }
+          throw error;
+        }
+      }
+      candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
+    }
+    if (candidates.length) fs.mkdirSync(path.join(this.root, "event-receipts-pruned"), { recursive: true, mode: 0o700 });
+    if (stamp !== this.#dedupeDirectoryStamp() || sequence !== this.#readSequence()) throw new DedupeScanChanged();
+    return { quiescent, refreshPending: false, stamp, sequence, keys, pending: new Set(pendingNames.map(name => path.join(directory, name))),
+      victims, candidates, freshCandidates: [], candidateIndex: 0, retired: [], compacted: false, pruneAttempts: 0, pruneMore: false };
+  }
+
+  /** Internal caller preflight for transact/schedule as well as ordinary publication. A stale
+   * scan is refused before the caller's callback, never replaying a committed transaction. */
+  async withMaintenance<T>(operation: (maintenance: EventLogMaintenance) => Promise<T>, reserve = 0): Promise<T> {
+    const deadline = Date.now() + this.#lock.lockTimeoutMs;
+    let refreshedPending = false;
+    // A stale namespace may be rescanned, but that must never turn a refused
+    // replacement into a fresh victim for this same admission.
+    const victims = new Map<string, fs.Stats | undefined>();
+    for (;;) {
+      let maintenance: EventLogMaintenance | undefined;
+      try {
+        maintenance = this.#scanDedupeReceipts(reserve, false, victims);
+        maintenance.refreshPending = !refreshedPending;
+        return await operation(maintenance);
+      } catch (error) {
+        if (!(error instanceof DedupeScanChanged) || Date.now() >= deadline) throw error;
+        if (error instanceof DedupePendingRefresh) refreshedPending = true;
+        await delay(0, this.#lock.writeAbortSignal);
+      } finally {
+        if (maintenance) {
+          this.#removeRetiredReceipts(maintenance.retired);
+          if (maintenance.compacted || maintenance.pruneMore) await this.#expireDedupeReceipts(victims);
+        }
+      }
+    }
+  }
+
+  /** Constant-size namespace/counter validation only; no directory listing on Windows either. */
+  validateMaintenance(maintenance: EventLogMaintenance): void {
+    if (!maintenance.quiescent || maintenance.sequence !== this.#readSequence() ||
+        maintenance.stamp !== this.#dedupeDirectoryStamp()) throw new DedupeScanChanged();
+  }
+
+  #reportReceiptCleanup(failure?: string): void {
+    if (failure) {
+      if (!this.#receiptCleanupFailed) logDiagnostic("src/mesh/event-log.ts", `mesh receipt cleanup deferred; retrying on next prune pass: ${failure}`);
+      this.#receiptCleanupFailed = true;
+    } else if (this.#receiptCleanupFailed) {
+      this.#receiptCleanupFailed = false;
+      logDiagnostic("src/mesh/event-log.ts", "mesh receipt cleanup recovered", "info");
+    }
+  }
+
+  /** Retry only this retirement namespace, off-lock, with a bounded physical-removal pass.
+   * Linux can leave the retired file inside verifiedRemove's private graveyard after unlink failure. */
+  #retryRetiredReceipts(): void {
+    const directory = path.join(this.root, "event-receipts-pruned");
+    const receipts: Array<{ file: string; stat: fs.Stats }> = [];
+    const retiredName = /^[a-f0-9]{64}\.[a-f0-9-]{36}\.json(?:\.[a-f0-9-]{36})?$/;
+    try {
+      const directories = [directory];
+      for (const parent of directories) {
+        for (const name of fs.readdirSync(parent)) {
+          if (receipts.length >= DEDUPE_PRUNE_MAX_VICTIMS) break;
+          if (parent === directory && /^\.retention-graveyard-\d+$/.test(name)) {
+            const grave = path.join(parent, name);
+            if (fs.lstatSync(grave).isDirectory()) directories.push(grave);
+          } else if (retiredName.test(name)) {
+            let file = path.join(parent, name);
+            const stat = fs.lstatSync(file);
+            if (stat.isFile()) {
+              if (parent !== directory) {
+                // Retry from the retirement root, not inside a graveyard (which
+                // would otherwise nest another graveyard on every failed unlink).
+                const retry = path.join(directory, `${name.slice(0, 64)}.${randomUUID()}.json`);
+                fs.renameSync(file, retry);
+                file = retry;
+              }
+              receipts.push({ file, stat });
+            }
+          }
+        }
+        if (receipts.length >= DEDUPE_PRUNE_MAX_VICTIMS) break;
+      }
+      if (receipts.length) this.#removeRetiredReceipts(receipts);
+      else this.#reportReceiptCleanup();
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") this.#reportReceiptCleanup(errorCode(error) ?? "retirement scan failed");
+      else if (!fs.existsSync(directory)) this.#reportReceiptCleanup();
+    }
+  }
+
+  #removeRetiredReceipts(receipts: Array<{ file: string; stat: fs.Stats }>): void {
+    if (!receipts.length) return;
+    let failure: string | undefined;
+    for (const receipt of receipts) {
+      try {
+        const result = verifiedRemove(receipt.file, receipt.stat, { deleter: "meshDedupeReceiptPrune",
+          fallback: () => { fs.rmSync(receipt.file, { force: true }); return true; } });
+        if (!result.removed) failure ??= result.reason;
+      } catch (error) { failure ??= errorCode(error) ?? "physical removal failed"; }
+    }
+    try {
+      syncPathNamespace(path.join(this.root, "event-receipts-pruned"));
+      syncPathNamespace(path.join(this.root, "event-receipts"));
+    } catch (error) { failure ??= errorCode(error) ?? "retirement namespace barrier failed"; }
+    receipts.length = 0;
+    // Logical retirement already freed the slot. Cleanup cannot turn a committed
+    // publication into a failed call; its leftovers are retried by the next scan.
+    this.#reportReceiptCleanup(failure);
+  }
+
+  /** Settlement precedes expiry, so scan again after compaction has released its hold. */
+  async #expireDedupeReceipts(victims: Map<string, fs.Stats | undefined>): Promise<void> {
+    const deadline = Date.now() + this.#lock.lockTimeoutMs;
+    let maintenance: EventLogMaintenance | undefined;
+    for (;;) {
+      try {
+        maintenance ??= this.#scanDedupeReceipts(0, true, victims);
+        await this.#lock.withLock(() => {
+          this.validateMaintenance(maintenance!);
+          maintenance!.pruneAttempts = 0;
+          this.#pruneDedupeReceipts(maintenance!);
+          maintenance!.stamp = this.#dedupeDirectoryStamp();
+        }, undefined, "publish");
+        if (!maintenance.pruneMore) return;
+        // Each bounded pass really releases custody. Retired files live in a separate
+        // directory, so their physical cleanup cannot relabel a stale receipt scan.
+      } catch (error) {
+        if (!(error instanceof DedupeScanChanged) || Date.now() >= deadline) throw error;
+        if (maintenance) this.#removeRetiredReceipts(maintenance.retired);
+        maintenance = undefined;
+        await delay(0, this.#lock.writeAbortSignal);
+      } finally { if (maintenance) this.#removeRetiredReceipts(maintenance.retired); }
+    }
+  }
+
+  /** A batch can settle a receipt and evict it again in the same hold. Capture that
+   * publication's installed identity, not another bulk scan; at most 32 new rows exist. */
+  #rememberBatchReceipt(maintenance: EventLogMaintenance, event: MeshEvent, file: string, pending: string): void {
+    if (fs.existsSync(pending)) return;
+    const key = path.basename(file, ".json");
+    const stat = fs.lstatSync(file), judged = maintenance.victims.get(key);
+    if (maintenance.victims.has(key) && (!judged || !this.#sameReceipt(judged, stat))) {
+      maintenance.victims.set(key, undefined);
+      return;
+    }
+    maintenance.victims.set(key, stat);
+    maintenance.freshCandidates = maintenance.freshCandidates.filter(candidate => candidate.key !== key);
+    maintenance.freshCandidates.push({ file, stat, createdAt: event.createdAt, sequence: event.sequence, key });
+    maintenance.freshCandidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
+  }
+
+  /** Under .lock only the selected victims' identity/pending CAS and atomic detachment.
+   * Physical removal and its namespace barrier run after release. Unexpired count-pressure
+   * eviction and publication-time/sequence ordering are unchanged. */
+  #pruneDedupeReceipts(maintenance: EventLogMaintenance, reserve = 0): number {
+    const limit = this.#maxDedupeReceipts - reserve, now = Date.now();
+    if (reserve && maintenance.keys.size <= limit) return maintenance.keys.size;
+    maintenance.pruneMore = false;
+    while (maintenance.candidateIndex < maintenance.candidates.length || maintenance.freshCandidates.length) {
+      const scanned = maintenance.candidates[maintenance.candidateIndex], fresh = maintenance.freshCandidates[0];
+      const useFresh = fresh && (!scanned || fresh.createdAt < scanned.createdAt ||
+        (fresh.createdAt === scanned.createdAt && (fresh.sequence < scanned.sequence ||
+          (fresh.sequence === scanned.sequence && fresh.file.localeCompare(scanned.file) < 0))));
+      const receipt = (useFresh ? fresh : scanned)!;
+      if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && maintenance.keys.size <= limit) break;
+      if (maintenance.pruneAttempts >= DEDUPE_PRUNE_MAX_VICTIMS) { maintenance.pruneMore = true; break; }
+      maintenance.pruneAttempts++;
+      if (useFresh) maintenance.freshCandidates.shift();
+      else maintenance.candidateIndex++;
+      if (!maintenance.keys.has(receipt.key) || (maintenance.victims.has(receipt.key) && !maintenance.victims.get(receipt.key))) continue;
+      try {
+        // A late finalizer or renewal can change these without reserving another sequence.
+        // Only point metadata is read here, never a receipt payload or a directory listing.
+        if (fs.lstatSync(path.join(path.dirname(receipt.file), receipt.key + ".pending.json"), { throwIfNoEntry: false }) ||
+            !this.#sameReceipt(receipt.stat, fs.lstatSync(receipt.file))) {
+          maintenance.victims.set(receipt.key, undefined);
+          continue;
+        }
+        const retired = path.join(this.root, "event-receipts-pruned", `${receipt.key}.${randomUUID()}.json`);
+        fs.renameSync(receipt.file, retired);
+        maintenance.retired.push({ ...receipt, file: retired });
+        maintenance.keys.delete(receipt.key);
+        maintenance.victims.delete(receipt.key); // a later same-hold publication may own this now-free key
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") { maintenance.victims.set(receipt.key, undefined); continue; }
+        throw error;
+      }
+    }
+    return maintenance.keys.size;
+  }
+
+  #compactEventLog(maintenance: EventLogMaintenance): void {
     // Never rewrite away an event named by a durable intent. Resolve every intent while
     // the publish lock is held, before taking the retained tail snapshot.
     let descriptor: number | undefined;
@@ -1760,9 +2019,9 @@ export class EventLog {
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
       const archive = MeshArchive.fromRoot(this.root);
-      this.#settleDedupeIntents(archive);
+      this.#settleDedupeIntents(maintenance, archive);
       this.#settleOutboxes(archive);
-      this.#pruneDedupeReceipts();
+      maintenance.compacted = true;
       const readBytes = Math.min(
         size,
         this.#retainedEventLogBytes + this.maxEventBytes + 1,

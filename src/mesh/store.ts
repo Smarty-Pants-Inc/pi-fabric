@@ -1,5 +1,5 @@
 import type { MeshLockProtocol } from "../config.js";
-import { diagnostics } from "../core/diagnostics.js";
+import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import { MeshIncarnationPendingError, meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -601,16 +601,24 @@ export class MeshStore {
     return events;
   }
 
+  #residentWakeOutage = false;
   async #wakeAfterPublish(events: readonly MeshEvent[]): Promise<void> {
     if (!events.length || !this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
     try {
       const { wakeResidentActors } = await import("../residency/wake.js");
       await wakeResidentActors(this, events, undefined, undefined, () => this.#canWakeResidents());
+      if (this.#residentWakeOutage) {
+        this.#residentWakeOutage = false;
+        logDiagnostic("src/mesh/store.ts", "[pi-fabric] resident wake recovered", "info");
+      }
     } catch (error) {
       // Already committed: throwing would invite a duplicate publish. The durable pending
       // index and archived event survive even without a wake request; scoped startup,
       // maintenance or the next matching publish retries it. Report failure rather than inventing delivery.
-      diagnostics.warn("src/mesh/store.ts", `[pi-fabric] resident wake deferred: ${String(error)}`);
+      if (!this.#residentWakeOutage) {
+        this.#residentWakeOutage = true;
+        logDiagnostic("src/mesh/store.ts", `[pi-fabric] resident wake deferred: ${String(error)}`);
+      }
     }
   }
 
@@ -638,15 +646,16 @@ export class MeshStore {
    */
   async transact<T>(operation: (append: (input: MeshAppendInput) => MeshEvent) => T): Promise<T> {
     const committed: MeshEvent[] = [];
-    const result = await this.#lock.withLock(() => {
-      try { committed.push(...this.#releaseDueLocked(Date.now())); } catch { /* schedule mutations report it */ }
+    const result = await this.#events.withMaintenance(maintenance => this.#lock.withLock(() => {
+      this.#events.validateMaintenance(maintenance);
+      try { committed.push(...this.#releaseDueLocked(Date.now(), maintenance)); } catch { /* schedule mutations report it */ }
       return operation((input) => {
         validateMeshTopic(input.topic);
-        const event = this.#events.appendLocked(input);
+        const event = this.#events.appendLocked(input, maintenance);
         committed.push(event);
         return event;
       });
-    }, undefined, "publish");
+    }, undefined, "publish"));
     // Committed appends wake dormant resident recipients, as publish() does.
     await this.#wakeAfterPublish(committed);
     return result;
@@ -712,7 +721,8 @@ export class MeshStore {
       throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
     }
     let releasedEvents: MeshEvent[] = [];
-    const scheduled = await this.#lock.withLock(() => {
+    const scheduled = await this.#events.withMaintenance(maintenance => this.#lock.withLock(() => {
+      this.#events.validateMaintenance(maintenance);
       // A caller cancelled while this waited for the lock must not commit: the provider's
       // abortable race rejects the caller but cannot stop this promise.
       input.signal?.throwIfAborted();
@@ -723,9 +733,9 @@ export class MeshStore {
       }
       pending.push(schedule);
       this.#writeSchedules(pending);
-      releasedEvents = this.#releaseDueLocked(now);
+      releasedEvents = this.#releaseDueLocked(now, maintenance);
       return JSON.parse(JSON.stringify(schedule)) as MeshSchedule;
-    }, undefined, "publish");
+    }, undefined, "publish"));
     await this.#wakeAfterPublish(releasedEvents);
     return scheduled;
   }
@@ -770,13 +780,16 @@ export class MeshStore {
   async releaseDueSchedules(now = Date.now()): Promise<MeshEvent[]> {
     const next = this.nextScheduleDueAt();
     if (next === undefined || next > now) return [];
-    const released = await this.#lock.withLock(() => this.#releaseDueLocked(now), undefined, "publish");
+    const released = await this.#events.withMaintenance(maintenance => this.#lock.withLock(() => {
+      this.#events.validateMaintenance(maintenance);
+      return this.#releaseDueLocked(now, maintenance);
+    }, undefined, "publish"));
     // Released schedules are deliveries: wake their dormant resident recipients.
     await this.#wakeAfterPublish(released);
     return released;
   }
 
-  #releaseDueLocked(now: number): MeshEvent[] {
+  #releaseDueLocked(now: number, maintenance: Parameters<EventLog["appendLocked"]>[1]): MeshEvent[] {
     if (!fs.existsSync(this.#schedulesPath)) return [];
     const file = this.#readSchedules(false);
     const due = file.schedules.filter((entry) => entry.dueAt <= now).sort(compareSchedules);
@@ -800,7 +813,7 @@ export class MeshStore {
           ...(entry.sender ? { sender: entry.sender } : {}),
           // The scheduler's principal, revalidated: a damaged record carries none.
           ...(copyFabricPrincipal(entry.principal) ? { principal: copyFabricPrincipal(entry.principal) } : {}),
-        }));
+        }, maintenance));
         releasedIds.add(entry.id);
       }
     } finally {

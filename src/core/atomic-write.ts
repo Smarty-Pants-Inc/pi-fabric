@@ -990,6 +990,13 @@ export class MeshBackgroundRetry {
   #alarm: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
   #alarmAfterMs = MESH_OUTAGE_ALARM_AFTER_MS;
   #diagnostic = meshDiagnostic;
+  #oncePerOutage = false;
+  #diagnosticOutage = false;
+  /** Diagnostic policy only: retries, alarms and permanent failures keep their existing behavior. */
+  diagnosticsOncePerOutageTo(sink: (line: string) => void): this {
+    this.#oncePerOutage = true;
+    return this.diagnosticsTo(sink);
+  }
   diagnosticsTo(sink: (line: string) => void): this {
     this.#diagnostic = line => { try { sink(line); } catch { /* Diagnostics never break background work. */ } };
     return this;
@@ -1101,6 +1108,13 @@ export class MeshBackgroundRetry {
       this.#outageSuccesses = 0;
     }
     void this.#flushAlarms(); // a pending alarm goes out before its recovery (queue order)
+    if (this.#oncePerOutage) {
+      if (this.#diagnosticOutage) {
+        this.#diagnosticOutage = false;
+        this.#diagnostic(`[pi-fabric] ${this.label}: ${this.#recoveryMessage}`);
+      }
+      return;
+    }
     if (!this.#suppressed || this.#lastReportedAt === undefined) return;
     const now = Date.now();
     const elapsedMs = now - this.#lastReportedAt;
@@ -1150,13 +1164,14 @@ export class MeshBackgroundRetry {
     // At most one lock-retry line per instance per window (default 60 s), even across
     // successful acquisitions: a flapping lock must not print one warning per short outage.
     // The first warning is immediate and carries the holder diagnostics.
-    if (elapsedMs >= this.warningWindowMs) {
+    if (this.#oncePerOutage ? !this.#diagnosticOutage : elapsedMs >= this.warningWindowMs) {
+      this.#diagnosticOutage = true;
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
       this.#diagnostic(`[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
-    } else {
+    } else if (!this.#oncePerOutage) {
       this.#suppressed++;
     }
     return transient;
@@ -1208,6 +1223,11 @@ export class MeshBackgroundQueue {
   #closed = false;
   #failed = false;
   constructor(label: string, minMs = 100, maxMs = 5_000) { this.#retry = new MeshBackgroundRetry(label, minMs, maxMs); }
+
+  diagnosticsOncePerOutageTo(sink: (line: string) => void): this {
+    this.#retry.diagnosticsOncePerOutageTo(sink);
+    return this;
+  }
 
   enqueue(operation: () => unknown | Promise<unknown>): Promise<void> {
     if (this.#closed) return Promise.resolve();

@@ -56,7 +56,20 @@ afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.r
 describe("publishBatch hold (smarty-dev#6729)", () => {
   it("writes byte-identical event lines to main's encoder (golden)", async () => {
     const golden = JSON.parse(fs.readFileSync(path.resolve("tests/fixtures/mesh-event-golden.json"), "utf8")) as string[];
-    const lines = await publishGoldenEvents({ MeshStore, StoreBridgeSide }, scratch()) as string[];
+    // The shared main-era encoder fixture stubs holds() without installing a receiver mirror.
+    // Bootstrap real attribution at its constructor seam, not by bypassing the full held fence.
+    class GoldenBridgeSide extends StoreBridgeSide {
+      override async publishBatch(...args: Parameters<StoreBridgeSide["publishBatch"]>) {
+        this.holds = StoreBridgeSide.prototype.holds; // undo the fixture's obsolete predicate stub
+        const sender = args[0][0]!.event.from, now = Date.now();
+        await this.mirror({ hosts: [{ record: { format: 1, id: sender.id, rootId: sender.id, identity: sender,
+          startedAt: now, updatedAt: now, expiresAt: now + 120_000 }, expiresAt: now + 120_000,
+          observedAt: now }], participants: [] }, now);
+        expect(this.holds(sender.id, sender)).toBe(true);
+        return super.publishBatch(...args);
+      }
+    }
+    const lines = await publishGoldenEvents({ MeshStore, StoreBridgeSide: GoldenBridgeSide }, scratch()) as string[];
     expect(lines.map(normalizeLine)).toEqual(golden);
     // The stitched envelope is exactly JSON.stringify of the event, field order included.
     for (const line of lines) expect(JSON.stringify(JSON.parse(line))).toBe(line);

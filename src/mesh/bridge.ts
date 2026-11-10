@@ -1358,8 +1358,8 @@ export class StoreBridgeSide implements BridgeSide {
 
   // Participant entries of both kinds: the shared state's (natives and mirrors) and the natives'
   // own files (smarty-dev#2004; under the participants-files policy natives are only there).
-  #participantEntries(): MeshStateEntry[] {
-    return [...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })];
+  #participantEntries(files = readParticipantFiles(this.store.root, { maxAgeMs: 0 })): MeshStateEntry[] {
+    return [...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...files];
   }
 
   readonly #ingressAbort = new AbortController();
@@ -1367,11 +1367,26 @@ export class StoreBridgeSide implements BridgeSide {
 
   // Retain advisory admission only for a held publication's designated initial event lock.
   // EventLog irrevocably consumes it before recovery/append; receipt locks keep ordinary bounds.
-  async #publishHeld<T>(operation: () => Promise<T>, held: boolean): Promise<T> {
+  async #publishHeld<T>(operation: (files?: { entries: readonly MeshStateEntry[]; unchanged: () => boolean }) => Promise<T>,
+    held: readonly string[]): Promise<T> {
     await this.store.prepareLock();
-    if (!held || this.store.tryLockBudgetMs !== undefined) return operation();
+    if (!held.length) return operation();
+    const prepare = (): Promise<T> => {
+      // EventLog invokes fence/admit with .lock ALREADY held. Even the SQLite observation
+      // in that fence must consume this off-lock listing, never scan the participant directory.
+      const stamp = meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR);
+      const entries = readParticipantFiles(this.store.root, { maxAgeMs: 0 });
+      if (meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR) !== stamp) throw new MeshSnapshotRetriesExhaustedError(1);
+      return operation({ entries, unchanged: process.platform === "win32" ? () => true
+        : () => meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR) === stamp });
+    };
+    // Existing namespace/key custody freezes precisely the aliases this publication checks,
+    // including on Windows, where directory timestamps do not fence replacements. POSIX also
+    // revalidates the stamp to refuse raw/legacy file replacements outside these receipts.
+    const run = (): Promise<T> => withParticipantFileDirectoryCustody(this.store, prepare, new Set(held));
+    if (this.store.tryLockBudgetMs !== undefined) return run();
     const diagnostics = bridgeIngressDiagnostics.getStore();
-    return withInitialMeshLockAdmission(this.store.root, operation, {
+    return withInitialMeshLockAdmission(this.store.root, run, {
       signal: this.#ingressAbort.signal,
       isPreAppendRefusal: error => {
         if (!(error instanceof Error)) return false;
@@ -1388,8 +1403,10 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async publish(event: BridgePublish, held: string[] = [], fromHub = false): Promise<{ sequence: number }> {
-    const input = this.#publication(event, held, fromHub);
-    const published = await this.#publishHeld(() => this.store.publish(input), held.length > 0);
+    held = [...held];
+    const input = this.#publication(event, fromHub);
+    const published = await this.#publishHeld(files => this.store.publish({ ...input,
+      ...(files ? this.#heldFence(held, input.from, files) : {}) }), held);
     return { sequence: published.sequence };
   }
 
@@ -1410,18 +1427,20 @@ export class StoreBridgeSide implements BridgeSide {
     const input: MeshPublishInput = {
       id: key, dedupeKey: key, topic: checked.topic, kind: checked.kind,
       from: { ...checked.from, verified: "bridge" }, to: checked.to, durable: true,
-      ...this.#heldFence([...new Set([checked.from.id, ...held])], checked.from),
       // createdAt is stamped by the host store at commit; no data/text/message/principal.
     };
-    const published = await this.#publishHeld(() => this.store.publish(input), true);
+    const ids = [...new Set([checked.from.id, ...held])];
+    const published = await this.#publishHeld(files => this.store.publish({ ...input,
+      ...this.#heldFence(ids, input.from, files!) }), ids);
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<Array<{ sequence: number }>> {
-    const inputs = events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub));
+    const inputs = events.map(({ event, held }) => ({ input: this.#publication(event, fromHub), held: [...(held ?? [])] }));
     const published = await this.#publishHeld(
-      () => this.store.publishBatch(inputs, { operation: "bridge-event-batch", phase: "event-batch" }),
-      inputs.some(input => input.fence !== undefined));
+      files => this.store.publishBatch(inputs.map(({ input, held }) => ({ ...input,
+        ...(held.length ? this.#heldFence(held, input.from, files!) : {}) })),
+      { operation: "bridge-event-batch", phase: "event-batch" }), inputs.flatMap(({ held }) => held));
     return published.map(({ sequence }) => ({ sequence }));
   }
 
@@ -1441,7 +1460,7 @@ export class StoreBridgeSide implements BridgeSide {
     return sequences.map(sequence => ({ sequence, ...(bySequence.has(sequence) ? { createdAt: bySequence.get(sequence)! } : {}) }));
   }
 
-  #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
+  #publication(event: BridgePublish, fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
     if (this.#staleAdmission) throw this.#staleAdmission;
     const checked = checkBridgePublish(event);
     const stamp = checked.data.bridge;
@@ -1478,7 +1497,7 @@ export class StoreBridgeSide implements BridgeSide {
       // acquired asynchronously). Under the participants-files policy a native's first file is
       // written without it; its host record, which reserves the root id, still goes through the
       // lock, and a mirror never outranks a native file (#142 S2).
-      ...(held.length > 0 ? this.#heldFence(held, checked.from) : {}),
+      // #publishHeld adds the ownership fence after preparing its participant-file snapshot.
       data,
     };
   }
@@ -1514,12 +1533,13 @@ export class StoreBridgeSide implements BridgeSide {
    * removed (the directory stamp), the lease files it used are unchanged (each held id's own file; the whole
    * directory when a handoff row exists, since handoffs read every lease), and every held lease is still live.
    * A failed proof releases the fence and checks again, twice; the third attempt runs the full check in the
-   * fence, as before. admit() still calls holds() for each id inside the fence; after the proof, holds()
-   * answers from the proven pre-check. A link that does not hold an id at the pre-check refuses it without
-   * taking the fence (refusing is fail-closed; the caller's one refresh-and-retry still applies). The file
-   * backend (no state revision) keeps the full check in its `.lock` passthrough fence, unchanged.
+   * fence, using the same off-lock participant-file snapshot. admit() still calls holds() for each id
+   * inside the fence; after the proof, holds() answers from the proven pre-check. A changed participant
+   * snapshot defers without appending: the caller retries with a new off-lock listing, never falls back
+   * to scanning under .lock. File state is still checked fresh under its committing mesh lock.
    */
-  #heldFence(held: readonly string[], from: MeshIdentity): Pick<MeshPublishInput, "fence" | "admit" | "signal"> {
+  #heldFence(held: readonly string[], from: MeshIdentity,
+    files: { entries: readonly MeshStateEntry[]; unchanged: () => boolean }): Pick<MeshPublishInput, "fence" | "admit" | "signal"> {
     held = [...held];
     const identityOf = (id: string): MeshIdentity | undefined => id === from.id ? from : undefined;
     return {
@@ -1530,13 +1550,19 @@ export class StoreBridgeSide implements BridgeSide {
           for (let attempt = 0; ; attempt += 1) {
             this.#ingressAbort.signal.throwIfAborted();
             if (this.#staleAdmission) throw this.#staleAdmission;
-            const observed = attempt < HELD_FENCE_ATTEMPTS - 1 ? this.#heldObservation(held, from) : undefined;
+            if (!files.unchanged()) throw new MeshSnapshotRetriesExhaustedError(1);
+            const observed = attempt < HELD_FENCE_ATTEMPTS - 1 ? this.#heldObservation(held, from, files.entries) : undefined;
             const outcome = this.store.withStateWriteFence(() => {
+              if (!files.unchanged()) throw new MeshSnapshotRetriesExhaustedError(1);
               if (observed !== undefined) {
                 if (!(observed.until > this.now() && this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) &&
                   this.#heldFiles(held, observed.leasesAll) === observed.files)) return HELD_FENCE_STALE;
-                for (const id of held) this.#proven.set(id, identityOf(id));
+              } else {
+                for (const id of held) if (this.#heldUntil(id, identityOf(id), files.entries) <= this.now()) {
+                  throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
+                }
               }
+              for (const id of held) this.#proven.set(id, identityOf(id));
               entered = true;
               try { return { value: commit() }; }
               finally { this.#proven.clear(); }
@@ -1562,7 +1588,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   // The pre-check of #heldFence: undefined when it cannot run outside the fence (no SQLite state revision).
   // Throws BridgeOwnershipError when this link does not hold an id now.
-  #heldObservation(held: readonly string[], from: MeshIdentity):
+  #heldObservation(held: readonly string[], from: MeshIdentity, participantFiles: readonly MeshStateEntry[]):
     { revision: string; until: number; files: string; leasesAll: boolean } | undefined {
     const revision = this.store.stateRevision();
     if (revision === undefined) return undefined;
@@ -1571,15 +1597,15 @@ export class StoreBridgeSide implements BridgeSide {
     const files = this.#heldFiles(held, leasesAll);
     let until = Infinity;
     for (const id of held) {
-      const expiry = this.#heldUntil(id, id === from.id ? from : undefined);
+      const expiry = this.#heldUntil(id, id === from.id ? from : undefined, participantFiles);
       if (expiry <= this.now()) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
       until = Math.min(until, expiry);
     }
     return { revision, until, files, leasesAll };
   }
 
-  // Stamps of the files the ownership check reads: one stat per held lease file (or the lease directory) and
-  // the participant directory. Atomic writes rename into the directory, so any change moves its stamp.
+  // Lease inputs of the ownership check: participant files have their own off-lock snapshot
+  // and custody guard. One stat per held lease, or the whole lease directory for handoffs.
   #heldFiles(held: readonly string[], leasesAll: boolean): string {
     const stat = (file: string): string => {
       try {
@@ -1592,11 +1618,11 @@ export class StoreBridgeSide implements BridgeSide {
     };
     const leases = leasesAll ? [meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)]
       : held.map((id) => stat(hostLeasePath(this.store.root, id)));
-    return [meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR), ...leases].join("|");
+    return leases.join("|");
   }
 
   // The lease expiry of `id` when this link holds it now (see holds()), else 0.
-  #heldUntil(id: string, identity?: MeshIdentity): number {
+  #heldUntil(id: string, identity?: MeshIdentity, participantFiles?: readonly MeshStateEntry[]): number {
     const now = this.now();
     const hostEntry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
     const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
@@ -1617,7 +1643,7 @@ export class StoreBridgeSide implements BridgeSide {
       const participant = participantOf(participantEntry.key, participantEntry.value);
       if (!participant || participant.ownerHostId !== id || participant.ownerIdentityId !== id) return 0;
     }
-    return this.#reservedNow().has(id) ? 0 : until;
+    return this.#reservedNow(participantFiles).has(id) ? 0 : until;
   }
 
   mirrored(id: string): boolean {
@@ -1625,9 +1651,9 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   // Every id this side holds that is not this link's mirror, read now, under the same handoffs.
-  #reservedNow(): Set<string> {
+  #reservedNow(participantFiles?: readonly MeshStateEntry[]): Set<string> {
     const hostEntries = this.store.listAll(HOST_PREFIX, { fresh: true });
-    const participantEntries = this.#participantEntries();
+    const participantEntries = this.#participantEntries(participantFiles);
     const handoffs = bridgeHandoffScope(this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }), hostEntries, participantEntries,
       () => readHostLeases(this.store.root), this.now(), this.peer);
     const reserved = new Set<string>(handoffs.reserved);
@@ -2401,7 +2427,8 @@ export class StoreBridgeSide implements BridgeSide {
               ops: [],
               prepare: (view) => {
                 if (halted()) return plan!.stage([], []);
-                const sameFiles = planRevision !== undefined || meshDirectoryStamp(this.store.root, "participants") === filesStamp;
+                const sameFiles = planRevision !== undefined || process.platform === "win32" ||
+                  meshDirectoryStamp(this.store.root, "participants") === filesStamp;
                 let current = activePlan;
                 if (planRevision !== undefined) {
                   if (!current || !sameFiles || !this.store.stateUnchangedSince(planRevision, HELD_STATE_PREFIXES,
@@ -2409,9 +2436,8 @@ export class StoreBridgeSide implements BridgeSide {
                     leaseStamp === undefined || !consultedLeasesUnchanged(current) ||
                     (judgesLeaseLiveness && !leaseLivenessUnchanged(current.livenessWindow, this.now()))) throw new MirrorPlanStale();
                 } else {
-                  const participantFiles = sameFiles ? (files ?? participantFileSnapshot(this.store.root))
-                    : participantFileSnapshot(this.store.root);
-                  const result = compute(view, participantFiles, false);
+                  if (!sameFiles || !files) throw new MirrorPlanStale();
+                  const result = compute(view, files, false);
                   if (!result) return plan!.stage([], []);
                   const { ops: cachedOps, leases: cachedLeases } = capSampled(result);
                   current = { revision: "", participantDirectoryStamp: filesStamp,
@@ -4592,6 +4618,8 @@ export class MeshBridge {
     let walCapDelay: number | undefined;
     let resample = false;
     let streakTimer: ReturnType<typeof setTimeout> | undefined;
+    // Re-sampling/reconnects reset retry streaks, not an outage. Only a successful pass recovers it.
+    let mirrorOutage = false;
     let busy: { count: number; started: number; reportedAt: number; first: string; last: string;
       retainedOffLockMs: number } | undefined;
     let recoveredIngress = { fenceRefusals: 0, retainedOffLockMs: 0 };
@@ -4612,6 +4640,7 @@ export class MeshBridge {
       if (streakTimer !== undefined) clearTimeout(streakTimer);
       streakTimer = undefined;
       if (!busy) {
+        if (outcome === "recovered" && mirrorOutage) logBusy(`bridge busy streak recovered (${direction}); bridge mirror restored`);
         if (failedIngress?.fenceRefusals) logBusy(`bridge ingress busy streak ${outcome} (toLocal); ` +
           `${failedIngress.fenceRefusals} fence refusals; retainedOffLockMs=${Math.max(0, Math.round(failedIngress.retainedOffLockMs))}`);
         return;
@@ -4691,6 +4720,7 @@ export class MeshBridge {
         retryMs = LOCK_RETRY_MIN_MS;
         walCapDelay = undefined;
         finishBusy("recovered");
+        mirrorOutage = false;
         // ponytail: back off only retained work to recover a missed notification without idle polling.
         const membershipRetryAt = this.#membershipRetryAt[direction];
         if (membershipRetryAt !== undefined) {
@@ -4751,7 +4781,8 @@ export class MeshBridge {
         }
         busy.count += 1;
         busy.last = label;
-        if (now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
+        if (error instanceof BridgeMirrorDeferredError ? !mirrorOutage
+          : now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
           // The shared helper projects typed WAL facts, but passes other errors' free text through.
           // Never retain owner, fence, recovery or path text in this streak's diagnostics.
           let detail = label;
@@ -4773,6 +4804,7 @@ export class MeshBridge {
             `elapsed ${Math.max(0, Math.round(now - busy.started))} ms; first=${busy.first}; last=${busy.last}; ` +
             `retainedOffLockMs=${Math.max(0, Math.round(busy.retainedOffLockMs))}: ${detail}`);
           busy.reportedAt = now;
+          if (error instanceof BridgeMirrorDeferredError) mirrorOutage = true;
         }
       }
       delete this.#membershipAttempt[direction];
@@ -5431,6 +5463,7 @@ export class MeshBridge {
     let reportedTimeout = false;
     let walCapLoggedAt = Number.NEGATIVE_INFINITY;
     let walCapDelay: number | undefined;
+    let mirrorOutage = false;
     let backingOff = false;
     let mirrorBackingOff = false;
     // smarty-dev#9751: once start() has loaded the cursors, each direction runs in its own loop (#directionLoop),
@@ -5519,6 +5552,8 @@ export class MeshBridge {
         backingOff = false;
         try {
           await pass;
+          if (mirrorOutage) this.#log("bridge busy streak recovered (presence); bridge mirror restored");
+          mirrorOutage = false;
           mirrorBackingOff = false;
           reportedTimeout = false;
           walCapDelay = undefined;
@@ -5555,8 +5590,11 @@ export class MeshBridge {
             walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
             delay = walCapDelay;
             const now = Date.now();
-            if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : "mesh state WAL cap"}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
+            if (error instanceof BridgeMirrorDeferredError) {
+              if (!mirrorOutage) this.#log(`bridge mirror degraded; retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
+              mirrorOutage = true;
+            } else if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
+              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {

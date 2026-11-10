@@ -216,12 +216,21 @@ describe("MeshStore", () => {
     const scan = vi.spyOn(MeshArchive.prototype, "readAfter");
     const lookup = vi.spyOn(MeshArchive.prototype, "lookupEntry");
     const reads = vi.spyOn(fs, "readFileSync");
-    const dirs = vi.spyOn(fs, "readdirSync");
+    const readdir = fs.readdirSync;
+    const dirs = vi.spyOn(fs, "readdirSync").mockImplementation((...args) => {
+      if (String(args[0]) === path.join(store.root, "event-receipts")) {
+        expect(fs.existsSync(path.join(store.root, ".lock"))).toBe(false);
+      }
+      return Reflect.apply(readdir, fs, args);
+    });
     expect(await store.publish(packet)).toEqual(event);
     expect(lookup).toHaveBeenCalledExactlyOnceWith(event.sequence);
     expect(scan).not.toHaveBeenCalled();
     expect(reads.mock.calls.some(([file]) => String(file).startsWith(archiveDir) && String(file).endsWith(".jsonl"))).toBe(false);
-    expect(dirs.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(dirs.mock.calls.map(([directory]) => String(directory))).toEqual([
+      path.join(store.root, "event-receipts"),
+      meshLockQueueDirectory(store.root),
+    ]);
     expect(fs.existsSync(base + ".pending.json")).toBe(false);
     expect(await store.publish(packet)).toEqual(event);
     expect(store.latestSequence()).toBe(later.sequence);
@@ -262,10 +271,19 @@ describe("MeshStore", () => {
     const event = store.read()[0]!;
     // An older rewrite can remove the live anchor; the synced indexed archive is still proof.
     fs.writeFileSync(path.join(store.root, "events.jsonl"), "");
-    const directories = vi.spyOn(fs, "readdirSync");
+    const readdir = fs.readdirSync;
+    const directories = vi.spyOn(fs, "readdirSync").mockImplementation((...args) => {
+      if (String(args[0]) === path.join(store.root, "event-receipts")) {
+        expect(fs.existsSync(path.join(store.root, ".lock"))).toBe(false);
+      }
+      return Reflect.apply(readdir, fs, args);
+    });
     const scans = vi.spyOn(MeshArchive.prototype, "readAfter");
     expect(await store.publish(packet)).toEqual(event);
-    expect(directories.mock.calls.map(([directory]) => String(directory))).toEqual([meshLockQueueDirectory(store.root)]);
+    expect(directories.mock.calls.map(([directory]) => String(directory))).toEqual([
+      path.join(store.root, "event-receipts"),
+      meshLockQueueDirectory(store.root),
+    ]);
     expect(scans).not.toHaveBeenCalled();
     const archive = MeshArchive.fromRoot(store.root)!;
     expect(archive.pending()).toBeUndefined();

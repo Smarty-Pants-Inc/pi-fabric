@@ -88,6 +88,7 @@ const io = (store: MeshStore) => {
       commits: writes.mock.calls.filter(([, p]) => String(p) === canonical).length,
       locks: locks.mock.calls.filter(([p]) => String(p) === path.join(store.root, ".lock")).length }),
     reset: () => { reads.mockClear(); writes.mockClear(); locks.mockClear(); },
+    restore: () => { reads.mockRestore(); writes.mockRestore(); locks.mockRestore(); },
   };
 };
 
@@ -101,7 +102,7 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     const presence = fleet(250, now);
     // Ensure even the first pass performs a canonical read, not an ENOENT probe.
     for (const store of [hub, reference]) fs.writeFileSync(path.join(store.root, "state.json"), JSON.stringify({ format: 1, entries: {} }));
-    const probe = io(hub);
+    let probe = io(hub);
     // The hub also holds this link's commit-outbox rows (smarty-dev#6477 L2b, R11): its lease effects
     // are recorded in the same commit and retired by a later one. Compare the presence records;
     // those rows also draw from the store's version counter, so versions are compared as an order.
@@ -121,6 +122,7 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     // be the locked write's own (the write path always reads authoritative bytes); every later pass
     // revalidates the cached parse by its identity, so it stays at one read.
     expect(probe.counts()).toEqual({ reads: 2, commits: 1, locks: 1 });
+    probe.restore();
     await perRecord(reference, presence, now);
     compare();
     // Not vacuous: every lease carries the marker and this link's fresh source observation.
@@ -130,9 +132,10 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     presence.participants = presence.participants.map(p => ({ ...p, status: "running", updatedAt: now }));
     // Each pass is a new source observation, even with unchanged host leases.
     presence.hosts = presence.hosts.map(host => ({ ...host, observedAt: now }));
-    probe.reset();
+    probe = io(hub);
     await side.mirror(presence);
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
+    probe.restore();
     await perRecord(reference, presence, now);
     compare();
     now += 1;
@@ -140,22 +143,25 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     const mixed = fleet(275, now, (i) => i % 2 === 0);
     mixed.hosts = mixed.hosts.slice(25);
     mixed.participants = mixed.participants.slice(25);
-    probe.reset();
+    probe = io(hub);
     await side.mirror(mixed);
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
+    probe.restore();
     await perRecord(reference, mixed, now);
     compare();
     expect([...readHostLeases(hub.root).values()].filter(lease => lease.mirrorLease === undefined && !lease.mirror)).toHaveLength(125);
-    probe.reset();
+    probe = io(hub);
     await side.withdraw();
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
+    probe.restore();
     expect(presenceRecords(hub)).toEqual([]);
     expect(readHostLeases(hub.root).size).toBe(0);
     // Tombstone recreation is one commit too, not a failed put + retry per key.
     const restarted = new StoreBridgeSide(hub, "forge");
-    probe.reset();
+    probe = io(hub);
     await restarted.mirror(mixed);
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
+    probe.restore();
     expect(hub.listAll("topology/participants/")).toHaveLength(250);
   }, 30_000);
 

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { diagnostics } from "../src/core/diagnostics.js";
+import * as diagnosticsModule from "../src/core/diagnostics.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { MeshArchive } from "../src/mesh/archive.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -213,7 +214,7 @@ function observe(f: Fixture, unreadableFile?: string) {
   const reads: Array<{ file: string; kind: "metadata" | "liveness"; held: boolean }> = [];
   const writes: ReceiptWrite[] = [];
   const acks: Array<{ delivery: WakeDelivery; terminalRecorded: boolean }> = [];
-  const warningHeld: boolean[] = [];
+  const warningHeld: boolean[] = [], deferredDiagnosticHeld: boolean[] = [];
   const descriptors = new Map<number, string>(), synced = new Set<string>();
   const exclusive = f.mesh.exclusive.bind(f.mesh);
   vi.spyOn(f.mesh, "exclusive").mockImplementation(async <T>(operation: () => T, timeout?: number): Promise<T> => {
@@ -270,15 +271,21 @@ function observe(f: Fixture, unreadableFile?: string) {
     rename(source, target);
     if (value) writes.push({ file, value, held: depth > 0, fileSynced: synced.has(String(source)) });
   });
+  const originalLogDiagnostic = diagnosticsModule.logDiagnostic;
+  const deferredDiagnostics = vi.spyOn(diagnosticsModule, "logDiagnostic").mockImplementation((...args) => {
+    deferredDiagnosticHeld.push(depth > 0);
+    originalLogDiagnostic(...args);
+  });
   const warnings = vi.spyOn(diagnostics, "warn").mockImplementation(() => { warningHeld.push(depth > 0); });
-  return { reads, writes, acks, warnings, warningHeld, get held() { return depth > 0; },
+  return { reads, writes, acks, warnings, deferredDiagnostics, warningHeld, deferredDiagnosticHeld, get held() { return depth > 0; },
     beforeExclusive(operation: () => void | Promise<void>) { beforeExclusive = operation; },
     get namespaceSyncs() { return namespaceSyncs; },
     counts() {
       return { exclusiveCalls, configReads: reads.filter(row => row.file === f.configFile).length,
         claims: writes.filter(row => row.file === f.failureFile && typeof row.value.claimId === "string").length,
         errors: writes.filter(row => row.file === f.failureFile && typeof row.value.error === "string" && !row.value.claimId).length,
-        terminals: writes.filter(row => row.file === f.terminalFile).length, warnings: warnings.mock.calls.length };
+        terminals: writes.filter(row => row.file === f.terminalFile).length, warnings: warnings.mock.calls.length,
+        deferredDiagnostics: deferredDiagnostics.mock.calls.length };
     },
   };
 }
@@ -287,6 +294,7 @@ function expectOutsideLock(probe: ReturnType<typeof observe>) {
   expect.soft(probe.writes.filter(row => row.held && (row.file.endsWith("wake-terminal.json") ||
     (typeof row.value.error === "string" && !row.value.claimId))), "failure/terminal receipt recording must not hold mesh.exclusive").toEqual([]);
   expect.soft(probe.warningHeld, "warnings must not run under mesh.exclusive").not.toContain(true);
+  expect.soft(probe.deferredDiagnosticHeld, "log-only diagnostics must not run under mesh.exclusive").not.toContain(true);
 }
 async function terminalizeDeadDelivery(f: Fixture) {
   const event = await f.publishPending();
@@ -375,7 +383,10 @@ describe("terminal resident wake disposition", () => {
         error: expect.stringContaining("ResidentWakeConfigMismatch"), failures: counts.claims });
       expect.soft(fs.existsSync(f.terminalFile)).toBe(false);
       expect.soft(f.launch).not.toHaveBeenCalled();
-      expect.soft(counts).toMatchObject({ errors: counts.claims, terminals: 0, warnings: counts.claims });
+      expect.soft(counts).toMatchObject({ errors: counts.claims, terminals: 0, warnings: 0, deferredDiagnostics: 1 });
+      expect.soft(probe.deferredDiagnostics).toHaveBeenCalledOnce();
+      expect.soft(probe.deferredDiagnostics).toHaveBeenCalledWith("src/residency/wake.ts",
+        expect.stringContaining(`resident wake deferred for ${f.directory}: ResidentWakeConfigMismatch`));
       expect.soft(probe.reads.some(row => row.kind === "liveness")).toBe(true);
       expectOutsideLock(probe);
     });

@@ -1,5 +1,5 @@
 import type { MeshLockProtocol } from "../config.js";
-import { diagnostics } from "../core/diagnostics.js";
+import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import { MeshIncarnationPendingError, meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -601,16 +601,24 @@ export class MeshStore {
     return events;
   }
 
+  #residentWakeOutage = false;
   async #wakeAfterPublish(events: readonly MeshEvent[]): Promise<void> {
     if (!events.length || !this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
     try {
       const { wakeResidentActors } = await import("../residency/wake.js");
       await wakeResidentActors(this, events, undefined, undefined, () => this.#canWakeResidents());
+      if (this.#residentWakeOutage) {
+        this.#residentWakeOutage = false;
+        logDiagnostic("src/mesh/store.ts", "[pi-fabric] resident wake recovered", "info");
+      }
     } catch (error) {
       // Already committed: throwing would invite a duplicate publish. The durable pending
       // index and archived event survive even without a wake request; scoped startup,
       // maintenance or the next matching publish retries it. Report failure rather than inventing delivery.
-      diagnostics.warn("src/mesh/store.ts", `[pi-fabric] resident wake deferred: ${String(error)}`);
+      if (!this.#residentWakeOutage) {
+        this.#residentWakeOutage = true;
+        logDiagnostic("src/mesh/store.ts", `[pi-fabric] resident wake deferred: ${String(error)}`);
+      }
     }
   }
 

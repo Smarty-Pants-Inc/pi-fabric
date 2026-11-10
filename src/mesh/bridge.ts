@@ -4592,6 +4592,8 @@ export class MeshBridge {
     let walCapDelay: number | undefined;
     let resample = false;
     let streakTimer: ReturnType<typeof setTimeout> | undefined;
+    // Re-sampling/reconnects reset retry streaks, not an outage. Only a successful pass recovers it.
+    let mirrorOutage = false;
     let busy: { count: number; started: number; reportedAt: number; first: string; last: string;
       retainedOffLockMs: number } | undefined;
     let recoveredIngress = { fenceRefusals: 0, retainedOffLockMs: 0 };
@@ -4612,6 +4614,7 @@ export class MeshBridge {
       if (streakTimer !== undefined) clearTimeout(streakTimer);
       streakTimer = undefined;
       if (!busy) {
+        if (outcome === "recovered" && mirrorOutage) logBusy(`bridge busy streak recovered (${direction}); bridge mirror restored`);
         if (failedIngress?.fenceRefusals) logBusy(`bridge ingress busy streak ${outcome} (toLocal); ` +
           `${failedIngress.fenceRefusals} fence refusals; retainedOffLockMs=${Math.max(0, Math.round(failedIngress.retainedOffLockMs))}`);
         return;
@@ -4691,6 +4694,7 @@ export class MeshBridge {
         retryMs = LOCK_RETRY_MIN_MS;
         walCapDelay = undefined;
         finishBusy("recovered");
+        mirrorOutage = false;
         // ponytail: back off only retained work to recover a missed notification without idle polling.
         const membershipRetryAt = this.#membershipRetryAt[direction];
         if (membershipRetryAt !== undefined) {
@@ -4751,7 +4755,8 @@ export class MeshBridge {
         }
         busy.count += 1;
         busy.last = label;
-        if (now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
+        if (error instanceof BridgeMirrorDeferredError ? !mirrorOutage
+          : now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
           // The shared helper projects typed WAL facts, but passes other errors' free text through.
           // Never retain owner, fence, recovery or path text in this streak's diagnostics.
           let detail = label;
@@ -4773,6 +4778,7 @@ export class MeshBridge {
             `elapsed ${Math.max(0, Math.round(now - busy.started))} ms; first=${busy.first}; last=${busy.last}; ` +
             `retainedOffLockMs=${Math.max(0, Math.round(busy.retainedOffLockMs))}: ${detail}`);
           busy.reportedAt = now;
+          if (error instanceof BridgeMirrorDeferredError) mirrorOutage = true;
         }
       }
       delete this.#membershipAttempt[direction];
@@ -5431,6 +5437,7 @@ export class MeshBridge {
     let reportedTimeout = false;
     let walCapLoggedAt = Number.NEGATIVE_INFINITY;
     let walCapDelay: number | undefined;
+    let mirrorOutage = false;
     let backingOff = false;
     let mirrorBackingOff = false;
     // smarty-dev#9751: once start() has loaded the cursors, each direction runs in its own loop (#directionLoop),
@@ -5519,6 +5526,8 @@ export class MeshBridge {
         backingOff = false;
         try {
           await pass;
+          if (mirrorOutage) this.#log("bridge busy streak recovered (presence); bridge mirror restored");
+          mirrorOutage = false;
           mirrorBackingOff = false;
           reportedTimeout = false;
           walCapDelay = undefined;
@@ -5555,8 +5564,11 @@ export class MeshBridge {
             walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
             delay = walCapDelay;
             const now = Date.now();
-            if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : "mesh state WAL cap"}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
+            if (error instanceof BridgeMirrorDeferredError) {
+              if (!mirrorOutage) this.#log(`bridge mirror degraded; retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
+              mirrorOutage = true;
+            } else if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
+              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {

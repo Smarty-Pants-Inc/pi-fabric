@@ -8571,7 +8571,9 @@ export class AgentManager {
     const info: AgentHandleInfo = {
       ...managed.runRoute,
       ...(managed.timeoutNote ? { timeoutNote: managed.timeoutNote } : {}),
-      ...(managed.modelPolicyWarnings?.length ? { warnings: [...managed.modelPolicyWarnings] } : {}),
+      ...((managed.modelPolicyWarnings?.length || managed.transport.warnings?.length)
+        ? { warnings: [...new Set([...(managed.modelPolicyWarnings ?? []), ...(managed.transport.warnings ?? [])])] }
+        : {}),
       id: managed.id,
       name: managed.name,
       ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
@@ -8671,8 +8673,8 @@ export class AgentManager {
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
       ...managed.runRoute,
       ...(managed.lostContact ? { lostContact: managed.lostContact } : {}),
-      ...((record.warnings?.length || managed.modelPolicyWarnings?.length || (includeSaveFailure && managed.settlementSaveFailure))
-        ? { warnings: [...new Set([...(record.warnings ?? []), ...(managed.modelPolicyWarnings ?? []),
+      ...((record.warnings?.length || managed.modelPolicyWarnings?.length || managed.transport.warnings?.length || (includeSaveFailure && managed.settlementSaveFailure))
+        ? { warnings: [...new Set([...(record.warnings ?? []), ...(managed.modelPolicyWarnings ?? []), ...(managed.transport.warnings ?? []),
           ...(includeSaveFailure && managed.settlementSaveFailure ? [managed.settlementSaveFailure.warning] : [])])] }
         : {}),
       ...(managed.promptSha256 ?? record.promptSha256 ? { promptSha256: managed.promptSha256 ?? record.promptSha256 } : {}),

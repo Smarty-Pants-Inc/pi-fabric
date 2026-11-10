@@ -299,6 +299,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     const needs = normalizeAgentCapabilityTokens(request.needs);
     request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     const placementDeadline = assertPlacementDeadline(request);
+    const warnings: string[] = [];
     if (request.placementAdmission) {
       if (request.placementLocalReason) {
         throw Object.assign(new Error("The admitted Placement transport cannot preserve this worker's host-side requirements"),
@@ -381,6 +382,15 @@ export class ProcessTransport implements AgentTransportAdapter {
       const log = args.get("--log-file");
       if (!log) throw new Error("Placement audit requires a run event log");
       fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
+      // Policy pins and fixed worker/cwd incompatibilities are not actionable
+      // fallbacks. Gate the request independently: unmet needs/default-local can
+      // mask its fixed incompatibility in the unchanged audit reason.
+      if (placement.default === "remote" && !needs?.includes("local") && !isActorLaunch(request.workerArguments)
+        && (!request.placementLocalReason || request.placementLocalReason === "launcher supports at most 240 minutes")
+        && (reason?.startsWith("placement-picker-local:") || reason?.startsWith("placement-probe-failed:")
+          || reason?.startsWith("unmet needs:") || reason === "launcher supports at most 240 minutes")) {
+        warnings.push(`placement: using local worker: ${reason}`);
+      }
     }
     }
     // Check on Main only after the remote decision; required paths may exist solely on the target.
@@ -462,6 +472,7 @@ export class ProcessTransport implements AgentTransportAdapter {
     const { cgroup } = processHandle as typeof processHandle & { cgroup?: string };
     return {
       kind: this.kind,
+      ...(warnings.length ? { warnings } : {}),
       ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
       ...(cgroup ? { cgroup } : {}),
       sessionId: String(processHandle.pid),

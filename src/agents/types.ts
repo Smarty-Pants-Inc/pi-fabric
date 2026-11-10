@@ -642,6 +642,8 @@ export interface AgentNativeExitDiagnostic {
 }
 
 export interface AgentTransportHandle {
+  /** Launch diagnostics surfaced on public handles and results; never override status. */
+  warnings?: string[];
   /** Actual worker release, not the parent manager's loaded generation. */
   fabricRelease?: string;
   kind: AgentRunTransport;

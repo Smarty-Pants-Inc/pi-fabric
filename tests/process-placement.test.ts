@@ -73,7 +73,7 @@ const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSession
   };
   const config = { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs, placement: normalizeFabricConfig({agents:{placement:raw}}).agents.placement! };
   const worker = path.join(root, "local.mjs");
-  fs.writeFileSync(worker, `import fs from 'node:fs'; const args = new Map(); for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]); const now=Date.now(); fs.writeFileSync(args.get('--status-file'),JSON.stringify({id:args.get('--id'),name:args.get('--name'),task:'local',status:'completed',runner:'pi',transport:'process',cwd:args.get('--cwd'),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:0,text:'LOCAL',usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));`);
+  fs.writeFileSync(worker, `import fs from 'node:fs'; const args = new Map(); for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]); const now=Date.now(); fs.writeFileSync(args.get('--status-file'),JSON.stringify({id:args.get('--id'),name:args.get('--name'),task:'local',status:'completed',runner:'pi',transport:'process',cwd:args.get('--cwd'),startedAt:now,updatedAt:now,finishedAt:now,turns:1,toolCalls:0,text:'LOCAL',warnings:['worker fixture warning'],usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:0}}));`);
   const placementConfigPath = path.join(profile, "fabric.json");
   if (live) fs.writeFileSync(placementConfigPath, JSON.stringify({ agents: { placement: raw } }));
   const manager = new AgentManager(root, config, { workerPath: worker, runRoot: path.join(root, "runs"), ...(resolveInheritedSessionPins ? { resolveInheritedSessionPins } : {}), ...(live ? { placementConfigPath } : {}) }); managers.push(manager);
@@ -306,11 +306,62 @@ describe("host process task placement", () => {
     for(const needs of ["corpus",[1],[""]]) expect(()=>normalizeAgentRunRequest({task:"x",needs},defaults)).toThrow("needs");
     for (const name of ["run","spawn"]) expect((AGENTS_ACTION_DESCRIPTORS.find(d=>d.name===name)!.inputSchema as {properties:Record<string,unknown>}).properties.needs).toBeDefined();
   });
-  it.each(["github-write","corpus","mac","ryzen1-service","unknown"])("keeps unmet %s local with exactly one audit line", async need => {
+  it.each(["github-write","corpus","mac","ryzen1-service","unknown"])("keeps unmet %s local with a public warning and exactly one audit line", async need => {
     const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:[need]});
-    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+    const warning = `placement: using local worker: unmet needs: ${need}`;
+    expect(h.warnings).toEqual([warning]);
+    expect(await f.manager.wait(h.id)).toMatchObject({ text: "LOCAL", warnings: ["worker fixture warning", warning] });
     const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
     expect(lines).toEqual([expect.objectContaining({reason:`unmet needs: ${need}`,needs:[need]})]);
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("sends a task without needs to a configured picker host without a local fallback warning", async () => {
+    const f = fixture(false, 240 * 60_000);
+    const picker = path.join(f.root, "picker.mjs"); fs.writeFileSync(picker, "console.log('ryzen2');");
+    f.config.placement.pickerCommand = [process.execPath, picker];
+    f.config.placement.sshAliases = { ryzen2: "ryzen2-agent" };
+    // Host selection remains real; leave input admission to the fixture launcher.
+    vi.stubEnv("SMARTY_ALPHA", "1");
+    const start = vi.spyOn(processUtils, "spawnDetached");
+    const handle = await f.manager.spawn({ task: "ordinary task" });
+    expect(handle.sessionId).toBe(`placement:${handle.id}`);
+    expect(handle.warnings).toBeUndefined();
+    const result = await f.manager.wait(handle.id);
+    expect(result).toMatchObject({ status: "completed", text: "REMOTE: ordinary task" });
+    expect(result.warnings).toEqual(["Remote one-shot placement: no streaming, controls, tool telemetry, or usage accounting."]);
+    const argv = JSON.parse(fs.readFileSync(path.join(f.results, handle.id, "argv.json"), "utf8"));
+    expect(argv.slice(0, 2)).toEqual(["--host", "ryzen2"]);
+    expect(argv[argv.indexOf("--minutes") + 1]).toBe("240");
+    expect(start).not.toHaveBeenCalled();
+  });
+  it("keeps the package's 24-hour default timeout local with an actionable warning", async () => {
+    const f = fixture(false, DEFAULT_FABRIC_CONFIG.agents.timeoutMs);
+    const warning = "placement: using local worker: launcher supports at most 240 minutes";
+    const handle = await f.manager.spawn({ task: "unconfigured timeout", transport: "process" });
+    expect(handle.warnings).toEqual([warning]);
+    expect(await f.manager.wait(handle.id)).toMatchObject({ text: "LOCAL", warnings: ["worker fixture warning", warning] });
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  // Keep reason: failure path — unavailable work host; recorded requirement smarty-dev#4605.
+  // Exercise the actual public manager boundary, not just transport metadata or audit events.
+  it.each((["spawn", "run"] as const).flatMap(method =>
+    ["missing", "empty", "nonzero", "malformed"].map(kind => ({ method, kind })),
+  ))("exposes $kind picker fallback on the $method handle and terminal result", async ({ method, kind }) => {
+    const f = fixture();
+    const picker = path.join(f.root, "picker.mjs");
+    fs.writeFileSync(picker, kind === "empty" ? "" : kind === "nonzero" ? "process.exit(3);" : "console.log('not a host');");
+    f.config.placement.pickerCommand = kind === "missing" ? [path.join(f.root, "absent-picker")] : [process.execPath, picker];
+    const onSpawned = vi.fn();
+    const request = { task: "picker fallback", transport: "process" as const };
+    const handle = method === "spawn" ? await f.manager.spawn(request) : undefined;
+    const result = handle ? await f.manager.wait(handle.id) : await f.manager.run(request, undefined, onSpawned);
+    const warning = expect.stringContaining("placement: using local worker: placement-picker-local:");
+    expect(handle ?? onSpawned.mock.calls[0]?.[0]).toMatchObject({ warnings: [warning] });
+    expect(result).toMatchObject({ status: "completed", text: "LOCAL", warnings: ["worker fixture warning", warning] });
+    const events = fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const local = events.filter(event => event.type === "placement.local");
+    expect(local).toHaveLength(1);
+    expect(result.warnings).toContain(`placement: using local worker: ${local[0].reason}`);
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it.each([false,true])("preserves argv and maps spawn/wait results (command polling=%s)", async pollCommand => {
@@ -450,10 +501,12 @@ describe("host process task placement", () => {
     await expect(new ProcessTransport(undefined,f.config.placement).launch(req)).rejects.toThrow("authorized");
     expect(fs.existsSync(f.results)).toBe(false);
   });
-  it("falls back locally with one audit reason when the executable probe fails", async () => {
+  it("falls back locally with a public warning and one audit reason when the executable probe fails", async () => {
     const f=fixture(); f.config.placement.command=[path.join(f.root,"missing"),"{id}"];
     const h=await f.manager.spawn({task:"x",transport:"process"});
-    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+    const warning = expect.stringContaining("placement: using local worker: placement-probe-failed:");
+    expect(h.warnings).toEqual([warning]);
+    expect(await f.manager.wait(h.id)).toMatchObject({ text: "LOCAL", warnings: ["worker fixture warning", warning] });
     const events=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
     expect(events.filter(line=>line.type==="placement.local")).toEqual([expect.objectContaining({reason:expect.stringContaining("placement-probe-failed:")})]);
     expect(fs.existsSync(f.results)).toBe(false);
@@ -573,10 +626,14 @@ describe("host process task placement", () => {
   });
   it.each(["0", "1"].flatMap(mode => ["reject", "malformed"].map(task => ({ mode, task }))))("alpha=$mode reports $task launch uncertainty, no local fallback", async ({ mode, task }) => {
     vi.stubEnv("SMARTY_ALPHA", mode);
-    const f=fixture(); const result=await f.manager.run({task,transport:"process"});
+    const f=fixture(); const start=vi.spyOn(processUtils,"spawnDetached");
+    const result=await f.manager.run({task,transport:"process"});
     expect(result.status).toBe("failed"); expect(result.error).toContain("unknown");
     expect(fs.existsSync(path.join(f.manager.runDirectory(result.id)!,"unresolved-worker.json"))).toBe(true);
     expect(result.text).not.toBe("LOCAL");
+    expect(result.warnings?.some(warning => warning.startsWith("placement: using local worker:")) ?? false).toBe(false);
+    expect(fs.readdirSync(f.results)).toEqual([result.id]);
+    expect(start).not.toHaveBeenCalled();
   });
   it("audits unsupported one-shot features and configured local default", async () => {
     const f=fixture();

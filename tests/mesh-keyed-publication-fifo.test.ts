@@ -157,7 +157,9 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
-it("publishes keyed events exactly once across native FIFO waiters while a participant registers and renews", async () => {
+// Loaded Windows cannot finish this 24k-receipt stress within the 120s publisher budget;
+// Windows keyed correctness remains covered in mesh-store.test.ts. Measurement: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/19935
+it.skipIf(process.platform === "win32")("publishes keyed events exactly once across native FIFO waiters while a participant registers and renews", async () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-keyed-publication-fifo-"));
   roots.push(base);
   const root = path.join(base, "mesh");

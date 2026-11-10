@@ -1874,6 +1874,7 @@ export class EventLog {
    * Linux can leave the retired file inside verifiedRemove's private graveyard after unlink failure. */
   #retryRetiredReceipts(): void {
     const directory = path.join(this.root, "event-receipts-pruned");
+    if (!fs.existsSync(directory)) { this.#reportReceiptCleanup(); return; }
     const receipts: Array<{ file: string; stat: fs.Stats }> = [];
     const retiredName = /^[a-f0-9]{64}\.[a-f0-9-]{36}\.json(?:\.[a-f0-9-]{36})?$/;
     try {

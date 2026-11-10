@@ -74,7 +74,8 @@ afterEach(() => {
   }
 });
 
-describe("per-operation dedupe capacity headroom", () => {
+// POSIX-only: the advisory sequence headroom FD is intentionally not used on Windows.
+describe.skipIf(process.platform === "win32")("per-operation dedupe capacity headroom", () => {
   // PR #1927 P1-1: unsupported namespace preparation leaves a fresh directory absent.
   it.each(["single", "batch"])("uses only the BASE locked listing for a missing receipt directory with unsupported namespace preparation (%s)", async mode => {
     const namespace = vi.spyOn(atomicWrite, "namespaceBarrierAvailable").mockReturnValue(false);
@@ -437,4 +438,42 @@ describe("per-operation dedupe capacity headroom", () => {
     expect(replacement.id).not.toBe(old.id);
     expect(replacement.sequence).toBeGreaterThan(young.sequence);
   });
+});
+
+it("skips the advisory headroom hint on Windows and replays a fresh receipt", async () => {
+  const store = createStore(100_000);
+  const seeded = await store.publish(packet("seed"));
+  const directory = path.join(store.root, "event-receipts");
+  const counter = path.join(store.root, "sequence");
+  expect(fs.readdirSync(directory)).toContain(path.basename(receipt(store, "seed")));
+  expect(Number(fs.readFileSync(counter, "utf8"))).toBe(seeded.sequence);
+
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  if (!originalPlatform) throw new Error("process.platform descriptor is unavailable");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    const observed = observe(store);
+    const lock = path.join(store.root, ".lock");
+    const sequenceOpensOutsideLock: unknown[] = [];
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation((...args) => {
+      if (args[0] === counter && !fs.existsSync(lock)) sequenceOpensOutsideLock.push(args[1]);
+      return Reflect.apply(open, fs, args);
+    });
+
+    const fresh = await store.publish(packet("fresh-windows"));
+    expect(sequenceOpensOutsideLock).toEqual([]);
+    expect(observed.listings).toEqual([true]);
+    expect(fresh).toMatchObject({ id: expect.any(String), sequence: seeded.sequence + 1, dedupeKey: "fresh-windows" });
+    expect(fresh.id).not.toBe(seeded.id);
+    expect(store.read()).toEqual([seeded, fresh]);
+
+    observed.listings.length = 0;
+    expect(await store.publish(packet("fresh-windows"))).toEqual(fresh);
+    expect(observed.listings).toEqual([]);
+    expect(sequenceOpensOutsideLock).toEqual([]);
+    expect(store.read()).toEqual([seeded, fresh]);
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
 });

@@ -751,6 +751,9 @@ export class EventLog {
    * Capture BEFORE the real listing, then validate under .lock; slack is not a bound on
    * other publishers. Unknown state always keeps the full serialized capacity pass. */
   #observeDedupeCapacityHeadroom(dedupeKeys: string[], namespace?: ReceiptNamespace): DedupeCapacityHeadroom | undefined {
+    // On Windows, a held sequence descriptor can make the commit's atomic counter replacement fail with EPERM.
+    // Skip this advisory path entirely there; BASE performs its listing under the mesh lock.
+    if (process.platform === "win32") return undefined;
     let descriptor: number | undefined;
     let retained = false;
     try {

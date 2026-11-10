@@ -24,6 +24,7 @@ const project = (config: Record<string, unknown> = {}): string => {
 
 const runtimeHarness = () => {
   const instances: FakeRuntime[] = [];
+  const signals: Array<AbortSignal | undefined> = [];
   let release: (() => void) | undefined;
   let blocked = false;
   let initializeFailures = 0;
@@ -33,8 +34,14 @@ const runtimeHarness = () => {
     widgetDismissedAt = 0;
     setDecisionProfile = vi.fn();
     observationHealth = vi.fn((): string[] => []);
-    initialize = vi.fn(async () => {
-      if (blocked) await new Promise<void>((resolve) => { release = resolve; });
+    initialize = vi.fn(async (_context?: ExtensionContext, _config?: unknown, options: { signal?: AbortSignal } = {}) => {
+      signals.push(options.signal);
+      if (blocked) await new Promise<void>((resolve, reject) => {
+        const aborted = () => reject(options.signal?.reason);
+        release = () => { options.signal?.removeEventListener("abort", aborted); resolve(); };
+        options.signal?.addEventListener("abort", aborted, { once: true });
+        if (options.signal?.aborted) aborted();
+      });
       this.initialized = true;
       if (initializeFailures > 0) {
         initializeFailures--;
@@ -52,6 +59,7 @@ const runtimeHarness = () => {
   }
   return {
     instances,
+    signals,
     loader: vi.fn(async () => ({ FabricRuntimeState: FakeRuntime })) as never,
     block() { blocked = true; },
     release() { blocked = false; release?.(); },
@@ -566,6 +574,154 @@ describe("FabricState lazy bootstrap", () => {
       await state.shutdown(reason, targetSessionFile);
       expect(harness.instances[0]?.shutdown).toHaveBeenCalledExactlyOnceWith(reason, targetSessionFile);
     } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  // First-connect can remain pending forever: a lifecycle boundary must cancel the actual
+  // initialize wait, not just retire the lease after that wait eventually returns.
+  it.each(["shutdown", "bootstrap", "session-switch", "initialize"] as const)(
+    "cancels pending activation before awaiting %s", async (boundary) => {
+      const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+      const harness = runtimeHarness();
+      const state = createState(harness.loader);
+      const context = contextAt(cwd);
+      let activation: Promise<unknown> | undefined;
+      let retiring: Promise<void> | undefined;
+      try {
+        await state.bootstrap(context);
+        harness.block();
+        activation = state.ensure(context).catch(error => error);
+        await vi.waitFor(() => expect(harness.instances[0]?.initialize).toHaveBeenCalledTimes(1));
+        const signal = harness.signals[0];
+        retiring = boundary === "shutdown" ? state.shutdown("reload")
+          : boundary === "initialize" ? state.initialize(context)
+          : state.bootstrap(contextAt(cwd, boundary === "session-switch" ? "session-2" : "session-1"));
+        expect(signal?.aborted).toBe(true);
+        harness.release(); // Successor, if any, need not wait; predecessor must already be aborted.
+        expect(await activation).toBeInstanceOf(Error);
+        await retiring;
+        expect(harness.instances[0]?.shutdown).toHaveBeenCalledTimes(1);
+        if (boundary !== "shutdown") {
+          await state.ensure(contextAt(cwd, boundary === "session-switch" ? "session-2" : "session-1"));
+          expect(state.initialized).toBe(true);
+          expect(harness.signals.at(-1)?.aborted).toBe(false);
+        }
+      } finally {
+        harness.release();
+        await activation;
+        await retiring;
+        await state.shutdown();
+        fs.rmSync(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["file", "nats"] as const)("preserves the %s session-start reactivation contract when deferral is requested", async (transport) => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true, transport,
+      ...(transport === "nats" ? { nats: {
+        servers: "tls://broker.example.invalid:4222", machine: "machine-a", operatorMachine: "fabric-ops",
+        credentials: path.join(os.tmpdir(), "unused-firstconnect.creds"), custodyStream: "CUSTODY",
+        livenessStream: "LIVENESS", pathBMachines: ["machine-a"], tls: { caFile: path.join(os.tmpdir(), "unused-firstconnect-ca.pem") },
+      } } : {}),
+    } });
+    vi.stubEnv("PI_FABRIC_MESH_HOST_TRANSPORT", transport);
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(contextAt(cwd));
+      const first = await state.ensure(contextAt(cwd));
+      await state.bootstrap(contextAt(cwd, "session-2"), { deferNatsActivation: true });
+      expect(first.current()).toBe(false);
+      expect(harness.instances[0]?.initialize).toHaveBeenCalledTimes(transport === "nats" ? 1 : 2);
+      await state.ensure(contextAt(cwd, "session-2"));
+      expect(harness.instances[0]?.initialize).toHaveBeenCalledTimes(2);
+      expect(state.initialized).toBe(true);
+      expect(harness.signals.every(signal => signal?.aborted === false)).toBe(true);
+    } finally {
+      await state.shutdown();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      vi.unstubAllEnvs();
+    }
+  });
+
+  // Keep reason: FC-AUDIT-002 escaped because SDK dispose emits no lifecycle event. Fake
+  // time proves ownership/timer cleanup and a long live outage without a wall-clock delay.
+  it.each(["dispose", "success", "failure"] as const)("confines the NATS pending liveness check to activation (%s)", async (terminal) => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_FABRIC_MESH_HOST_TRANSPORT", "nats");
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true, transport: "nats", nats: {
+      servers: "tls://broker.example.invalid:4222", machine: "machine-a", operatorMachine: "fabric-ops",
+      credentials: path.join(os.tmpdir(), "unused-disposal.creds"), custodyStream: "CUSTODY",
+      livenessStream: "LIVENESS", pathBMachines: ["machine-a"], tls: { caFile: path.join(os.tmpdir(), "unused-disposal-ca.pem") },
+    } } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    let stale = false;
+    const context = new Proxy(contextAt(cwd), { get(object, key, receiver) {
+      if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+      return Reflect.get(object, key, receiver);
+    } });
+    let pending: Promise<unknown> | undefined;
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    try {
+      await state.bootstrap(context);
+      expect(vi.getTimerCount()).toBe(0); // Idle bootstrap must stay inert.
+      harness.block();
+      if (terminal === "failure") harness.failInitialize();
+      pending = state.ensure(context).catch(error => error);
+      await vi.waitFor(() => expect(harness.instances[0]?.initialize).toHaveBeenCalledTimes(1));
+      const signal = harness.signals[0]!;
+      expect(vi.getTimerCount()).toBe(1);
+      expect(intervals.mock.results[0]!.value.hasRef()).toBe(false);
+      await vi.advanceTimersByTimeAsync(60_000); // No total startup timeout for a live owner.
+      expect(signal.aborted).toBe(false);
+      expect(harness.instances[0]?.shutdown).not.toHaveBeenCalled();
+      if (terminal === "dispose") stale = true;
+      else harness.release();
+      await vi.advanceTimersByTimeAsync(250);
+      const result = await pending;
+      if (terminal === "success") expect(state.initialized).toBe(true);
+      else expect(result).toBeInstanceOf(Error);
+      expect(signal.aborted).toBe(terminal === "dispose");
+      expect(vi.getTimerCount()).toBe(0);
+      stale = true;
+      await vi.advanceTimersByTimeAsync(60_000);
+      // No completed activation acquires a new disposal timer/abort; shutdown owns withdrawal.
+      expect(signal.aborted).toBe(terminal === "dispose");
+    } finally {
+      harness.release(); await pending;
+      await state.shutdown();
+      intervals.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      vi.useRealTimers(); vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not abort a completed activation before graceful runtime custody withdrawal", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    let releaseShutdown: (() => void) | undefined;
+    try {
+      await state.bootstrap(contextAt(cwd));
+      const lease = await state.ensure(contextAt(cwd));
+      const signal = harness.signals[0];
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect(signal?.aborted).toBe(false);
+      harness.instances[0]!.shutdown.mockImplementationOnce(async () => {
+        expect(signal?.aborted).toBe(false); // Carrier still usable by close/quiesce/CAS withdrawal.
+        await new Promise<void>(resolve => { releaseShutdown = resolve; });
+      });
+      const shutdown = state.shutdown("reload");
+      expect(lease.current()).toBe(false);
+      expect(signal?.aborted).toBe(false);
+      releaseShutdown?.();
+      await shutdown;
+      expect(state.initialized).toBe(false);
+    } finally {
+      releaseShutdown?.();
+      await state.shutdown();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("cleans failed activation and retries with a fresh runtime", async () => {

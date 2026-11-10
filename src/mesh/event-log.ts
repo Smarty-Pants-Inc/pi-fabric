@@ -201,7 +201,9 @@ interface DedupeReceiptCandidate {
 
 /** Prepared outside .lock; one instance belongs to one synchronous append hold. */
 interface EventLogMaintenance {
+  /** A stale optional snapshot may not authorize compaction or intent settlement. */
   quiescent: boolean;
+  required: boolean;
   refreshPending: boolean;
   stamp: string;
   sequence: number;
@@ -907,22 +909,11 @@ export class EventLog {
       // Only a new single archived keyed append gets this publish's proof. Recovery above,
       // batch, prior receipts and changed off-lock archive selection retain their defaults.
       let publishNamespace: ReturnType<KeyedPublishPrefix["forArchive"]>;
-      // Admission precedes caller callbacks: a bounded retirement pass may need to
-      // release and refresh its scan before any publication effect can be replayed.
-      if (intentPath) {
-        const key = path.basename(receiptPath!, ".json");
-        if (!maintenance!.keys.has(key)) {
-          if (this.#pruneDedupeReceipts(maintenance!, 1) >= this.#maxDedupeReceipts) {
-            if (maintenance!.pruneMore) throw new DedupeScanChanged();
-            // A pending -> settled finalizer does not reserve another sequence and
-            // directory timestamps can repeat. Refresh protected-only capacity once
-            // outside custody before reporting a pending-intent-full refusal.
-            if (maintenance!.refreshPending && maintenance!.pending.size) throw new DedupePendingRefresh();
-            throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
-          }
-          maintenance!.keys.add(key);
-        }
-      }
+      // Capacity eligibility may refresh before caller effects, but must not retire
+      // an earlier receipt until this publication passes its fence and validation.
+      const key = intentPath ? path.basename(receiptPath!, ".json") : undefined;
+      const capacityVictims = key && !maintenance!.keys.has(key)
+        ? this.#prepareDedupeCapacity(maintenance!) : [];
       const append = (): { event: MeshEvent; line: string; bytes: number } => {
         // Unknown admission/data/outbox errors and possible partial appends must never replay.
         consumeInitialMeshLockAdmission(this.root);
@@ -962,6 +953,15 @@ export class EventLog {
         // remains a durable pending nudge for the next delivery, never a post-append throw.
         // A failed append can leave only a harmless nudge; actor cursors still own delivery.
         this.indexDeliveryBeforeAppend?.(event);
+        if (key) {
+          // Callbacks can refuse or change a candidate. Recheck the complete plan
+          // before detaching anything; never refresh/replay after caller effects.
+          if (capacityVictims.some(receipt => !this.#canRetireReceipt(maintenance!, receipt))) {
+            throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
+          }
+          for (const receipt of capacityVictims) this.#retireReceipt(maintenance!, receipt);
+          maintenance!.keys.add(key);
+        }
         // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
         // The archive holds the event durably before it goes live (smarty-dev#754); the live
         // append commits it. If either step fails, the event is cut back out of the archive.
@@ -1822,13 +1822,13 @@ export class EventLog {
       candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
     }
     if (candidates.length) fs.mkdirSync(path.join(this.root, "event-receipts-pruned"), { recursive: true, mode: 0o700 });
-    if (stamp !== this.#dedupeDirectoryStamp() || sequence !== this.#readSequence()) throw new DedupeScanChanged();
-    return { quiescent, refreshPending: false, stamp, sequence, keys, pending: new Set(pendingNames.map(name => path.join(directory, name))),
+    const current = quiescent && stamp === this.#dedupeDirectoryStamp() && sequence === this.#readSequence();
+    return { quiescent: current, required: reserve > 0 || expire, refreshPending: false, stamp, sequence, keys, pending: new Set(pendingNames.map(name => path.join(directory, name))),
       victims, candidates, freshCandidates: [], candidateIndex: 0, retired: [], compacted: false, pruneAttempts: 0, pruneMore: false };
   }
 
-  /** Internal caller preflight for transact/schedule as well as ordinary publication. A stale
-   * scan is refused before the caller's callback, never replaying a committed transaction. */
+  /** Internal preflight for transact/schedule and publication. Required capacity scans
+   * refresh before caller effects; stale optional scans skip maintenance, not the operation. */
   async withMaintenance<T>(operation: (maintenance: EventLogMaintenance) => Promise<T>, reserve = 0): Promise<T> {
     const deadline = Date.now() + this.#lock.lockTimeoutMs;
     let refreshedPending = false;
@@ -1837,27 +1837,41 @@ export class EventLog {
     const victims = new Map<string, fs.Stats | undefined>();
     for (;;) {
       let maintenance: EventLogMaintenance | undefined;
+      let completed = false;
       try {
         maintenance = this.#scanDedupeReceipts(reserve, false, victims);
         maintenance.refreshPending = !refreshedPending;
-        return await operation(maintenance);
+        const result = await operation(maintenance);
+        completed = true;
+        return result;
       } catch (error) {
-        if (!(error instanceof DedupeScanChanged) || Date.now() >= deadline) throw error;
+        if (!(error instanceof DedupeScanChanged)) throw error;
+        if (Date.now() >= deadline) {
+          throw new MeshDedupeRecoveryError("Mesh dedupe capacity admission changed before custody; retry publication", { cause: error });
+        }
         if (error instanceof DedupePendingRefresh) refreshedPending = true;
         await delay(0, this.#lock.writeAbortSignal);
       } finally {
         if (maintenance) {
           this.#removeRetiredReceipts(maintenance.retired);
-          if (maintenance.compacted || maintenance.pruneMore) await this.#expireDedupeReceipts(victims);
+          // A lowered cap can need more victims than one keyed admission may
+          // retire. Successful ordinary maintenance drains it through the same
+          // bounded expiry holds, even when the live log needs no rewrite.
+          if (maintenance.compacted || (completed && !maintenance.required && maintenance.quiescent &&
+              maintenance.keys.size > this.#maxDedupeReceipts)) await this.#expireDedupeReceipts(victims);
         }
       }
     }
   }
 
-  /** Constant-size namespace/counter validation only; no directory listing on Windows either. */
+  /** Constant-size validation only. Ordinary appends need no receipt snapshot:
+   * contention skips optional compaction, not publication or its admission callback. */
   validateMaintenance(maintenance: EventLogMaintenance): void {
     if (!maintenance.quiescent || maintenance.sequence !== this.#readSequence() ||
-        maintenance.stamp !== this.#dedupeDirectoryStamp()) throw new DedupeScanChanged();
+        maintenance.stamp !== this.#dedupeDirectoryStamp()) {
+      maintenance.quiescent = false;
+      if (maintenance.required) throw new DedupeScanChanged();
+    }
   }
 
   #reportReceiptCleanup(failure?: string): void {
@@ -1932,7 +1946,6 @@ export class EventLog {
 
   /** Settlement precedes expiry, so scan again after compaction has released its hold. */
   async #expireDedupeReceipts(victims: Map<string, fs.Stats | undefined>): Promise<void> {
-    const deadline = Date.now() + this.#lock.lockTimeoutMs;
     let maintenance: EventLogMaintenance | undefined;
     for (;;) {
       try {
@@ -1947,10 +1960,10 @@ export class EventLog {
         // Each bounded pass really releases custody. Retired files live in a separate
         // directory, so their physical cleanup cannot relabel a stale receipt scan.
       } catch (error) {
-        if (!(error instanceof DedupeScanChanged) || Date.now() >= deadline) throw error;
-        if (maintenance) this.#removeRetiredReceipts(maintenance.retired);
-        maintenance = undefined;
-        await delay(0, this.#lock.writeAbortSignal);
+        // Expiry is optional after the committing hold. A changed scan belongs to
+        // the next maintenance pass, never to the already committed publisher.
+        if (error instanceof DedupeScanChanged) return;
+        throw error;
       } finally { if (maintenance) this.#removeRetiredReceipts(maintenance.retired); }
     }
   }
@@ -1969,6 +1982,52 @@ export class EventLog {
     maintenance.freshCandidates = maintenance.freshCandidates.filter(candidate => candidate.key !== key);
     maintenance.freshCandidates.push({ file, stat, createdAt: event.createdAt, sequence: event.sequence, key });
     maintenance.freshCandidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
+  }
+
+  #canRetireReceipt(maintenance: EventLogMaintenance, receipt: DedupeReceiptCandidate): boolean {
+    try {
+      if (!fs.lstatSync(path.join(path.dirname(receipt.file), receipt.key + ".pending.json"), { throwIfNoEntry: false }) &&
+          this.#sameReceipt(receipt.stat, fs.lstatSync(receipt.file))) return true;
+    } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+    maintenance.victims.set(receipt.key, undefined);
+    return false;
+  }
+
+  #retireReceipt(maintenance: EventLogMaintenance, receipt: DedupeReceiptCandidate): void {
+    const retired = path.join(this.root, "event-receipts-pruned", `${receipt.key}.${randomUUID()}.json`);
+    fs.renameSync(receipt.file, retired);
+    maintenance.retired.push({ ...receipt, file: retired });
+    maintenance.keys.delete(receipt.key);
+    maintenance.victims.delete(receipt.key);
+  }
+
+  /** Read-only capacity judgment before callbacks; no retirement on refusal.
+   * A reduced cap needing more than one hold of victims fails closed. Successful
+   * unkeyed maintenance drains that backlog without replaying publication callbacks. */
+  #prepareDedupeCapacity(maintenance: EventLogMaintenance): DedupeReceiptCandidate[] {
+    const needed = maintenance.keys.size + 1 - this.#maxDedupeReceipts;
+    if (needed <= 0) return [];
+    if (needed > DEDUPE_PRUNE_MAX_VICTIMS - maintenance.pruneAttempts) {
+      throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
+    }
+    const selected: DedupeReceiptCandidate[] = [];
+    while (maintenance.candidateIndex < maintenance.candidates.length || maintenance.freshCandidates.length) {
+      const scanned = maintenance.candidates[maintenance.candidateIndex], fresh = maintenance.freshCandidates[0];
+      const useFresh = fresh && (!scanned || fresh.createdAt < scanned.createdAt ||
+        (fresh.createdAt === scanned.createdAt && (fresh.sequence < scanned.sequence ||
+          (fresh.sequence === scanned.sequence && fresh.file.localeCompare(scanned.file) < 0))));
+      if (maintenance.pruneAttempts >= DEDUPE_PRUNE_MAX_VICTIMS) throw new DedupeScanChanged();
+      maintenance.pruneAttempts++;
+      const receipt = (useFresh ? maintenance.freshCandidates.shift() : maintenance.candidates[maintenance.candidateIndex++])!;
+      if (!maintenance.keys.has(receipt.key) || (maintenance.victims.has(receipt.key) && !maintenance.victims.get(receipt.key)) ||
+          !this.#canRetireReceipt(maintenance, receipt)) continue;
+      selected.push(receipt);
+      if (selected.length === needed) return selected;
+    }
+    // A finalizer can settle a protected key without changing the reservation
+    // counter; allow one off-lock refresh even on coarse directory timestamps.
+    if (maintenance.refreshPending && maintenance.pending.size) throw new DedupePendingRefresh();
+    throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
   }
 
   /** Under .lock only the selected victims' identity/pending CAS and atomic detachment.
@@ -1993,16 +2052,8 @@ export class EventLog {
       try {
         // A late finalizer or renewal can change these without reserving another sequence.
         // Only point metadata is read here, never a receipt payload or a directory listing.
-        if (fs.lstatSync(path.join(path.dirname(receipt.file), receipt.key + ".pending.json"), { throwIfNoEntry: false }) ||
-            !this.#sameReceipt(receipt.stat, fs.lstatSync(receipt.file))) {
-          maintenance.victims.set(receipt.key, undefined);
-          continue;
-        }
-        const retired = path.join(this.root, "event-receipts-pruned", `${receipt.key}.${randomUUID()}.json`);
-        fs.renameSync(receipt.file, retired);
-        maintenance.retired.push({ ...receipt, file: retired });
-        maintenance.keys.delete(receipt.key);
-        maintenance.victims.delete(receipt.key); // a later same-hold publication may own this now-free key
+        if (!this.#canRetireReceipt(maintenance, receipt)) continue;
+        this.#retireReceipt(maintenance, receipt);
       } catch (error) {
         if (errorCode(error) === "ENOENT") { maintenance.victims.set(receipt.key, undefined); continue; }
         throw error;
@@ -2012,6 +2063,7 @@ export class EventLog {
   }
 
   #compactEventLog(maintenance: EventLogMaintenance): void {
+    if (!maintenance.quiescent) return;
     // Never rewrite away an event named by a durable intent. Resolve every intent while
     // the publish lock is held, before taking the retained tail snapshot.
     let descriptor: number | undefined;

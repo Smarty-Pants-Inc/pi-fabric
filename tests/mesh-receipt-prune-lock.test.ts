@@ -38,6 +38,103 @@ afterEach(async () => {
 });
 
 describe("receipt pruning outside mesh custody", () => {
+  // KEEP: a refused control publication must not destroy an earlier command's idempotency evidence.
+  it.each(["admit", "fence", "fixed-size", "stamp", "stamp-size", "outbox"] as const)("preserves the at-cap receipt after pre-append %s refusal", async refusal => {
+    const root = scratch(), store = storeAt(root, 1);
+    const first = await store.publish(packet("first"));
+    const before = fs.readFileSync(receipt(root, "first"));
+    const reject = vi.fn(() => { throw new Error("publication refused"); });
+    const stamp = vi.fn(() => refusal === "stamp" ? reject() : "x".repeat(2048));
+    const binding = refusal === "outbox" ? store.bindEventPublisher("refusal", async () => undefined, reject) : undefined;
+    try {
+      await expect(store.publish({ ...packet("rejected"),
+        ...(refusal === "admit" ? { admit: reject } : {}),
+        ...(refusal === "fence" ? { fence: reject } : {}),
+        ...(refusal === "fixed-size" ? { text: "x".repeat(2048) } : {}),
+        ...(refusal === "stamp" || refusal === "stamp-size" ? { data: stamp } : {}),
+      })).rejects.toThrow(refusal.endsWith("size") ? "Mesh event exceeds" : "publication refused");
+      expect(fs.existsSync(receipt(root, "first"))).toBe(true);
+      expect(fs.readFileSync(receipt(root, "first"))).toEqual(before);
+      expect(await store.publish(packet("first"))).toEqual(first);
+      expect(store.read()).toEqual([first]);
+      expect(store.latestSequence()).toBe(first.sequence);
+      expect(fs.existsSync(receipt(root, "rejected", ".pending.json"))).toBe(false);
+      if (refusal === "stamp" || refusal === "stamp-size") expect(stamp).toHaveBeenCalledTimes(1);
+      if (!refusal.endsWith("size")) expect(reject).toHaveBeenCalledTimes(1);
+    } finally { await binding?.close(); }
+  });
+
+  it("still evicts within TTL only after the new key passes admission and validation", async () => {
+    const root = scratch(), store = storeAt(root, 1);
+    const first = await store.publish(packet("first"));
+    const admit = vi.fn(() => expect(fs.existsSync(receipt(root, "first"))).toBe(true));
+    const stamp = vi.fn(() => { expect(fs.existsSync(receipt(root, "first"))).toBe(true); return { accepted: true }; });
+    const accepted = await store.publish({ ...packet("accepted"), admit, data: stamp });
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(stamp).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(receipt(root, "first"))).toBe(false);
+    expect(await store.publish(packet("accepted"))).toEqual(accepted);
+    expect(store.read()).toEqual([first, accepted]);
+  });
+
+  it.each(["renewal", "pending"] as const)("does not replay admission or retire a planned victim changed by %s during validation", async mutation => {
+    const root = scratch(), store = storeAt(root, 1);
+    const first = await store.publish(packet("first"));
+    const renewed = { ...first, id: "renewed", createdAt: first.createdAt + 1000 };
+    const admit = vi.fn(() => {
+      if (mutation === "renewal") {
+        const temporary = path.join(root, "renewed");
+        fs.writeFileSync(temporary, JSON.stringify(renewed));
+        fs.renameSync(temporary, receipt(root, "first"));
+      } else fs.writeFileSync(receipt(root, "first", ".pending.json"), JSON.stringify({
+        dedupeKey: "first", eventId: first.id, reservedSequence: first.sequence, liveOffset: 0,
+      }));
+    });
+    await expect(store.publish({ ...packet("rejected"), admit })).rejects.toBeInstanceOf(MeshDedupeStoreFullError);
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fs.readFileSync(receipt(root, "first"), "utf8"))).toEqual(mutation === "renewal" ? renewed : first);
+    expect(fs.existsSync(receipt(root, "first", ".pending.json"))).toBe(mutation === "pending");
+    expect(store.read()).toEqual([first]);
+    expect(store.latestSequence()).toBe(first.sequence);
+  });
+
+  it.each([1, 2])("keeps the 32-victim admission bound when an existing store lowers its cap to %s", async cap => {
+    const root = scratch(), seed = storeAt(root, 40);
+    for (let index = 0; index < 33; index++) await seed.publish(packet(`seed-${index}`));
+    const store = storeAt(root, cap), admit = vi.fn();
+    const rename = vi.spyOn(fs, "renameSync");
+    const publishing = store.publish({ ...packet("new"), admit });
+    if (cap === 1) {
+      await expect(publishing).rejects.toBeInstanceOf(MeshDedupeStoreFullError);
+      expect(admit).not.toHaveBeenCalled();
+      expect(fs.readdirSync(path.join(root, "event-receipts")).filter(name => /^[a-f0-9]{64}\.json$/.test(name))).toHaveLength(33);
+      expect(store.latestSequence()).toBe(33);
+    } else {
+      const event = await publishing;
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(await store.publish(packet("new"))).toEqual(event);
+      expect(fs.readdirSync(path.join(root, "event-receipts")).filter(name => /^[a-f0-9]{64}\.json$/.test(name))).toHaveLength(2);
+    }
+    const retirements = () => rename.mock.calls.filter(([, target]) => path.dirname(String(target)) === path.join(root, "event-receipts-pruned"));
+    expect(retirements()).toHaveLength(cap === 1 ? 0 : 32);
+    expect(store.read()).toHaveLength(cap === 1 ? 33 : 34);
+    if (cap === 1) {
+      // Refusal itself cannot make room, even on repeated attempts. Ordinary
+      // successful maintenance must then recover without waiting for compaction.
+      await expect(store.publish({ ...packet("new"), admit })).rejects.toBeInstanceOf(MeshDedupeStoreFullError);
+      expect(retirements()).toHaveLength(0);
+      expect(admit).not.toHaveBeenCalled();
+      await store.publish({ topic: "mesh.prune", from });
+      expect(fs.existsSync(path.join(root, "generation"))).toBe(false);
+      expect(retirements()).toHaveLength(32);
+      expect(fs.readdirSync(path.join(root, "event-receipts")).filter(name => /^[a-f0-9]{64}\.json$/.test(name))).toHaveLength(1);
+      const accepted = await store.publish({ ...packet("new"), admit });
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(accepted.sequence).toBe(35);
+      expect(await store.publish(packet("new"))).toEqual(accepted);
+    }
+  });
+
   it("a process stalled after listing lets another lock user and a no-archive finalizer progress", async () => {
     const root = scratch();
     const store = storeAt(root);

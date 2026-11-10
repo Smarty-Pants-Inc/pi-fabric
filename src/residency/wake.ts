@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { diagnostics } from "../core/diagnostics.js";
+import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -78,6 +78,17 @@ const wakeRetryDelay = (failures: number): number => Math.min(RESIDENT_WAKE_RETR
 const wakeFailures = (failure: ResidentWakeFailure | undefined): number =>
   Number.isSafeInteger(failure?.failures) && failure!.failures! >= 0 ? failure!.failures! : 0;
 const residentWakeRetrySweeps = new Map<string, Promise<void>>();
+// Per-root diagnostic state only; delivery receipts and retry admission remain authoritative.
+const residentWakeOutages = new Set<string>();
+const reportResidentWakeDeferred = (root: string, error: unknown): void => {
+  if (residentWakeOutages.has(root)) return;
+  residentWakeOutages.add(root);
+  logDiagnostic("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
+};
+const reportResidentWakeRecovered = (root: string): void => {
+  if (residentWakeOutages.delete(root))
+    logDiagnostic("src/residency/wake.ts", `[pi-fabric] resident wake recovered for ${root}`, "info");
+};
 
 /** Receipt writers share intent custody; only index operations need mesh custody. */
 const withWakeReceipt = async <T>(root: string, operation: () => Promise<T>): Promise<T> => {
@@ -494,7 +505,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
       return routes && events.some(event => residentDeliveryMatches(routes, event, lifecycle));
     } catch (error) {
       // Preserve per-root isolation when retained actor metadata is malformed.
-      diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
+      reportResidentWakeDeferred(root, error);
       return false;
     }
   });
@@ -544,6 +555,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
           await requestResidentWake(root, covered, launch, onIntentWritten, admission);
           served = true;
           await acknowledge(root, delivery);
+          reportResidentWakeRecovered(root);
         }
         continue;
       }
@@ -562,6 +574,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
         served = true;
         await acknowledge(root, delivery);
         await clearWakeFailure(root, delivery);
+        reportResidentWakeRecovered(root);
       }
     } catch (error) {
       if (error instanceof ResidentWakeAdmissionClosed) {
@@ -575,7 +588,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
       // failure recorder (which could otherwise turn that error into an ACK).
       if (delivery && !served && await recordResidentWakeFailure(mesh, root, attemptedDelivery ?? delivery,
           error, Date.now(), undefined, false)) continue;
-      diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
+      reportResidentWakeDeferred(root, error);
     }
   }
 }
@@ -658,7 +671,7 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
         if (delivery) attempts.push({ root, delivery, claimId });
       } catch (error) {
         // Without durable claim custody, leave the index/receipt for a later sweep.
-        diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake retry deferred for ${root}: ${String(error)}`);
+        reportResidentWakeDeferred(root, error);
       }
     }
     await Promise.all(attempts.map(async ({ root, delivery, claimId }) => {
@@ -675,6 +688,7 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
           if (wakeFailureAt(root)?.claimId !== claimId) return;
           await mesh.exclusive(() => acknowledgeResidentDelivery(mesh.root, root, served));
           fs.rmSync(wakeFailurePath(root), { force: true });
+          reportResidentWakeRecovered(root);
         });
       } catch (error) {
         if (error instanceof ResidentWakeAdmissionClosed) {
@@ -689,7 +703,7 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
           return;
         }
         if (await recordResidentWakeFailure(mesh, root, delivery, error, Math.max(now, Date.now()), claimId)) return;
-        diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
+        reportResidentWakeDeferred(root, error);
       }
     }));
   })();

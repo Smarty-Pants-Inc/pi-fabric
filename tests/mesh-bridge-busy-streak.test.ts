@@ -115,8 +115,9 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
   return {
     bridge, hub, far, local, agent, remote, sent, attempts, recovered, logs,
     verifiedReconnect: () => { expect(notifyChange).toBeDefined(); notifyChange!("verified-reconnect"); },
-    launch: async () => {
+    launch: async (waitForDirectionRetry = true) => {
       running = bridge.run().catch(error => { failure = error; });
+      if (!waitForDirectionRetry) return;
       // Native recovery/subscription I/O can outlive a zero-time fake-timer flush. Wait for the
       // first real direction retry log; the injected tail attempt is timestamped before this signal,
       // while fake time is still exactly zero and no retry timer has been advanced.
@@ -197,6 +198,88 @@ const sameFile = (fd: number, file: string) => {
 };
 
 describe("real MeshBridge direction busy streaks", () => {
+  it.each([false, true])("logs a changing mirror outage once, recovers once, and re-arms (inbound=%s)", async inbound => {
+    let outage = true, refused = 0;
+    const f = await fixture(() => outage ? new BridgeMirrorDeferredError(++refused % 2 === 1, refused * 100) : undefined,
+      undefined, false, 600_000, inbound);
+    const direction = inbound ? "toLocal" : "toRemote";
+    const warnings = () => f.logs.filter(({ message }) => message.startsWith(`bridge mirror degraded (${direction});`));
+    const recoveries = () => f.logs.filter(({ message }) => message.startsWith(`bridge busy streak recovered (${direction})`));
+    await f.launch();
+    await vi.advanceTimersByTimeAsync(35_000); // more than the old ten-second rate limit, changing code/message
+    expect(refused).toBeGreaterThan(2);
+    expect(warnings()).toHaveLength(1);
+    expect(recoveries()).toHaveLength(0);
+    outage = false;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await f.recovered;
+    expect(recoveries()).toHaveLength(1);
+    assertDelivered(f);
+    outage = true;
+    f.verifiedReconnect();
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(warnings()).toHaveLength(2);
+    expect(recoveries()).toHaveLength(1);
+    outage = false;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(recoveries()).toHaveLength(2);
+    expect(warnings()).toHaveLength(2);
+    assertDelivered(f);
+  });
+
+  it("logs presence mirror failure once across changing errors, then recovery and a new outage", async () => {
+    let outage = true, refused = 0;
+    const firstWarning = deferred();
+    let refusal = deferred(), recovery = deferred();
+    const f = await fixture(() => undefined, message => {
+      if (message.startsWith("bridge mirror degraded;")) firstWarning.resolve();
+      if (message.startsWith("bridge busy streak recovered (presence)")) recovery.resolve();
+    }, false, 600_000);
+    const sync = f.bridge.syncPresence.bind(f.bridge);
+    vi.spyOn(f.bridge, "syncPresence").mockImplementation(async () => {
+      if (outage) {
+        refusal.resolve();
+        throw new BridgeMirrorDeferredError(++refused % 2 === 1, refused * 100);
+      }
+      return sync();
+    });
+    const warnings = () => f.logs.filter(({ message }) => message.startsWith("bridge mirror degraded;"));
+    const recoveries = () => f.logs.filter(({ message }) => message.startsWith("bridge busy streak recovered (presence)"));
+    await f.launch(false);
+    await firstWarning.promise;
+    // Join each real reconcile/read before advancing another retry timer; virtual time alone
+    // does not settle the filesystem promises before start has completed.
+    for (let pass = 0; pass < 5; pass++) {
+      refusal = deferred();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await refusal.promise;
+    } // crosses the old WAL/mirror progress-log period
+    expect(refused).toBeGreaterThan(2);
+    expect(warnings()).toHaveLength(1);
+    expect(warnings()[0]!.message).toContain("FABRIC_BRIDGE_STALE: Fabric bridge-stale:");
+    expect(recoveries()).toHaveLength(0);
+    outage = false;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await recovery.promise;
+    expect(recoveries()).toHaveLength(1);
+    recovery = deferred();
+    outage = true;
+    f.verifiedReconnect();
+    for (let pass = 0; pass < 3; pass++) {
+      refusal = deferred();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await refusal.promise;
+    }
+    expect(warnings()).toHaveLength(2);
+    expect(recoveries()).toHaveLength(1);
+    outage = false;
+    await vi.advanceTimersByTimeAsync(30_000);
+    await recovery.promise;
+    expect(recoveries()).toHaveLength(2);
+    expect(warnings()).toHaveLength(2);
+    expect(f.failure()).toBeUndefined();
+  });
+
   // KEEP: recorded A' broker-outage failure after the adapter wake. Virtual time isolates
   // verified reconnect from retry deadlines; real stores, direction loops and cursors remain.
   describe.each([false, true])("verified reconnect (inbound=%s)", inbound => {
@@ -206,15 +289,13 @@ describe("real MeshBridge direction busy streaks", () => {
       { name: "contention during a pass", refuse: timeout, thirdAt: 600, minimum: 200, inFlight: true },
       { name: "degraded mirror during a pass", refuse: () => new BridgeMirrorDeferredError(false, 0), thirdAt: 3_000, minimum: 1_000, inFlight: true },
     ])("resets $name before the armed retry and starts a fresh streak", async ({ refuse, thirdAt, minimum, inFlight }) => {
-      const gate = deferred(), entered = deferred(), freshRetry = deferred();
-      let reconnected = false;
+      const gate = deferred(), entered = deferred(), freshAttempt = deferred();
       const direction = inbound ? "toLocal" : "toRemote";
       const f = await fixture(async attempt => {
         if (attempt === 3 && inFlight) { entered.resolve(); await gate.promise; }
+        if (attempt === 4) freshAttempt.resolve();
         return attempt <= 4 ? refuse() : undefined;
-      }, message => {
-        if (reconnected && message.includes(`(${direction}); retrying in`)) freshRetry.resolve();
-      }, false, 120_000, inbound);
+      }, undefined, false, 120_000, inbound);
       cleanups.push(async () => { gate.resolve(); });
       await f.launch();
       await vi.advanceTimersByTimeAsync(thirdAt);
@@ -224,20 +305,25 @@ describe("real MeshBridge direction busy streaks", () => {
       expect(f.cursor()).toBeLessThan(f.sent.sequence);
 
       // No peer changes and no retry-timer advancement: only verified reconnect wakes us.
-      reconnected = true;
       f.verifiedReconnect();
       if (inFlight) {
         await Promise.resolve();
         expect(f.attempts).toHaveLength(3); // keep the in-flight fence until it settles
         gate.resolve();
       }
-      await freshRetry.promise;
+      await freshAttempt.promise;
+      await vi.advanceTimersByTimeAsync(0); // settle that attempt's catch without consuming its next retry
       expect(f.attempts).toEqual([0, minimum, thirdAt, thirdAt]);
       const resampled = f.streak().find(({ message }) => message.startsWith(`bridge busy streak resampling (${direction})`));
       expect(resampled?.message).toContain("; 3 failed direction attempts,");
-      const fresh = f.streak().at(-1)!;
-      expect(fresh.at).toBe(thirdAt);
-      expect(fresh.message).toContain(`retrying in ${minimum} ms; 1 failed direction attempts, elapsed 0 ms;`);
+      if (refuse() instanceof BridgeMirrorDeferredError) {
+        // A verified reconnect re-samples retry state, but is not proof that the outage recovered.
+        expect(f.logs.filter(({ message }) => message.startsWith(`bridge mirror degraded (${direction});`))).toHaveLength(1);
+      } else {
+        const fresh = f.streak().at(-1)!;
+        expect(fresh.at).toBe(thirdAt);
+        expect(fresh.message).toContain(`retrying in ${minimum} ms; 1 failed direction attempts, elapsed 0 ms;`);
+      }
       expect(f.received()).toEqual([]);
       expect(f.cursor()).toBeLessThan(f.sent.sequence);
 

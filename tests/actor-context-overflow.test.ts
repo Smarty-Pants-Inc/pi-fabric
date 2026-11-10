@@ -7,7 +7,7 @@ import { ActorManager, ACTOR_ACTIVATION_OVERFLOW_KIND, actorEventRef } from "../
 import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 
 // RECORDED-CALL seam (#4664): real rotations/stores/worker still run, but this suite never
 // executes the product backup deleter. vitest records every prune request instead.
@@ -32,6 +32,8 @@ afterEach(async () => {
 // Every outcome arrives as an event; the run timeout is only a hang guard (smarty-dev#883).
 const HANG_GUARD_MS = 120_000;
 const TEST_GUARD_MS = HANG_GUARD_MS + 30_000;
+// Placement regressions must fail promptly if a misclassified overflow leaves an ask blocked.
+const PLACEMENT_GUARD_MS = 20_000;
 
 interface Prompt { history: boolean; overflow: boolean; session?: string; marker: string }
 
@@ -43,12 +45,20 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 60_000): Promise<vo
   }
 };
 
-const setup = (options: ConstructorParameters<typeof ActorManager>[6] = {}) => {
+const setup = (options: ConstructorParameters<typeof ActorManager>[6] = {}, placementDefault?: "remote" | "local") => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-overflow-"));
   roots.push(dir);
   const log = path.join(dir, "prompts.jsonl");
   vi.stubEnv("FAKE_PI_LOG", log);
-  const agents = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: HANG_GUARD_MS }, {
+  const placement = placementDefault === undefined ? undefined : normalizeFabricConfig({ agents: { placement: {
+    default: placementDefault,
+    // Actor activations must use the existing offline worker, never this task launcher.
+    command: [process.execPath, "-e", "throw new Error('actor activations must remain local')"],
+    resultDirectory: path.join(dir, "placed", "{id}"),
+    cancelCommand: [process.execPath, "-e", "process.exit(1)"],
+  } } }).agents.placement;
+  const agents = new AgentManager(dir, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: HANG_GUARD_MS,
+    ...(placement ? { placement } : {}) }, {
     workerPath: path.resolve(process.env.PI_FABRIC_ACTIVATION_TEST_WORKER ?? "src/worker.ts"),
     piBinary: path.resolve("tests/fixtures/fake-pi-overflow.mjs"), runRoot: path.join(dir, "runs"),
   });
@@ -219,6 +229,107 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     await waitFor(() => s.actors.inFlightCount() === 0);
     expect(registryWrites()).toBe(withUnchangedUsage); // same writes as a turn with no measurement
     expect(storedUsage(s.dir, actor.id)).toEqual(usage); // kept until a new real measurement
+  }, TEST_GUARD_MS);
+
+  // Keep reason: pi-fabric#1931 P1, real transport metadata must not contradict a typed
+  // actor overflow. The worker and classifier run unchanged; only placement is configured.
+  it.each(["remote", "local"] as const)("1931 retries a real carried no-tool overflow with %s-default placement without a public placement warning", async placementDefault => {
+    const s = setup({}, placementDefault);
+    s.recordResults();
+    const actor = await s.create("placement-retry");
+    await expect(s.actors.ask(actor.id, "FIRST_REVIEW", undefined, AbortSignal.timeout(PLACEMENT_GUARD_MS)))
+      .resolves.toMatchObject({ text: "verdict: ok" });
+    await waitFor(() => s.actors.inFlightCount() === 0, PLACEMENT_GUARD_MS);
+    const carried = header(actor.sessionFile!);
+    const outcome = await s.actors.ask(actor.id, "OVERFLOW_ON_HISTORY", { pr: 1931 }, AbortSignal.timeout(PLACEMENT_GUARD_MS))
+      .catch(error => error);
+    // Baseline rejects this ask instead of retrying; do not await a successor on its hard block.
+    expect(outcome).toMatchObject({ direction: "out", text: "verdict: ok" });
+    await waitFor(() => s.actors.inFlightCount() === 0, PLACEMENT_GUARD_MS);
+    expect(s.results.map(({ status, errorCode, toolCalls }) => ({ status, errorCode, toolCalls }))).toEqual([
+      { status: "completed", errorCode: undefined, toolCalls: 0 },
+      { status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 0 },
+      { status: "completed", errorCode: undefined, toolCalls: 0 },
+    ]);
+    expect(s.prompts()).toEqual([
+      { history: false, overflow: false, session: carried, marker: "FIRST_REVIEW" },
+      { history: true, overflow: true, session: carried, marker: "OVERFLOW_ON_HISTORY" },
+      { history: false, overflow: false, session: expect.not.stringMatching(carried), marker: "OVERFLOW_ON_HISTORY" },
+    ]);
+    expect(header(actor.sessionFile!)).not.toBe(carried);
+    expect(backups(actor.sessionFile!)).toHaveLength(1);
+    expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true, retry: true })]);
+    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
+    expect(s.overflowEvents()).toEqual([]);
+    expect(s.ownerAlarms()).toEqual([]);
+    expect(s.alarms).toEqual([]);
+    for (const result of s.results) {
+      expect((result.warnings ?? []).filter(warning => warning.startsWith("placement:"))).toEqual([]);
+      const log = s.actors.readLog(actor.id, { type: "run", runId: result.id, lines: 500 });
+      const placementEvents = log.run!.events.map(event => JSON.parse(event.raw) as { type?: string })
+        .filter(event => event.type?.startsWith("placement."));
+      expect(placementEvents).toEqual([expect.objectContaining({ type: "placement.local", id: result.id,
+        reason: placementDefault === "local" ? "placement default is local" : expect.any(String) })]);
+    }
+  }, TEST_GUARD_MS);
+
+  it.each(["fresh", "toolful"] as const)("1931 classifies a real %s overflow with remote-default placement and settles the next event on a fresh session", async mode => {
+    const s = setup({}, "remote");
+    s.recordResults();
+    const actor = await s.create("placement-settlement");
+    if (mode === "toolful") {
+      await expect(s.actors.ask(actor.id, "FIRST_REVIEW", undefined, AbortSignal.timeout(PLACEMENT_GUARD_MS)))
+        .resolves.toMatchObject({ text: "verdict: ok" });
+      await waitFor(() => s.actors.inFlightCount() === 0, PLACEMENT_GUARD_MS);
+    }
+    const marker = mode === "toolful" ? "TOOL_THEN_OVERFLOW_ON_HISTORY" : "OVERFLOW_ALWAYS";
+    const outcome = await s.actors.ask(actor.id, marker, { pr: 1931 }, AbortSignal.timeout(PLACEMENT_GUARD_MS))
+      .catch(error => error);
+    const failed = s.results.at(-1)!;
+    expect(failed).toMatchObject({ actorId: actor.id, status: "failed", errorCode: "CONTEXT_OVERFLOW",
+      toolCalls: mode === "toolful" ? 1 : 0 });
+    // This assertion fails promptly on the old placement warning's unknown/hard classification.
+    expect(outcome).toMatchObject({ code: "CONTEXT_OVERFLOW",
+      data: { code: "context-overflow-item", errorCode: "CONTEXT_OVERFLOW" } });
+    await waitFor(() => s.actors.inFlightCount() === 0 && resets(s.actors, actor.id).length === 1 &&
+      s.actors.status(actor.id).activationBlocked === undefined && s.overflowEvents().length === 1 &&
+      s.ownerAlarms().length === 1 && s.alarms.length === 1, PLACEMENT_GUARD_MS);
+    const overflowedSession = s.prompts().at(-1)!.session!;
+    const freshSession = header(actor.sessionFile!);
+    expect(freshSession).not.toBe(overflowedSession);
+    expect(backups(actor.sessionFile!)).toHaveLength(1);
+    expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true, retry: false })]);
+    expect(s.overflowEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({
+      runId: failed.id, error: "context-overflow", code: "context-overflow-item", eventRef: expect.objectContaining({ pr: 1931 }) }) })]);
+    expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({
+      actorId: actor.id, reason: "context_window", errorCode: "CONTEXT_OVERFLOW" }) })]);
+    if (mode === "toolful") expect(s.actors.messages(actor.id, 50)).toContainEqual(expect.objectContaining({
+      data: { contextOverflow: expect.objectContaining({ retry: false, toolCalls: 1, runId: failed.id }) },
+    }));
+
+    await expect(s.actors.ask(actor.id, "NEXT_REVIEW", undefined, AbortSignal.timeout(PLACEMENT_GUARD_MS)))
+      .resolves.toMatchObject({ direction: "out", text: "verdict: ok" });
+    await waitFor(() => s.actors.inFlightCount() === 0, PLACEMENT_GUARD_MS);
+    expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
+      ...(mode === "toolful" ? [{ history: false, marker: "FIRST_REVIEW" }] : []),
+      { history: mode === "toolful", marker }, { history: false, marker: "NEXT_REVIEW" },
+    ]);
+    expect(s.prompts().at(-1)!.session).toBe(freshSession);
+    expect(header(actor.sessionFile!)).toBe(freshSession);
+    expect(s.results.at(-1)).toMatchObject({ status: "completed", toolCalls: 0 });
+    expect(s.toolRuns()).toHaveLength(mode === "toolful" ? 1 : 0);
+    expect(resets(s.actors, actor.id)).toHaveLength(1);
+    expect(s.overflowEvents()).toHaveLength(1);
+    expect(s.ownerAlarms()).toHaveLength(1);
+    expect(s.alarms).toHaveLength(1);
+    expect(s.actors.status(actor.id).activationBlocked).toBeUndefined();
+    for (const result of s.results) {
+      expect((result.warnings ?? []).filter(warning => warning.startsWith("placement:"))).toEqual([]);
+      const log = s.actors.readLog(actor.id, { type: "run", runId: result.id, lines: 500 });
+      const placementEvents = log.run!.events.map(event => JSON.parse(event.raw) as { type?: string })
+        .filter(event => event.type?.startsWith("placement."));
+      expect(placementEvents).toEqual([expect.objectContaining({ type: "placement.local", id: result.id, reason: expect.any(String) })]);
+    }
   }, TEST_GUARD_MS);
 
   it("resets a carried session and retries the overflowing event once, which then succeeds", async () => {

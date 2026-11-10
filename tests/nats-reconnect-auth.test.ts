@@ -148,12 +148,13 @@ async function fixture(withSecond: boolean, ownerSignal?: AbortSignal) {
   const f = await prepareFixture(withSecond);
   try {
     const first = f.brokers[0]!;
-    const options = { ...first.runtimeOptions(first.users.machineA), servers: f.relays.map((relay) => relay.url),
+    const readyFile = path.join(first.root, `nats-ready-${process.pid}`);
+    const options = { ...first.runtimeOptions(first.users.machineA), servers: f.relays.map((relay) => relay.url), readyFile,
       tls: { ca: f.brokers.map((broker) => fs.readFileSync(broker.tls!.caFile, "utf8")).join("\n") }, hostId: HOST,
       provision: false, requestTimeoutMs: 2_000, ...(ownerSignal === undefined ? {} : { signal: ownerSignal }) };
     const runtime = await f.trackRuntime(openNatsTransport(options));
     if (f.brokers[1]) f.relays[1]!.routeTo(f.brokers[1]);
-    return { ...f, runtime };
+    return { ...f, runtime, readyFile };
   } catch (error) { await f.close(); throw error; }
 }
 
@@ -309,6 +310,7 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
         relay.enabled = true;
         await bounded(relay.verification.promise, "owner's held reopen real USER.INFO");
       }
+      expect(fs.existsSync(f.readyFile)).toBe(!heldReopen);
       const abortStarted = performance.now();
       owner.abort();
       expect((await bounded(pending, "owner abort ends waiting inbox", 1_500)).done).toBe(true);
@@ -317,6 +319,7 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
       if (heldReopen) await bounded(relay.verificationClosed.promise, "owner cancels held reopen socket", 1_500);
       await bounded(relay.whenIdle(), "owner abort closes all relay sockets", 1_500);
       expect(relay.activeConnections).toBe(0);
+      expect(fs.existsSync(f.readyFile)).toBe(false);
       // Explicit close is terminal: Unavailable would retry cancellation publication on a transport that cannot reopen.
       expect(await outcome(() => f.runtime.send(command("aborted-owner-send")))).toBeInstanceOf(TransportInvalidError);
       expect(await outcome(() => kv.get("machine-a.h.reconnect"))).toBeInstanceOf(TransportUnavailableError);
@@ -337,6 +340,7 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
       expect(relay.activeConnections).toBe(0);
       expect(relay.subjects).toEqual(subjectsAtClose);
       expect(relay.commands).toEqual(commandsAtClose);
+      expect(fs.existsSync(f.readyFile)).toBe(false);
       expect((await bounded(iterator.next(), "closed inbox cannot receive post-abort command", 1_500)).done).toBe(true);
       expect(await outcome(() => f.runtime.send(command("still-aborted-after-restart")))).toBeInstanceOf(TransportInvalidError);
       expect(await outcome(() => kv.get("machine-a.h.reconnect"))).toBeInstanceOf(TransportUnavailableError);
@@ -352,8 +356,11 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
   it("retries a transient USER.INFO timeout on native reconnect and resumes the inbox", async () => {
     const f = await fixture(false);
     const relay = f.relays[0]!;
+    let verifiedReconnects = 0;
+    const unsubscribe = f.runtime.onVerifiedReconnect!(() => { verifiedReconnects += 1; });
     let inbox: AsyncIterator<import("../src/transport/types.js").TransportDelivery<TransportEnvelope>> | undefined;
     try {
+      expect(fs.existsSync(f.readyFile)).toBe(true);
       inbox = f.runtime.inbox(f.abort.signal)[Symbol.asyncIterator]();
       const initial = inbox.next();
       await f.runtime.send(command("before-transient-verification-timeout"));
@@ -369,6 +376,8 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
       relay.enabled = true;
       await bounded(relay.verification.promise, "first reconnect USER.INFO request is dropped", 10_000);
       expect(relay.subjects).toEqual(["$SYS.REQ.USER.INFO"]);
+      expect(fs.existsSync(f.readyFile)).toBe(false);
+      expect(verifiedReconnects).toBe(0);
       expect(await outcome(() => f.runtime.send(command("blocked-during-transient-verification"))))
         .toBeInstanceOf(TransportUnavailableError);
       expect(await outcome(() => f.runtime.kv("presence").get("machine-a.h.reconnect-timeout")))
@@ -380,9 +389,12 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
       expect(resumed.payload.id).toBe(retry.id);
       await resumed.ack();
       expect(relay.subjects.filter((subject) => subject === "$SYS.REQ.USER.INFO")).toHaveLength(2);
+      expect(fs.existsSync(f.readyFile)).toBe(true);
+      expect(verifiedReconnects).toBe(1);
       expect(await f.runtime.drainState()).toEqual({ pending: 0, ackPending: 0 });
       expect(relay.errors).toEqual([]);
     } finally {
+      unsubscribe();
       f.abort.abort();
       await inbox?.return?.();
       await f.close();

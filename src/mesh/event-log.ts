@@ -746,8 +746,11 @@ export class EventLog {
       // Existing keys retain the direct receipt/recovery path without a bulk listing.
       if (dedupeKeys.some(key => fs.existsSync(this.#dedupePath(key, ".json")) ||
           fs.existsSync(this.#dedupePath(key, ".pending.json")))) return false;
+      const directory = path.join(this.root, "event-receipts");
+      // Unsupported namespace preparation can leave this absent; keep BASE's one locked listing.
+      if (!fs.existsSync(directory)) return false;
       const reserve = dedupeKeys.length;
-      const count = fs.readdirSync(path.join(this.root, "event-receipts")).length;
+      const count = fs.readdirSync(directory).length;
       return count + reserve + DEDUPE_CAPACITY_HEADROOM_SLACK < this.#maxDedupeReceipts;
     } catch { return false; }
   }

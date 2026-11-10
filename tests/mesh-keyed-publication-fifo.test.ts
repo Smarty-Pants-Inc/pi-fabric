@@ -282,4 +282,4 @@ it("publishes keyed events exactly once across native FIFO waiters while a parti
     participant: { pid: participant.child.pid, exit: participantExit, sourceCalls: stopped.sourceCalls,
       registeredLeaseUpdatedAt: registeredLease!.updatedAt, renewedLeaseUpdatedAt: renewedWhileContended!.updatedAt },
     seedReceipts: SEED_RECEIPTS, publishedEvents: actualEvents.length, stableReplay: true, pendingIntents: 0 }));
-});
+}, 300_000); // Allow native workers and the 24k-receipt seed to finish on Windows.

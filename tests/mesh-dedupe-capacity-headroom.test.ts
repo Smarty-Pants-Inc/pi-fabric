@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomicWrite from "../src/core/atomic-write.js";
 import { MeshStore, type MeshStoreOptions } from "../src/mesh/store.js";
 
 // Keep reason: data safety at capacity/TTL boundaries, and the recorded PR-B lock-hold
@@ -71,6 +72,37 @@ afterEach(() => {
 });
 
 describe("per-operation dedupe capacity headroom", () => {
+  // PR #1927 P1-1: unsupported namespace preparation leaves a fresh directory absent.
+  it.each(["single", "batch"])("uses only the BASE locked listing for a missing receipt directory with unsupported namespace preparation (%s)", async mode => {
+    const namespace = vi.spyOn(atomicWrite, "namespaceBarrierAvailable").mockReturnValue(false);
+    const store = createStore(100_000);
+    const directory = path.join(store.root, "event-receipts");
+    expect(fs.existsSync(directory)).toBe(false);
+    const observed = observe(store);
+    const publish = async (key: string) => mode === "single"
+      ? store.publish(packet(key)) : (await store.publishBatch([packet(key)]))[0]!;
+
+    const first = await publish("fresh");
+    expect(namespace).toHaveBeenCalled();
+    expect(observed.listings).toEqual([true]);
+    expect(fs.existsSync(directory)).toBe(true);
+    expect(first.sequence).toBe(1);
+    expectSerializedReceiptWork(observed);
+
+    observed.listings.length = 0;
+    expect(await publish("fresh")).toEqual(first);
+    expect(observed.listings).toEqual([]);
+
+    const next = await publish("next");
+    expect(observed.listings).toEqual([false]);
+    expect(next.sequence).toBe(2);
+    expectSerializedReceiptWork(observed);
+    observed.listings.length = 0;
+    expect(await publish("next")).toEqual(next);
+    expect(observed.listings).toEqual([]);
+    expect(store.read().map(event => event.id)).toEqual([first.id, next.id]);
+  });
+
   it("keeps a populated receipt-directory listing off .lock without reading or retiring its payloads", async () => {
     const store = createStore(100_000);
     const keys = Array.from({ length: 64 }, (_, index) => `bulk-${index}`);

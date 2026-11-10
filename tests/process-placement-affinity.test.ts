@@ -162,6 +162,7 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
       "--host", "worker-a", "--cwd", f.cwd, "--require", missing, "--", "task",
     ]);
     expect(fs.readFileSync(f.launchCalls, "utf8")).toBe("called\n");
+    expect(fs.existsSync(local.events) ? fs.readFileSync(local.events, "utf8") : "").not.toContain('"type":"placement.local"');
     for (const file of [f.admissionCalls, f.sshCalls, local.marker]) expect(fs.existsSync(file)).toBe(false);
     expect(start).not.toHaveBeenCalled();
   });
@@ -320,11 +321,13 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     expect(fs.readFileSync(local.marker, "utf8")).toBe("LOCAL");
     const events = fs.readFileSync(local.events, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(events).toContainEqual(expect.objectContaining({ type: "placement.local", reason: "placement-picker-local: Preflight deadline expired" }));
+    expect(handle.warnings).toEqual(["placement: using local worker: placement-picker-local: Preflight deadline expired"]);
     expect(fs.readFileSync(f.pickerCalls, "utf8")).toBe("called\n");
     for (const file of [f.sshCalls, f.launchCalls]) expect(fs.existsSync(file)).toBe(false);
   });
 
-  it.each(["ineligible", "missing", "nonzero", "empty", "timeout"] as const)("runs a real local worker when picker admission is %s", async kind => {
+  // Keep reason: failure path — unavailable work host; recorded requirement smarty-dev#4605.
+  it.each(["ineligible", "missing", "nonzero", "empty", "timeout"] as const)("runs a real local worker with a warning when picker admission is %s", async kind => {
     const f = fixture({ candidates: kind === "empty" ? [] : ["intel1", "ryzen2"], pickerExit: kind === "nonzero" ? 3 : 0 });
     const command = [...f.config.command];
     if (kind === "ineligible") command[command.indexOf("--host") + 1] = "qs32729";
@@ -349,6 +352,9 @@ describe.skipIf(process.platform === "win32")("installed fleet placement affinit
     const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8");
     expect(events).toContain("placement.local");
     expect(events).toContain("placement-picker-local:");
+    const local = events.trim().split("\n").map(line => JSON.parse(line)).filter(event => event.type === "placement.local");
+    expect(local).toHaveLength(1);
+    expect(handle.warnings).toEqual([`placement: using local worker: ${local[0].reason}`]);
     if (kind === "ineligible") expect(events).toContain("host qs32729 is not picker-eligible");
   });
 

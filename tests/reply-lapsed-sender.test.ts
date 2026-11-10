@@ -56,7 +56,7 @@ describe("a reply to a sender whose lease lapsed (smarty-dev#447)", () => {
     await vi.waitFor(() => expect(replier.directory.get(sender.identity.id)).toBeDefined(), { timeout: 5_000, interval: 20 });
 
     // The sender stays live (its control plane runs), but its heartbeat stalls: the lease lapses.
-    const stalledRefresh = vi.spyOn(sender.directory, "refresh").mockResolvedValue(undefined);
+    sender.directory.suspend();
     await vi.waitFor(() => expect(replier.directory.get(sender.identity.id)).toBeUndefined(), { timeout: 5_000, interval: 20 });
 
     // A lapsed live sender is not dead, but the reply must recover its lease
@@ -66,7 +66,7 @@ describe("a reply to a sender whose lease lapsed (smarty-dev#447)", () => {
       lockWaiting: () => true,
       sleep: async () => {
         leaseWaits++;
-        stalledRefresh.mockRestore();
+        sender.directory.resume();
         await sender.directory.refresh();
       },
     };

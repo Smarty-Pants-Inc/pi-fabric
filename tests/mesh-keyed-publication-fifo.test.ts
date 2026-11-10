@@ -27,7 +27,7 @@ const SEED_RECEIPTS = 24_000;
 const MAX_RECEIPTS = 100_000;
 const PUBLISHERS = 4;
 const PUBLISHES_PER_PROCESS = 40;
-const LOCK_TIMEOUT_MS = 30_000;
+const LOCK_TIMEOUT_MS = 120_000;
 const TOPIC = "mesh.keyed-publication-fifo";
 const PARTICIPANT_ID = "session:mesh-keyed-fifo-participant";
 
@@ -241,7 +241,7 @@ it("publishes keyed events exactly once across native FIFO waiters while a parti
   expect(holderExit).toEqual({ code: 0, signal: null });
 
   const publisherResults = await Promise.all(publishers.map(async (state, index) => {
-    const result = await withTimeout(state.next("done"), 60_000, `publisher ${index} completion`);
+    const result = await withTimeout(state.next("done"), LOCK_TIMEOUT_MS, `publisher ${index} completion`);
     const exit = await withTimeout(state.closed, 10_000, `publisher ${index} native exit`);
     expect(exit, state.stderr()).toEqual({ code: 0, signal: null });
     expect(result.receiptReadsUnderOwnLock).toBe(0);

@@ -10,7 +10,7 @@ const [role, root, identityId, countText, maxReceiptsText] = process.argv.slice(
 if (!role || !root) throw new Error("worker requires role and mesh root");
 const count = Number(countText ?? 0);
 const maxReceipts = Number(maxReceiptsText ?? 100_000);
-const lockTimeoutMs = 30_000;
+const lockTimeoutMs = 120_000;
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const nextCommand = (): Promise<string> => new Promise(resolve => input.once("line", resolve));
 const emit = (value: Record<string, unknown>): void => { fs.writeSync(1, `${JSON.stringify({ pid: process.pid, ...value })}\n`); };

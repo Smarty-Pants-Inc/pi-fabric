@@ -123,6 +123,7 @@ const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_DEDUPE_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_DEDUPE_RECEIPTS = 100_000;
+const DEDUPE_CAPACITY_HEADROOM_SLACK = 10_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 /** First read of the live log's last line (see #readLastEventSequence). */
@@ -737,7 +738,22 @@ export class EventLog {
     }
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock, prefixScope?: KeyedPublishPrefix): () => MeshEvent {
+  /** Best-effort names-only observation before .lock. Count every name conservatively,
+   * including receipt/intent pairs; unknown state keeps the full serialized capacity pass.
+   * The slack bounds ordinary intervening publications while this operation is queued. */
+  #hasDedupeCapacityHeadroom(dedupeKeys: string[]): boolean {
+    try {
+      // Existing keys retain the direct receipt/recovery path without a bulk listing.
+      if (dedupeKeys.some(key => fs.existsSync(this.#dedupePath(key, ".json")) ||
+          fs.existsSync(this.#dedupePath(key, ".pending.json")))) return false;
+      const reserve = dedupeKeys.length;
+      const count = fs.readdirSync(path.join(this.root, "event-receipts")).length;
+      return count + reserve + DEDUPE_CAPACITY_HEADROOM_SLACK < this.#maxDedupeReceipts;
+    } catch { return false; }
+  }
+
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock, prefixScope?: KeyedPublishPrefix,
+    capacityHeadroom = false): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     if (input.dedupeFingerprint !== undefined &&
@@ -914,7 +930,7 @@ export class EventLog {
         this.#outbox?.validate?.(event);
         // One slot per key, including unresolved intents. Admission must fail closed BEFORE
         // reserving a sequence or appending (failed compaction cannot grow pending files).
-        if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
+        if (intentPath && !capacityHeadroom && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
           throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
         }
         // Match and bound the wake set before touching the live/archive event. Overflow
@@ -1018,8 +1034,9 @@ export class EventLog {
     let event: MeshEvent;
     for (;;) {
       try {
+        const capacityHeadroom = !!input.dedupeKey && this.#hasDedupeCapacityHeadroom([input.dedupeKey]);
         event = await withInitialMeshLockAcquisition(this.root, () =>
-          this.#lock.withLock(this.#preparePublish(input, undefined, after, preparation?.prefixScope), undefined, "publish"));
+          this.#lock.withLock(this.#preparePublish(input, undefined, after, preparation?.prefixScope, capacityHeadroom), undefined, "publish"));
         break;
       }
       catch (error) {
@@ -1056,10 +1073,12 @@ export class EventLog {
       const committed: AfterUnlock[] = [];
       let events: MeshEvent[];
       try {
+        const dedupeKeys = inputs.flatMap(input => input.dedupeKey ? [input.dedupeKey] : []);
+        const capacityHeadroom = dedupeKeys.length > 0 && this.#hasDedupeCapacityHeadroom(dedupeKeys);
         const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number }; after: AfterUnlock }> = [];
         for (const input of inputs) {
           const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = { namespace };
-          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
+          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after, undefined, capacityHeadroom), outcome, after }); }
           catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
         }
         events = await withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => {
@@ -1704,10 +1723,9 @@ export class EventLog {
 
   /** Under .lock: reserve capacity before append, or expire receipts during compaction.
    * One key consumes one slot even while both receipt and pending intent are present.
-   * This listing is authoritative admission/retention state, not an advisory cache. An
-   * off-lock snapshot could miss another writer's new key or pending intent, admitting
-   * over capacity or evicting protected evidence. Legacy writers publish no generation
-   * fence for validating that snapshot, so keep the scan serialized with their writes. */
+   * This full fallback listing is authoritative admission/retention state. Only an
+   * off-lock names count with ample reserved headroom skips capacity work; compaction
+   * always keeps this serialized scan, payload reads and retirement with other writes. */
   #pruneDedupeReceipts(reserve = 0): number {
     const directory = path.join(this.root, "event-receipts");
     let names: string[];

@@ -23,7 +23,7 @@ const createStore = (maxDedupeReceipts: number, options: MeshStoreOptions = {}) 
 const receipt = (store: MeshStore, key: string, suffix = ".json") =>
   path.join(store.root, "event-receipts", createHash("sha256").update(key).digest("hex") + suffix);
 
-const observe = (store: MeshStore, hintError?: string) => {
+const observe = (store: MeshStore, hintError?: string, afterNativeCount?: () => void) => {
   const directory = path.join(store.root, "event-receipts");
   const held = () => fs.existsSync(path.join(store.root, ".lock"));
   const listings: boolean[] = [];
@@ -40,7 +40,10 @@ const observe = (store: MeshStore, hintError?: string) => {
       listings.push(locked);
       if (!locked && hintError) throw Object.assign(new Error("hint unavailable"), { code: hintError });
     }
-    return Reflect.apply(readdir, fs, args);
+    const names = Reflect.apply(readdir, fs, args);
+    // Match the native regression's pause: actual names are captured BEFORE this callback.
+    if (args[0] === directory && !held()) afterNativeCount?.();
+    return names;
   });
   vi.spyOn(fs, "readFileSync").mockImplementation((...args) => {
     if (inReceipts(args[0])) reads.push({ file: String(args[0]), locked: held() });
@@ -190,6 +193,174 @@ describe("per-operation dedupe capacity headroom", () => {
     expect(await store.publish(packet("batch-first"))).toEqual(events[0]);
     expect(await store.publish(packet("batch-last"))).toEqual(events[2]);
     expect(store.read().map(event => event.id)).toEqual([original.id, ...events.map(event => event.id)]);
+  });
+
+  it.each([
+    { state: "advanced", mode: "single" }, { state: "advanced", mode: "batch" },
+    { state: "same-value replacement", mode: "single" }, { state: "same-value replacement", mode: "batch" },
+    { state: "missing", mode: "single" }, { state: "missing", mode: "batch" },
+    { state: "malformed", mode: "single" }, { state: "malformed", mode: "batch" },
+  ])("rejects a $state counter after the real off-lock count ($mode)", async ({ state, mode }) => {
+    const store = createStore(100_000);
+    const original = await store.publish(packet("old"));
+    const counter = path.join(store.root, "sequence");
+    let changed = false;
+    const observed = observe(store, undefined, () => {
+      if (changed) return;
+      changed = true;
+      if (state === "missing") fs.rmSync(counter);
+      else atomicWrite.writeFileAtomic(counter, state === "advanced" ? "2" : state === "malformed" ? "broken" : "1");
+    });
+    const inputs = mode === "single" ? [packet("new")] : [packet("first"), packet(), packet("last")];
+    const events = mode === "single" ? [await store.publish(inputs[0]!)] : await store.publishBatch(inputs);
+    expect(changed).toBe(true);
+    // An invalid grant is not refreshed after the first own reservation in a batch.
+    expect(observed.listings).toEqual(mode === "single" ? [false, true] : [false, true, true]);
+    const firstSequence = state === "advanced" ? 3 : 2;
+    expect(events.map(event => event.sequence)).toEqual(inputs.map((_, index) => firstSequence + index));
+    expectSerializedReceiptWork(observed);
+    vi.restoreAllMocks();
+    expect(await store.publish(packet("old"))).toEqual(original);
+    for (let index = 0; index < inputs.length; index++) {
+      if (inputs[index]!.dedupeKey) expect(await store.publish(inputs[index]!)).toEqual(events[index]);
+    }
+    expect(store.read().map(event => event.id)).toEqual([original.id, ...events.map(event => event.id)]);
+  });
+
+  it.each([
+    { state: "missing", text: undefined },
+    { state: "invalid JSON", text: "broken" },
+    { state: "string", text: '"0"' },
+    { state: "negative", text: "-1" },
+    { state: "fractional", text: "1.5" },
+    { state: "unsafe", text: "9007199254740992" },
+  ])("does not turn a $state sequence into a known zero headroom stamp", async ({ text }) => {
+    const store = createStore(100_000);
+    const original = await store.publish(packet("old"));
+    const counter = path.join(store.root, "sequence");
+    if (text === undefined) fs.rmSync(counter);
+    else atomicWrite.writeFileAtomic(counter, text);
+    const observed = observe(store);
+    const next = await store.publish(packet("new"));
+    expect(observed.listings).toEqual([true]);
+    expect(next.sequence).toBe(2);
+    expectSerializedReceiptWork(observed);
+    vi.restoreAllMocks();
+    expect(await store.publish(packet("old"))).toEqual(original);
+    expect(await store.publish(packet("new"))).toEqual(next);
+  });
+
+  it("accepts a real safe-integer zero stamp, unlike unknown sequence state", async () => {
+    const store = createStore(100_000);
+    await store.publish(packet("old"));
+    atomicWrite.writeFileAtomic(path.join(store.root, "sequence"), "0");
+    const observed = observe(store);
+    const next = await store.publish(packet("new"));
+    expect(observed.listings).toEqual([false]);
+    expect(next.sequence).toBe(2);
+    expectSerializedReceiptWork(observed);
+  });
+
+  it("falls back when opening the advisory sequence fails", async () => {
+    const store = createStore(100_000);
+    await store.publish(packet("old"));
+    const counter = path.join(store.root, "sequence"), open = fs.openSync;
+    let fail = true;
+    vi.spyOn(fs, "openSync").mockImplementation((...args) => {
+      if (args[0] === counter && !fs.existsSync(path.join(store.root, ".lock")) && fail) {
+        fail = false;
+        throw Object.assign(new Error("counter unavailable"), { code: "EIO" });
+      }
+      return Reflect.apply(open, fs, args);
+    });
+    const observed = observe(store);
+    const next = await store.publish(packet("new"));
+    expect(fail).toBe(false);
+    expect(observed.listings).toEqual([true]);
+    expect(next.sequence).toBe(2);
+    expectSerializedReceiptWork(observed);
+  });
+
+  it("uses locked admission when counter validation itself encounters EIO", async () => {
+    const store = createStore(100_000);
+    await store.publish(packet("old"));
+    const counter = path.join(store.root, "sequence"), lstat = fs.lstatSync;
+    let counted = false, failed = false;
+    vi.spyOn(fs, "lstatSync").mockImplementation((...args) => {
+      if (args[0] === counter && counted && !failed && fs.existsSync(path.join(store.root, ".lock"))) {
+        failed = true;
+        throw Object.assign(new Error("stamp validation unavailable"), { code: "EIO" });
+      }
+      return Reflect.apply(lstat, fs, args);
+    });
+    const observed = observe(store, undefined, () => { counted = true; });
+    const next = await store.publish(packet("new"));
+    expect(failed).toBe(true);
+    expect(observed.listings).toEqual([false, true]);
+    expect(next.sequence).toBe(2);
+    expectSerializedReceiptWork(observed);
+  });
+
+  it.each(["present", "EIO", "ENOTDIR"])("requires proven canonical lock absence after capture (%s)", async state => {
+    const store = createStore(100_000);
+    await store.publish(packet("old"));
+    const lock = path.join(store.root, ".lock"), lstat = fs.lstatSync;
+    let denied = false;
+    vi.spyOn(fs, "lstatSync").mockImplementation((...args) => {
+      if (args[0] === lock && !denied) {
+        denied = true;
+        if (state !== "present") throw Object.assign(new Error("idle state unknown"), { code: state });
+        return Reflect.apply(lstat, fs, [path.join(store.root, "sequence"), ...args.slice(1)]);
+      }
+      return Reflect.apply(lstat, fs, args);
+    });
+    const observed = observe(store);
+    const next = await store.publish(packet("new"));
+    expect(denied).toBe(true);
+    expect(observed.listings).toEqual([true]);
+    expect(next.sequence).toBe(2);
+    expectSerializedReceiptWork(observed);
+  });
+
+  it("invalidates a validated grant before repairing an actual torn live tail", async () => {
+    const store = createStore(100_000);
+    const original = await store.publish(packet("old"));
+    fs.appendFileSync(path.join(store.root, "events.jsonl"), '{"partial":');
+    const observed = observe(store);
+    const next = await store.publish(packet("new"));
+    expect(observed.listings).toEqual([false, true]);
+    expect(next.sequence).toBe(2);
+    expect(store.read().map(event => event.id)).toEqual([original.id, next.id]);
+    expectSerializedReceiptWork(observed);
+  });
+
+  it.each(["success", "preparation error", "aborted"])("closes its pinned observation on %s", async outcome => {
+    const store = createStore(100_000);
+    await store.publish(packet("old"));
+    const counter = path.join(store.root, "sequence"), open = fs.openSync, close = fs.closeSync;
+    const pinned = new Set<number>();
+    let captures = 0, releases = 0;
+    vi.spyOn(fs, "openSync").mockImplementation((...args) => {
+      const fd = Reflect.apply(open, fs, args);
+      if (args[0] === counter && args[1] === "r" && !fs.existsSync(path.join(store.root, ".lock"))) {
+        pinned.add(fd); captures++;
+      }
+      return fd;
+    });
+    vi.spyOn(fs, "closeSync").mockImplementation((...args) => {
+      const result = Reflect.apply(close, fs, args);
+      if (pinned.delete(args[0])) releases++;
+      return result;
+    });
+    const controller = new AbortController();
+    if (outcome === "aborted") controller.abort();
+    const publication = store.publish({ ...packet("new"), signal: controller.signal,
+      ...(outcome === "preparation error" ? { topic: "invalid topic" } : {}) });
+    if (outcome === "success") expect((await publication).sequence).toBe(2);
+    else await expect(publication).rejects.toThrow();
+    expect(captures).toBe(1);
+    expect(releases).toBe(captures);
+    expect(pinned.size).toBe(0);
   });
 
   it("counts names conservatively, including a protected receipt/intent pair and an unrelated name", async () => {

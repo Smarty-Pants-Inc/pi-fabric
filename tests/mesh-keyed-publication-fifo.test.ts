@@ -246,7 +246,15 @@ it.skipIf(process.platform === "win32")("publishes keyed events exactly once acr
     const result = await withTimeout(state.next("done"), LOCK_TIMEOUT_MS, `publisher ${index} completion`);
     const exit = await withTimeout(state.closed, 10_000, `publisher ${index} native exit`);
     expect(exit, state.stderr()).toEqual({ code: 0, signal: null });
-    expect(result.receiptReadsUnderOwnLock).toBe(0);
+    expect(result.freshReceiptListDeltas).toEqual(expect.any(Array));
+    expect(result.replayReceiptListDeltas).toEqual(expect.any(Array));
+    const freshDeltas = result.freshReceiptListDeltas as Array<{ totalLists: number; ownLockLists: number }>;
+    const replayDeltas = result.replayReceiptListDeltas as Array<{ totalLists: number; ownLockLists: number }>;
+    expect(freshDeltas).toHaveLength(PUBLISHES_PER_PROCESS);
+    expect(freshDeltas.every(delta => Number.isInteger(delta.totalLists) && delta.totalLists >= 0 &&
+      Number.isInteger(delta.ownLockLists) && delta.ownLockLists >= 0 && delta.ownLockLists <= 1)).toBe(true);
+    expect(replayDeltas).toHaveLength(PUBLISHES_PER_PROCESS);
+    expect(replayDeltas.every(delta => delta.totalLists === 0 && delta.ownLockLists === 0)).toBe(true);
     expect(result.receiptReads).toEqual(expect.any(Array));
     const counts = result.receiptReads as number[];
     expect(counts.length).toBeGreaterThanOrEqual(PUBLISHES_PER_PROCESS);
@@ -280,7 +288,9 @@ it.skipIf(process.platform === "win32")("publishes keyed events exactly once acr
     publishers: publishers.map((state, index) => ({ pid: state.child.pid, exit: { code: 0, signal: null },
       keyedCalls: (publisherResults[index]!.first as unknown[]).length,
       replays: (publisherResults[index]!.replays as unknown[]).length,
-      receiptReads: (publisherResults[index]!.receiptReads as number[]).length })),
+      receiptReads: (publisherResults[index]!.receiptReads as number[]).length,
+      freshReceiptListDeltas: publisherResults[index]!.freshReceiptListDeltas,
+      replayReceiptListDeltas: publisherResults[index]!.replayReceiptListDeltas })),
     participant: { pid: participant.child.pid, exit: participantExit, sourceCalls: stopped.sourceCalls,
       registeredLeaseUpdatedAt: registeredLease!.updatedAt, renewedLeaseUpdatedAt: renewedWhileContended!.updatedAt },
     seedReceipts: SEED_RECEIPTS, publishedEvents: actualEvents.length, stableReplay: true, pendingIntents: 0 }));

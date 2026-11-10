@@ -63,18 +63,31 @@ const main = async (): Promise<void> => {
     const command = await nextCommand();
     if (command !== "go") throw new Error(`publisher expected go, received ${command}`);
     const first = [];
+    const freshReceiptListDeltas: Array<{ totalLists: number; ownLockLists: number }> = [];
     for (let index = 0; index < count; index += 1) {
-      first.push(await mesh.publish({ topic: "mesh.keyed-publication-fifo", kind: "message",
+      const totalListsBefore = receiptReads.length;
+      const ownLockListsBefore = receiptReadsUnderOwnLock;
+      const event = await mesh.publish({ topic: "mesh.keyed-publication-fifo", kind: "message",
         from: { id: `session:${writer}`, name: writer, kind: "main" },
-        dedupeKey: `fifo:${writer}:${index}`, text: `${writer}:${index}`, data: { writer, index } }));
+        dedupeKey: `fifo:${writer}:${index}`, text: `${writer}:${index}`, data: { writer, index } });
+      freshReceiptListDeltas.push({ totalLists: receiptReads.length - totalListsBefore,
+        ownLockLists: receiptReadsUnderOwnLock - ownLockListsBefore });
+      first.push(event);
     }
     const replays = [];
+    const replayReceiptListDeltas: Array<{ totalLists: number; ownLockLists: number }> = [];
     for (let index = 0; index < count; index += 1) {
-      replays.push(await mesh.publish({ topic: "mesh.keyed-publication-fifo", kind: "message",
+      const totalListsBefore = receiptReads.length;
+      const ownLockListsBefore = receiptReadsUnderOwnLock;
+      const event = await mesh.publish({ topic: "mesh.keyed-publication-fifo", kind: "message",
         from: { id: `session:${writer}`, name: writer, kind: "main" },
-        dedupeKey: `fifo:${writer}:${index}`, text: `${writer}:${index}`, data: { writer, index } }));
+        dedupeKey: `fifo:${writer}:${index}`, text: `${writer}:${index}`, data: { writer, index } });
+      replayReceiptListDeltas.push({ totalLists: receiptReads.length - totalListsBefore,
+        ownLockLists: receiptReadsUnderOwnLock - ownLockListsBefore });
+      replays.push(event);
     }
-    emit({ done: true, writer, first, replays, receiptReads, receiptReadsUnderOwnLock });
+    emit({ done: true, writer, first, replays, receiptReads, receiptReadsUnderOwnLock,
+      freshReceiptListDeltas, replayReceiptListDeltas });
     mesh.closeState();
     return;
   }

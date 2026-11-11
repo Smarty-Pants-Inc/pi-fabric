@@ -3,6 +3,7 @@ import { connect } from "@nats-io/transport-node";
 import { JetStreamApiError, jetstream, jetstreamManager, type Consumer, type Consumers } from "@nats-io/jetstream";
 
 type ReadinessOptions = { timeoutMs?: number };
+type StreamReadinessOptions = ReadinessOptions & { monitorUrl?: string };
 type Capture = { stream: string; receivers: Consumer[]; active: boolean; restore: (() => void)[] };
 type ConsumerTarget = string | Pick<Consumer, "info">;
 // The pinned PullConsumerImpl exposes live stream/name even though Consumer's public type omits them.
@@ -30,6 +31,40 @@ const identity = async (stream: string, consumer: ConsumerTarget): Promise<strin
 };
 const captures = new AsyncLocalStorage<Capture>();
 let captureUsers = 0;
+
+const routeReadiness = (value: unknown, expectedServerId: unknown, leader: string, configuredValue: unknown): { ready: boolean; diagnostic: Record<string, unknown> } => {
+  const monitor: { server_id?: unknown; server_name?: unknown; routes?: unknown } = value && typeof value === "object"
+    ? value as { server_id?: unknown; server_name?: unknown; routes?: unknown } : {};
+  const serverId = typeof monitor.server_id === "string" ? monitor.server_id.slice(0, 100) : undefined;
+  const serverName = typeof monitor.server_name === "string" ? monitor.server_name.slice(0, 100) : undefined;
+  const base = { serverId, serverName, leader };
+  if (typeof monitor.server_id !== "string" || !monitor.server_id.trim()
+    || typeof expectedServerId !== "string" || !expectedServerId.trim() || monitor.server_id !== expectedServerId) {
+    return { ready: false, diagnostic: { ...base, expectedServerId: typeof expectedServerId === "string" ? expectedServerId.slice(0, 100) : undefined, reason: "monitor server_id mismatch" } };
+  }
+  if (monitor.server_name === leader) return { ready: true, diagnostic: { ...base, via: "local leader", ready: true } };
+
+  const configured = Array.isArray(configuredValue) ? configuredValue : [];
+  const patterns = configured.filter((subject): subject is string => typeof subject === "string" && subject.length > 0);
+  const validSubjects = configured.length > 0 && patterns.length === configured.length;
+  const routes = Array.isArray(monitor.routes) ? monitor.routes : [];
+  const installed = new Set<string>();
+  let leaderRoutes = 0;
+  for (const value of routes) {
+    if (!value || typeof value !== "object") continue;
+    const route = value as { remote_name?: unknown; subscriptions_list?: unknown };
+    if (route.remote_name !== leader) continue;
+    leaderRoutes++;
+    if (!Array.isArray(route.subscriptions_list)) continue;
+    for (const subject of route.subscriptions_list) {
+      if (typeof subject === "string" && subject.length > 0 && subject !== "$SYS" && !subject.startsWith("$SYS.")) installed.add(subject);
+    }
+  }
+  const missing = patterns.filter(subject => !installed.has(subject));
+  const ready = validSubjects && missing.length === 0;
+  return { ready, diagnostic: { ...base, via: "remote routes", leaderRoutes, configuredSubjects: configured.length,
+    installedSubjects: installed.size, missing: missing.slice(0, 8), ...(validSubjects ? {} : { reason: "empty or invalid configured subjects" }), ready } };
+};
 let restoreGet: (() => void) | undefined;
 
 /** Observe the actual SDK get selected by the product, not LIST or a late ACK from an abandoned get.
@@ -97,11 +132,12 @@ const transientRead = (error: unknown): boolean => {
 /** INFO has no push event for replica-current or pending NEXT. Sample only during fixture setup/recovery,
  * under one absolute deadline (including connect/requests), without publishing or resetting a consumer. */
 const waitForReady = async (server: string, stream: string, consumer: ConsumerTarget | undefined,
-  timeoutMs: number): Promise<void> => {
+  timeoutMs: number, monitorUrl?: string): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   let last: unknown = "no stream INFO yet";
   let lastError: string | undefined;
-  const expired = () => new Error(`NATS ${consumer === undefined ? "stream" : "stream/first NEXT"} readiness deadline for ${stream}: ${JSON.stringify({ last, lastError })}`);
+  let lastMonitor: unknown;
+  const expired = () => new Error(`NATS ${consumer === undefined ? "stream" : "stream/first NEXT"} readiness deadline for ${stream}: ${JSON.stringify({ last, lastError, ...(monitorUrl === undefined ? {} : { lastMonitor }) })}`);
   const bounded = async <T,>(request: () => Promise<T>): Promise<T> => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw expired();
@@ -137,7 +173,24 @@ const waitForReady = async (server: string, stream: string, consumer: ConsumerTa
         const current = consumer === undefined ? undefined : await bounded(() => identity(stream, consumer));
         last = { configuredReplicas: required, leader, replicas,
           ...(snapshot === undefined ? {} : { consumers: [{ name: snapshot.name, waiting: snapshot.num_waiting }], current }) };
-        if (Date.now() < deadline && streamReady
+        let routesReady = true;
+        if (streamReady && monitorUrl !== undefined && required > 1) {
+          routesReady = false;
+          lastMonitor = { leader, state: "routez pending" };
+          try {
+            const routez = await bounded(async () => {
+              const response = await fetch(`${monitorUrl.replace(/\/+$/, "")}/routez?subs=1`);
+              if (!response.ok) throw new Error(`routez HTTP ${response.status}`);
+              return response.json();
+            });
+            const readiness = routeReadiness(routez, nc.info?.server_id, leader!, info.config.subjects);
+            routesReady = readiness.ready;
+            lastMonitor = readiness.diagnostic;
+          } catch (error) {
+            lastMonitor = { ready: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 160) };
+          }
+        }
+        if (Date.now() < deadline && streamReady && routesReady
           && (consumer === undefined || snapshot !== undefined && name === current && snapshot.num_waiting > 0)) return;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
@@ -155,8 +208,8 @@ const waitForReady = async (server: string, stream: string, consumer: ConsumerTa
 };
 
 /** A CREATE ACK / elected leader alone does not prove all configured stream replicas have caught up. */
-export const waitForNatsStreamReady = (server: string, stream: string, options: ReadinessOptions = {}): Promise<void> =>
-  waitForReady(server, stream, undefined, options.timeoutMs ?? 10_000);
+export const waitForNatsStreamReady = (server: string, stream: string, options: StreamReadinessOptions = {}): Promise<void> =>
+  waitForReady(server, stream, undefined, options.timeoutMs ?? 10_000, options.monitorUrl);
 
 /** Test setup only: require full stream replication AND the broker's real pending pull before the first write.
  * Retain the existing 45s setup bound: the SDK's default pull can recover at its native 30s expiry.

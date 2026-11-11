@@ -503,7 +503,9 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
   }, 25_000);
 
   it("expires uncertain same-ID retries 30 seconds inside the actual stream window", async () => {
-    const duplicateWindowMs = 30_500;
+    // requestTimeoutMs also bounds stream/consumer setup; keep the suite's 1.5s API budget.
+    // A 34s duplicate window preserves the 30s safety margin and a 4s safe retry horizon.
+    const duplicateWindowMs = 34_000;
     const shortFixture = await createPathBHarness({ binary: binary!, tls: {} });
     const ownedTransports: FabricTransport[] = [];
     let bootstrap: Awaited<ReturnType<PathBHarness["connect"]>> | undefined;
@@ -525,9 +527,9 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
       const before = (await manager.streams.info(stream)).state.messages;
       proxy = await WireFaults.open(shortFixture.serverUrl, shortFixture.tls!);
       const sender = await openNatsTransport({ ...shortFixture.runtimeOptions(shortFixture.users.machineA), servers: proxy.url,
-        hostId: "retry-window-sender", duplicateWindowMs, requestTimeoutMs: 100 });
+        hostId: "retry-window-sender", duplicateWindowMs, requestTimeoutMs: 1_500 });
       const receiver = await openNatsTransport({ ...shortFixture.runtimeOptions(shortFixture.users.machineB),
-        hostId: "retry-window-receiver", duplicateWindowMs, requestTimeoutMs: 100 });
+        hostId: "retry-window-receiver", duplicateWindowMs, requestTimeoutMs: 1_500 });
       ownedTransports.push(sender, receiver);
       const input = envelope(sender, receiver, "retry-window-expired", { commandId: "retry-window-command", text: "still-stored" });
       proxy.loseNextPubAcks(10);
@@ -539,7 +541,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
         expiryCode: "FABRIC_TRANSPORT_UNCERTAIN_EXPIRED", id: input.id,
         resolvedBody: { commandId: "retry-window-command", text: "still-stored" } });
       expect((failure as Error).message).toContain("safe retry window expired");
-      expect(elapsedMs).toBeLessThan(2_000);
+      expect(elapsedMs).toBeLessThan(6_000);
       expect(proxy.publishes).toBe(2);
       expect(proxy.pubAckDrops).toBe(2);
       expect((await manager.streams.info(stream)).state.messages - before).toBe(1);

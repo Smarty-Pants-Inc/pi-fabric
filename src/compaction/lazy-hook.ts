@@ -5,8 +5,12 @@ import type { CompactionHookOptions } from "./hook.js";
 // hook.js is a stable build entry, so delayed loads survive installed-generation swaps.
 export const registerLazyCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
   pi.on("session_before_compact", async (event, context) => {
+    // Without a prepared tail the sentinel has nothing for the safety guard.
+    if (event.customInstructions === "__pi_vcc__" && !event.preparation?.firstKeptEntryId) return;
+    const { handleKeptTailBeforeCompact, handleFabricBeforeCompact } = await import("./hook.js");
+    const guarded = handleKeptTailBeforeCompact(event, context, pi);
+    if (guarded) return guarded;
     if (event.customInstructions === "__pi_vcc__") return;
-    const { handleFabricBeforeCompact } = await import("./hook.js");
     return handleFabricBeforeCompact(event, context, options, pi);
   });
   pi.on("session_before_tree", async (event, context) => {

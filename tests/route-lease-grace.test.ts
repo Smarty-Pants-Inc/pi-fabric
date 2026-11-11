@@ -351,7 +351,7 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
     };
     await mesh.put({ key: "topology/liveness", identity: reader, value: { version: 1, hostLeases: "files" } });
     const targetDirectory = directory(target, 100, 200), readerDirectory = directory(reader, 60000, 120000);
-    await targetDirectory.refresh(); await readerDirectory.refresh();
+    await targetDirectory.start(); await readerDirectory.start();
     const epoch = targetDirectory.ownerIncarnation;
     const leaseToken = readHostLease(meshRoot, target.id)!.incarnationToken;
     const unknown = { cwd: root, status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } };
@@ -377,6 +377,8 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
         const items = JSON.parse(fs.readFileSync(journal, "utf8")).items as Array<{ message: string }>;
         expect(items.some(item => item.message === command.message)).toBe(true);
         admissions.push({ id: command.commandId, message: command.message!, at: performance.now() });
+        // Keep the first journaled admission in flight beyond the 2 x 100ms owner gate.
+        if (admissions.length === 1) await delay(300);
       }
       return result;
     });
@@ -389,9 +391,13 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
     const rows: Array<Record<string, unknown>> = [];
     try {
       for (let i = 0; i < 20; i++) {
+        targetDirectory.suspend();
         await targetDirectory.refresh();
         const lease = readHostLease(meshRoot, target.id)!;
-        await delay(Math.max(0, lease.expiresAt - Date.now() + 15));
+        // FILE renewal precedes publication confirmation; expire both freshness windows.
+        await delay(Math.max(0, Math.max(lease.expiresAt, targetDirectory.confirmedAt() + 2 * 100) - Date.now() + 15));
+        expect(readHostLease(meshRoot, target.id)!.expiresAt).toBeLessThan(Date.now());
+        expect(targetDirectory.canConsumeMesh()).toBe(false);
         expect(targetDirectory.ownerIncarnation).toBe(epoch);
         expect(readHostLease(meshRoot, target.id)!.incarnationToken).toBe(leaseToken);
         // A real scratch mesh holder supplies the ordinary FILE contention signal.
@@ -403,7 +409,11 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
         await held;
         // Normal heartbeat is the event source. This one delayed callback is the fault,
         // not a replacement routing retry or safety-net polling protocol.
-        const renewal = delay(150).then(async () => { release(); await holding; await targetDirectory.refresh(); owner.resume(); });
+        const renewal = delay(150).then(async () => {
+          release(); await holding;
+          targetDirectory.resume();
+          await targetDirectory.refresh();
+        });
         const message = `a4-input-${i}`, started = performance.now();
         let refusal: string | undefined, acknowledged = false;
         try {
@@ -424,6 +434,9 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
         admissions: admissions.length, journalItems: items.length, duplicates: admissions.length - new Set(admissions.map(item => item.id)).size,
         refusals: rows.filter(row => row.refusal !== null).length, p50: percentile(.5), p95: percentile(.95), p99: percentile(.99), rows };
       console.info("A4_PUBLIC_N20", JSON.stringify(summary));
+      // Join any in-flight heartbeat before replacing its lease for the negative control.
+      targetDirectory.suspend();
+      await targetDirectory.refresh();
       // A fresh stale-incarnation FILE may not extend canonical successor authority.
       const hostKey = key("topology/hosts/", target.id), storedHost = mesh.get(hostKey, { fresh: true })!.value as Record<string, unknown>;
       const currentLease = readHostLease(meshRoot, target.id)!;
@@ -439,6 +452,7 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
         await mesh.put({ key: hostKey, identity: target, value: storedHost });
       }
       expect(summary.refusals).toBe(0);
+      expect(rows.every(row => row.acknowledged === true)).toBe(true);
       expect(summary.commands).toBe(20); expect(summary.admissions).toBe(20); expect(summary.duplicates).toBe(0);
       expect(items.map(item => [item.message, item.data])).toEqual(Array.from({ length: 20 }, (_, i) => [`a4-input-${i}`, { input: i }]));
       expect(new Set(items.map(item => item.deliveryId)).size).toBe(20);

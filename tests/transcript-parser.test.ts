@@ -14,6 +14,59 @@ const result = (id: string, isError = false) => ({
 });
 const payload = (event: ReturnType<typeof result>) => ({ content: event.message.content, details: event.message.details });
 
+describe("TranscriptAccumulator nested tool parents", () => {
+  it("uses explicit parent IDs for slash IDs and deeper nested calls", () => {
+    const accumulator = new TranscriptAccumulator();
+    accumulator.append([
+      { ...start("fabric-root"), toolName: "fabric_exec" },
+      { ...start("fabric-root/1"), parentToolCallId: "fabric-root" },
+      { ...start("fabric-root/1/1"), parentToolCallId: "fabric-root/1" },
+    ]);
+
+    expect(accumulator.snapshot().entries).toEqual([
+      expect.objectContaining({ id: "fabric-root", status: "running" }),
+      expect.objectContaining({ id: "fabric-root/1", parentId: "fabric-root", depth: 1 }),
+      expect.objectContaining({ id: "fabric-root/1/1", parentId: "fabric-root/1", depth: 2 }),
+    ]);
+  });
+
+  it("routes interleaved children to their exact explicit parents", () => {
+    const accumulator = new TranscriptAccumulator();
+    accumulator.append([
+      { ...start("fabric-first"), toolName: "fabric_exec" },
+      { ...start("fabric-second"), toolName: "fabric_exec" },
+      { ...start("fabric-first/1"), parentToolCallId: "fabric-first" },
+      { ...start("fabric-second/1"), parentToolCallId: "fabric-second" },
+    ]);
+
+    expect(accumulator.snapshot().entries).toEqual([
+      expect.objectContaining({ id: "fabric-first", status: "running" }),
+      expect.objectContaining({ id: "fabric-second", status: "running" }),
+      expect.objectContaining({ id: "fabric-first/1", parentId: "fabric-first", depth: 1 }),
+      expect.objectContaining({ id: "fabric-second/1", parentId: "fabric-second", depth: 1 }),
+    ]);
+  });
+
+  it("keeps legacy prefix fallback but does not infer parents for ordinary or unknown-parent calls", () => {
+    const accumulator = new TranscriptAccumulator();
+    accumulator.append([
+      { ...start("fabric-legacy"), toolName: "fabric_exec" },
+      start("fabric_legacy-child"),
+      start("ordinary/root/1"),
+      { ...start("fabric_unknown-child"), parentToolCallId: "missing-parent" },
+    ]);
+
+    expect(accumulator.snapshot().entries).toEqual([
+      expect.objectContaining({ id: "fabric-legacy", status: "running" }),
+      expect.objectContaining({ id: "fabric_legacy-child", parentId: "fabric-legacy", depth: 1 }),
+      expect.objectContaining({ id: "ordinary/root/1", status: "running" }),
+      expect.objectContaining({ id: "fabric_unknown-child", status: "running" }),
+    ]);
+    expect(accumulator.snapshot().entries[2]).not.toHaveProperty("parentId");
+    expect(accumulator.snapshot().entries[3]).not.toHaveProperty("parentId");
+  });
+});
+
 describe("TranscriptAccumulator canonical tool results", () => {
   it("correlates interleaved elided ends with canonical messages, without rendering markers", () => {
     const accumulator = new TranscriptAccumulator();

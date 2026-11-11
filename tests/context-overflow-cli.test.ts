@@ -382,7 +382,8 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
         expect(textOf(projectedGiant && "content" in projectedGiant ? projectedGiant.content : undefined)).toBe(stub);
       } else {
         expect(projectedGiant).toBeUndefined();
-        expect(projected.some(message => "content" in message && textOf(message.content).includes(stub))).toBe(true);
+        // getMessages exposes the pre-conversion AgentMessage; compaction summaries store text in `summary`.
+        expect(projected.some(message => message.role === "compactionSummary" && message.summary.includes(stub))).toBe(true);
         expect(projected.some(message => message.role === "assistant" && message.content.some(part => part.type === "toolCall" && part.id === GIANT_CALL))).toBe(false);
       }
       expect(JSON.stringify(projected)).not.toContain("G".repeat(4096));

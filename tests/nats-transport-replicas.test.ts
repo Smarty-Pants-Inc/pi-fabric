@@ -376,9 +376,9 @@ it.skipIf(skipCluster)("real NATS 2.14.7 R3 leases, presence and actual transpor
 
   const adminNc = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true, timeout: 2_000 });
   rawConnections.push(adminNc);
-  const adminManager = await jetstreamManager(adminNc);
+  const adminManager = await jetstreamManager(adminNc, { timeout: 30_000 });
   const adminHandle: NatsConnectionHandle = {
-    nc: adminNc, js: jetstream(adminNc), manager: adminManager, isVerified: () => !adminNc.isClosed(), onStatus: () => () => undefined,
+    nc: adminNc, js: adminManager.jetstream(), manager: adminManager, isVerified: () => !adminNc.isClosed(), onStatus: () => () => undefined,
     closed: () => adminNc.closed(), close: () => adminNc.close(),
   };
   connections.bootstrap.mockResolvedValue(adminHandle);
@@ -424,7 +424,8 @@ it.skipIf(skipCluster)("real NATS 2.14.7 R3 leases, presence and actual transpor
   const sent = await transport.send(envelope);
   expect(sent).toMatchObject({ id: envelope.id, duplicate: false });
   expect(sent.sequence).toBeGreaterThan(0);
-  expect(await transport.drainState()).toEqual({ pending: 1, ackPending: 0 });
+  // A PubAck confirms storage before R3 consumer accounting necessarily converges.
+  await expect.poll(() => transport.drainState(), { timeout: 5_000, interval: 25 }).toEqual({ pending: 1, ackPending: 0 });
   const abort = new AbortController();
   const inbox = transport.inbox(abort.signal)[Symbol.asyncIterator]();
   try {

@@ -85,23 +85,24 @@ branch on ryzen5 (32 CPUs, shared and loaded, `nice -n 19`) with the default loa
 
 ## CI
 
-The `mesh-lock-bench` job of `.github/workflows/test.yml` (ubuntu-latest, Node 24; on pushes to `main`
-and on pull requests whose base matches the workflow's `pull_request.branches`: `main` and the
-`refactor/sd-6477-**` / `feat/sd-6477-**` stack branches) builds and runs the default load against the committed baseline:
+The `runtime-bench` lane inside the `linux-tests` job of `.github/workflows/test.yml` (ubuntu-latest,
+Node 24; on pushes to `main` and on pull requests whose base matches the workflow's
+`pull_request.branches`: `main` and the `refactor/sd-6477-**` / `feat/sd-6477-**` stack branches)
+runs the default load against the committed baseline:
 
 ```sh
-bun run build
 bun run bench:mesh-lock:check --out mesh-lock.json   # = --baseline bench/mesh-lock-baseline.json --max-regress 10
 ```
 
-and uploads `mesh-lock.json`. It fails (exit 1) when a load-insensitive metric is more than 10%
-above the baseline (all of them are lower-is-better; `timeoutsPer10kOps` has a zero baseline, so one
-timeout fails), and exit 2 when the run is invalid. Timing metrics are printed in the table on
-stderr (class `timing`, with their delta) but never gate there: a shared runner moves them by tens
-of percent (one local pass shows them at +27-33% while the ratchet metrics stay within 0.05%). The
-default load takes about 2.5 minutes (seeding, 15 s warm-up, 120 s window, drain); the job about
-4. It is not a required check; making it one is a separate decision in `.mergify.yml`. A dedicated
-runner can add `--gate-timing` against a baseline recorded on that runner.
+and uploads `mesh-lock.json`. The ratchet still reports exit 1 when a load-insensitive metric is
+more than 10% above the baseline (all of them are lower-is-better; `timeoutsPer10kOps` has a zero
+baseline, so one timeout fails), and exit 2 when the run is invalid. Timing metrics are printed in
+the table on stderr (class `timing`, with their delta) but never gate there: a shared runner moves
+them by tens of percent (one local pass shows them at +27-33% while the ratchet metrics stay within
+0.05%). The default load takes about 2.5 minutes (seeding, 15 s warm-up, 120 s window, drain). The
+lane keeps and prints the benchmark log and writes PASS/FAIL to the workflow step summary; a failed
+ratchet emits a warning but is non-fatal to `linux-tests` and the required `check (ubuntu-latest)`.
+A dedicated runner can add `--gate-timing` against a baseline recorded on that runner.
 
 **Updating the baseline intentionally.** A change that is meant to move the numbers (an
 improvement that should tighten the ratchet, a load or default change, the SQLite cutover)

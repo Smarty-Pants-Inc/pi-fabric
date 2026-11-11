@@ -15,12 +15,23 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'merge_group' && !startsWith(github.ref, 'refs/heads/gh-readonly-queue/') && !startsWith(github.ref, 'refs/heads/mergify/') && !startsWith(github.head_ref, 'mergify/') }}
 
 jobs:
-  linux-gates:
-    runs-on: ubuntu-latest
+  linux-tests:
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Recent CSV medians total ~86 runner-minutes across lanes; four-way critical path ~27m plus ~3m gates.
+    # The 45m timeout leaves ~15m for fixed setup and runtime variance.
+    timeout-minutes: 45
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+      PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/check-setup
+        with:
+          runner-environment: ${{ (vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest') == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}
+      - uses: ./.github/actions/check-systemd
       - name: Install pinned Bend proof compiler
         shell: bash
         env:
@@ -45,8 +56,7 @@ jobs:
         run: bun run build
       - name: Archive gated build
         shell: bash
-        # Record the exact source commit, so a shard can prove the build is
-        # of its own checkout before it refreshes the restored mtimes.
+        # The aggregate receipt job checks out the exact source SHA before restoring this build.
         run: |
           printf '%s\n' "$GITHUB_SHA" > dist/.gated-source-sha
           tar -cf "$RUNNER_TEMP/dist.tar" dist
@@ -56,7 +66,265 @@ jobs:
           path: ${{ runner.temp }}/dist.tar
           if-no-files-found: error
           retention-days: 1
-
+      - name: Run Linux tests in eight logged parallel lanes
+        shell: bash
+        run: |
+          set -uo pipefail
+          lane_root="$RUNNER_TEMP/linux-lanes"
+          report_root="$RUNNER_TEMP/affected"
+          mkdir -p "$lane_root" "$report_root"
+          lane_pids=()
+          declare -A lane_names_by_pid=()
+          failed=0
+          # ubuntu-latest public runners have 4 vCPU / 16 GB; cap active lanes at four.
+          max_lanes=4
+          reap_lane() {
+            local finished_pid=""
+            if wait -n -p finished_pid "${lane_pids[@]}"; then
+              echo "${lane_names_by_pid[$finished_pid]}: PASS"
+            else
+              echo "${lane_names_by_pid[$finished_pid]}: FAIL"
+              failed=1
+            fi
+            unset 'lane_names_by_pid[$finished_pid]'
+            local remaining_pids=()
+            for pid in "${lane_pids[@]}"; do
+              if [ "$pid" != "$finished_pid" ]; then remaining_pids+=("$pid"); fi
+            done
+            lane_pids=("${remaining_pids[@]}")
+          }
+          start_lane() {
+            local lane="$1"
+            while [ "${#lane_pids[@]}" -ge "$max_lanes" ]; do
+              reap_lane
+            done
+            (
+              mkdir -p "$lane_root/$lane"
+              lane_status=0
+              run_logged() {
+                local label="$1"
+                shift
+                local log="$lane_root/$lane/$label.log"
+                local code=0
+                if "$@" > "$log" 2>&1; then
+                  code=0
+                else
+                  code=$?
+                fi
+                echo "::group::$lane / $label"
+                cat "$log"
+                echo "::endgroup::"
+                printf '%s: exit %s\n' "$label" "$code"
+                if [ "$code" -ne 0 ]; then lane_status=1; fi
+              }
+              run_advisory_logged() {
+                local label="$1"
+                shift
+                local log="$lane_root/$lane/$label.log"
+                local code=0
+                if "$@" > "$log" 2>&1; then
+                  code=0
+                else
+                  code=$?
+                fi
+                echo "::group::$lane / $label (non-fatal)"
+                cat "$log"
+                echo "::endgroup::"
+                printf '%s: exit %s (non-fatal)\n' "$label" "$code"
+                if [ "$code" -ne 0 ]; then
+                  echo "::warning::Mesh lock benchmark ratchet failed with exit $code; this non-fatal lane will not fail linux-tests."
+                fi
+                if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                  {
+                    printf '### Mesh lock benchmark (non-fatal)\n\n'
+                    if [ "$code" -eq 0 ]; then
+                      printf 'Result: **PASS**.\n\n'
+                    else
+                      printf 'Result: **FAIL** (exit `%s`); `linux-tests` continues.\n\n' "$code"
+                    fi
+                    printf 'Log: `%s`\n' "$log"
+                  } >> "$GITHUB_STEP_SUMMARY"
+                fi
+                return 0
+              }
+              case "$lane" in
+                affected-1-2)
+                  run_logged shard-1 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-1" bun run test:affected --shard=1/10
+                  run_logged shard-2 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-2" bun run test:affected --shard=2/10
+                  ;;
+                affected-3-4)
+                  run_logged shard-3 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-3" bun run test:affected --shard=3/10
+                  run_logged shard-4 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-4" bun run test:affected --shard=4/10
+                  ;;
+                affected-5-6)
+                  run_logged shard-5 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-5" bun run test:affected --shard=5/10
+                  run_logged shard-6 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-6" bun run test:affected --shard=6/10
+                  ;;
+                affected-7-8)
+                  run_logged shard-7 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-7" bun run test:affected --shard=7/10
+                  run_logged shard-8 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-8" bun run test:affected --shard=8/10
+                  ;;
+                affected-9-10)
+                  run_logged shard-9 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-9" bun run test:affected --shard=9/10
+                  run_logged shard-10 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-10" bun run test:affected --shard=10/10
+                  ;;
+                acceptance-core)
+                  run_logged session-channel env PI_FABRIC_REQUIRE_NATS=1 NATS_EXPECTED_SERVER_VERSION=2.14.7 bunx vitest run --retry=0 tests/nats-session-channel.test.ts
+                  run_logged package-install bun run smoke:package-install
+                  run_logged ci-workflows bunx vitest run tests/ci-workflows.test.ts tests/ci-test-counts.test.ts
+                  run_logged kernel-errors bunx vitest run tests/kernel-errors.test.ts
+                  ;;
+                acceptance-runtime)
+                  run_logged verified-kernels bunx vitest run tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts tests/verified-artifact.test.ts
+                  run_logged verified-dist bun run proof:dist
+                  run_logged launcher-regressions bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts
+                  run_logged provider-dead env FABRIC_8742_REAL_PI=1 bunx vitest run tests/main-provider-dead-real-pi.test.ts
+                  run_logged extension-hidden-tools env FABRIC_5492_REAL_PI=1 bunx vitest run tests/extension-hidden-tools-real-pi.test.ts
+                  run_logged sender-headers env FABRIC_6207_REAL_PI=1 bunx vitest run tests/sender-headers-real-pi.test.ts
+                  ;;
+                runtime-bench)
+                  run_logged platform-smoke bun run test:smoke
+                  run_logged scope-e2e env FABRIC_SCOPE_E2E_REQUIRED=1 bunx vitest run --project scope-e2e
+                  run_advisory_logged mesh-lock-bench bun run bench:mesh-lock:check --out mesh-lock.json
+                  ;;
+                *) echo "unknown lane: $lane" >&2; exit 2 ;;
+              esac
+              exit "$lane_status"
+            ) &
+            lane_pids+=("$!")
+            lane_names_by_pid["$!"]="$lane"
+          }
+          start_lane affected-1-2
+          start_lane affected-3-4
+          start_lane affected-5-6
+          start_lane affected-7-8
+          start_lane affected-9-10
+          start_lane acceptance-core
+          start_lane acceptance-runtime
+          start_lane runtime-bench
+          while [ "${#lane_pids[@]}" -gt 0 ]; do
+            reap_lane
+          done
+          exit "$failed"
+      - name: Upload mesh lock benchmark result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mesh-lock-bench-${{ github.sha }}
+          path: mesh-lock.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload affected-test receipt 1/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-1
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-1/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 2/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-2
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-2/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 3/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-3
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-3/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 4/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-4
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-4/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 5/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-5
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-5/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 6/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-6
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-6/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 7/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-7
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-7/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 8/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-8
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-8/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 9/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-9
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-9/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload affected-test receipt 10/10
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: affected-ubuntu-latest-10
+          path: ${{ runner.temp }}/affected/affected-ubuntu-latest-10/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Package tested Linux runtime
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          stage="$RUNNER_TEMP/fabric-runtime"
+          output="$RUNNER_TEMP/fabric-artifact"
+          mkdir -p "$stage" "$output"
+          git archive HEAD | tar -x -C "$stage"
+          cp -a dist node_modules "$stage/"
+          git rev-parse HEAD > "$output/COMMIT"
+          git rev-parse HEAD^{tree} > "$output/TREE"
+          node --version > "$output/NODE-VERSION"
+          bun --version > "$output/BUN-VERSION"
+          tar -czf "$output/fabric-runtime.tar.gz" -C "$stage" .
+          (cd "$output" && sha256sum fabric-runtime.tar.gz > SHA256SUMS)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Real Pi exit cleanup e2e (smarty-dev#8467)
+        timeout-minutes: 8
+        env:
+          FABRIC_8467_REAL_PI: '1'
+        run: bunx vitest run tests/mesh-exit-cleanup-real-pi.e2e.test.ts
+      - name: Upload tested Linux runtime
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fabric-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/fabric-artifact/
+          if-no-files-found: error
+          retention-days: 7
   windows-gates:
     runs-on: windows-latest
     steps:
@@ -87,41 +355,6 @@ jobs:
           path: ${{ runner.temp }}/dist.tar
           if-no-files-found: error
           retention-days: 1
-
-  linux-tests:
-    name: Linux affected (${{ matrix.shard }}/10)
-    needs: linux-gates
-    runs-on: ubuntu-latest
-    env:
-      # Real-broker conformance stays in the unchanged dedicated nats-* jobs.
-      FABRIC_TEST_SKIP_NATS: '1'
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    steps:
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/check-setup
-        with:
-          dist-artifact: dist-ubuntu-latest
-      - uses: ./.github/actions/check-systemd
-      - name: Affected tests
-        env:
-          PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          PI_TEST_REPORT_DIR: ${{ runner.temp }}/affected
-        run: bun run test:affected --shard=${{ matrix.shard }}/10
-      - name: Upload shard counts
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: affected-ubuntu-latest-${{ matrix.shard }}
-          path: ${{ runner.temp }}/affected/
-          if-no-files-found: error
-          retention-days: 7
-
   windows-tests:
     name: Windows affected (${{ matrix.shard }}/10)
     needs: windows-gates
@@ -153,48 +386,6 @@ jobs:
           path: ${{ runner.temp }}/affected/
           if-no-files-found: error
           retention-days: 7
-
-  linux-acceptance:
-    needs: linux-gates
-    runs-on: ubuntu-latest
-    env:
-      FABRIC_TEST_SKIP_NATS: '1'
-    steps:
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/check-setup
-        with:
-          dist-artifact: dist-ubuntu-latest
-      - name: Session-channel real-broker acceptance
-        if: runner.os == 'Linux'
-        env:
-          PI_FABRIC_REQUIRE_NATS: '1'
-          NATS_EXPECTED_SERVER_VERSION: '2.14.7'
-        run: bunx vitest run --retry=0 tests/nats-session-channel.test.ts
-      - name: Package install smoke (no peers, as pi install)
-        run: bun run smoke:package-install
-      - uses: ./.github/actions/check-regressions
-      - name: Real Pi provider-dead path (smarty-dev#8742)
-        if: runner.os == 'Linux'
-        env:
-          FABRIC_8742_REAL_PI: '1'
-        run: bunx vitest run tests/main-provider-dead-real-pi.test.ts
-      - name: Real Pi extension-hidden tools (smarty-dev#5492)
-        if: runner.os == 'Linux'
-        env:
-          FABRIC_5492_REAL_PI: '1'
-        run: bunx vitest run tests/extension-hidden-tools-real-pi.test.ts
-      - name: Real Pi sender headers (smarty-dev#6207)
-        if: runner.os == 'Linux'
-        env:
-          FABRIC_6207_REAL_PI: '1'
-        run: bunx vitest run tests/sender-headers-real-pi.test.ts
-      - uses: ./.github/actions/check-systemd
-      - name: Process-slice scope E2E (required on Linux)
-        env:
-          FABRIC_SCOPE_E2E_REQUIRED: '1'
-        run: bunx vitest run --project scope-e2e
-
   windows-acceptance:
     needs: windows-gates
     runs-on: windows-latest
@@ -212,61 +403,11 @@ jobs:
       # Preserve the Windows smoke floor too; the old matrix ran it on both OSes.
       - name: Platform smoke floor
         run: bun run test:smoke
-
-  linux-runtime:
-    # Packaging/upload must not race ahead of a failing or incomplete shard.
-    needs: [linux-gates, linux-tests, linux-acceptance]
-    runs-on: ubuntu-latest
-    env:
-      FABRIC_TEST_SKIP_NATS: '1'
-    steps:
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/check-setup
-        with:
-          dist-artifact: dist-ubuntu-latest
-      - uses: ./.github/actions/check-systemd
-      - name: Platform smoke floor
-        run: bun run test:smoke
-      - name: Package tested Linux runtime
-        if: runner.os == 'Linux' && github.event_name == 'push'
-        shell: bash
-        run: |
-          stage="$RUNNER_TEMP/fabric-runtime"
-          output="$RUNNER_TEMP/fabric-artifact"
-          mkdir -p "$stage" "$output"
-          git archive HEAD | tar -x -C "$stage"
-          cp -a dist node_modules "$stage/"
-          git rev-parse HEAD > "$output/COMMIT"
-          git rev-parse HEAD^{tree} > "$output/TREE"
-          node --version > "$output/NODE-VERSION"
-          bun --version > "$output/BUN-VERSION"
-          tar -czf "$output/fabric-runtime.tar.gz" -C "$stage" .
-          (cd "$output" && sha256sum fabric-runtime.tar.gz > SHA256SUMS)
-      # Preserve Node 24 and package -> real-Pi exit cleanup -> upload ordering.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Real Pi exit cleanup e2e (smarty-dev#8467)
-        if: runner.os == 'Linux'
-        timeout-minutes: 8
-        env:
-          FABRIC_8467_REAL_PI: '1'
-        run: bunx vitest run tests/mesh-exit-cleanup-real-pi.e2e.test.ts
-      - name: Upload tested Linux runtime
-        if: runner.os == 'Linux' && github.event_name == 'push'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: fabric-runtime-${{ github.sha }}
-          path: ${{ runner.temp }}/fabric-artifact/
-          if-no-files-found: error
-          retention-days: 7
-
   check-linux:
     name: check (ubuntu-latest)
     if: always()
-    needs: [linux-gates, linux-tests, linux-acceptance, linux-runtime]
-    runs-on: ubuntu-latest
+    needs: [linux-tests]
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}
     env:
       FABRIC_TEST_SKIP_NATS: '1'
       PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -278,6 +419,7 @@ jobs:
       - uses: ./.github/actions/check-setup
         with:
           dist-artifact: dist-ubuntu-latest
+          runner-environment: ${{ (vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest') == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}
       - name: Discover unsharded affected test files (no test execution)
         shell: bash
         run: node scripts/test-affected.mjs --list-only > "$RUNNER_TEMP/unsharded-selection.json"
@@ -303,7 +445,6 @@ jobs:
         shell: bash
         run: |
           node --input-type=module -e 'const jobs = JSON.parse(process.env.RESULTS); if (Object.values(jobs).some(job => job.result !== "success")) { console.error(jobs); process.exit(1); }'
-
   check-windows:
     name: check (windows-latest)
     if: always()
@@ -345,21 +486,10 @@ jobs:
         shell: bash
         run: |
           node --input-type=module -e 'const jobs = JSON.parse(process.env.RESULTS); if (Object.values(jobs).some(job => job.result !== "success")) { console.error(jobs); process.exit(1); }'
-
   nats-state-conformance:
-    # The StateBackend contract suites on a real nats-server (smarty-dev#7504 phase 2): JetStream with
-    # sync_interval always (the backend refuses a server that does not fsync every write) and an http
-    # monitor port (read for /varz). NATS_SERVER_REQUIRED=1 fails the job if the server is missing, so it
-    # never passes by skipping. Separate from `check`; not a required check.
-    # smarty-dev#11373: the same three suites run against both NATS_STATE_PROFILE values. `single` is one server;
-    # `cluster` is three routed loopback nodes (replicas 3). NATS_SERVER_URL/NATS_MONITOR_URL stay the single seed
-    # inputs; the profile only selects the replica count the test helper writes into the private fixture config.
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [single, cluster]
+    # StateBackend and authenticated real-broker suites share one clean large sandbox.
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-bun
@@ -369,7 +499,6 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Install pinned NATS server
-        # The same pinned download as the JetStream event-log job (feat/nats-event-log).
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -382,72 +511,59 @@ jobs:
           (
             cd "$stage"
             awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
-            # Also bind the release asset to the locally qualified v2.14.7 bytes.
             printf 'e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2  %s\n' "$archive" | sha256sum --check --strict -
             tar -xzf "$archive"
           )
           echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
-      - name: Start nats-server ${{ matrix.profile }} (loopback, JetStream sync always, monitor ports)
+      - name: StateBackend conformance on single and cluster NATS profiles
         shell: bash
-        env:
-          NATS_STATE_PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          case "$NATS_STATE_PROFILE" in
-            single) nodes=1 ;;
-            cluster) nodes=3 ;;
-            *) echo "unknown NATS profile: $NATS_STATE_PROFILE" >&2; exit 1 ;;
-          esac
-          for i in $(seq 1 "$nodes"); do
-            store="$RUNNER_TEMP/nats-store-$i"
-            mkdir -p "$store"
-            conf="$RUNNER_TEMP/nats-$i.conf"
-            {
-              printf 'server_name: n%s\nlisten: 127.0.0.1:%s\nhttp: 127.0.0.1:%s\n' "$i" $((4221 + i)) $((8221 + i))
-              printf 'jetstream {\n  store_dir: "%s"\n  sync_interval: always\n}\n' "$store"
-              if [ "$nodes" -gt 1 ]; then
-                routes=""
-                for j in $(seq 1 "$nodes"); do
-                  [ "$j" -eq "$i" ] || routes="${routes:+$routes, }nats-route://127.0.0.1:$((6221 + j))"
-                done
-                printf 'cluster {\n  name: fabric-state-ci\n  listen: 127.0.0.1:%s\n  routes: [%s]\n}\n' $((6221 + i)) "$routes"
-              fi
-            } > "$conf"
-            nohup "$NATS_BIN" -c "$conf" > "$RUNNER_TEMP/nats-$i.log" 2>&1 &
-          done
-          # Shared bounded readiness: the CLI performs one absolute 60 s gate with
-          # 200 ms monitor polling, full and JS-only health, syncAlways, identities,
-          # distinct peer routes, and current/online JetStream metadata replicas.
-          # It prints every per-node response and derived failure before this step exits.
-          monitors=()
-          for i in $(seq 1 "$nodes"); do
-            monitors+=("n$i=http://127.0.0.1:$((8221 + i))")
-          done
-          node scripts/nats-cluster-readiness.mjs "${monitors[@]}"
-      - name: StateBackend conformance on nats (${{ matrix.profile }})
+          run_profile() (
+            set -euo pipefail
+            profile="$1"
+            nodes="$2"
+            pids=()
+            cleanup() {
+              for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+              for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+            }
+            trap cleanup EXIT
+            for i in $(seq 1 "$nodes"); do
+              store="$RUNNER_TEMP/nats-$profile-store-$i"
+              mkdir -p "$store"
+              conf="$RUNNER_TEMP/nats-$profile-$i.conf"
+              {
+                printf 'server_name: n%s\nlisten: 127.0.0.1:%s\nhttp: 127.0.0.1:%s\n' "$i" $((4221 + i)) $((8221 + i))
+                printf 'jetstream {\n  store_dir: "%s"\n  sync_interval: always\n}\n' "$store"
+                if [ "$nodes" -gt 1 ]; then
+                  routes=""
+                  for j in $(seq 1 "$nodes"); do
+                    [ "$j" -eq "$i" ] || routes="${routes:+$routes, }nats-route://127.0.0.1:$((6221 + j))"
+                  done
+                  printf 'cluster {\n  name: fabric-state-ci\n  listen: 127.0.0.1:%s\n  routes: [%s]\n}\n' $((6221 + i)) "$routes"
+                fi
+              } > "$conf"
+              nohup "$NATS_BIN" -c "$conf" > "$RUNNER_TEMP/nats-$profile-$i.log" 2>&1 &
+              pids+=("$!")
+            done
+            monitors=()
+            for i in $(seq 1 "$nodes"); do monitors+=("n$i=http://127.0.0.1:$((8221 + i))"); done
+            node scripts/nats-cluster-readiness.mjs "${monitors[@]}"
+            env NATS_SERVER_REQUIRED=1 NATS_STATE_PROFILE="$profile" NATS_SERVER_URL=nats://127.0.0.1:4222 NATS_MONITOR_URL=http://127.0.0.1:8222 bunx vitest run --retry=0 tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
+            if [ "$profile" = cluster ]; then
+              bunx vitest run --retry=0 tests/state-backend-nats-election.test.ts
+              env NATS_EXPECTED_SERVER_VERSION=2.14.7 NATS_SERVER_REQUIRED=1 bunx vitest run --retry=0 tests/nats-transport-replicas.test.ts
+              bunx vitest run --retry=0 tests/state-backend-nats-publish-dedupe.test.ts
+              bunx vitest run --retry=0 tests/state-backend-nats-pull-recovery.test.ts
+            fi
+          )
+          run_profile single 1
+          run_profile cluster 3
+      - name: Hosted authenticated NATS T2/T8 and Path B grants (source CLI)
         env:
-          NATS_SERVER_REQUIRED: '1'
-          NATS_STATE_PROFILE: ${{ matrix.profile }}
-          NATS_SERVER_URL: nats://127.0.0.1:4222
-          NATS_MONITOR_URL: http://127.0.0.1:8222
-        run: bunx vitest run --retry=0 tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
-      - name: State backend through a forced metadata-leader election
-        if: matrix.profile == 'cluster'
-        # The fixture owns another three-node cluster on unique ports, so only its own leader is paused.
-        run: bunx vitest run --retry=0 tests/state-backend-nats-election.test.ts
-      - name: Transport replicas and real R3 inbox delivery
-        if: matrix.profile == 'cluster'
-        # The test owns a separate three-node cluster and private scratch, not the shared conformance streams.
-        env:
-          NATS_EXPECTED_SERVER_VERSION: '2.14.7'
-          NATS_SERVER_REQUIRED: '1'
-        run: bunx vitest run --retry=0 tests/nats-transport-replicas.test.ts
-      - name: Publish retry deduplication on R3
-        if: matrix.profile == 'cluster'
-        run: bunx vitest run --retry=0 tests/state-backend-nats-publish-dedupe.test.ts
-      - name: Lost first pull recovery on R3
-        if: matrix.profile == 'cluster'
-        run: bunx vitest run --retry=0 tests/state-backend-nats-pull-recovery.test.ts
+          NATS_AUTH_REQUIRED: '1'
+        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts tests/nats-reconnect-auth.test.ts --retry=0
       - name: Server logs (all nodes)
         if: failure()
         shell: bash
@@ -458,47 +574,12 @@ jobs:
             cat "$log"
             echo "::endgroup::"
           done
-
-  mesh-lock-bench:
-    # The mesh lock benchmark ratchet (smarty-dev#6676, docs/mesh-lock-bench.md): fails a >10%
-    # regression of the deterministic per-op lock metrics against bench/mesh-lock-baseline.json.
-    # Timing metrics are reported only: on a shared runner they swing by tens of percent.
-    # Not a required check (.mergify.yml requires `check (ubuntu-latest)` only).
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-bun
-      # The benchmark runs dist/ (built for node24) in node worker processes.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      - name: Fetch the pinned native toolchain
-        run: node scripts/native-toolchain.mjs fetch
-      - name: Build
-        env:
-          FABRIC_NATIVE_CC_PINNED: "1"
-        run: bun run build
-      - name: Mesh lock benchmark ratchet
-        # The table (ratchet, timing and report rows) goes to stderr; the JSON result to the file.
-        run: bun run bench:mesh-lock:check --out mesh-lock.json > /dev/null
-      - name: Upload benchmark result
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: mesh-lock-bench-${{ github.sha }}
-          path: mesh-lock.json
-          if-no-files-found: warn
-          retention-days: 14
-
   idle-wakes:
     # The idle wake gate (smarty-dev#7978, R-no-polling; docs/idle-wake-gate.md): an idle activated Pi Main and an
     # idle Fabric resident host, 300 s each in parallel after a 30 s warm-up. Breach: > 1.0 timer wakes/s in total,
     # or one callsite firing more than once a minute. Report-only while IDLE_WAKE_ENFORCE is 0: set it to 1 to block.
     # Not a required check. Wall time ~8 min: install + build ~2 min, self-test ~70 s, both modes ~6 min.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       IDLE_WAKE_ENFORCE: '0'
@@ -540,39 +621,3 @@ jobs:
           path: idle-wakes-*
           if-no-files-found: warn
           retention-days: 14
-
-  nats-auth:
-    # Hosted smarty-dev#7504 T2 role matrix and configured 1/1 T8 auth slice; this does not claim init --local or adapter coverage.
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-bun
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: package.json
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      - name: Install pinned NATS server
-        # The same pinned download as the JetStream event-log job (feat/nats-event-log).
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version=2.14.7
-          archive="nats-server-v${version}-linux-amd64.tar.gz"
-          stage="$RUNNER_TEMP/nats-release"
-          mkdir -p "$stage"
-          gh release download -R nats-io/nats-server "v${version}" -p SHA256SUMS -p "$archive" -D "$stage"
-          (
-            cd "$stage"
-            awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
-            # Also bind the release asset to the locally qualified v2.14.7 bytes.
-            printf 'e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2  %s\n' "$archive" | sha256sum --check --strict -
-            tar -xzf "$archive"
-          )
-          echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
-      - name: Hosted authenticated NATS T2/T8 and Path B grants (source CLI)
-        env:
-          NATS_AUTH_REQUIRED: '1'
-        run: bunx vitest run tests/nats-auth-server.test.ts tests/nats-auth-path-b-*.test.ts tests/nats-messaging.test.ts tests/nats-transport-auth.test.ts tests/nats-inbox-faults.test.ts tests/nats-kv-watch.test.ts tests/nats-dead-letter.test.ts tests/nats-reconnect-auth.test.ts --retry=0

@@ -1,8 +1,10 @@
+import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type {
   CompactionResult,
   ExtensionAPI,
   ExtensionContext,
   SessionBeforeCompactEvent,
+  SessionBeforeCompactResult,
   SessionBeforeTreeEvent,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
@@ -869,6 +871,195 @@ export const compileFabricSummary = (
   };
 };
 
+/** Interim Fix A convention: serialized projected content, including JSON escaping. */
+export const KEPT_TAIL_TOOL_RESULT_MAX_BYTES = 50 * 1024;
+
+interface OmittedToolReply {
+  message: Extract<AgentMessage, { role: "toolResult" }>;
+  notice: string;
+}
+
+const oversizedToolReply = (message: AgentMessage, entryId: string): OmittedToolReply | undefined => {
+  if (message.role !== "toolResult") return;
+  const bytes = utf8Bytes(JSON.stringify(message.content));
+  if (bytes <= KEPT_TAIL_TOOL_RESULT_MAX_BYTES) return;
+  return {
+    message,
+    notice: `[tool reply of ${bytes} bytes from ${message.toolName} omitted; raw entry ${entryId} kept in the session file]`,
+  };
+};
+
+const keptTailFailure = (context: ExtensionContext, message: string): SessionBeforeCompactResult => {
+  // Pi 1.1 catches thrown extension errors and proceeds with its original cut.
+  // A veto, not a throw/fallthrough, is necessary to prevent an unsafe retry.
+  notifyDiagnostic(context, "src/compaction/hook.ts", clipUtf8(`Kept-tail compaction stopped: ${message}`, 1024), "error");
+  return { cancel: true };
+};
+
+/**
+ * A synchronous no-op unless Pi's currently projected kept tail contains a giant
+ * tool reply. Registration stays host-free; only that exceptional compaction
+ * loads and calls Pi's public native summarizer through the session's registry.
+ */
+export const handleKeptTailBeforeCompact = (
+  event: SessionBeforeCompactEvent,
+  context: ExtensionContext,
+  pi?: ExtensionAPI,
+): Promise<SessionBeforeCompactResult> | undefined => {
+  const { preparation, branchEntries } = event;
+  const start = preparation?.firstKeptEntryId
+    ? branchEntries.findIndex((entry) => entry.id === preparation.firstKeptEntryId)
+    : -1;
+  if (start < 0) return;
+  const projection = context?.sessionManager?.buildSessionProjection?.();
+  if (!projection) return;
+  const indices = new Map(branchEntries.map((entry, index) => [entry.id, index]));
+  const projected = projection.entries.flatMap(({ sourceEntry, messages }) => {
+    const index = indices.get(sourceEntry.id);
+    return index === undefined || sourceEntry.type === "compaction" ? [] : [{
+      index, entryId: sourceEntry.id, messages: messages.filter((message) => message.role !== "system"),
+    }];
+  }).sort((a, b) => a.index - b.index);
+  const omitted = new Map<string, OmittedToolReply>();
+  let cut = start;
+  for (const entry of projected) {
+    if (entry.index < start) continue;
+    for (const message of entry.messages) {
+      const reply = oversizedToolReply(message, entry.entryId);
+      if (!reply) continue;
+      omitted.set(reply.message.toolCallId, reply);
+      cut = Math.max(cut, entry.index + 1);
+    }
+  }
+  if (omitted.size === 0) return;
+
+  // Close forward, not backward: every result of every call before the cut must
+  // move with its assistant, including normal siblings of an oversized reply.
+  const spans = new Map<string, { call: number; result: number }>();
+  for (const entry of projected) {
+    for (const message of entry.messages) {
+      if (message.role === "assistant") {
+        for (const id of toolCallIdsOf(message)) {
+          const span = spans.get(id) ?? { call: entry.index, result: -1 };
+          span.call = Math.min(span.call, entry.index);
+          spans.set(id, span);
+        }
+      } else if (message.role === "toolResult") {
+        const span = spans.get(message.toolCallId) ?? { call: Infinity, result: -1 };
+        span.result = Math.max(span.result, entry.index);
+        spans.set(message.toolCallId, span);
+      }
+    }
+  }
+  let previousCut: number;
+  do {
+    previousCut = cut;
+    for (const span of spans.values()) {
+      if (span.call < cut && span.result >= cut) cut = span.result + 1;
+    }
+    // A raw bookkeeping/omission entry is a valid retain boundary. A projected
+    // tool result is not, even in malformed history with no surviving call.
+    if (projected.some((entry) => entry.index === cut && entry.messages.some((message) => message.role === "toolResult"))) cut++;
+  } while (cut !== previousCut);
+
+  const boundaryId = branchEntries[cut]?.id;
+  const moved = projected.filter((entry) => entry.index >= start && entry.index < cut);
+  return (async () => {
+    try {
+      event.signal.throwIfAborted();
+      if (!context.model) throw new Error("no model selected for the native summary");
+      if (!boundaryId && (!pi?.appendEntry || !context.sessionManager.getLeafId || !context.sessionManager.getEntry)) {
+        throw new Error("no branch entry follows the final tool-call group; public appendEntry/getLeafId is required for a safe kept boundary");
+      }
+      const fileOps = {
+        read: new Set(preparation.fileOps.read),
+        written: new Set(preparation.fileOps.written),
+        edited: new Set(preparation.fileOps.edited),
+      };
+      const movedMessages = moved.flatMap((entry) => entry.messages);
+      // Extend, never mutate, the native file inventory as ordinary work moves
+      // from the kept tail into its normal summary input (including nested calls).
+      for (const message of movedMessages) {
+        const calls = message.role === "assistant"
+          ? message.content.filter((part) => part.type === "toolCall")
+          : message.role === "toolResult" ? message.nestedCalls?.calls ?? [] : [];
+        for (const call of calls) {
+          const path = call.arguments?.path;
+          if (typeof path !== "string") continue;
+          if (call.name === "read") fileOps.read.add(path);
+          else if (call.name === "write") fileOps.written.add(path);
+          else if (call.name === "edit") fileOps.edited.add(path);
+        }
+      }
+      // Native preparation already contains projected history/turn prefixes.
+      // Retain that work and previousSummary, but use one normal native history
+      // summary now that the cut has advanced. Do not resurrect raw edited data.
+      const messages = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages, ...movedMessages];
+      const sources = new Map(projected.flatMap((entry) => entry.messages.flatMap((message) =>
+        message.role === "toolResult" ? [[message.toolCallId, entry.entryId] as const] : [])));
+      const messagesToSummarize = messages.map((message): AgentMessage => {
+        const id = message.role === "toolResult" ? sources.get(message.toolCallId) : undefined;
+        const reply = id ? oversizedToolReply(message, id) : undefined;
+        if (!reply) return message;
+        omitted.set(reply.message.toolCallId, reply);
+        // Drop *all* unbounded result fields, not only visible text. Original
+        // details, structured content, images and usage remain in the raw entry.
+        return {
+          role: "toolResult", toolCallId: reply.message.toolCallId, toolName: reply.message.toolName,
+          content: [{ type: "text", text: reply.notice }],
+          isError: reply.message.isError, timestamp: reply.message.timestamp,
+        };
+      });
+      const auth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
+      event.signal.throwIfAborted();
+      if (!auth.ok) throw new Error(auth.error);
+      const { compact } = await import("@earendil-works/pi-coding-agent");
+      event.signal.throwIfAborted();
+      const stream = context.modelRegistry.stream.bind(context.modelRegistry) as StreamFn;
+      const summaryStream: StreamFn = async (...args) => {
+        const response = await stream(...args);
+        // SDK 1.1's public compact() does not reject an aborted provider result
+        // unless its signal also aborted. Never persist that partial checkpoint.
+        if ((await response.result()).stopReason === "aborted") throw new Error("native summary aborted");
+        return response;
+      };
+      const result = await compact({
+        ...preparation, firstKeptEntryId: boundaryId ?? preparation.firstKeptEntryId,
+        messagesToSummarize, turnPrefixMessages: [], isSplitTurn: false, fileOps,
+      }, auth.baseUrl ? { ...context.model, baseUrl: auth.baseUrl } : context.model,
+      // The legacy helper's header type predates null-as-removal. It only
+      // forwards headers; retain those values for the session registry stream.
+      auth.apiKey, auth.headers as Parameters<typeof compact>[3], event.customInstructions, event.signal,
+      context.thinkingLevel ?? pi?.getThinkingLevel?.(), summaryStream, auth.env);
+      event.signal.throwIfAborted();
+      let firstKeptEntryId = boundaryId;
+      if (!firstKeptEntryId) {
+        // The latest tool pair may be the entire suffix (manual/between-turn
+        // compaction). Reuse Pi's public append-only state-entry mechanism only
+        // after summary success, so auth/cancellation failures append nothing.
+        const before = context.sessionManager.getLeafId();
+        pi!.appendEntry("fabric.kept-tail-boundary");
+        const after = context.sessionManager.getLeafId();
+        const marker = after ? context.sessionManager.getEntry(after) : undefined;
+        if (!after || after === before || marker?.type !== "custom"
+          || marker.customType !== "fabric.kept-tail-boundary" || marker.parentId !== before) {
+          throw new Error("public appendEntry did not create a safe kept-tail boundary");
+        }
+        firstKeptEntryId = after;
+      }
+      // Do not ask the model to remember the omission notice: persist its exact
+      // byte count/address even when the native summary only describes the task.
+      const notices = [...omitted.values()].map(({ notice }) => notice).filter((notice) => !result.summary.includes(notice));
+      return { compaction: {
+        ...result, firstKeptEntryId,
+        summary: result.summary + (notices.length ? `\n\n${notices.join("\n")}` : ""),
+      } };
+    } catch (error) {
+      return keptTailFailure(context, error instanceof Error ? error.message : String(error));
+    }
+  })();
+};
+
 export interface CompactionHookOptions {
   getEngine: () => CompactionEngine;
   getTargetContextRatio?: () => number;
@@ -1017,6 +1208,7 @@ export const handleFabricBeforeTree = (
 
 // Keep the synchronous entrypoint for callers that already use the compaction engine.
 export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
-  pi.on("session_before_compact", (event, context) => handleFabricBeforeCompact(event, context, options, pi));
+  pi.on("session_before_compact", (event, context) =>
+    handleKeptTailBeforeCompact(event, context, pi) ?? handleFabricBeforeCompact(event, context, options, pi));
   pi.on("session_before_tree", (event, context) => handleFabricBeforeTree(event, context, options));
 };

@@ -3,7 +3,7 @@ import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable, namespaceKey } from "../core/atomic-write.js";
 import { meshEventsNotDurable } from "./not-durable.js";
 import { FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -123,6 +123,7 @@ const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_DEDUPE_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_DEDUPE_RECEIPTS = 100_000;
+const DEDUPE_CAPACITY_HEADROOM_SLACK = 10_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 /** First read of the live log's last line (see #readLastEventSequence). */
@@ -187,6 +188,14 @@ interface AfterUnlock {
   receipt?: (() => Promise<void> | void) | undefined;
   /** Keyed publication: the receipt namespace prepared before `.lock` (fresh leaf barriers inside). */
   namespace?: ReceiptNamespace | undefined;
+}
+
+/** One off-lock observation, usable only in its initial publication hold. */
+interface DedupeCapacityHeadroom {
+  allowed: boolean;
+  validate: () => void;
+  invalidate: () => void;
+  close: () => void;
 }
 
 // One live-log barrier per root, shared by every confirmation queued before it STARTS. A
@@ -619,11 +628,12 @@ export class EventLog {
   }
 
   #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock,
-    fingerprint?: string): MeshEvent | undefined {
+    fingerprint?: string, capacityHeadroom?: DedupeCapacityHeadroom): MeshEvent | undefined {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
     // An existing intent may restore a live/archive append or settle durable metadata.
+    capacityHeadroom?.invalidate();
     consumeInitialMeshLockAdmission(this.root);
     const intent = JSON.parse(text) as MeshDedupeIntent;
     if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
@@ -737,7 +747,92 @@ export class EventLog {
     }
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock, prefixScope?: KeyedPublishPrefix): () => MeshEvent {
+  /** Advisory names count: the existing reservation file versions new-key admissions.
+   * Capture BEFORE the real listing, then validate under .lock; slack is not a bound on
+   * other publishers. Unknown state always keeps the full serialized capacity pass. */
+  #observeDedupeCapacityHeadroom(dedupeKeys: string[], namespace?: ReceiptNamespace): DedupeCapacityHeadroom | undefined {
+    // On Windows, a held sequence descriptor can make the commit's atomic counter replacement fail with EPERM.
+    // Skip this advisory path entirely there; BASE performs its listing under the mesh lock.
+    if (process.platform === "win32") return undefined;
+    let descriptor: number | undefined;
+    let retained = false;
+    try {
+      // Existing keys retain the direct receipt/recovery path without a bulk listing.
+      if (dedupeKeys.some(key => fs.existsSync(this.#dedupePath(key, ".json")) ||
+          fs.existsSync(this.#dedupePath(key, ".pending.json")))) return undefined;
+      const directory = path.join(this.root, "event-receipts");
+      // Unsupported namespace preparation can leave this absent; keep BASE's one locked listing.
+      if (!fs.existsSync(directory)) return undefined;
+      descriptor = fs.openSync(this.#counterPath, "r");
+      const fd = descriptor;
+      const identity = fs.fstatSync(fd, { bigint: true });
+      if (!identity.isFile() || identity.ino <= 0n) return undefined;
+      const sameFile = (stat: fs.BigIntStats): boolean => stat.isFile() &&
+        stat.dev === identity.dev && stat.ino === identity.ino && stat.size === identity.size &&
+        stat.mtimeNs === identity.mtimeNs && stat.ctimeNs === identity.ctimeNs;
+      const text = fs.readFileSync(fd, "utf8");
+      const sequence: unknown = JSON.parse(text);
+      // Unlike #readSequence(), unknown/malformed state must never become a known zero.
+      if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0 ||
+          !sameFile(fs.fstatSync(fd, { bigint: true })) ||
+          !sameFile(fs.lstatSync(this.#counterPath, { bigint: true }))) return undefined;
+      // A reservation can precede its intent. Reject a writer already holding .lock
+      // after capture; only ENOENT proves idle, never a stale-owner judgment or reclaim.
+      try { fs.lstatSync(this.#lock.lockPath); return undefined; }
+      catch (error) { if (errorCode(error) !== "ENOENT") return undefined; }
+      const directoryKey = namespaceKey(directory);
+      if (namespace && (namespace.directory !== directory || namespace.key !== directoryKey)) return undefined;
+      const count = fs.readdirSync(directory).length;
+      if (!(count + dedupeKeys.length + DEDUPE_CAPACITY_HEADROOM_SLACK < this.#maxDedupeReceipts)) return undefined;
+      const bytes = Buffer.from(text, "utf8");
+      let validated = false, invalidated = false;
+      const observation: DedupeCapacityHeadroom = {
+        allowed: false,
+        invalidate: () => { invalidated = true; observation.allowed = false; },
+        validate: () => {
+          // Never refresh a failed grant, including a later acquisition/prefix attempt.
+          if (validated || invalidated) return;
+          validated = true;
+          try {
+            if (!sameFile(fs.fstatSync(fd, { bigint: true })) ||
+                !sameFile(fs.lstatSync(this.#counterPath, { bigint: true })) ||
+                namespaceKey(directory) !== directoryKey) return;
+            const current = Buffer.alloc(bytes.length);
+            if (fs.readSync(fd, current, 0, current.length, 0) !== current.length || !current.equals(bytes) ||
+                !sameFile(fs.fstatSync(fd, { bigint: true })) ||
+                !sameFile(fs.lstatSync(this.#counterPath, { bigint: true }))) return;
+            observation.allowed = true;
+          } catch { /* Advisory failure: unchanged locked admission remains authoritative. */ }
+        },
+        close: () => {
+          observation.invalidate();
+          if (descriptor !== undefined) {
+            const closing = descriptor;
+            descriptor = undefined;
+            try { fs.closeSync(closing); } catch { /* Do not mask a publication error. */ }
+          }
+        },
+      };
+      // Keep the old inode alive until validation: equal-value atomic recovery replacements
+      // (and ordinary inode reuse after a pause) must not masquerade as this observation.
+      retained = true;
+      return observation;
+    } catch { return undefined; }
+    finally {
+      if (!retained && descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch { /* Advisory descriptor only. */ }
+      }
+    }
+  }
+
+  #withDedupeCapacityHeadroom<T>(headroom: DedupeCapacityHeadroom | undefined, commit: () => T): T {
+    headroom?.validate();
+    try { return commit(); }
+    finally { headroom?.close(); } // No grant or descriptor survives into a later hold.
+  }
+
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock, prefixScope?: KeyedPublishPrefix,
+    capacityHeadroom?: DedupeCapacityHeadroom): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     if (input.dedupeFingerprint !== undefined &&
@@ -849,28 +944,28 @@ export class EventLog {
           liveCatchUp.after > (archive.head()?.sequence ?? 0) ||
           liveCatchUp.identity !== this.#liveLogIdentity()) throw new MeshArchiveRecoveryChanged();
       }
-      this.#repairEventLog();
+      this.#repairEventLog(capacityHeadroom);
       // Recover the whole reboot suffix before any one intent can advance the live horizon.
       // In the same boot, defer ordinary pending cutback until the exact retry has settled.
       // New keys still take only the normal recovery path, with no event-history lookup.
       if (input.dedupeKey) {
         if (archive && fs.existsSync(intentPath!)) {
-          try { this.#recoverArchive(archive, true, prepared, liveCatchUp); }
+          try { this.#recoverArchive(archive, true, prepared, liveCatchUp, capacityHeadroom); }
           catch (error) {
             if (error instanceof MeshArchiveRecoveryChanged) throw error;
             throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
           }
         }
-        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after, input.dedupeFingerprint);
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after, input.dedupeFingerprint, capacityHeadroom);
         if (prior) {
           this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
           return prior;
         }
       }
       if (archive) {
-        this.#recoverArchive(archive, false, prepared, liveCatchUp);
+        this.#recoverArchive(archive, false, prepared, liveCatchUp, capacityHeadroom);
         if (archive.dir === preflight?.dir) {
-          if (digestRepair) consumeInitialMeshLockAdmission(this.root);
+          if (digestRepair) { capacityHeadroom?.invalidate(); consumeInitialMeshLockAdmission(this.root); }
           archive.installDigestRepair(digestRepair);
         }
       }
@@ -914,7 +1009,7 @@ export class EventLog {
         this.#outbox?.validate?.(event);
         // One slot per key, including unresolved intents. Admission must fail closed BEFORE
         // reserving a sequence or appending (failed compaction cannot grow pending files).
-        if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
+        if (intentPath && !capacityHeadroom?.allowed && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
           throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
         }
         // Match and bound the wake set before touching the live/archive event. Overflow
@@ -1017,15 +1112,20 @@ export class EventLog {
     const after: AfterUnlock = { namespace: preparation?.receiptNamespace };
     let event: MeshEvent;
     for (;;) {
+      let capacityHeadroom: DedupeCapacityHeadroom | undefined;
       try {
-        event = await withInitialMeshLockAcquisition(this.root, () =>
-          this.#lock.withLock(this.#preparePublish(input, undefined, after, preparation?.prefixScope), undefined, "publish"));
+        capacityHeadroom = input.dedupeKey
+          ? this.#observeDedupeCapacityHeadroom([input.dedupeKey], preparation?.receiptNamespace) : undefined;
+        event = await withInitialMeshLockAcquisition(this.root, () => {
+          const commit = this.#preparePublish(input, undefined, after, preparation?.prefixScope, capacityHeadroom);
+          return this.#lock.withLock(() => this.#withDedupeCapacityHeadroom(capacityHeadroom, commit), undefined, "publish");
+        });
         break;
       }
       catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
-      }
+      } finally { capacityHeadroom?.close(); }
     }
     // Committed. Never retry from here: a failed barrier must not append the event twice.
     // The publish resolves only after its bytes (and any receipt) are durable.
@@ -1055,14 +1155,19 @@ export class EventLog {
       // The after-release work of each event the hold committed, in commit order.
       const committed: AfterUnlock[] = [];
       let events: MeshEvent[];
+      let capacityHeadroom: DedupeCapacityHeadroom | undefined;
       try {
+        const dedupeKeys = inputs.flatMap(input => input.dedupeKey ? [input.dedupeKey] : []);
+        capacityHeadroom = dedupeKeys.length > 0 ? this.#observeDedupeCapacityHeadroom(dedupeKeys, namespace) : undefined;
         const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number }; after: AfterUnlock }> = [];
         for (const input of inputs) {
           const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = { namespace };
-          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
+          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after, undefined, capacityHeadroom), outcome, after }); }
           catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
         }
-        events = await withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => {
+        events = await withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => this.#withDedupeCapacityHeadroom(capacityHeadroom, () => {
+          // All keyed inputs, including duplicates and any uncommitted suffix, were reserved.
+          // One validated grant therefore covers this hold's own sequence replacements.
           const started = performance.now();
           const events: MeshEvent[] = [];
           let bytes = 0;
@@ -1086,7 +1191,7 @@ export class EventLog {
           // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
           this.#compactEventLog();
           return events;
-        }, undefined, "bridge", false, timing));
+        }), undefined, "bridge", false, timing));
       } catch (error) {
         // A hold that failed after committing a prefix never retries; its committed receipts
         // still finish (best effort: an intent left behind recovers like a death after append).
@@ -1097,7 +1202,7 @@ export class EventLog {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
         continue;
-      }
+      } finally { capacityHeadroom?.close(); }
       // Test-only process-death fence: committed and released, before any after-release barrier.
       if (process.env.PI_FABRIC_TEST_CRASH_BEFORE_BATCH_BARRIER === "1") process.kill(process.pid, "SIGKILL");
       // Committed. Never retry from here: a failed barrier must not append the events twice.
@@ -1269,14 +1374,15 @@ export class EventLog {
   // live, the catch-up below archives it again from the live log. So do events that a store
   // without the archive appended (an older Fabric, or before the archive was set).
   #recoverArchive(archive: MeshArchive, rebootOnly = false, prepared?: MeshArchiveRecoveryPlan,
-    liveCatchUp?: PreparedLiveCatchUp): void {
+    liveCatchUp?: PreparedLiveCatchUp, capacityHeadroom?: DedupeCapacityHeadroom): void {
     // Same-boot recovery with no pending record is read-only: do not disable fleet ingress
     // retries merely because archives are enabled. Reboot/pending recovery can mutate BEFORE
     // returning, so consume first (a raced/missing plan throws before promotion).
-    if (prepared || archive.pending()) consumeInitialMeshLockAdmission(this.root);
+    if (prepared || archive.pending()) { capacityHeadroom?.invalidate(); consumeInitialMeshLockAdmission(this.root); }
     const recovery = archive.recover(this.#readLastEventSequence(), prepared, rebootOnly);
     if (rebootOnly && !recovery.rebooted) return;
     if (recovery.rebooted) {
+      capacityHeadroom?.invalidate();
       consumeInitialMeshLockAdmission(this.root);
       // A power loss took live appends whose archive lines were synced: they go live again,
       // synced this time, before anything else can take their sequences.
@@ -1296,6 +1402,7 @@ export class EventLog {
     const archived = archive.head()?.sequence ?? 0;
     if (archived < this.#readLastEventSequence()) {
       if (!liveCatchUp || liveCatchUp.dir !== archive.dir || liveCatchUp.after > archived) throw new MeshArchiveRecoveryChanged();
+      capacityHeadroom?.invalidate();
       consumeInitialMeshLockAdmission(this.root);
       archive.catchUp(liveCatchUp.entries.filter(entry => entry.event.sequence > archived));
     }
@@ -1704,10 +1811,9 @@ export class EventLog {
 
   /** Under .lock: reserve capacity before append, or expire receipts during compaction.
    * One key consumes one slot even while both receipt and pending intent are present.
-   * This listing is authoritative admission/retention state, not an advisory cache. An
-   * off-lock snapshot could miss another writer's new key or pending intent, admitting
-   * over capacity or evicting protected evidence. Legacy writers publish no generation
-   * fence for validating that snapshot, so keep the scan serialized with their writes. */
+   * This full fallback listing is authoritative admission/retention state. Only an
+   * off-lock names count validated against its reservation stamp skips capacity work; compaction
+   * always keeps this serialized scan, payload reads and retirement with other writes. */
   #pruneDedupeReceipts(reserve = 0): number {
     const directory = path.join(this.root, "event-receipts");
     let names: string[];
@@ -1785,7 +1891,7 @@ export class EventLog {
     }
   }
 
-  #repairEventLog(): void {
+  #repairEventLog(capacityHeadroom?: DedupeCapacityHeadroom): void {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r+");
@@ -1798,6 +1904,7 @@ export class EventLog {
       const tail = Buffer.allocUnsafe(readBytes);
       fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
       const newline = tail.lastIndexOf(0x0a);
+      capacityHeadroom?.invalidate();
       consumeInitialMeshLockAdmission(this.root);
       fs.ftruncateSync(descriptor, newline >= 0 ? size - readBytes + newline + 1 : 0);
     } catch (error) {

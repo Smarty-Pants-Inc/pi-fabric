@@ -32,6 +32,7 @@ const request = (value: unknown, provider = "demo") => ({
   action: action(provider),
   args: { query: "value" },
   toolCallId: `${FABRIC_NESTED_TOOL_CALL_ID_PREFIX}test`,
+  parentToolCallId: "parent",
   value,
 });
 
@@ -54,6 +55,7 @@ describe("FabricToolResultProxy", () => {
       type: "tool_result",
       toolName: "demo.echo",
       toolCallId: `${FABRIC_NESTED_TOOL_CALL_ID_PREFIX}test`,
+      parentToolCallId: "parent",
       input: { query: "value" },
       content: [{ type: "text", text: "unbounded output" }],
       isError: false,
@@ -156,6 +158,7 @@ describe("ActionRegistry result proxy", () => {
     expect(result).toEqual({ artifact: "artifact_test", originalChars: 1_000 });
     expect(proxy.proxy).toHaveBeenCalledWith(expect.objectContaining({
       toolCallId: expect.stringMatching(/^fabric_/),
+      parentToolCallId: "parent",
       value: "x".repeat(1_000),
     }));
   });

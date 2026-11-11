@@ -113,7 +113,11 @@ export class TranscriptAccumulator {
     return undefined;
   }
 
-  #toolParent(id: string): FabricTranscriptEntry | undefined {
+  #toolParent(id: string, parentToolCallId?: string): FabricTranscriptEntry | undefined {
+    if (parentToolCallId !== undefined) {
+      const parent = this.#tools.get(parentToolCallId);
+      return parent?.status === "running" ? parent : undefined;
+    }
     if (!id.startsWith("fabric_")) return undefined;
     for (let index = this.#activeTools.length - 1; index >= 0; index--) {
       const candidate = this.#activeTools[index];
@@ -126,6 +130,7 @@ export class TranscriptAccumulator {
     id: string,
     label: string,
     args: unknown,
+    parentToolCallId?: string,
   ): FabricTranscriptEntry {
     // Every explicit start ends any prior awaiting-canonical correlation,
     // including reused IDs whose compact end kept the entry in #tools.
@@ -139,7 +144,7 @@ export class TranscriptAccumulator {
       return existing;
     }
     this.#finishedTools.delete(id);
-    const parent = this.#toolParent(id);
+    const parent = this.#toolParent(id, parentToolCallId);
     const safeLabel = terminalSafe(label) || "tool";
     const entry: FabricTranscriptEntry = {
       id,
@@ -235,7 +240,12 @@ export class TranscriptAccumulator {
           const part = recordOf(value);
           if (part?.type !== "toolCall" || typeof part.name !== "string") continue;
           const toolId = typeof part.id === "string" ? part.id : `session-tool-${this.#sequence++}`;
-          this.#startTool(toolId, part.name, part.arguments);
+          this.#startTool(
+            toolId,
+            part.name,
+            part.arguments,
+            typeof event.parentToolCallId === "string" ? event.parentToolCallId : undefined,
+          );
         }
       }
       return;
@@ -336,7 +346,12 @@ export class TranscriptAccumulator {
           if (part?.type !== "tool_use") continue;
           const toolId = typeof part.id === "string" ? part.id : `claude-tool-${this.#sequence++}`;
           const label = typeof part.name === "string" ? part.name : "tool";
-          this.#startTool(toolId, label, part.input);
+          this.#startTool(
+            toolId,
+            label,
+            part.input,
+            typeof event.parentToolCallId === "string" ? event.parentToolCallId : undefined,
+          );
         }
       }
       const text = terminalSafe(contentText(message.content));
@@ -479,7 +494,12 @@ export class TranscriptAccumulator {
 
     if (event.type === "tool_execution_start") {
       const label = typeof event.toolName === "string" ? event.toolName : "tool";
-      const entry = this.#startTool(id, label, event.args);
+      const entry = this.#startTool(
+        id,
+        label,
+        event.args,
+        typeof event.parentToolCallId === "string" ? event.parentToolCallId : undefined,
+      );
       if (typeof event.toolCallId !== "string") {
         const key = terminalSafe(label) || "tool";
         this.#tools.delete(entry.id);
@@ -625,6 +645,7 @@ export const normalizedToolStarts = (event: Record<string, unknown>): ToolLifecy
           toolCallId: part.id,
           toolName: name,
           args: type === "toolCall" ? part.arguments : part.input,
+          ...(typeof event.parentToolCallId === "string" ? { parentToolCallId: event.parentToolCallId } : {}),
         },
       });
     }

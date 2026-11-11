@@ -73,11 +73,11 @@ function curlsGitHubReleaseDownload(source: string): boolean {
 }
 
 const hostedRunnerLabels = ["ubuntu-latest", "windows-latest"];
-const boatRunnerExpressions = {
-  "test.yml:linux-tests": "${{ vars.PI_FABRIC_LINUX_RUNNER || 'boat-xlarge' }}",
-  "test.yml:check-linux": "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}",
-  "test.yml:nats-state-conformance": "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}",
-  "test.yml:idle-wakes": "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}",
+const linuxRunnerExpressions = {
+  "test.yml:linux-tests": "${{ vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest' }}",
+  "test.yml:check-linux": "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}",
+  "test.yml:nats-state-conformance": "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}",
+  "test.yml:idle-wakes": "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}",
 };
 
 function assertHostedRunnerSetup(inventory: Record<string, Workflow>, setupAction: ActionConfig): void {
@@ -385,13 +385,13 @@ describe("pinned local Bun setup contract", () => {
 });
 
 describe("CI runner admission", () => {
-  it("requires the exact Boat Linux sizes and keeps every other workflow job on its existing hosted runner", () => {
+  it("uses GitHub-hosted Linux defaults and keeps every other workflow job on its existing hosted runner", () => {
     const inventory = workflowInventory();
     for (const [file, config] of Object.entries(inventory)) {
       for (const [id, job] of Object.entries(config.jobs)) {
         const key = `${file}:${id}`;
-        const boatExpression = boatRunnerExpressions[key as keyof typeof boatRunnerExpressions];
-        if (boatExpression) expect(job["runs-on"], key).toBe(boatExpression);
+        const linuxExpression = linuxRunnerExpressions[key as keyof typeof linuxRunnerExpressions];
+        if (linuxExpression) expect(job["runs-on"], key).toBe(linuxExpression);
         else expect(hostedRunnerLabels, key).toContain(job["runs-on"]);
       }
     }
@@ -407,7 +407,7 @@ describe("CI runner admission", () => {
   });
 });
 
-describe("Boat Linux packing and required checks", () => {
+describe("Public Linux packing and required checks", () => {
   it.each([["linux", "ubuntu-latest"], ["windows", "windows-latest"]])("preserves every %s selected test and required aggregate context", (platform, os) => {
     const { jobs } = workflow();
     const tests = jobs[`${platform}-tests`] as Job;
@@ -434,10 +434,14 @@ describe("Boat Linux packing and required checks", () => {
       expect(jobs["windows-gates"]?.["runs-on"]).toBe("windows-latest");
       expect(aggregate["runs-on"]).toBe("windows-latest");
     } else {
-      expect(tests["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER || 'boat-xlarge' }}");
+      expect(tests["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest' }}");
       expect(tests.needs).toBeUndefined();
       expect(tests.strategy).toBeUndefined();
       const lanes = tests.steps?.find((step) => step.name === "Run Linux tests in eight logged parallel lanes")?.run ?? "";
+      expect(tests["timeout-minutes"]).toBe(45);
+      expect(lanes).toContain("max_lanes=4");
+      expect(lanes).toContain('wait -n -p finished_pid "${lane_pids[@]}"');
+      expect(lanes).toContain('while [ "${#lane_pids[@]}" -ge "$max_lanes" ]; do');
       expect(lanes.match(/bun run test:affected --shard=\d+\/10/g)).toHaveLength(10);
       for (let shard = 1; shard <= 10; shard++) expect(lanes).toContain(`bun run test:affected --shard=${shard}/10`);
       expect(lanes).toContain("run_logged session-channel env PI_FABRIC_REQUIRE_NATS=1 NATS_EXPECTED_SERVER_VERSION=2.14.7 bunx vitest run --retry=0 tests/nats-session-channel.test.ts");
@@ -449,10 +453,10 @@ describe("Boat Linux packing and required checks", () => {
       expect(tests.steps?.some((step) => step.run === "bun run typecheck")).toBe(true);
       expect(tests.steps?.some((step) => step.run === "node scripts/native-toolchain.mjs fetch")).toBe(true);
       expect(tests.steps?.some((step) => step.run === "bun run build")).toBe(true);
-      expect(aggregate["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}");
-      expect(jobs["nats-state-conformance"]?.["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}");
+      expect(aggregate["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}");
+      expect(jobs["nats-state-conformance"]?.["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}");
       expect(jobs["nats-state-conformance"]?.strategy).toBeUndefined();
-      expect(jobs["idle-wakes"]?.["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}");
+      expect(jobs["idle-wakes"]?.["runs-on"]).toBe("${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}");
       expect(jobs["idle-wakes"]?.needs).toBeUndefined();
       expect(jobs["idle-wakes"]?.steps?.some((step) => step.run?.includes("scripts/benchmark-idle-cpu.mjs"))).toBe(true);
       const nats = jobs["nats-state-conformance"]!;

@@ -16,7 +16,10 @@ concurrency:
 
 jobs:
   linux-tests:
-    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER || 'boat-xlarge' }}
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Recent CSV medians total ~86 runner-minutes across lanes; four-way critical path ~27m plus ~3m gates.
+    # The 45m timeout leaves ~15m for fixed setup and runtime variance.
+    timeout-minutes: 45
     env:
       FABRIC_TEST_SKIP_NATS: '1'
       PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -71,9 +74,30 @@ jobs:
           report_root="$RUNNER_TEMP/affected"
           mkdir -p "$lane_root" "$report_root"
           lane_pids=()
-          lane_names=()
+          declare -A lane_names_by_pid=()
+          failed=0
+          # ubuntu-latest public runners have 4 vCPU / 16 GB; cap active lanes at four.
+          max_lanes=4
+          reap_lane() {
+            local finished_pid=""
+            if wait -n -p finished_pid "${lane_pids[@]}"; then
+              echo "${lane_names_by_pid[$finished_pid]}: PASS"
+            else
+              echo "${lane_names_by_pid[$finished_pid]}: FAIL"
+              failed=1
+            fi
+            unset 'lane_names_by_pid[$finished_pid]'
+            local remaining_pids=()
+            for pid in "${lane_pids[@]}"; do
+              if [ "$pid" != "$finished_pid" ]; then remaining_pids+=("$pid"); fi
+            done
+            lane_pids=("${remaining_pids[@]}")
+          }
           start_lane() {
             local lane="$1"
+            while [ "${#lane_pids[@]}" -ge "$max_lanes" ]; do
+              reap_lane
+            done
             (
               mkdir -p "$lane_root/$lane"
               lane_status=0
@@ -138,7 +162,7 @@ jobs:
               exit "$lane_status"
             ) &
             lane_pids+=("$!")
-            lane_names+=("$lane")
+            lane_names_by_pid["$!"]="$lane"
           }
           start_lane affected-1-2
           start_lane affected-3-4
@@ -148,14 +172,8 @@ jobs:
           start_lane acceptance-core
           start_lane acceptance-runtime
           start_lane runtime-bench
-          failed=0
-          for index in "${!lane_pids[@]}"; do
-            if wait "${lane_pids[$index]}"; then
-              echo "${lane_names[$index]}: PASS"
-            else
-              echo "${lane_names[$index]}: FAIL"
-              failed=1
-            fi
+          while [ "${#lane_pids[@]}" -gt 0 ]; do
+            reap_lane
           done
           exit "$failed"
       - name: Upload mesh lock benchmark result
@@ -359,7 +377,7 @@ jobs:
     name: check (ubuntu-latest)
     if: always()
     needs: [linux-tests]
-    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}
     env:
       FABRIC_TEST_SKIP_NATS: '1'
       PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -440,7 +458,7 @@ jobs:
           node --input-type=module -e 'const jobs = JSON.parse(process.env.RESULTS); if (Object.values(jobs).some(job => job.result !== "success")) { console.error(jobs); process.exit(1); }'
   nats-state-conformance:
     # StateBackend and authenticated real-broker suites share one clean large sandbox.
-    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -531,7 +549,7 @@ jobs:
     # idle Fabric resident host, 300 s each in parallel after a 30 s warm-up. Breach: > 1.0 timer wakes/s in total,
     # or one callsite firing more than once a minute. Report-only while IDLE_WAKE_ENFORCE is 0: set it to 1 to block.
     # Not a required check. Wall time ~8 min: install + build ~2 min, self-test ~70 s, both modes ~6 min.
-    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'boat-large' }}
+    runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       IDLE_WAKE_ENFORCE: '0'

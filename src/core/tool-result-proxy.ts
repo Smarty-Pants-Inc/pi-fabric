@@ -16,6 +16,7 @@ export interface FabricToolResultProxyRequest {
   action: ResolvedFabricAction;
   args: Record<string, unknown>;
   toolCallId: string;
+  parentToolCallId: string;
   value: unknown;
   signal?: AbortSignal;
 }
@@ -64,6 +65,7 @@ export class FabricToolResultProxy implements FabricNestedToolResultProxy {
       type: "tool_result",
       toolName: request.action.ref,
       toolCallId: request.toolCallId,
+      parentToolCallId: request.parentToolCallId,
       input: request.args,
       content,
       details,

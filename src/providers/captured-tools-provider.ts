@@ -227,6 +227,7 @@ export class CapturedToolsProvider implements FabricProvider {
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_start",
       toolCallId,
+      parentToolCallId: context.parentToolCallId,
       toolName: entry.name,
       args,
     }));
@@ -253,6 +254,7 @@ export class CapturedToolsProvider implements FabricProvider {
           args,
           sessionCwd: sessionContext.cwd,
           toolCallId,
+          parentToolCallId: context.parentToolCallId,
           runner,
           signal: context.signal,
           blocked: `Captured tool ${entry.name} was blocked`,
@@ -273,6 +275,7 @@ export class CapturedToolsProvider implements FabricProvider {
           type: "tool_call",
           toolName: entry.name,
           toolCallId,
+          parentToolCallId: context.parentToolCallId,
           input: args,
         }));
         context.updateArguments?.(args);
@@ -293,6 +296,7 @@ export class CapturedToolsProvider implements FabricProvider {
             runAbortable(context.signal, () => runner.emit({
               type: "tool_execution_update",
               toolCallId,
+              parentToolCallId: context.parentToolCallId,
               toolName: entry.name,
               args,
               partialResult,
@@ -324,6 +328,7 @@ export class CapturedToolsProvider implements FabricProvider {
       type: "tool_result",
       toolName: entry.name,
       toolCallId,
+      parentToolCallId: context.parentToolCallId,
       input: args,
       content: result.content,
       details: result.details,
@@ -344,6 +349,7 @@ export class CapturedToolsProvider implements FabricProvider {
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_end",
       toolCallId,
+      parentToolCallId: context.parentToolCallId,
       toolName: entry.name,
       result,
       isError,

@@ -69,10 +69,11 @@ const emitToolCall = async (
   toolCallId: string,
   input: Record<string, unknown>,
   blocked: string,
+  parentToolCallId?: string,
 ) => {
   const judged = JSON.stringify(input);
   const identity = { type: "tool_call" as const, toolName, toolCallId };
-  const event = { input } as { readonly type: "tool_call"; readonly toolName: string; readonly toolCallId: string; input: Record<string, unknown> };
+  const event = { input, ...(parentToolCallId ? { parentToolCallId } : {}) } as { readonly type: "tool_call"; readonly toolName: string; readonly toolCallId: string; parentToolCallId?: string; input: Record<string, unknown> };
   for (const key of IDENTITY_KEYS) {
     Object.defineProperty(event, key, { value: identity[key], writable: false, configurable: false, enumerable: true });
   }
@@ -106,6 +107,7 @@ export interface ShellCallPreflight {
   /** The cwd guards judge commands in; any other cwd is shown as a leading cd. */
   sessionCwd: string;
   toolCallId: string;
+  parentToolCallId?: string;
   runner: ToolCallRunner;
   signal?: AbortSignal | undefined;
   /** Refusal text when a blocking hook gives no reason. */
@@ -143,7 +145,7 @@ export const preflightShellCall = async (call: ShellCallPreflight): Promise<Reco
   assertShellToolPermitted(name, call.powershell);
   const blocked = call.blocked || `Pi tool ${name} was blocked`;
   const judge = async (toolName: string, id: string, input: Record<string, unknown>): Promise<void> => {
-    const { preflight, rewritten } = await emitToolCall(runner, signal, toolName, id, input, blocked);
+    const { preflight, rewritten } = await emitToolCall(runner, signal, toolName, id, input, blocked, call.parentToolCallId);
     if (preflight?.block) {
       call.onBlock?.();
       throw new Error(preflight.reason || blocked);
@@ -202,6 +204,7 @@ export const createShellCommandPreflight = (catalog: CapturedToolCatalog): Shell
       args: { command },
       sessionCwd: context.cwd,
       toolCallId: `${context.nestedToolCallId}:${source}:${index}`,
+      parentToolCallId: context.parentToolCallId,
       runner,
       signal: context.signal,
       blocked: `${source} command was blocked`,

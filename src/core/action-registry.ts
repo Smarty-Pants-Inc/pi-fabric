@@ -1164,6 +1164,7 @@ export class ActionRegistry {
             action,
             args: snapshotArguments(catalog.args),
             toolCallId: nestedToolCallId,
+            parentToolCallId: context.parentToolCallId,
             value: providerValue,
             ...(context.signal ? { signal: context.signal } : {}),
           }))

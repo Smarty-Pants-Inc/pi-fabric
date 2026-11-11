@@ -810,6 +810,7 @@ export class PiToolsProvider implements FabricProvider {
           args,
           sessionCwd: this.#cwd,
           toolCallId: context.nestedToolCallId,
+          parentToolCallId: context.parentToolCallId,
           runner,
           signal: context.signal,
           onBlock: () => context.updateArguments?.(args),
@@ -835,6 +836,7 @@ export class PiToolsProvider implements FabricProvider {
       type: "tool_call",
       toolName: name,
       toolCallId: context.nestedToolCallId,
+      parentToolCallId: context.parentToolCallId,
       input,
     }));
     if (preflight?.block) {
@@ -865,6 +867,7 @@ export class PiToolsProvider implements FabricProvider {
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_start",
       toolCallId,
+      parentToolCallId: context.parentToolCallId,
       toolName: name,
       args,
     }));
@@ -888,6 +891,7 @@ export class PiToolsProvider implements FabricProvider {
               runAbortable(context.signal, () => runner.emit({
                 type: "tool_execution_update",
                 toolCallId,
+                parentToolCallId: context.parentToolCallId,
                 toolName: name,
                 args,
                 partialResult,
@@ -922,6 +926,7 @@ export class PiToolsProvider implements FabricProvider {
       type: "tool_result",
       toolName: name,
       toolCallId,
+      parentToolCallId: context.parentToolCallId,
       input: args,
       content: result.content,
       details: result.details,
@@ -949,6 +954,7 @@ export class PiToolsProvider implements FabricProvider {
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_end",
       toolCallId,
+      parentToolCallId: context.parentToolCallId,
       toolName: name,
       result,
       isError,

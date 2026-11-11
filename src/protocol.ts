@@ -280,7 +280,7 @@ export const readFabricPeerAwaitSettleRequestV1 = (
   return value as FabricPeerAwaitSettleRequestV1;
 };
 
-/** Identifies host-side tool lifecycle events replayed for a nested Fabric call. */
+/** Fabric-assigned nested tool ID prefix; parent attribution uses parentToolCallId. */
 export const FABRIC_NESTED_TOOL_CALL_ID_PREFIX = "fabric_";
 
 /** Discriminant for the transient details envelope on a proxied provider result. */

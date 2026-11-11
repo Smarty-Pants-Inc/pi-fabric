@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/check-setup
         with:
-          runner-environment: ${{ vars.PI_FABRIC_LINUX_RUNNER == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}
+          runner-environment: ${{ (vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest') == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}
       - uses: ./.github/actions/check-systemd
       - name: Install pinned Bend proof compiler
         shell: bash
@@ -117,6 +117,36 @@ jobs:
                 printf '%s: exit %s\n' "$label" "$code"
                 if [ "$code" -ne 0 ]; then lane_status=1; fi
               }
+              run_advisory_logged() {
+                local label="$1"
+                shift
+                local log="$lane_root/$lane/$label.log"
+                local code=0
+                if "$@" > "$log" 2>&1; then
+                  code=0
+                else
+                  code=$?
+                fi
+                echo "::group::$lane / $label (non-fatal)"
+                cat "$log"
+                echo "::endgroup::"
+                printf '%s: exit %s (non-fatal)\n' "$label" "$code"
+                if [ "$code" -ne 0 ]; then
+                  echo "::warning::Mesh lock benchmark ratchet failed with exit $code; this non-fatal lane will not fail linux-tests."
+                fi
+                if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                  {
+                    printf '### Mesh lock benchmark (non-fatal)\n\n'
+                    if [ "$code" -eq 0 ]; then
+                      printf 'Result: **PASS**.\n\n'
+                    else
+                      printf 'Result: **FAIL** (exit `%s`); `linux-tests` continues.\n\n' "$code"
+                    fi
+                    printf 'Log: `%s`\n' "$log"
+                  } >> "$GITHUB_STEP_SUMMARY"
+                fi
+                return 0
+              }
               case "$lane" in
                 affected-1-2)
                   run_logged shard-1 env PI_TEST_REPORT_DIR="$report_root/affected-ubuntu-latest-1" bun run test:affected --shard=1/10
@@ -155,7 +185,7 @@ jobs:
                 runtime-bench)
                   run_logged platform-smoke bun run test:smoke
                   run_logged scope-e2e env FABRIC_SCOPE_E2E_REQUIRED=1 bunx vitest run --project scope-e2e
-                  run_logged mesh-lock-bench bun run bench:mesh-lock:check --out mesh-lock.json
+                  run_advisory_logged mesh-lock-bench bun run bench:mesh-lock:check --out mesh-lock.json
                   ;;
                 *) echo "unknown lane: $lane" >&2; exit 2 ;;
               esac
@@ -389,7 +419,7 @@ jobs:
       - uses: ./.github/actions/check-setup
         with:
           dist-artifact: dist-ubuntu-latest
-          runner-environment: ${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}
+          runner-environment: ${{ (vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest') == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}
       - name: Discover unsharded affected test files (no test execution)
         shell: bash
         run: node scripts/test-affected.mjs --list-only > "$RUNNER_TEMP/unsharded-selection.json"

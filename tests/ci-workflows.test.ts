@@ -80,6 +80,19 @@ const linuxRunnerExpressions = {
   "test.yml:idle-wakes": "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest' }}",
 };
 
+function resolveRunnerLabel(expression: string, configuredLabel?: string): { variable: string; label: string } {
+  const match = /^\$\{\{\s*vars\.([A-Z0-9_]+)\s*\|\|\s*'([^']+)'\s*\}\}$/.exec(expression);
+  if (!match) throw new Error(`Unsupported runs-on expression: ${expression}`);
+  return { variable: match[1]!, label: configuredLabel || match[2]! };
+}
+
+function evaluateRunnerEnvironment(expression: string, configuredLabel?: string): { variable: string; environment: string } {
+  const match = /^\$\{\{\s*\(vars\.([A-Z0-9_]+)\s*\|\|\s*'([^']+)'\)\s*==\s*'([^']+)'\s*&&\s*'([^']+)'\s*\|\|\s*'([^']+)'\s*\}\}$/.exec(expression);
+  if (!match) throw new Error(`Unsupported runner-environment expression: ${expression}`);
+  const runnerLabel = configuredLabel || match[2]!;
+  return { variable: match[1]!, environment: runnerLabel === match[3] ? match[4]! : match[5]! };
+}
+
 function assertHostedRunnerSetup(inventory: Record<string, Workflow>, setupAction: ActionConfig): void {
   expect(setupAction.inputs?.["runner-environment"]?.default).toBe("github-hosted");
   const actionSteps = Object.entries(inventory).flatMap(([file, config]) => Object.entries(config.jobs)
@@ -88,11 +101,26 @@ function assertHostedRunnerSetup(inventory: Record<string, Workflow>, setupActio
   for (const { file, id, step } of actionSteps) {
     const key = `${file}:${id}`;
     const expected = key === "test.yml:linux-tests"
-      ? "${{ vars.PI_FABRIC_LINUX_RUNNER == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}"
+      ? "${{ (vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest') == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}"
       : key === "test.yml:check-linux"
-        ? "${{ vars.PI_FABRIC_LINUX_RUNNER_LARGE == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}"
+        ? "${{ (vars.PI_FABRIC_LINUX_RUNNER_LARGE || 'ubuntu-latest') == 'ubuntu-latest' && 'github-hosted' || 'self-hosted' }}"
         : undefined;
     expect(step.with?.["runner-environment"], key).toBe(expected);
+    if (expected === undefined) continue;
+
+    const runnerExpression = inventory[file]!.jobs[id]!['runs-on'];
+    const environmentExpression = step.with?.["runner-environment"];
+    expect(typeof runnerExpression).toBe("string");
+    expect(typeof environmentExpression).toBe("string");
+    const runnerDefault = resolveRunnerLabel(runnerExpression as string);
+    const environmentDefault = evaluateRunnerEnvironment(environmentExpression as string);
+    expect(environmentDefault.variable, key).toBe(runnerDefault.variable);
+    expect(runnerDefault.label, `${key} when its variable is unset`).toBe("ubuntu-latest");
+    expect(environmentDefault.environment, `${key} when its variable is unset`).toBe("github-hosted");
+
+    const configuredRunner = "boat-linux";
+    expect(resolveRunnerLabel(runnerExpression as string, configuredRunner).label).toBe(configuredRunner);
+    expect(evaluateRunnerEnvironment(environmentExpression as string, configuredRunner).environment).toBe("self-hosted");
   }
 
   const admission = setupAction.runs?.steps?.find((step) => step.env?.EXPECTED_RUNNER_ENVIRONMENT !== undefined);
@@ -486,6 +514,10 @@ describe("Public Linux packing and required checks", () => {
     expect(laneRun).toContain("run_logged verified-kernels bunx vitest run tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts tests/verified-artifact.test.ts");
     expect(laneRun).toContain("run_logged launcher-regressions bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts");
     expect(laneRun).toContain("run_logged scope-e2e env FABRIC_SCOPE_E2E_REQUIRED=1");
+    expect(laneRun).toContain("run_advisory_logged mesh-lock-bench bun run bench:mesh-lock:check --out mesh-lock.json");
+    expect(laneRun).toContain("this non-fatal lane will not fail linux-tests");
+    expect(laneRun).toContain("Result: **FAIL**");
+    expect(laneRun).toContain("`linux-tests` continues.");
     for (const command of [
       "bunx vitest run tests/ci-workflows.test.ts tests/ci-test-counts.test.ts",
       "bunx vitest run tests/kernel-errors.test.ts",

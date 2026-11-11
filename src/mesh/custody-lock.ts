@@ -26,7 +26,8 @@ import {
  */
 export const MESH_CUSTODY_LOCK_NAME = "custody.lock";
 const CUSTODY_LOCK_TIMEOUT_MS = 10_000;
-// Same conservative 30s staleness bound as mesh/exclusive locks; age alone NEVER proves death.
+// Same conservative 30s staleness bound as mesh/exclusive locks; also the ownerless release grace.
+// Nonempty receipts still require owner/PID evidence; ownerless recovery first seals the directory.
 export const CUSTODY_LOCK_STALE_MS = 30_000;
 
 /** Not a contention timeout: callers must surface this refusal, not silently retry/skip it. */
@@ -214,7 +215,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
 
 // A complete receipt of a dead pid, or of a live pid with another incarnation, is recovered at
 // once by renaming it to a retained, identity-named fence (as the mesh lock does): a paused
-// second recoverer cannot rename a successor onto the same nonempty fence.
+// second recoverer cannot rename a successor onto the same nonempty fence. An ownerless host-qualified
+// gate gets the stale grace, then an exclusive empty owner seals it before the same retained rename.
 const clearDeadCustodyLock = async (lock: string, readOwner: () => string | undefined, deadline: number,
   ownStart: string | undefined, hostQualified = false, note: StaleLockNote = {}, lockProtocol: 1 | 2 | 3 = 1): Promise<boolean> => {
   delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
@@ -231,9 +233,24 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
       // canonical lock we actually observed, just as recovery fences the same inode/bytes.
       const current = fs.lstatSync(lock);
       if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
+      // Publication installs a complete owner, but releaseFenceLock unlinks (pinned) or
+      // renames (unpinned) owner BEFORE canonical rmdir. Missing/empty owners get the
+      // release grace; nonempty malformed PID bytes still refuse at once.
+      // Use the rechecked mtime: the initial stat may predate the release's owner removal.
+      if (owner === undefined || owner === "") {
+        if (Date.now() - current.mtimeMs <= CUSTODY_LOCK_STALE_MS) return false;
+        // Seal BEFORE rename: an empty .dead target could be replaced by a paused recoverer
+        // detaching a live successor. wx never overwrites a successor's complete owner, and
+        // release never removes this new empty owner. Both ownerless forms use the same fence.
+        if (owner === undefined) fs.writeFileSync(path.join(lock, "owner"), "", { flag: "wx", mode: 0o600 });
+        const sealed = fs.lstatSync(lock);
+        if (!sealed.isDirectory() || sealed.dev !== stat.dev || sealed.ino !== stat.ino || readOwner() !== "") return false;
+        fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:`).digest("hex")}`);
+        return true;
+      }
       throw new MeshCustodyUnrecoverableError(lock);
     }
-    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
+    if (owner === undefined || !owner.endsWith("\n")) return false;
     // A host-lease commit gate is never recovered by a foreign/unknown PID. Matching
     // machine evidence is still mandatory when boot/process identity is unavailable.
     const physical = hostQualified ? readPhysicalHostIdentity() : undefined;

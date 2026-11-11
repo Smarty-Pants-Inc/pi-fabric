@@ -26,7 +26,8 @@ const controlledInfo = () => {
   // LIST deliberately offers unrelated ready evidence even when the exact target is absent/not waiting.
   const list = vi.fn(() => ({ next: async () => [{ name: "unrelated", num_waiting: 1 }] }));
   const close = vi.fn(async () => undefined);
-  vi.spyOn(transport, "connect").mockResolvedValue({ close } as unknown as Awaited<ReturnType<typeof transport.connect>>);
+  const connection = { close, info: { server_id: "seed-id" } };
+  vi.spyOn(transport, "connect").mockResolvedValue(connection as unknown as Awaited<ReturnType<typeof transport.connect>>);
   const manager = { streams: { info }, consumers: { info: consumer, list } } as unknown as Awaited<ReturnType<typeof js.jetstreamManager>>;
   const getManager = vi.spyOn(js, "jetstreamManager").mockResolvedValue(manager);
   return { state, info, consumer, list, close, manager, getManager };
@@ -376,6 +377,87 @@ describe("NATS harness readiness conditions", () => {
     await vi.advanceTimersByTimeAsync(75);
     expect((await outcome)?.message).toContain("readiness deadline for STATE");
     expect((await outcome)?.message).toContain("no stream INFO yet");
+    expect(close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("waits for seed routes to expose every stream subject from the current leader", async () => {
+    const { state, close } = controlledInfo();
+    state.stream.config.subjects = ["STATE.alpha", "STATE.beta"];
+    const observation: { serverId: string; serverName: string; routes: { remote_name: string; subscriptions_list: string[] }[] } = {
+      serverId: "seed-id", serverName: "seed-follower", routes: [{ remote_name: "n1", subscriptions_list: [] }],
+    };
+    const monitor = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({
+      server_id: observation.serverId, server_name: observation.serverName, routes: observation.routes,
+    }));
+    let ready = false;
+    const gate = waitForNatsStreamReady("nats://fixture", "STATE", {
+      timeoutMs: 500, monitorUrl: "http://seed-monitor.test",
+    }).then(() => { ready = true; });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.stream.cluster?.replicas?.every(peer => peer.current && !peer.offline && peer.lag === 0)).toBe(true);
+    expect(ready).toBe(false); // R3 INFO is current, but the seed has no stream-subject interest yet.
+
+    observation.serverId = "different-server-id";
+    observation.routes = [{ remote_name: "n1", subscriptions_list: ["STATE.alpha", "STATE.beta"] }];
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false); // Do not trust route data from a different monitor server.
+
+    observation.serverId = "seed-id";
+    observation.routes = [{ remote_name: "n2", subscriptions_list: ["STATE.alpha", "STATE.beta"] }];
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false); // Full interest from the wrong remote leader is not evidence.
+
+    observation.routes = [{ remote_name: "n1", subscriptions_list: ["STATE.alpha"] }];
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ready).toBe(false); // A partial subject set is still not ready.
+
+    // Interest may be spread across multiple pooled routes to the elected stream leader.
+    observation.routes = [
+      { remote_name: "n1", subscriptions_list: ["STATE.alpha"] },
+      { remote_name: "n1", subscriptions_list: ["STATE.beta"] },
+    ];
+    await vi.advanceTimersByTimeAsync(50);
+    await gate;
+    expect(ready).toBe(true);
+    expect(monitor.mock.calls.map(([input]) => String(input))).toEqual(
+      Array(5).fill("http://seed-monitor.test/routez?subs=1"));
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("allows a healthy seed that is itself the stream leader without remote route interest", async () => {
+    const { state, close } = controlledInfo();
+    state.stream.config.subjects = ["STATE.alpha", "STATE.beta"];
+    state.stream.cluster!.leader = "seed-leader";
+    const monitor = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      server_id: "seed-id", server_name: "seed-leader", routes: [],
+    }));
+    let ready = false;
+    const gate = waitForNatsStreamReady("nats://fixture", "STATE", {
+      monitorUrl: "http://seed-monitor.test",
+    }).then(() => { ready = true; });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ready).toBe(true);
+    await gate;
+    expect(monitor).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("bounds a stalled monitor response body by the same absolute readiness deadline", async () => {
+    const { close } = controlledInfo();
+    const body = vi.fn(() => new Promise<never>(() => undefined));
+    const monitor = vi.spyOn(globalThis, "fetch").mockResolvedValue({ ok: true, json: body } as unknown as Response);
+    const outcome = waitForNatsStreamReady("nats://fixture", "STATE", {
+      timeoutMs: 100, monitorUrl: "http://seed-monitor.test",
+    }).then(() => undefined, error => error as Error);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(monitor).toHaveBeenCalledOnce();
+    expect(body).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await outcome)?.message).toContain("readiness deadline for STATE");
     expect(close).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
   });

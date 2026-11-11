@@ -22,7 +22,14 @@ it.skipIf(!binary)("an identical same-ID retry after a committed R3 publish is a
   const nc = await connect({ servers: [cluster.seedUrl], ignoreClusterUpdates: true });
   try {
     await port.ensureStream(stream, [subject], { maxMsgSize: 1024 * 1024, replicas: 3 });
-    await waitForNatsStreamReady(cluster.seedUrl, stream);
+    // INFO's current replica flag is Raft state, not data-subject routing interest. routez `subs=1` exposes
+    // route subscriptions (https://nats-io.github.io/docs/nats_server/monitoring.html#route-information);
+    // nats-server v2.14.7 installs them under the same route-client lock used by the monitor
+    // (https://github.com/nats-io/nats-server/blob/v2.14.7/server/route.go#L1655-L1709 and
+    // https://github.com/nats-io/nats-server/blob/v2.14.7/server/monitor.go#L875-L905). nats.js wraps
+    // publish NoResponders as JetStreamNotEnabled, so guard setup on routed interest; this is not a claim
+    // about the cause of any natural baseline incident.
+    await waitForNatsStreamReady(cluster.seedUrl, stream, { monitorUrl: cluster.seedMonitorUrl });
     const manager = await jetstreamManager(nc);
     expect((await manager.streams.info(stream)).config.duplicate_window).toBeGreaterThan(5_000 * 1e6);
     const bytes = new TextEncoder().encode("batch-one");

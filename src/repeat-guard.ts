@@ -12,8 +12,8 @@ export const FABRIC_REPEAT_BLOCK = 6;
 
 export const fabricRepeatWarnText = (count: number, blockAt: number): string =>
   alphaModeEnabled()
-    ? `[circuit-breaker] identical fabric_exec code has now run ${count} times in a row; warn-only under alpha mode, so identical runs are not blocked. Change the approach or finish your turn.`
-    : `[circuit-breaker] identical fabric_exec code has now run ${count} times in a row; at ${blockAt} identical runs will be blocked. Change the approach or finish your turn.`;
+    ? `[circuit-breaker] identical fabric_exec code has now run ${count} times in a row. This is a warning, not a block; alpha mode leaves identical runs unblocked. An intended repeat (for example polling or a watch loop) should carry on. If this is NOT intended, change the approach.`
+    : `[circuit-breaker] identical fabric_exec code has now run ${count} times in a row; at ${blockAt} identical runs will be blocked. Until then, this is only a warning. An intended repeat (for example polling or a watch loop) should carry on. If this is NOT intended, change the approach.`;
 
 export const fabricRepeatBlockText = (count: number): string =>
   `Circuit breaker: this exact fabric_exec code has now executed ${count} times in a row and was blocked. Re-running identical code adds no information. Summarize what you already know and finish your turn; if the call is genuinely required, change the code materially.`;

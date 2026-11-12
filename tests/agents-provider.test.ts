@@ -3195,7 +3195,7 @@ describe("AgentsProvider runner support", () => {
     if (kind === "symlink" && process.platform === "win32") return;
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-error-"));
     roots.push(lane);
-    fs.mkdirSync(path.join(lane, ".local"));
+    fs.mkdirSync(path.join(lane, ".local"), { mode: 0o700 });
     const marker = path.join(lane, ".local", "lead");
     if (kind === "directory") fs.mkdirSync(marker);
     else if (kind === "symlink") fs.symlinkSync("/dev/null", marker);
@@ -3211,13 +3211,13 @@ describe("AgentsProvider runner support", () => {
     );
   });
 
-  it.each(["session:11111111-1111-4111-8111-111111111111", "11111111-1111-4111-8111-111111111111"])("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch: %s", async (marker) => {
+  it.skipIf(process.getuid === undefined).each(["session:11111111-1111-4111-8111-111111111111", "11111111-1111-4111-8111-111111111111"])("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch: %s", async (marker) => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-moved-lane-"));
     roots.push(lane);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: lane, stdio: "ignore" });
     git("init", "-q");
     git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
-    fs.mkdirSync(path.join(lane, ".local"));
+    fs.mkdirSync(path.join(lane, ".local"), { mode: 0o700 });
     fs.writeFileSync(path.join(lane, ".local", "lead"), `${marker}\n`);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const base = { ownerIncarnation: "fixture:owner", format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",

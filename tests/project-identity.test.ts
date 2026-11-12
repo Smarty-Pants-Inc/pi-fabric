@@ -128,7 +128,7 @@ describe("project identity", () => {
     expect(resolveProjectAgent([own, foreign], project, { repository, leadId: own.id })).toBe(own);
   });
 
-  it("gives independent host checkouts and a worktree the same origin identity and reads the lane launch marker", () => {
+  it.skipIf(process.getuid === undefined)("gives independent host checkouts and a worktree the same origin identity and reads the lane launch marker", () => {
     const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-origin-")));
     roots.push(base);
     const lead = path.join(base, "lead");
@@ -140,7 +140,7 @@ describe("project identity", () => {
     git(lead, "worktree", "add", "-q", path.join(base, "wt"));
     expect(repositoryOf(lane)).toBe(repositoryOf(lead));
     expect(repositoryOf(path.join(base, "wt"))).toBe(repositoryOf(lead));
-    fs.mkdirSync(path.join(lane, ".local"));
+    fs.mkdirSync(path.join(lane, ".local"), { mode: 0o700 });
     fs.mkdirSync(path.join(lane, "sub"));
     fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
     expect(recordedProjectLead(path.join(lane, "sub"), {})).toBe("session:11111111-1111-4111-8111-111111111111");
@@ -151,7 +151,7 @@ describe("project identity", () => {
   const markerLane = () => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-"));
     roots.push(lane);
-    fs.mkdirSync(path.join(lane, ".local"));
+    fs.mkdirSync(path.join(lane, ".local"), { mode: 0o700 });
     return lane;
   };
 
@@ -171,7 +171,7 @@ describe("project identity", () => {
     expectIgnoredMarker(lane);
   });
 
-  it.each(["11111111-1111-4111-8111-111111111111", "ABCDEF01-2345-6789-ABCD-EF0123456789"])("normalizes and uses a bare UUID without rewriting it: %s", (uuid) => {
+  it.skipIf(process.getuid === undefined).each(["11111111-1111-4111-8111-111111111111", "ABCDEF01-2345-6789-ABCD-EF0123456789"])("normalizes and uses a bare UUID without rewriting it: %s", (uuid) => {
     const lane = markerLane();
     const marker = path.join(lane, ".local", "lead");
     const contents = ` ${uuid}\n`;

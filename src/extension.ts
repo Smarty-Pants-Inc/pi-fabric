@@ -969,20 +969,35 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     endEntropyLifecycle();
   };
 
+  const sessionReadySupported = (pi as ExtensionAPI & {
+    hostCapabilities?: { sessionReadyEvent?: unknown };
+  }).hostCapabilities?.sessionReadyEvent === true;
+  const replacementSessionReasons = new Set(["new", "resume", "fork", "switch"]);
+  let sessionLifecycleGeneration = 0;
+  let pendingSessionReady: {
+    generation: number;
+    reason: string;
+    sessionId: string;
+    sessionGeneration?: string;
+    continueSessionStart: (context: ExtensionContext) => Promise<void>;
+  } | undefined;
+
   pi.on("session_start", async (event, context) => {
+    const generation = ++sessionLifecycleGeneration;
+    pendingSessionReady = undefined;
     const sessionId = context.sessionManager?.getSessionId?.() ?? "";
+    const reason = event?.reason ?? "";
     configureFabricDiagnostics(sessionId);
     await sealScope();
-    // Retire the previous session's delayed work, then reopen entropy for this one.
+    // Retire the previous session's delayed work, then rebuild only local bindings here.
     retireSessionTimers();
-    inboxIssuer = rootInboxReceiptIssuer(context.sessionManager, sessionId, event?.reason === "reload");
-    entropyStopping = false;
+    state.setRecordsWake(undefined);
+    programRunContext = undefined;
+    inboxIssuer = rootInboxReceiptIssuer(context.sessionManager, sessionId, reason === "reload");
     fabricPrewarm = undefined;
     // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
     const reloadNotice = takeReloadStoppedNotice(sessionId, event?.reason ?? "");
     if (reloadNotice && context.hasUI) notifyDiagnostic(context, "src/extension.ts", reloadNotice, "warning");
-    inboxWake.context = context;
-    inboxWake.armed = true;
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
@@ -1000,63 +1015,104 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       }
     }
     state.thinking.invalidate();
-    programRunContext = context;
-    await state.bootstrap(context);
-    state.resetRecordsInboxCursor(context.sessionManager);
-    // Re-derive the inbox receipt cursor once at session_start; file-backed sessions cache their
-    // confirmed prefix and in-memory sessions use SessionManager's point-lookup active-branch walk.
-    confirmedRootInboxSession(context.sessionManager, verifyIssuedInbox);
-    principalView.start(context);
-    // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
-    state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
-    // Event-driven: armed by the runtime only once it is current and its mesh activation completed.
-    state.setRootInboxWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
-    // A Fabric child narrows its level into the parent's inherited bounds.
-    if (process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined && state.bootstrapped) {
+    const startContext = context;
+    const continueSessionStart = async (context: ExtensionContext = startContext): Promise<void> => {
+      const current = () => generation === sessionLifecycleGeneration && extensionContextLive(context);
+      if (!current()) return;
+      entropyStopping = false;
+      inboxWake.context = context;
+      inboxWake.armed = true;
+      programRunContext = context;
+      await state.bootstrap(context);
+      if (!current()) return;
+      state.resetRecordsInboxCursor(context.sessionManager);
+      // Re-derive the inbox receipt cursor once when activation resumes; file-backed sessions cache
+      // their confirmed prefix and in-memory sessions use the active-branch point lookup.
+      confirmedRootInboxSession(context.sessionManager, verifyIssuedInbox);
+      principalView.start(context);
+      // Inert until Pi queues a triggered message behind a live prompt preflight (also for records, F21).
+      state.setRecordsWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
+      // Event-driven: armed by the runtime only once it is current and its mesh activation completed.
+      state.setRootInboxWake(hostQueuesTriggeredBehindPreflight(pi) ? wakeIdleMain : undefined);
+      // A Fabric child narrows its level into the parent's inherited bounds.
+      if (process.env[FABRIC_THINKING_BOUNDS_ENV] !== undefined && state.bootstrapped) {
+        try {
+          await state.thinking.enforceBounds(context);
+        } catch (error) {
+          diagnostics.warn("src/extension.ts", `[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (!current()) return;
+      // bootstrap() cancels any live arm; the borrowed Main model survives so a
+      // new session that inherited the in-place executor can snap back.
+      await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
+      if (!current()) return;
+      refreshCodePreviewSettings();
+      applyFabricMode();
+      // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
+      const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
+      // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
+      const selfReloaded = selfReload.sessionStart(reason, context);
+      const { releaseSlot, ...reloadReport } = selfReloaded ?? {};
       try {
-        await state.thinking.enforceBounds(context);
-      } catch (error) {
-        diagnostics.warn("src/extension.ts", `[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
+        if (selfReloaded && context.hasUI) {
+          const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
+          notifyDiagnostic(context, "src/extension.ts", notice, "info");
+          // Keep the notice after the TUI's own reload status line replaces it.
+          context.ui.setStatus(SELF_RELOAD_STATUS, isPrincipalDiagnostics() ? undefined : notice);
+        }
+        const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
+        const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
+        if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
+          throw new Error("resident startup probe requires a bound RPC worker");
+        }
+        if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+        if (!current()) return;
+        if (residentProbe) {
+          // Positive native ACK is published only after this generation activated.
+          writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
+            runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
+        }
+        if (selfReloaded) {
+          await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
+            ...reloadReport,
+            sessionId: context.sessionManager.getSessionId(),
+          });
+        }
+      } finally {
+        // Hold the lease through activation, actor re-arm and reporting, even on failure.
+        releaseSlot?.();
       }
+    };
+
+    if (sessionReadySupported && replacementSessionReasons.has(reason)) {
+      const sessionGeneration = (context as ExtensionContext & { userMessageSessionGeneration?: unknown }).userMessageSessionGeneration;
+      pendingSessionReady = {
+        generation,
+        reason,
+        sessionId,
+        ...(typeof sessionGeneration === "string" ? { sessionGeneration } : {}),
+        continueSessionStart,
+      };
+      return;
     }
-    // bootstrap() cancels any live arm; the borrowed Main model survives so a
-    // new session that inherited the in-place executor can snap back.
-    await restoreBorrowedInPlaceMain(state.prewalk, pi, context, () => state.config.agents);
-    refreshCodePreviewSettings();
-    applyFabricMode();
-    // Results of task agents the last reload/shutdown stopped reach the spawner now (smarty-dev#1602).
-    const stoppedUndelivered = readStoppedRuns(context.sessionManager?.getEntries?.() ?? []).undelivered.length > 0;
-    // A self-reload (smarty-dev#2160) re-arms the actors this Main hosts and reports on the mesh.
-    const selfReloaded = selfReload.sessionStart(event?.reason ?? "", context);
-    const { releaseSlot, ...reloadReport } = selfReloaded ?? {};
-    try {
-      if (selfReloaded && context.hasUI) {
-        const notice = `${selfReloaded.owner ?? "Fabric"} reloaded: ${selfReloaded.old} → ${selfReloaded.new}`;
-        notifyDiagnostic(context, "src/extension.ts", notice, "info");
-        // Keep the notice after the TUI's own reload status line replaces it.
-        context.ui.setStatus(SELF_RELOAD_STATUS, isPrincipalDiagnostics() ? undefined : notice);
-      }
-      const probeNonce = process.env.PI_FABRIC_RESIDENT_PROBE_NONCE;
-      const residentProbe = Boolean(probeNonce && process.env.PI_FABRIC_RESIDENT_PROBE_WORKER_PID === String(process.ppid));
-      if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
-        throw new Error("resident startup probe requires a bound RPC worker");
-      }
-      if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
-      if (residentProbe) {
-        // Positive native ACK is published only after this generation activated.
-        writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,
-          runId: process.env.PI_FABRIC_PARENT_RUN, nonce: probeNonce, extension: FABRIC_EXTENSION_ENTRY_PATH })}\n`);
-      }
-      if (selfReloaded) {
-        await state.publishOpsEvent(RELOADED_TOPIC, "fabric.reloaded", {
-          ...reloadReport,
-          sessionId: context.sessionManager.getSessionId(),
-        });
-      }
-    } finally {
-      // Hold the lease through activation, actor re-arm and reporting, even on failure.
-      releaseSlot?.();
-    }
+    return continueSessionStart();
+  });
+
+  // Pi emits this notification after replacement input opens; bind the deferred work to its fresh ctx.
+  (pi as unknown as {
+    on: (name: "session_ready", handler: (
+      event: { reason?: string; sessionGeneration?: string }, context: ExtensionContext,
+    ) => unknown) => void;
+  }).on("session_ready", async (event, context) => {
+    const pending = pendingSessionReady;
+    if (!pending || pending.generation !== sessionLifecycleGeneration) return;
+    const sessionId = context.sessionManager?.getSessionId?.() ?? "";
+    const sessionGeneration = typeof event?.sessionGeneration === "string" ? event.sessionGeneration : undefined;
+    if (pending.sessionId !== sessionId || (pending.reason && event?.reason && pending.reason !== event.reason) ||
+      (pending.sessionGeneration && sessionGeneration && pending.sessionGeneration !== sessionGeneration)) return;
+    pendingSessionReady = undefined;
+    return pending.continueSessionStart(context);
   });
 
   // Register after activation/reload startup so renderer snapshots cannot replace it.
@@ -1739,6 +1795,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   });
 
   pi.on("session_shutdown", async (event, context) => {
+    sessionLifecycleGeneration++;
+    pendingSessionReady = undefined;
     retireSessionTimers();
     const reason = event?.reason ?? "exit";
     if (reason !== "reload") rootInboxReceiptIssuer(context?.sessionManager);

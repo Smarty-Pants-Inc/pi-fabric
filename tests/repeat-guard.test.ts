@@ -80,8 +80,10 @@ describe("FabricRepeatGuard under alpha", () => {
       expect(g.observe("return 1")).toEqual({ count, blocked: false, warn: count >= 3 });
     }
     expect(fixture.exists).toHaveBeenCalledTimes(12);
-    expect(fabricRepeatWarnText(12, FABRIC_REPEAT_BLOCK)).toContain("warn-only under alpha mode");
+    expect(fabricRepeatWarnText(12, FABRIC_REPEAT_BLOCK)).toContain("This is a warning, not a block");
+    expect(fabricRepeatWarnText(12, FABRIC_REPEAT_BLOCK)).toContain("An intended repeat");
     expect(fabricRepeatWarnText(12, FABRIC_REPEAT_BLOCK)).not.toContain("will be blocked");
+    expect(fabricRepeatWarnText(12, FABRIC_REPEAT_BLOCK)).not.toContain("finish your turn");
     expect(g.observe("return 2")).toEqual({ count: 1, blocked: false, warn: false });
   });
 
@@ -93,8 +95,10 @@ describe("FabricRepeatGuard under alpha", () => {
     }
     expect(fixture.home).toHaveBeenCalledTimes(8);
     expect(fixture.exists).toHaveBeenLastCalledWith(join("/fixture-home", ".config/smarty/bash-guard.disabled"));
-    expect(fabricRepeatWarnText(8, FABRIC_REPEAT_BLOCK)).toContain("warn-only under alpha mode");
+    expect(fabricRepeatWarnText(8, FABRIC_REPEAT_BLOCK)).toContain("This is a warning, not a block");
+    expect(fabricRepeatWarnText(8, FABRIC_REPEAT_BLOCK)).toContain("An intended repeat");
     expect(fabricRepeatWarnText(8, FABRIC_REPEAT_BLOCK)).not.toContain("will be blocked");
+    expect(fabricRepeatWarnText(8, FABRIC_REPEAT_BLOCK)).not.toContain("finish your turn");
   });
 
   it("switches modes on the same guard without discarding consecutive history", () => {
@@ -122,13 +126,16 @@ describe("FabricRepeatGuard under alpha", () => {
 
   it("rechecks the mode whenever warning copy is formatted", () => {
     expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("at 6 identical runs will be blocked");
+    expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("Until then, this is only a warning");
+    expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("An intended repeat");
+    expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).not.toContain("finish your turn");
     vi.stubEnv("SMARTY_ALPHA", "1");
-    expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("warn-only under alpha mode");
+    expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("This is a warning, not a block");
     vi.stubEnv("SMARTY_ALPHA", "0");
     fixture.disabled = true;
-    expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("warn-only under alpha mode");
+    expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("This is a warning, not a block");
     fixture.disabled = false;
     expect(fabricRepeatWarnText(3, FABRIC_REPEAT_BLOCK)).toContain("at 6 identical runs will be blocked");
-    expect(fixture.exists).toHaveBeenCalledTimes(4);
+    expect(fixture.exists).toHaveBeenCalledTimes(7);
   });
 });

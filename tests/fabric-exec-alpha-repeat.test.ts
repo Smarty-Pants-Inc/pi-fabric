@@ -62,8 +62,12 @@ describe("fabric_exec alpha repeat boundary", () => {
         expect(output.split("\n")[0]).toBe(`execution-${count}`);
         if (count >= 3) {
           expect(output).toContain(`identical fabric_exec code has now run ${count} times in a row`);
-          expect(output).toContain("warn-only under alpha mode");
+          expect(output).toContain("This is a warning, not a block");
           expect(output).not.toContain("will be blocked");
+          if (count >= 6) {
+            expect(output).toContain("This is a warning, not a block");
+            expect(output).not.toContain("finish your turn");
+          }
         } else {
           expect(output).not.toContain("[circuit-breaker]");
         }

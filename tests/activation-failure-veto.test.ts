@@ -120,3 +120,20 @@ describe("registry veto activation classification (smarty-dev#11998)", () => {
     expect(activationBlockClass(result.code)).toBe("hard");
   });
 });
+
+// smarty-dev#20456: a provider 5xx in parentheses is transient, as docs/agents.md says.
+describe("provider 5xx in parentheses (smarty-dev#20456)", () => {
+  it.each([
+    "cliproxyapi-anthropic/claude-opus-5-5: Anthropic API error (503)",
+    "Anthropic API error (502)",
+    "upstream failed (500)",
+  ])("is transient: %s", lastError => {
+    const result = classifyActivationFailure({ lastError });
+    expect(result.code).toBe("provider-transient");
+    expect(result.transient).toBe(true);
+  });
+  it.each(["took (503 ms)", "read (502 tokens)"])("a parenthesised number that is not a status stays fail-closed: %s", lastError => {
+    expect(classifyActivationFailure({ lastError }).transient).toBe(false);
+  });
+});
+

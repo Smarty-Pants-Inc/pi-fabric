@@ -4,7 +4,7 @@ import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, type TestContext, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -14,7 +14,6 @@ import { processAlive } from "../src/storage/scratch.js";
 import * as agentRemoval from "../src/agents/rm.js";
 import * as retention from "../src/storage/retention.js";
 import { ageRunRoot } from "./helpers/age-run-root.js";
-import { withProcessCensusDiagnostics } from "./helpers/process-census-diagnostics.js";
 
 vi.mock("node:child_process", async original => {
   const actual = await original<typeof import("node:child_process")>();
@@ -40,6 +39,7 @@ const heldRoot = (source: string): string => {
   return row.destination;
 };
 const hostedDelete = hostedOnly("AgentManager close deletion");
+const hostedLinux = process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_ENVIRONMENT === "github-hosted" && process.platform === "linux";
 const managers: AgentManager[] = [];
 const roots: string[] = [];
 const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
@@ -376,8 +376,9 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(path.join(caller, ".fabric-owner.json"))).toBe(false);
   });
 
-  it.runIf(hostedDelete).for(["live", "unknown", "exited"] as const)("keeps an evicted parent's owned budget until checked descendant exit (%s)", { timeout: 30_000 }, async (state, context: TestContext) => withProcessCensusDiagnostics(context, state === "live", async (diagnostic) => {
-    diagnostic.mark("fixture-setup-start");
+  // Hosted Linux measured 218.9s vs native 45.3s (4.83x); use a rounded 5x deadline only for live there. https://github.com/Smarty-Pants-Inc/pi-fabric/pull/1960#issuecomment-6859085592
+  for (const state of ["live", "unknown", "exited"] as const) {
+    it.runIf(hostedDelete)(`keeps an evicted parent's owned budget until checked descendant exit (${state})`, async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-eviction-"));
     roots.push(tempRoot);
     vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
@@ -392,26 +393,17 @@ describe("AgentManager close storage", () => {
     const budget = activeBudgetState()!;
     expect(budget.budget).toBe(100);
     appendBudgetLedger(budget.file, { id: "existing-spend", depth: 0, cost: 0.25, tokens: 25, ts: Date.now() });
-    diagnostic.mark("fixture-setup-done");
-    diagnostic.mark("parent-run-start");
     const parent = await manager.run({ task: "recursive parent", recursive: true });
-    diagnostic.mark("parent-run-done");
     const parentDirectory = manager.runDirectory(parent.id)!;
     // A real nested manager inherits the parent's ledger and launches a real worker.
-    diagnostic.mark("child-manager-creation-start");
     vi.stubEnv("PI_FABRIC_DEPTH", "1");
     const childManager = new AgentManager(process.cwd(), { ...config, retainRuns: true }, { workerPath, runRoot: path.join(parentDirectory, "nested") });
     managers.push(childManager);
     vi.stubEnv("PI_FABRIC_DEPTH", "0");
-    diagnostic.mark("child-manager-creation-done");
-    diagnostic.mark("child-spawn-start");
     const child = await childManager.spawn({ task: "HANG_WITH_PROGRESS", extensions: false });
-    diagnostic.mark("child-spawn-done");
     const childDirectory = childManager.runDirectory(child.id)!;
     const childStatus = path.join(childDirectory, "status.json");
-    diagnostic.mark("progress-ready-start");
     await vi.waitFor(() => expect(childManager.status(child.id)).toMatchObject({ status: "running", turns: 3 }), { timeout: 5_000 });
-    diagnostic.mark("progress-ready-done");
     const pid = Number(child.sessionId);
     expect(processAlive(pid)).toBe(true);
     // Persist the real transport identity, as production workers do; UNKNOWN is
@@ -435,54 +427,37 @@ describe("AgentManager close storage", () => {
       }));
       return { kind: "process", sessionId: absentPid, isAlive: async () => false, stop: async () => {} };
     });
-    diagnostic.mark("pressure-start");
     try {
       for (let index = 0; index < 1_000; index++) {
         expect((await manager.run({ task: `eviction pressure ${index}`, extensions: false })).status).toBe("completed");
-        if ((index + 1) % 100 === 0) diagnostic.mark("pressure-call-completed", { completedCalls: index + 1 });
       }
     } finally { launch.mockRestore(); }
-    diagnostic.mark("pressure-done");
-    diagnostic.mark("eviction-assertions-start");
     expect(manager.runDirectory(parent.id), "settled parent handle was really evicted").toBeUndefined();
     expect(processAlive(Number(parent.sessionId)), "evicted primary process has exited").toBe(false);
     expect(fs.existsSync(parentDirectory)).toBe(true);
     expect(hasUnresolvedWorker(parentDirectory)).toBe(false);
-    diagnostic.mark("eviction-assertions-done");
-    diagnostic.mark("retention-assertions-start");
     if (state === "exited") {
-      diagnostic.mark("child-stop-before-close-start");
       await childManager.stop(child.id);
-      diagnostic.mark("child-stop-before-close-done");
       expect(processAlive(pid), "checked child process exit").toBe(false);
       expect(runTreeExitVeto(parentDirectory, 0, undefined, true)).toBeUndefined();
     } else {
       expect(runTreeExitVeto(parentDirectory, 0, undefined, true)).toMatch(state === "unknown" ? /unknown descendant identity/ : /descendant worker may still be running/);
     }
-    diagnostic.mark("retention-assertions-done");
-    diagnostic.mark("budget-read-start");
     const accounting = fs.readFileSync(budget.file, "utf8");
     expect(readBudgetLedger(budget.file).cost).toBeGreaterThanOrEqual(0.25);
-    diagnostic.mark("budget-read-done");
-    diagnostic.mark("parent-close-start");
     await manager.close();
-    diagnostic.mark("parent-close-done");
-    diagnostic.mark("final-accounting-start");
     if (state === "exited") {
       expect(fs.existsSync(path.dirname(budget.file)), "checked descendant exit releases owned budget").toBe(false);
     } else {
       expect(fs.existsSync(budget.file), "evicted live/unknown descendant still owns the ledger").toBe(true);
       expect(fs.readFileSync(budget.file, "utf8")).toBe(accounting);
       const before = readBudgetLedger(budget.file);
-      diagnostic.mark("child-stop-after-close-start");
       await childManager.stop(child.id);
-      diagnostic.mark("child-stop-after-close-done");
       expect(processAlive(pid)).toBe(false);
       expect(readBudgetLedger(budget.file).cost, "descendant can still append its final accounting after parent close").toBeGreaterThan(before.cost);
     }
-    diagnostic.mark("final-accounting-done");
-    diagnostic.mark("body-assertions-completed");
-  }));
+    }, hostedLinux && state === "live" ? 150_000 : 30_000);
+  }
 
   it("cancels queued admissions on close without launching and retains the active stopped prompt", async () => {
     const { manager, root } = setup(false);

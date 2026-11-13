@@ -13,7 +13,7 @@ import {
   type TaskCgroupBoundary,
 } from "./task-cgroup.js";
 import { taskScopeWrapperSource } from "./task-scope-wrapper.js";
-import { emitProcessCensusTestEvent, linuxGroupMember, linuxProcesses, type LinuxGroupMember } from "./linux-process-census.js";
+import { linuxGroupMember, linuxProcesses, type LinuxGroupMember } from "./linux-process-census.js";
 
 /** A bounded tree observation ended without proof of descendant exit. */
 export class ProcessTreeCustodyUnconfirmedError extends Error {
@@ -478,10 +478,6 @@ export const spawnDetached = async (
     // between-tick cgroup escapes while the scope stays populated. Full scans
     // still own stop, signaling and final exit (smarty-dev#20387).
     const cgroupDirectory = !forceFull && treeObservationReady && scopeEvents ? path.dirname(scopeEvents) : undefined;
-    if (!cgroupDirectory && process.env.PI_TEST_PROCESS_CENSUS_DIAGNOSTICS === "1") {
-      emitProcessCensusTestEvent({ kind: "full-view-request", pid,
-        reason: exited ? "primary-exited" : forceFull ? "explicit-full" : "unverified-scope" });
-    }
     const snapshot = linuxProcesses({ ...(cgroupDirectory ? { cgroupDirectory } : {}), ownedPids: owned.keys() }).filter((member) => !exited || member.pid !== pid);
     // Retain detached execution groups BEFORE their custodian can die/reparent
     // them. An edge is admitted only while its parent's birth still matches.
@@ -521,12 +517,7 @@ export const spawnDetached = async (
     }
     // Filtering can empty a nonempty scope too; never declare exit from that
     // partial view. Explicit stop and post-primary exit always use the full view.
-    if (!current.length && cgroupDirectory) {
-      if (process.env.PI_TEST_PROCESS_CENSUS_DIAGNOSTICS === "1") {
-        emitProcessCensusTestEvent({ kind: "attribution-empty", pid, cgroupDirectory });
-      }
-      return members(true);
-    }
+    if (!current.length && cgroupDirectory) return members(true);
     return current;
   };
   const stop = async (): Promise<void> => {
@@ -756,9 +747,6 @@ export const spawnDetached = async (
       // Preserve failures for the subscriber without an admission-gap rejection.
       void treeClosed.catch(() => undefined);
       treeObservationReady = true;
-      if (process.env.PI_TEST_PROCESS_CENSUS_DIAGNOSTICS === "1") {
-        emitProcessCensusTestEvent({ kind: "scope-armed", pid, scope: scopeUnit, boundary: directory });
-      }
       void observeTree();
       return true;
     } catch (error) {

@@ -4,8 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { syncBuiltinESMExports } from "node:module";
 import { performance } from "node:perf_hooks";
-import { afterEach, expect, it, type TestContext } from "vitest";
-import { withProcessCensusDiagnostics, type ProcessCensusDiagnostics } from "./helpers/process-census-diagnostics.js";
+import { afterEach, expect, it } from "vitest";
 import { BRIDGE_PROTOCOL_VERSION, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MESH_ARCHIVE_CONFIG, archiveFileName } from "../src/mesh/archive.js";
 import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
@@ -487,37 +486,6 @@ function nativeDelta(current: NativeSnapshot, previous: NativeSnapshot): NativeS
   return difference;
 }
 
-function diagnosticMark(diagnostic: ProcessCensusDiagnostics | undefined, phase: string,
-  details: Record<string, unknown> = {}, native?: NativeSnapshot, cost?: RecoveryReadCost): void {
-  if (!diagnostic) return;
-  const scalarDetails = Object.fromEntries(Object.entries(details)
-    .filter((entry): entry is [string, number | boolean] =>
-      typeof entry[1] === "boolean" || typeof entry[1] === "number" && Number.isFinite(entry[1]))
-    .slice(0, 24));
-  const counters: Array<[string, number]> = [];
-  for (const [key, value] of Object.entries(native ?? {})) {
-    if (typeof value === "number") counters.push([`native_${key}`, value]);
-  }
-  for (const [key, value] of Object.entries(cost ?? {})) {
-    if (typeof value === "number") counters.push([`cost_${key}`, value]);
-  }
-  const firstCapacity = Math.max(0, 24 - Object.keys(scalarDetails).length);
-  const firstCounters = counters.slice(0, firstCapacity);
-  let offset = firstCounters.length;
-  let group = 1;
-  while (offset < counters.length) {
-    const identifiers = Object.fromEntries(["topicCount", "pageIndex", "cursor"]
-      .filter(key => typeof details[key] === "number").map(key => [key, details[key]]));
-    const capacity = 24 - Object.keys(identifiers).length;
-    diagnostic.mark(`${phase}-counters-${group++}`, {
-      ...identifiers, ...Object.fromEntries(counters.slice(offset, offset + capacity)),
-    });
-    offset += capacity;
-  }
-  // Leave the named phase open last, so a timeout during the next long await retains it as pending.
-  diagnostic.mark(phase, { ...scalarDetails, ...Object.fromEntries(firstCounters) });
-}
-
 interface PageRecord {
   page: { ids: string[]; through: number; done: boolean };
   cost?: RecoveryReadCost;
@@ -537,7 +505,7 @@ interface SuccessfulScan {
   checkTurns: number;
 }
 
-async function runSuccessfulScan(fixture: Fixture, diagnostic?: ProcessCensusDiagnostics): Promise<SuccessfulScan> {
+async function runSuccessfulScan(fixture: Fixture): Promise<SuccessfulScan> {
   const side = new StoreBridgeSide(fixture.store, PEER);
   const observer = observeNative(fixture);
   const pages: PageRecord[] = [];
@@ -553,23 +521,15 @@ async function runSuccessfulScan(fixture: Fixture, diagnostic?: ProcessCensusDia
   const maxAttempts = Math.ceil(fixture.topicCount / PAGE_POSITIONS) + 2;
   try {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const pageNativeBefore = observer.snapshot();
-      diagnosticMark(diagnostic, "clean-scan-page-start", { pageIndex: attempt, cursor },
-        pageNativeBefore, copyCost(side.recoveryReadCost));
       const timing = await withCheckPhaseHeartbeat(() => side.bridgedIds(cursor));
       elapsedMs += timing.elapsedMs;
       maxCheckGapMs = Math.max(maxCheckGapMs, timing.maxCheckGapMs);
       checkTurns += timing.checkTurns;
-      const currentNative = observer.snapshot();
-      const cost = copyCost(side.recoveryReadCost);
-      diagnosticMark(diagnostic, "clean-scan-page-end", { pageIndex: attempt, cursor,
-        returned: timing.value !== undefined, failed: timing.value === undefined,
-        elapsedMs: timing.elapsedMs, maxCheckGapMs: timing.maxCheckGapMs, checkTurns: timing.checkTurns,
-        through: timing.value?.through ?? null, done: timing.value?.done ?? null },
-        nativeDelta(currentNative, pageNativeBefore), cost);
       if (!timing.value) { failure = timing.error ?? new Error("Recovery returned no page"); break; }
       const page = timing.value;
       ids.push(...page.ids);
+      const cost = copyCost(side.recoveryReadCost);
+      const currentNative = observer.snapshot();
       pages.push({ page, ...(cost ? { cost } : {}), timing, native: nativeDelta(currentNative, previousNative) });
       previousNative = currentNative;
       if (page.done) break;
@@ -608,7 +568,7 @@ const errorRecord = (error: unknown): CancellationRecord["error"] => error insta
       hasPageFields: "ids" in error || "through" in error || "done" in error }
   : undefined;
 
-async function runInitialDiscoveryCancellation(fixture: Fixture, diagnostic?: ProcessCensusDiagnostics): Promise<CancellationRecord> {
+async function runInitialDiscoveryCancellation(fixture: Fixture): Promise<CancellationRecord> {
   const side = new StoreBridgeSide(fixture.store, PEER);
   let scheduled = false;
   let fencePromise: Promise<void> | undefined;
@@ -625,17 +585,9 @@ async function runInitialDiscoveryCancellation(fixture: Fixture, diagnostic?: Pr
   let cost: RecoveryReadCost | undefined;
   let native!: NativeSnapshot;
   try {
-    diagnosticMark(diagnostic, "initial-cancel-operation-start", { cursor: 0 }, observer.snapshot());
     timing = await withCheckPhaseHeartbeat(() => side.bridgedIds(0));
-    diagnosticMark(diagnostic, "initial-cancel-operation-end", { returned: timing.value !== undefined,
-      errorPresent: timing.error !== undefined, elapsedMs: timing.elapsedMs,
-      maxCheckGapMs: timing.maxCheckGapMs, checkTurns: timing.checkTurns },
-      observer.snapshot(), copyCost(side.recoveryReadCost));
-    diagnosticMark(diagnostic, "initial-cancel-fence-wait-start", { fenceScheduled: scheduled }, observer.snapshot());
     await new Promise<void>(resolve => setImmediate(resolve));
     if (fencePromise) await fencePromise;
-    diagnosticMark(diagnostic, "initial-cancel-fence-wait-end", { fenceSettled: fencePromise !== undefined },
-      observer.snapshot());
     cost = copyCost(side.recoveryReadCost);
     native = observer.snapshot();
   } finally {
@@ -648,16 +600,10 @@ async function runInitialDiscoveryCancellation(fixture: Fixture, diagnostic?: Pr
     native, timing, fenceSettled: fencePromise !== undefined };
 }
 
-async function runResumedValidationCancellation(fixture: Fixture, diagnostic?: ProcessCensusDiagnostics): Promise<CancellationRecord> {
+async function runResumedValidationCancellation(fixture: Fixture): Promise<CancellationRecord> {
   const side = new StoreBridgeSide(fixture.store, PEER);
-  diagnosticMark(diagnostic, "resumed-cancel-prime-start", { cursor: 0, nativeObserverInstalled: false });
   const primeTiming = await withCheckPhaseHeartbeat(() => side.bridgedIds(0));
   const priorCost = copyCost(side.recoveryReadCost);
-  diagnosticMark(diagnostic, "resumed-cancel-prime-end", { returned: primeTiming.value !== undefined,
-    errorPresent: primeTiming.error !== undefined, elapsedMs: primeTiming.elapsedMs,
-    maxCheckGapMs: primeTiming.maxCheckGapMs, checkTurns: primeTiming.checkTurns,
-    through: primeTiming.value?.through ?? null, done: primeTiming.value?.done ?? null,
-    nativeObserverInstalled: false }, undefined, priorCost);
   const after = primeTiming.value?.through ?? 0;
   let scheduled = false;
   let fencePromise: Promise<void> | undefined;
@@ -674,17 +620,9 @@ async function runResumedValidationCancellation(fixture: Fixture, diagnostic?: P
   let cost: RecoveryReadCost | undefined;
   let native!: NativeSnapshot;
   try {
-    diagnosticMark(diagnostic, "resumed-cancel-operation-start", { cursor: after }, observer.snapshot());
     timing = await withCheckPhaseHeartbeat(() => side.bridgedIds(after));
-    diagnosticMark(diagnostic, "resumed-cancel-operation-end", { returned: timing.value !== undefined,
-      errorPresent: timing.error !== undefined, elapsedMs: timing.elapsedMs,
-      maxCheckGapMs: timing.maxCheckGapMs, checkTurns: timing.checkTurns },
-      observer.snapshot(), copyCost(side.recoveryReadCost));
-    diagnosticMark(diagnostic, "resumed-cancel-fence-wait-start", { fenceScheduled: scheduled }, observer.snapshot());
     await new Promise<void>(resolve => setImmediate(resolve));
     if (fencePromise) await fencePromise;
-    diagnosticMark(diagnostic, "resumed-cancel-fence-wait-end", { fenceSettled: fencePromise !== undefined },
-      observer.snapshot());
     cost = copyCost(side.recoveryReadCost);
     native = observer.snapshot();
   } finally {
@@ -766,45 +704,21 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 }, 300_000);
 
-async function runFrontierTest(topicCount: number, diagnostic?: ProcessCensusDiagnostics): Promise<void> {
-  diagnosticMark(diagnostic, "fixture-creation-start", { topicCount });
-  const fixtureStarted = performance.now();
+const hostedLinux = process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_ENVIRONMENT === "github-hosted" && process.platform === "linux";
+// Hosted Linux measured 218.9s vs native 45.3s (4.83x); use a rounded 5x deadline only for 100000 topics there. https://github.com/Smarty-Pants-Inc/pi-fabric/pull/1960#issuecomment-6859085592
+for (const topicCount of [100_000, 3_321]) {
+  it(`measures native recovery over a ${topicCount}-topic one-row archive day`, async () => {
   const fixture = createFixture(topicCount);
-  diagnosticMark(diagnostic, "fixture-creation-end", { topicCount, elapsedMs: performance.now() - fixtureStarted,
-    archiveBytes: fixture.archiveBytes });
-
-  const initialStarted = performance.now();
-  diagnosticMark(diagnostic, "initial-cancel-start", { topicCount });
-  const initialCancellation = await runInitialDiscoveryCancellation(fixture, diagnostic);
-  diagnosticMark(diagnostic, "initial-cancel-end", { topicCount, elapsedMs: performance.now() - initialStarted,
-    triggered: initialCancellation.triggered, pageReturned: initialCancellation.pageReturned,
-    operationElapsedMs: initialCancellation.timing.elapsedMs, fenceSettled: initialCancellation.fenceSettled },
-    initialCancellation.native, initialCancellation.cost);
-
-  let resumedCancellation: CancellationRecord | undefined;
-  if (topicCount > PAGE_POSITIONS) {
-    const resumedStarted = performance.now();
-    diagnosticMark(diagnostic, "resumed-cancel-start", { topicCount });
-    resumedCancellation = await runResumedValidationCancellation(fixture, diagnostic);
-    diagnosticMark(diagnostic, "resumed-cancel-end", { topicCount, elapsedMs: performance.now() - resumedStarted,
-      triggered: resumedCancellation.triggered, pageReturned: resumedCancellation.pageReturned,
-      primeElapsedMs: resumedCancellation.primeTiming?.elapsedMs ?? null,
-      operationElapsedMs: resumedCancellation.timing.elapsedMs, fenceSettled: resumedCancellation.fenceSettled },
-      resumedCancellation.native, resumedCancellation.cost);
-  }
-
+  const initialCancellation = await runInitialDiscoveryCancellation(fixture);
+  const resumedCancellation = topicCount > PAGE_POSITIONS
+    ? await runResumedValidationCancellation(fixture)
+    : undefined;
   // The clean scan is a fresh-side positive control after cancellation and proves complete coverage.
-  diagnosticMark(diagnostic, "clean-scan-start", { topicCount });
-  const scanStarted = performance.now();
-  const scan = await runSuccessfulScan(fixture, diagnostic);
-  diagnosticMark(diagnostic, "clean-scan-end", { topicCount, elapsedMs: performance.now() - scanStarted,
-    positions: scan.ids.length, pages: scan.pages.length, done: scan.pages.at(-1)?.page.done ?? false,
-    failed: scan.failure !== undefined }, scan.native);
+  const scan = await runSuccessfulScan(fixture);
 
   // Emit positive cardinality, page, slice, memory and native-work evidence before assertions.
   emitEvidence(fixture, scan, initialCancellation, resumedCancellation);
 
-  diagnosticMark(diagnostic, "assertions-start", { topicCount, positions: scan.ids.length, pages: scan.pages.length });
   const expected = expectedIds(topicCount);
   const expectedPages = Math.ceil(topicCount / PAGE_POSITIONS);
   expect(scan.failure).toBeUndefined();
@@ -913,12 +827,5 @@ async function runFrontierTest(topicCount: number, diagnostic?: ProcessCensusDia
     expect(resumedCancellation.native.openFdCount).toBe(0);
     expect(costParseTotal(resumedCancellation.cost!)).toBe(resumedCancellation.native.jsonParseAttempts);
   }
-  diagnosticMark(diagnostic, "assertions-completed", { topicCount, positions: scan.ids.length,
-    pages: scan.pages.length, done: scan.pages.at(-1)?.page.done ?? false });
+  }, hostedLinux && topicCount === 100_000 ? 1_500_000 : 300_000);
 }
-
-it.for([100_000, 3_321])("measures native recovery over a %s-topic one-row archive day", { timeout: 300_000 }, async (topicCount, context: TestContext) => {
-  await withProcessCensusDiagnostics(context, topicCount === 100_000, async diagnostic => {
-    await runFrontierTest(topicCount, topicCount === 100_000 ? diagnostic : undefined);
-  });
-});

@@ -63,7 +63,9 @@ const NOT_A_STATUS = String.raw`(?!\s*(?:ms|s|seconds?|bytes|tokens|lines)\b)`;
 
 const PROVIDER_TRANSIENT: readonly (readonly [why: string, pattern: RegExp])[] = [
   ["provider 5xx or overload", new RegExp(
-    String.raw`\b(?:HTTP\/[\d.]+\s+|status(?:\s*code)?[:=\s]+|code[:=\s]+|error[:=\s]+|[:(]\s*)5\d\d\b${NOT_A_STATUS}|^\s*5\d\d\b${NOT_A_STATUS}` +
+    // smarty-dev#20456: "Anthropic API error (503)": a word boundary cannot precede "(", so the
+    // ":" / "(" cue sits outside the \b group.
+    String.raw`(?:\b(?:HTTP\/[\d.]+\s+|status(?:\s*code)?[:=\s]+|code[:=\s]+|error[:=\s]+)|[:(]\s*)5\d\d\b${NOT_A_STATUS}|^\s*5\d\d\b${NOT_A_STATUS}` +
     String.raw`|\bbad gateway\b|service[ _]unavailable|gateway time-?out|internal server error|\bserver_error\b|\boverloaded(?:_error)?\b|server_is_overloaded` +
     String.raw`|currently experiencing high demand|upstream connect error|reset before headers`, "im")],
   ["provider throttling (429)", /\b429\b|too many requests|rate[ _-]?limit(?:ed|_error|_exceeded)?\b|\bthrottl/i],

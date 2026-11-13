@@ -56,7 +56,7 @@ function observeReads() {
     actual(file, options as never)) as typeof fs.readFileSync);
 }
 
-describe("Linux process census on real temporary proc/cgroup files", () => {
+describe.skipIf(process.platform !== "linux")("Linux process census on real temporary proc/cgroup files", () => {
   it("reads only the small scoped tree, not unrelated host process stats", () => {
     const f = fixture();
     const expected = [f.put(410), f.put(411, 410, 410), f.put(412, 411, 412)];

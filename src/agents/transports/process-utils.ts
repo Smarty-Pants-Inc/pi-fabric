@@ -13,6 +13,7 @@ import {
   type TaskCgroupBoundary,
 } from "./task-cgroup.js";
 import { taskScopeWrapperSource } from "./task-scope-wrapper.js";
+import { linuxGroupMember, linuxProcesses, type LinuxGroupMember } from "./linux-process-census.js";
 
 /** A bounded tree observation ended without proof of descendant exit. */
 export class ProcessTreeCustodyUnconfirmedError extends Error {
@@ -272,23 +273,6 @@ export const workerCommand = async (
 ): Promise<string> =>
   (await scriptSpawnArgs(workerPath, workerArguments)).map(shellQuote).join(" ");
 
-type LinuxGroupMember = { pid: number; parent: number; group: number; started: string; state: string };
-const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-    return { pid, parent: Number(fields[1]), group: Number(fields[2]), started: fields[19]!, state: fields[0]! };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") return undefined;
-    throw error; // Unknown identity is not permission to signal or to report exit.
-  }
-};
-const linuxProcesses = (): LinuxGroupMember[] =>
-  fs.readdirSync("/proc").flatMap((entry) => {
-    if (!/^\d+$/.test(entry)) return [];
-    const member = linuxGroupMember(Number(entry));
-    return member && member.state !== "Z" && member.state !== "X" ? [member] : [];
-  });
 const STOP_TERM_MS = 2_000;
 const STOP_KILL_MS = 2_000;
 const TREE_CENSUS_MIN_SPACING_MS = 60_000;
@@ -487,8 +471,14 @@ export const spawnDetached = async (
   };
   let stopped = false;
   let stopFailed = false;
-  const members = (): LinuxGroupMember[] => {
-    const snapshot = linuxProcesses().filter((member) => !exited || member.pid !== pid);
+  const members = (forceFull = exited): LinuxGroupMember[] => {
+    // Only the existing verified arm supplies a dedicated scope. Scope launch or
+    // an ambient /proc cgroup observation alone grants no census fast path.
+    // Steady-state discovery covers the scope plus retained births, not unseen
+    // between-tick cgroup escapes while the scope stays populated. Full scans
+    // still own stop, signaling and final exit (smarty-dev#20387).
+    const cgroupDirectory = !forceFull && treeObservationReady && scopeEvents ? path.dirname(scopeEvents) : undefined;
+    const snapshot = linuxProcesses({ ...(cgroupDirectory ? { cgroupDirectory } : {}), ownedPids: owned.keys() }).filter((member) => !exited || member.pid !== pid);
     // Retain detached execution groups BEFORE their custodian can die/reparent
     // them. An edge is admitted only while its parent's birth still matches.
     let changed = true;
@@ -525,6 +515,9 @@ export const spawnDetached = async (
       }
       for (const member of groupMembers) owned.set(member.pid, member.started);
     }
+    // Filtering can empty a nonempty scope too; never declare exit from that
+    // partial view. Explicit stop and post-primary exit always use the full view.
+    if (!current.length && cgroupDirectory) return members(true);
     return current;
   };
   const stop = async (): Promise<void> => {
@@ -532,17 +525,17 @@ export const spawnDetached = async (
     // Capture group identities BEFORE TERM, while the owned leader still pins it.
     // A leader can exit before its refusing child. Retain that child's birth, not
     // just a group number, and never adopt a recycled group with no owned member.
-    if (process.platform === "linux") members();
+    if (process.platform === "linux") members(true);
     else if (process.platform !== "win32") await portableMembers();
     const settled = async (): Promise<boolean> => {
-      if (process.platform === "linux") return members().length === 0 && nativeClosed && !(executionPending && groups.size === 1);
+      if (process.platform === "linux") return members(true).length === 0 && nativeClosed && !(executionPending && groups.size === 1);
       const remaining = process.platform === "win32" ? [] : await portableMembers();
       if (!nativeClosed || executionPending || portableUncertain) return false;
       return remaining.length === 0;
     };
     const signal = (value: NodeJS.Signals): void => {
       const targets = process.platform === "linux"
-        ? [...new Set(members().filter(member => value !== "SIGTERM" || exited || member.group === pid).map(member => -member.group))]
+        ? [...new Set(members(true).filter(member => value !== "SIGTERM" || exited || member.group === pid).map(member => -member.group))]
         : exited ? [] : [process.platform === "win32" ? pid : -pid];
       // TERM the live custodian, not its execution first: it must record stop
       // intent before the child can close. Escalation owns all retained groups.
@@ -552,9 +545,9 @@ export const spawnDetached = async (
       for (const target of targets) {
         // Refresh birth anchors immediately before EACH signal, not only once
         // before signalling several independently detached execution groups.
-        if (process.platform === "linux" && !members().some((member) => member.group === -target)) continue;
+        if (process.platform === "linux" && !members(true).some((member) => member.group === -target)) continue;
         if (process.platform === "linux") {
-          for (const member of members()) if (member.pid !== pid && member.group === -target) {
+          for (const member of members(true)) if (member.pid !== pid && member.group === -target) {
             forcedDescendants.add(`${member.pid}:${member.started}`);
           }
         }
@@ -665,7 +658,7 @@ export const spawnDetached = async (
       // No /proc census or execution uncertainty applies inside the owned boundary.
       if (scopeEvents && boundary && gateReleased) { executionPending = false; finishTree(); return; }
       censusStarted = true;
-      const remaining = process.platform === "linux" ? members().length : (await portableMembers()).length;
+      const remaining = process.platform === "linux" ? members(true).length : (await portableMembers()).length;
       const uncertain = process.platform === "linux"
         ? executionPending && groups.size === 1 : executionPending || portableUncertain;
       if (remaining === 0 && !uncertain) { finishTree(); return; }
@@ -842,7 +835,7 @@ export const spawnDetached = async (
             // without adopting a new birth or an unowned surviving group. In
             // particular, an unreadable birth is NOT this absent-worker case.
             const signalAbsent = (value: NodeJS.Signals): void => {
-              if (birthUnknown || linuxGroupMember(pid) || members().length) {
+              if (birthUnknown || linuxGroupMember(pid) || members(true).length) {
                 throw new Error(`Cannot confirm ownership/exit of Fabric process group ${pid}`);
               }
               try { process.kill(-pid, value); }

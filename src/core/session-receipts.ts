@@ -97,7 +97,7 @@ interface ReceiptCache extends SessionReceiptSnapshot {
   matches: ReceiptMatcher;
   matchesEntry?: ReceiptEntryMatcher;
   project: ReceiptProjector;
-  stat: fs.Stats;
+  stat: Pick<fs.BigIntStats, "dev" | "ino" | "mtimeNs" | "ctimeNs"> & { size: number };
   carry: readonly Buffer[];
   /** SHA-256 state over every observed byte, including the incomplete final line. */
   hash: Hash;
@@ -116,6 +116,11 @@ const memoryReceiptCaches = new WeakMap<SessionReceiptManager, Map<ReceiptMatche
 // Keep byte verification independent of receipt-identity hashing. Never update the seed itself.
 let receiptHashSeed: Hash | undefined;
 const newReceiptHash = (): Hash => (receiptHashSeed ??= createHash("sha256")).copy();
+
+// smarty-dev#20527: Windows can reuse the complete raw stat tuple for an immediate
+// same-size rewrite. Correctness costs O(prefix bytes) idle reads/hashing there;
+// other platforms retain the stat-only O(1) idle path after the native barriers.
+const verifyEqualStatReceiptPrefix = (): boolean => process.platform === "win32";
 
 const readAt = (fd: number, buffer: Buffer, position: number): void => {
   let read = 0;
@@ -177,21 +182,28 @@ export const confirmedSessionReceiptSnapshot = (
   if (!file) return manager.isPersisted?.() === true ? empty() : memory();
   let snapshot = empty();
   try {
-    const found = withConfirmedSessionFile(file, (fd, stat) => {
+    const found = withConfirmedSessionFile(file, (fd) => {
+      // The shared barrier helper retains numeric Stats for its other callers. Cache
+      // identity from the SAME descriptor without rounding native timestamps to Number
+      // milliseconds (distinct NTFS 100ns ticks can alias at a present-day epoch).
+      const precise = fs.fstatSync(fd, { bigint: true });
+      const stat = { dev: precise.dev, ino: precise.ino, size: Number(precise.size),
+        mtimeNs: precise.mtimeNs, ctimeNs: precise.ctimeNs };
       let previous = receiptCaches.get(manager);
       const sessionId = manager.getSessionId?.();
       if (previous?.file !== file || previous.sessionId !== sessionId || previous.matches !== matches || previous.matchesEntry !== matchesEntry || previous.project !== project ||
           previous.stat.dev !== stat.dev || previous.stat.ino !== stat.ino || stat.size < previous.stat.size) {
         previous = undefined;
       }
-      // An unchanged file owes the native barriers above, but no transcript reads. ctime
-      // detects an in-place rewrite even if its writer restores the old mtime.
-      if (previous && stat.size === previous.stat.size && stat.mtimeMs === previous.stat.mtimeMs &&
-          stat.ctimeMs === previous.stat.ctimeMs) {
+      // Preserve every timestamp bit exposed by the filesystem. On Windows even
+      // identical raw timestamps are ambiguous: verify bytes before reusing receipts.
+      const equalStat = previous && stat.size === previous.stat.size &&
+        stat.mtimeNs === previous.stat.mtimeNs && stat.ctimeNs === previous.stat.ctimeNs;
+      if (previous && equalStat && !verifyEqualStatReceiptPrefix()) {
         snapshot = previous;
         return;
       }
-      // Stat changes can hide rewrites anywhere in the old bytes, not just at the tail.
+      // Stat changes (or collisions) can hide rewrites anywhere, not just at the tail.
       // Verify the entire observed prefix (including carry) before retaining any projections.
       // On a true append this verified hash can continue directly over the new bytes.
       const buffer = Buffer.allocUnsafe(1 << 20);
@@ -207,6 +219,11 @@ export const confirmedSessionReceiptSnapshot = (
         if (!hash.copy().digest().equals(previous.hash.copy().digest())) {
           previous = undefined;
           hash = newReceiptHash();
+        } else if (equalStat) {
+          // Identical bytes retain the exact canonical/derived snapshot identities:
+          // no JSON parsing, projection, delta construction or generation change.
+          snapshot = previous;
+          return;
         }
       }
       let position = previous?.stat.size ?? 0;

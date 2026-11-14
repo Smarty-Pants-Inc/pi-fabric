@@ -1584,7 +1584,7 @@ describe("FabricControlPlane", () => {
       const f = await setup(100);
       vi.useFakeTimers();
       const outcome = settle(f.sender.request("host:owner", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
-      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(50_000);
       const { error } = await outcome;
       await f.sender.close();
       vi.useRealTimers();
@@ -2029,14 +2029,14 @@ describe("FabricControlPlane", () => {
       } finally { await f.dispose(); }
     });
 
-    it("does not let same-origin renewal extend the 45 s bridge budget", async () => {
+    it("does not let same-origin renewal extend the bridge budget plus fixed late-confirmation grace", async () => {
       const f = await setup();
       try {
         f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 120_000 });
         const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
         await vi.advanceTimersByTimeAsync(44_000);
         f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 60_000 });
-        await vi.advanceTimersByTimeAsync(1_000);
+        await vi.advanceTimersByTimeAsync(6_000);
         expect((await outcome).error?.message).toContain("is not responding");
         expect(f.commands().map((event) => event.kind)).toEqual(["steer", "cancel"]);
         await f.sender.close();

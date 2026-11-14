@@ -172,6 +172,7 @@ export class JevClient {
   /** Actual operations, not the abort-raced waiters; host credential APIs may not cancel. */
   readonly #pendingCredentials = new Set<Promise<string>>();
   readonly #gateway: { use: JevGatewayUse; transport: JevGatewayTransport } | undefined;
+  readonly #endpoint: string;
   constructor(
     readonly config: FabricJevConfig,
     private readonly fetcher: typeof fetch = fetch,
@@ -180,6 +181,11 @@ export class JevClient {
     gateway?: JevGatewayBinding,
   ) {
     this.credentials = credentials ?? new JevCredentials(config.credentialCommand, process.env, undefined, route.envKeys);
+    // Resolve here, not just during config normalization: production callers also
+    // construct clients from DEFAULT_JEV_CONFIG. Keep explicit route injection intact.
+    const baseUrl = process.env.PI_FABRIC_JEV_BASE_URL?.trim() || config.baseUrl?.trim();
+    this.#endpoint = route.id === "typesafe" && route.endpoint === JEV_TYPESAFE_ROUTE.endpoint && baseUrl
+      ? `${baseUrl.replace(/\/+$/, "")}/systemone` : route.endpoint;
     // jev.gatewaySocket alone never reroutes a client: only an explicit binding to a registered use does.
     if (gateway) {
       if (!(JEV_GATEWAY_USES as readonly string[]).includes(gateway.use)) {
@@ -224,7 +230,7 @@ export class JevClient {
     const body = jsonText({ ...request, model }, this.config.maxRequestBytes, "Jev request");
     let response: Response;
     try {
-      response = await runAbortable(timedSignal, () => this.fetcher(this.route.endpoint, {
+      response = await runAbortable(timedSignal, () => this.fetcher(this.#endpoint, {
         method: "POST", redirect: "error", signal: timedSignal,
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body,
       }));

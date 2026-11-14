@@ -48,13 +48,20 @@ export default function (pi) {
     log({type:"request",calls,messages:context.messages});
     void (async () => {
       while (!fs.existsSync(path.join(root,"release-"+calls))) await new Promise(resolve=>setTimeout(resolve,10));
-      const tool = process.env.TERMINAL_PROOF_INTERMEDIATE === "1" && calls === 1;
+      const noFinal = process.env.TERMINAL_PROOF_NO_FINAL;
+      const tool = (process.env.TERMINAL_PROOF_INTERMEDIATE === "1" || noFinal === "prior-intermediate-thinking") && calls === 1;
       const reply = process.env.TERMINAL_PROOF_REPLY === "1" && calls === 1;
+      const retryableError = process.env.TERMINAL_PROOF_NATIVE_RETRY === "1" && calls === 1;
+      const thinkingOnly = noFinal === "thinking-only" || noFinal === "prior-intermediate-thinking";
+      const content = retryableError ? [{type:"text",text:"partial failed provider attempt"},{type:"toolCall",id:"failed-retry-tool-call",name:"bash",arguments:{command:"printf failed-turn-tool-should-not-run"}}] : reply ? [{type:"toolCall",id:"reply",name:"fabric_reply",arguments:{ok:true}}] : tool ? [{type:"text",text:"intermediate progress"},{type:"toolCall",id:"work",name:"bash",arguments:{command:"printf intermediate"}}] : thinkingOnly ? [{type:"thinking",thinking:"synthetic private reasoning"}] : noFinal === "whitespace" ? [{type:"text",text:" \t "}] : noFinal === "empty" ? [] : [{type:"text",text:fs.readFileSync(path.join(root,"answer.txt"),"utf8")}];
+      const stopReason = retryableError ? "error" : tool || reply ? "toolUse" : "stop";
       const message = {role:"assistant",provider:selected.provider,model:selected.id,api:selected.api,timestamp:Date.now(),
-        content:reply ? [{type:"toolCall",id:"reply",name:"fabric_reply",arguments:{ok:true}}] : tool ? [{type:"text",text:"intermediate progress"},{type:"toolCall",id:"work",name:"bash",arguments:{command:"printf intermediate"}}] : [{type:"text",text:fs.readFileSync(path.join(root,"answer.txt"),"utf8")}],
-        stopReason:tool || reply ? "toolUse":"stop",usage:{input:3,output:4,cacheRead:0,cacheWrite:0,totalTokens:7,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
+        content, stopReason, ...(retryableError ? {errorMessage:"Provider returned error: synthetic overloaded provider"} : {}),
+        usage:{input:3,output:4,cacheRead:0,cacheWrite:0,totalTokens:7,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
       events.push({type:"start",partial:message});
-      events.push({type:"done",reason:tool || reply ? "toolUse":"stop",message});events.end();
+      if (retryableError) events.push({type:"error",reason:"error",error:message});
+      else events.push({type:"done",reason:stopReason,message});
+      events.end();
     })();
     return events;
   };
@@ -66,7 +73,7 @@ export default function (pi) {
 const setup = () => {
   const root = temporary();
   const agentDir = path.join(root, "agent"); fs.mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
-  fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false }, defaultProjectTrust: "never" }));
+  fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: process.env.TERMINAL_PROOF_NATIVE_RETRY === "1", maxRetries: 1, baseDelayMs: 0 }, defaultProjectTrust: "never" }));
   fs.writeFileSync(path.join(agentDir, "extensions", "provider.ts"), provider);
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir); vi.stubEnv("PI_OFFLINE", "1"); vi.stubEnv("TERMINAL_PROOF_ROOT", root);
   const notices: unknown[] = [];
@@ -99,9 +106,13 @@ describe("durable task final-answer contract", () => {
   it.each(["toolUse", "length", "error", "aborted", "pending", "deferred"])("does not terminate on non-final %s prose", stopReason => {
     expect(finalAssistantText({ role: "assistant", stopReason, content: [{ type: "text", text: "not final" }] })).toBeUndefined();
   });
-  it("requires no tool calls even when the provider reports stop, and admits an empty final", () => {
+  it("requires a nonblank final while preserving valid answer bytes", () => {
     expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "progress" }, { type: "toolCall" }] })).toBeUndefined();
-    expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [] })).toBe("");
+    expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "private reasoning" }] })).toBeUndefined();
+    expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [] })).toBeUndefined();
+    expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: " \t\n " }] })).toBeUndefined();
+    const answer = " \nvalid answer\t ";
+    expect(finalAssistantText({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: answer }] })).toBe(answer);
   });
   it("does not resurrect a consumed control on replay", () => {
     const root = temporary(); const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -112,6 +123,75 @@ describe("durable task final-answer contract", () => {
 });
 
 describe("native worker task terminal boundary", () => {
+  it.each(["thinking-only", "whitespace", "empty", "prior-intermediate-thinking"] as const)("fails without a final answer for %s and drains the native child", async mode => {
+    const s = setup(); vi.stubEnv("TERMINAL_PROOF_NO_FINAL", mode);
+    const { handle, directory } = await spawn(s);
+    fs.writeFileSync(path.join(s.root, "release-1"), "");
+    if (mode === "prior-intermediate-thinking") {
+      await until(() => rows(path.join(s.root, "provider.jsonl")).filter(row => row.type === "request").length === 2);
+      fs.writeFileSync(path.join(s.root, "release-2"), "");
+    }
+    const result = await s.manager.wait(handle.id, { timeoutMs: 30000 });
+    expect(result, result.error).toMatchObject({ status: "failed", errorCode: "NO_FINAL_TEXT" });
+    expect(result.finalAnswerReceipt).toBeUndefined();
+    expect(readFinalAnswerReceipt(directory, handle.id)).toBeUndefined();
+    const requests = rows(path.join(s.root, "provider.jsonl")).filter(row => row.type === "request");
+    expect(requests).toHaveLength(mode === "prior-intermediate-thinking" ? 2 : 1);
+    const nativePid = requests[0]!.pid as number;
+    await until(() => !alive(nativePid));
+    expect(alive(nativePid)).toBe(false);
+  }, 45000);
+
+  it("does not retain an unexecuted tool call from a natively omitted retry attempt", async () => {
+    vi.stubEnv("TERMINAL_PROOF_NATIVE_RETRY", "1");
+    const s = setup();
+    const answer = "answer after native provider retry";
+    fs.writeFileSync(path.join(s.root, "answer.txt"), answer);
+    const { handle, directory } = await spawn(s);
+    fs.writeFileSync(path.join(s.root, "release-1"), "");
+    await until(() => rows(path.join(s.root, "provider.jsonl")).filter(row => row.type === "request").length === 2);
+    fs.writeFileSync(path.join(s.root, "release-2"), "");
+
+    const result = await s.manager.wait(handle.id, { timeoutMs: 30000 });
+    expect(result.status, result.error).toBe("completed");
+    expect(result.text).toBe(answer);
+    expect(result.toolCalls).toBe(0);
+    const receipt = readFinalAnswerReceipt(directory, handle.id)!;
+    expect(receipt).toMatchObject({
+      runId: handle.id,
+      text: answer,
+      assistant: {
+        lastAssistantStopReason: "stop",
+        lastAssistantBlockCounts: { text: 1 },
+        lastAssistantTextBytes: Buffer.byteLength(answer, "utf8"),
+        unresolvedToolCalls: 0,
+      },
+    });
+    expect(result.finalAnswerReceipt).toEqual({ id: receipt.id, recordedAt: receipt.recordedAt });
+
+    const providerRows = rows(path.join(s.root, "provider.jsonl"));
+    const requests = providerRows.filter(row => row.type === "request");
+    expect(requests).toHaveLength(2);
+    expect(requests[0]!.pid).toBe(requests[1]!.pid);
+    expect(providerRows.filter(row => row.type === "native-start")).toHaveLength(1);
+    const userMessages = (request: Record<string, any>) => request.messages
+      .filter((message: Record<string, any>) => message.role === "user")
+      .map((message: Record<string, any>) => message.content);
+    expect(userMessages(requests[1]!)).toEqual(userMessages(requests[0]!));
+    expect(JSON.stringify(requests[1]!.messages)).not.toContain("failed-retry-tool-call");
+
+    const nativeEvents = rows(path.join(directory, "events.jsonl"));
+    expect(nativeEvents.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
+    expect(nativeEvents.some(event => event.type === "fabric_provider_resume")).toBe(false);
+    expect(nativeEvents.some(event => event.type === "tool_execution_start" && event.toolCallId === "failed-retry-tool-call")).toBe(false);
+    const history = rows(path.join(directory, "session.jsonl"));
+    expect(history.some(row => row.message?.role === "assistant" && row.message.stopReason === "error" &&
+      row.message.content?.some((block: Record<string, any>) => block.type === "toolCall" && block.id === "failed-retry-tool-call"))).toBe(true);
+    const nativePid = requests[0]!.pid as number;
+    await until(() => !alive(nativePid));
+    expect(alive(nativePid)).toBe(false);
+  }, 45000);
+
   it("fences already queued steer/followUp before another request and closes its owned process", async () => {
     const s = setup(); const answer = "authorized full answer\n".repeat(10000);
     fs.writeFileSync(path.join(s.root, "answer.txt"), answer);

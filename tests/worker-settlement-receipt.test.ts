@@ -7,13 +7,22 @@ import { savePiSettlementReceipt } from "../src/worker/settlement-receipt.js";
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const file = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-settlement-")); roots.push(root); return path.join(root, "settlement.json"); };
+const writeSettlementReceipt = savePiSettlementReceipt as (
+  file: string, runId: string, text: string, structuredReply?: boolean,
+) => void;
 
 describe("native successful settlement receipt (#5256)", () => {
-  it("persists intentional empty output with durability barriers", () => {
+  it.each(["", " \t\n"])("rejects unstructured blank output (%j)", text => {
+    const target = file();
+    expect(() => writeSettlementReceipt(target, "run", text)).toThrow();
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it("persists explicitly structured empty output with durability barriers", () => {
     const target = file();
     const sync = vi.spyOn(fs, "fsyncSync");
-    savePiSettlementReceipt(target, "run", "");
-    expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ version: 1, runId: "run", outcome: "completed", text: "" });
+    writeSettlementReceipt(target, "run", "", true);
+    expect(JSON.parse(fs.readFileSync(target, "utf8"))).toMatchObject({ version: 1, runId: "run", outcome: "completed", text: "" });
     expect(sync).toHaveBeenCalled();
   });
   it.skipIf(process.platform === "win32")("rejects a visible receipt when its post-rename namespace barrier fails", () => {

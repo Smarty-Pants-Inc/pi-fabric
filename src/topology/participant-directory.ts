@@ -551,6 +551,7 @@ const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo
     pendingMessages: participant.pendingMessages === true,
     local: false,
     ...(participant.remoteHost ? { host: participant.remoteHost } : {}),
+    ...(participant.bridgeStale ? { bridgeStale: true as const } : {}),
   };
 };
 

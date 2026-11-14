@@ -61,6 +61,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_TASK_ESCALATION_TARGET_DENIED: "TaskEscalationTargetError",
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
   FABRIC_PROJECT_AGENT_AMBIGUOUS: "FabricProjectAgentAmbiguousError",
+  FABRIC_PROJECT_AGENT_BRIDGE_STALE: "FabricProjectAgentBridgeStaleError",
   FABRIC_PROJECT_LEAD_INVALID: "FabricProjectLeadInvalidError",
   FABRIC_AGENT_SPAWN_FORBIDDEN: "AgentSpawnForbiddenError",
   FABRIC_PYTHON_RUNTIME_POLICY: "FabricPythonRuntimePolicyError",
@@ -85,6 +86,13 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   }
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
+  if (code === "FABRIC_PROJECT_AGENT_BRIDGE_STALE") {
+    // Only this classification exports bounded lookup attribution, never getters.
+    for (const field of ["targetId", "remoteHost"] as const) {
+      const value = Object.getOwnPropertyDescriptor(error, field)?.value;
+      if (typeof value === "string" && value.length >= 1 && value.length <= 200) metadata[field] = value;
+    }
+  }
   if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE" || code === "FABRIC_IDEMPOTENCY_KEY_REUSED") {
     // The public message schema bounds retry keys to 1-200 chars. Read only own
     // data properties: never invoke a host getter or export unrelated metadata.

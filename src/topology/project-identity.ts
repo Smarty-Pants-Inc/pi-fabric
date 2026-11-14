@@ -301,6 +301,17 @@ export class FabricProjectAgentAmbiguousError extends Error {
   readonly code = "FABRIC_PROJECT_AGENT_AMBIGUOUS";
 }
 
+export class FabricProjectAgentBridgeStaleError extends Error {
+  override readonly name = "FabricProjectAgentBridgeStaleError";
+  readonly code = "FABRIC_PROJECT_AGENT_BRIDGE_STALE";
+  readonly retryable = true;
+  constructor(readonly targetId: string, readonly remoteHost: string) {
+    super(`Recorded project agent ${targetId} on remote host ${remoteHost} has unconfirmed bridge freshness; ` +
+      "no message was published by this lookup. Refresh bridge presence and retry this lookup; " +
+      "this lookup does not establish the outcome of any earlier send.");
+  }
+}
+
 /**
  * The launch-recorded id is an exact return address, independent of repository. The directory
  * admits live, non-colliding roots; an attributed but bridge-stale mirror cannot lead.
@@ -316,7 +327,7 @@ export const resolveProjectAgent = <T extends ProjectRoot>(
     (!root.capabilities || (root.capabilities.includes("steer") && root.capabilities.includes("followUp")));
   if (options.leadId) {
     const recorded = allRoots.find((root) => root.id === options.leadId);
-    if (!recorded || recorded.stale || recorded.bridgeStale) {
+    if (!recorded || recorded.stale) {
       throw new FabricProjectAgentUnresolvedError(
         `No live project agent for ${project}: recorded launch lead ${options.leadId} is absent or stale.`,
       );
@@ -324,6 +335,16 @@ export const resolveProjectAgent = <T extends ProjectRoot>(
     if (!eligible(recorded)) {
       throw new FabricProjectAgentUnresolvedError(
         `No live project agent for ${project}: recorded launch lead ${options.leadId} is non-interactive or lacks steer/followUp capabilities.`,
+      );
+    }
+    if (recorded.bridgeStale) {
+      // The directory validates ownership and collisions before retaining this mirror. Only
+      // an eligible, attributed exact launch address warrants retryable transport uncertainty.
+      if (typeof recorded.remoteHost === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(recorded.remoteHost)) {
+        throw new FabricProjectAgentBridgeStaleError(recorded.id, recorded.remoteHost);
+      }
+      throw new FabricProjectAgentUnresolvedError(
+        `No live project agent for ${project}: recorded launch lead ${options.leadId} is absent or stale.`,
       );
     }
     return recorded;

@@ -388,23 +388,123 @@ describe("source-clock root liveness (#10068)", () => {
     expect(f.local.holds(rootId)).toBe(false); // Retained routing attribution is NOT bridge authority.
   });
 
-  it.each(["bridge-stale", "lease-stale"] as const)("pending command distinguishes %s, cancels once and preserves unknown outcome", async status => {
-    const f = await fixture();
+  it("a published control survives a translated-expiry gap and accepts only its original owner's ACK", async () => {
+    const f = await fixture(-60_000, 7_000);
     const outcome = settle(request(f));
     await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
-    if (status === "bridge-stale") f.advance(MIRROR_FRESH_MS + 1);
-    else f.advertise(mirror(f.now(), { sourceExpiresAt: f.now() - 60_001 }));
+    const command = commands(f)[0]!.data as { commandId: string; deadlineAt: number };
+    const originalLease = f.lease();
+    const read = vi.spyOn(f.directory, "mirroredControlOwner");
+    f.advance(7_500);
+    expect(f.now() - f.lease().mirror!.observedAt).toBeLessThan(MIRROR_FRESH_MS);
+    expect(mirroredLeaseStatus("ryzen4", f.lease().mirror, f.now())).toBe("live");
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ bridgeStale: true });
+    await vi.waitFor(() => expect(read).toHaveBeenCalled()); // An actual watchdog tick sees the gap.
+    expect(f.lease()).toEqual(originalLease); // Waiting never extends source or translated authority.
+    expect(f.local.holds(rootId)).toBe(false);
+    expect(commands(f)).toHaveLength(1);
+
+    const sourceAt = f.now() - 60_000;
+    await f.local.mirror({ ...f.presence, hosts: [{ ...f.presence.hosts[0]!, observedAt: sourceAt,
+      record: { ...f.presence.hosts[0]!.record, updatedAt: sourceAt, expiresAt: sourceAt + 13_000 },
+      expiresAt: sourceAt + 13_000 }] }, f.now());
+    expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
+    expect(f.now()).toBeLessThan(command.deadlineAt);
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId: command.commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "recovered", bridge: { from: "ryzen4" } } });
+    expect(await outcome).toMatchObject({ value: { acknowledged: true, messageId: "recovered" }, error: undefined });
+    expect(commands(f)).toHaveLength(1); // No resend and no cancellation.
+  });
+
+  it("a permanently stale published control keeps its original 45 s bound, then cancels exactly once with UNKNOWN", async () => {
+    const f = await fixture(-60_000, 7_000);
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    let settled = false;
+    const outcome = settle(request(f)).then(result => { settled = true; return result; });
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    f.advance(44_999);
+    await vi.advanceTimersByTimeAsync(44_999 - (Date.now() - startedAt));
+    expect(settled).toBe(false);
+    expect(commands(f)).toHaveLength(1);
+    f.advance(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    expect(Date.now() - startedAt).toBe(45_000);
+    const result = await outcome;
+    expect(result.error).toBeInstanceOf(FabricBridgeStaleError);
+    expect(result.error?.message).toContain("outcome is unknown");
+    expect(result.error?.message).not.toContain("lapsed");
+    expect(result.error).not.toHaveProperty("notRun");
+    await vi.waitFor(() => expect(commands(f).filter(event => event.kind === "cancel")).toHaveLength(1));
+    await f.control.close();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(commands(f).map(event => event.kind)).toEqual(["followUp", "cancel"]);
+  });
+
+  it("a fresh source-lapsed proof still immediately stops a published command after a bridge-stale gap", async () => {
+    const f = await fixture(-60_000, 7_000);
+    const outcome = settle(request(f));
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const read = vi.spyOn(f.directory, "mirroredControlOwner");
+    f.advance(7_500);
+    await vi.waitFor(() => expect(read).toHaveBeenCalled());
+    f.advertise(mirror(f.now(), { sourceExpiresAt: f.now() - 60_001 }));
     const result = await outcome;
     expect(result.error?.message).toContain("outcome is unknown");
     expect(result.error).not.toHaveProperty("notRun");
-    if (status === "bridge-stale") {
-      expect(result.error).toBeInstanceOf(FabricBridgeStaleError);
-      expect(result.error?.message).not.toContain("lapsed");
-    } else {
-      expect(result.error?.message).toContain("remote host ryzen4 lapsed");
-      expect(f.directory.get(rootId, f.now())).toBeUndefined();
-    }
+    expect(result.error?.message).toContain("remote host ryzen4 lapsed");
+    expect(f.directory.get(rootId, f.now())).toBeUndefined();
     await vi.waitFor(() => expect(commands(f).filter(event => event.kind === "cancel")).toHaveLength(1));
+  });
+
+  it("a renewed successor cannot replace the published command's pinned ACK owner", async () => {
+    const f = await fixture(-60_000, 7_000);
+    let settled = false;
+    const outcome = request(f).finally(() => { settled = true; });
+    void outcome.catch(() => undefined);
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const commandId = (commands(f)[0]!.data as { commandId: string }).commandId;
+    const read = vi.spyOn(f.directory, "mirroredControlOwner");
+    f.advance(7_500);
+    await vi.waitFor(() => expect(read).toHaveBeenCalled());
+    const sourceAt = f.now() - 60_000;
+    await f.local.mirror({ ...f.presence,
+      participants: f.presence.participants.map(p => ({ ...p, ownerIncarnation: "activation-2" })),
+      hosts: [{ ...f.presence.hosts[0]!, observedAt: sourceAt,
+        record: { ...f.presence.hosts[0]!.record, updatedAt: sourceAt, expiresAt: sourceAt + 13_000 },
+        expiresAt: sourceAt + 13_000 }] }, f.now());
+    await vi.waitFor(() => expect(read.mock.results.some(result => result.type === "return" &&
+      result.value?.ownerIncarnation === "activation-2")).toBe(true));
+    const tail = vi.spyOn(f.store, "tail");
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-2", accepted: true,
+        messageId: "successor", bridge: { from: "ryzen4" } } });
+    await vi.waitFor(() => expect(tail.mock.results.some(result => result.type === "return" &&
+      result.value.events.some(event => event.topic === "fabric.control.ack"))).toBe(true));
+    expect(settled).toBe(false);
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "original-owner", bridge: { from: "ryzen4" } } });
+    await expect(outcome).resolves.toMatchObject({ acknowledged: true, messageId: "original-owner" });
+    expect(commands(f)).toHaveLength(1);
+  });
+
+  it.each(["abort", "close"] as const)("%s still settles a published command during a bridge-stale gap", async winner => {
+    const f = await fixture(-60_000, 7_000);
+    const controller = new AbortController();
+    const outcome = settle(f.control.request(rootId, rootId, "followUp", {
+      ownerIncarnation: "activation-1", message: "cancel during gap" }, rootId,
+      { routedRemoteHost: "ryzen4", signal: controller.signal }));
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const read = vi.spyOn(f.directory, "mirroredControlOwner");
+    f.advance(7_500);
+    await vi.waitFor(() => expect(read).toHaveBeenCalled());
+    if (winner === "abort") controller.abort();
+    else await f.control.close();
+    expect((await outcome).error?.message).toContain(winner === "abort" ? "cancelled" : "closed");
+    await vi.waitFor(() => expect(commands(f).map(event => event.kind)).toEqual(["followUp", "cancel"]));
   });
 
   it("a late mirror commit does not renew freshness; a new sample restores it", async () => {

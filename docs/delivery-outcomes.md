@@ -23,6 +23,14 @@ The outcomes mean:
 - **unknown:** the sender timed out without knowing the outcome. A receiver's
   later `delivered` line for the same event id is valid and does not erase unknown.
 
+Before publication, an unconfirmed mirrored owner uses the existing single bounded
+renewal wait, then a definite not-published refusal if still unconfirmed. After
+publication, an unconfirmed mirror alone preserves the original ACK deadline;
+it never renews source authority or replays the command, and an ACK still requires
+the pinned owner's authentication. Without a verified outcome at that deadline,
+the result remains **unknown**, not a definite delivery failure. A fresh sample
+proving the source lease lapsed still ends the pending request immediately.
+
 Mesh-carried sends use the original mesh event id. Local messages and
 pre-publication refusals use a sender-owned send id. Identity metadata is supplied
 by the host and retained separately from user message data in durable queues.

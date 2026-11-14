@@ -1,3 +1,4 @@
+import { createHash, type Hash } from "node:crypto";
 import fs from "node:fs";
 import { syncPathNamespace } from "./atomic-write.js";
 import { SessionEntryCursor, type SessionEntryCursorManager } from "./preview.js";
@@ -96,12 +97,10 @@ interface ReceiptCache extends SessionReceiptSnapshot {
   matches: ReceiptMatcher;
   matchesEntry?: ReceiptEntryMatcher;
   project: ReceiptProjector;
-  stat: fs.Stats;
-  /** Confirmed complete-line offset; stat.size also includes the unconfirmed carry. */
-  offset: number;
+  stat: Pick<fs.BigIntStats, "dev" | "ino" | "mtimeNs" | "ctimeNs"> & { size: number };
   carry: readonly Buffer[];
-  tail: Buffer;
-  partialTail: Buffer;
+  /** SHA-256 state over every observed byte, including the incomplete final line. */
+  hash: Hash;
 }
 // One current file/filter per manager, released with the host session manager. Filters must
 // have stable identity; a different predicate must never inherit another filter's receipts.
@@ -113,7 +112,15 @@ interface MemoryReceiptCache {
   snapshot?: SessionReceiptSnapshot;
 }
 const memoryReceiptCaches = new WeakMap<SessionReceiptManager, Map<ReceiptMatcher, Map<ReceiptProjector, Map<ReceiptEntryMatcher | undefined, MemoryReceiptCache>>>>();
-const TAIL_BYTES = 64;
+// Lazily initialize an untouched SHA-256 seed; copies start fresh prefix checks.
+// Keep byte verification independent of receipt-identity hashing. Never update the seed itself.
+let receiptHashSeed: Hash | undefined;
+const newReceiptHash = (): Hash => (receiptHashSeed ??= createHash("sha256")).copy();
+
+// smarty-dev#20527: Windows can reuse the complete raw stat tuple for an immediate
+// same-size rewrite. Correctness costs O(prefix bytes) idle reads/hashing there;
+// other platforms retain the stat-only O(1) idle path after the native barriers.
+const verifyEqualStatReceiptPrefix = (): boolean => process.platform === "win32";
 
 const readAt = (fd: number, buffer: Buffer, position: number): void => {
   let read = 0;
@@ -122,12 +129,6 @@ const readAt = (fd: number, buffer: Buffer, position: number): void => {
     if (bytes <= 0) throw new Error("Session receipt changed while reading");
     read += bytes;
   }
-};
-
-const tailMatches = (fd: number, offset: number, tail: Buffer): boolean => {
-  const current = Buffer.allocUnsafe(tail.length);
-  readAt(fd, current, offset - tail.length);
-  return current.equals(tail);
 };
 
 /** Snapshot matching, complete JSONL entries only after confirming the native write.
@@ -181,39 +182,60 @@ export const confirmedSessionReceiptSnapshot = (
   if (!file) return manager.isPersisted?.() === true ? empty() : memory();
   let snapshot = empty();
   try {
-    const found = withConfirmedSessionFile(file, (fd, stat) => {
+    const found = withConfirmedSessionFile(file, (fd) => {
+      // The shared barrier helper retains numeric Stats for its other callers. Cache
+      // identity from the SAME descriptor without rounding native timestamps to Number
+      // milliseconds (distinct NTFS 100ns ticks can alias at a present-day epoch).
+      const precise = fs.fstatSync(fd, { bigint: true });
+      const stat = { dev: precise.dev, ino: precise.ino, size: Number(precise.size),
+        mtimeNs: precise.mtimeNs, ctimeNs: precise.ctimeNs };
       let previous = receiptCaches.get(manager);
       const sessionId = manager.getSessionId?.();
       if (previous?.file !== file || previous.sessionId !== sessionId || previous.matches !== matches || previous.matchesEntry !== matchesEntry || previous.project !== project ||
           previous.stat.dev !== stat.dev || previous.stat.ino !== stat.ino || stat.size < previous.stat.size) {
         previous = undefined;
       }
-      // An unchanged file owes the native barriers above, but no transcript reads. ctime
-      // detects an in-place rewrite even if its writer restores the old mtime.
-      if (previous && stat.size === previous.stat.size && stat.mtimeMs === previous.stat.mtimeMs &&
-          stat.ctimeMs === previous.stat.ctimeMs) {
+      // Preserve every timestamp bit exposed by the filesystem. On Windows even
+      // identical raw timestamps are ambiguous: verify bytes before reusing receipts.
+      const equalStat = previous && stat.size === previous.stat.size &&
+        stat.mtimeNs === previous.stat.mtimeNs && stat.ctimeNs === previous.stat.ctimeNs;
+      if (previous && equalStat && !verifyEqualStatReceiptPrefix()) {
         snapshot = previous;
         return;
       }
-      // A changed file must still contain the confirmed prefix. Check the carry's end too:
-      // a writer can replace an incomplete line before completing it.
-      if (previous && (!tailMatches(fd, previous.offset, previous.tail) ||
-          (previous.stat.size > previous.offset && !tailMatches(fd, previous.stat.size, previous.partialTail)))) {
-        previous = undefined;
+      // Stat changes (or collisions) can hide rewrites anywhere, not just at the tail.
+      // Verify the entire observed prefix (including carry) before retaining any projections.
+      // On a true append this verified hash can continue directly over the new bytes.
+      const buffer = Buffer.allocUnsafe(1 << 20);
+      let hash = newReceiptHash();
+      if (previous) {
+        for (let position = 0; position < previous.stat.size;) {
+          const length = Math.min(buffer.length, previous.stat.size - position);
+          const view = buffer.subarray(0, length);
+          readAt(fd, view, position);
+          hash.update(view);
+          position += length;
+        }
+        if (!hash.copy().digest().equals(previous.hash.copy().digest())) {
+          previous = undefined;
+          hash = newReceiptHash();
+        } else if (equalStat) {
+          // Identical bytes retain the exact canonical/derived snapshot identities:
+          // no JSON parsing, projection, delta construction or generation change.
+          snapshot = previous;
+          return;
+        }
       }
       let position = previous?.stat.size ?? 0;
-      let offset = previous?.offset ?? 0;
       let count = previous?.count ?? 0;
       const entries = new Map(previous?.entries);
       const appended = new Map<number, unknown>();
       let carry = [...(previous?.carry ?? [])];
-      let tail = previous?.tail ?? Buffer.alloc(0);
-      let endTail = previous?.partialTail ?? tail;
-      const buffer = Buffer.allocUnsafe(1 << 20);
       while (position < stat.size) {
         const length = Math.min(buffer.length, stat.size - position);
         readAt(fd, buffer.subarray(0, length), position);
         const view = buffer.subarray(0, length);
+        hash.update(view);
         let start = 0;
         for (let newline = view.indexOf(10); newline !== -1; newline = view.indexOf(10, start)) {
           const line = Buffer.concat([...carry, view.subarray(start, newline)]).toString("utf8");
@@ -232,17 +254,13 @@ export const confirmedSessionReceiptSnapshot = (
               appended.set(index, projected);
             }
           }
-          offset = position + start;
         }
-        // Retain only small rewrite guards and one partial line, never unrelated history.
-        if (start > 0) tail = Buffer.from(Buffer.concat([endTail, view.subarray(0, start)]).subarray(-TAIL_BYTES));
-        endTail = Buffer.from(Buffer.concat([endTail, view]).subarray(-TAIL_BYTES));
+        // Retain only one partial line, never unrelated complete history.
         position += length;
         if (start < length) carry.push(Buffer.from(view.subarray(start)));
       }
       const update = { generation: previous?.update?.generation ?? {}, from: previous?.count ?? 0, entries: appended };
-      const cache: ReceiptCache = { file, sessionId, matches, ...(matchesEntry ? { matchesEntry } : {}), project, stat, offset, count, entries, update, carry, tail,
-        partialTail: endTail };
+      const cache: ReceiptCache = { file, sessionId, matches, ...(matchesEntry ? { matchesEntry } : {}), project, stat, count, entries, update, carry, hash };
       receiptCaches.set(manager, cache);
       snapshot = cache;
     });

@@ -1,9 +1,12 @@
+import { Hash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { confirmedSessionEntries, confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../src/core/session-receipts.js";
-import { confirmedMainInboxIds, projectRootInboxReceipt } from "../src/topology/root-inbox.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { confirmedMainInboxIds, projectRootInboxReceipt, RootInbox } from "../src/topology/root-inbox.js";
 import { confirmedRootInboxSession, registerIssuedInbox, rootInboxSession } from "./root-inbox-issued-fixture.js";
 
 const matches = (line: string) => line.includes("pi-fabric-inbox") || line.includes("pi-fabric-agent-message");
@@ -35,6 +38,22 @@ const full = (file: string): unknown[] => {
   entries.length = lines.length; return entries;
 };
 const bytesRead = (spy: ReturnType<typeof vi.spyOn>) => spy.mock.results.reduce((sum: number, result: { type: string; value?: unknown }) => sum + (result.type === "return" && typeof result.value === "number" ? result.value : 0), 0);
+// Scoped descriptor replacement follows host-lease-archive-windows.test.ts.
+// Change only the cache-policy platform AFTER real native open/fsync/namespace
+// confirmation: fake Linux directory fsync is not supported on a Windows host.
+// No barriers are omitted and no public product-only test API is needed.
+const onPlatform = <T>(platform: NodeJS.Platform, confirm: () => T): T => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const namespace = atomicWrite.syncPathNamespace;
+  const sync = vi.spyOn(atomicWrite, "syncPathNamespace").mockImplementation((...args) => {
+    namespace(...args);
+    Object.defineProperty(process, "platform", { ...descriptor, value: platform });
+  });
+  try { return confirm(); } finally {
+    Object.defineProperty(process, "platform", descriptor);
+    sync.mockRestore();
+  }
+};
 
 describe("incremental confirmed session receipts", () => {
   it("retains receipt identity, not a second copy of delivered text or metadata (#2177)", () => {
@@ -90,7 +109,7 @@ describe("incremental confirmed session receipts", () => {
     expect(rootInboxSession([...confirmedSessionReceiptSnapshot(memory, matches, projectRootInboxReceipt).entries.values()]).holdsBatch(["memory"])).toBe(true);
   });
 
-  it("reads zero bytes on an unchanged 150 MiB file, retaining only matching entries", () => {
+  it("reads zero bytes on an unchanged 150 MiB file on Linux, retaining only matching entries", () => {
     const { file, manager } = fixture();
     const line = JSON.stringify({ type: "custom", data: "x".repeat(1024 * 1024 - 28) }) + "\n";
     const fd = fs.openSync(file, "w");
@@ -99,19 +118,20 @@ describe("incremental confirmed session receipts", () => {
     const first = confirmedSessionEntries(manager, matches);
     expect(first.length).toBe(151); expect(Object.keys(first)).toEqual(["150"]);
     const read = vi.spyOn(fs, "readSync"); const sync = vi.spyOn(fs, "fsyncSync");
-    expect(confirmedSessionEntries(manager, matches)).toEqual(first);
+    expect(onPlatform("linux", () => confirmedSessionEntries(manager, matches))).toEqual(first);
     expect(read).not.toHaveBeenCalled(); expect(sync).toHaveBeenCalled();
     const snapshot = confirmedSessionReceiptSnapshot(manager, matches);
     expect(snapshot.count).toBe(151); expect(snapshot.entries.size).toBe(1);
   }, 30_000);
 
-  it("reads only an append plus the 64-byte rewrite guard and preserves full-scan indices", () => {
+  it("verifies the full old prefix, reads the append once, and preserves full-scan indices", () => {
     const { file, manager } = fixture(other + receipt("first") + other.repeat(600));
     const before = confirmedSessionEntries(manager, matches);
+    const prefixSize = fs.statSync(file).size;
     const append = other + "{pi-fabric-inbox malformed}\n\n" + receipt("second");
     fs.appendFileSync(file, append);
     const read = vi.spyOn(fs, "readSync"); const next = confirmedSessionEntries(manager, matches);
-    expect(bytesRead(read)).toBe(Buffer.byteLength(append) + 64);
+    expect(bytesRead(read)).toBe(prefixSize + Buffer.byteLength(append));
     expect(next).toEqual(full(file)); expect(Object.keys(next)).toEqual(["1", "605"]);
     expect(before.length).toBe(602); expect(before[605]).toBeUndefined();
     const inbox = confirmedRootInboxSession(manager);
@@ -123,7 +143,8 @@ describe("incremental confirmed session receipts", () => {
     const complete = Buffer.from(receipt("completed-😀")); const cut = complete.indexOf(Buffer.from("😀")) + 2;
     const { file, manager } = fixture(Buffer.concat([Buffer.from(other), complete.subarray(0, cut)]));
     const first = confirmedSessionEntries(manager, matches); expect(first.length).toBe(1); expect(Object.keys(first)).toEqual([]);
-    const unchanged = vi.spyOn(fs, "readSync"); confirmedSessionEntries(manager, matches); expect(unchanged).not.toHaveBeenCalled();
+    const unchanged = vi.spyOn(fs, "readSync");
+    onPlatform("linux", () => confirmedSessionEntries(manager, matches)); expect(unchanged).not.toHaveBeenCalled();
     fs.appendFileSync(file, complete.subarray(cut)); const next = confirmedSessionEntries(manager, matches);
     expect(next).toEqual(full(file)); expect(next.length).toBe(2); expect(Object.keys(next)).toEqual(["1"]);
     expect(first.length).toBe(1);
@@ -151,11 +172,258 @@ describe("incremental confirmed session receipts", () => {
     expect(bytesRead(read)).toBe(fs.statSync(file).size);
   });
 
-  it("detects a same-size rewrite by its trailing window, even with restored mtime", () => {
+  it("detects a same-size prefix rewrite, even with restored mtime", () => {
     const { file, manager } = fixture(other + receipt("first")); confirmedSessionEntries(manager, matches);
     const before = fs.statSync(file); fs.writeFileSync(file, other + receipt("other")); fs.utimesSync(file, before.atime, before.mtime);
     const read = vi.spyOn(fs, "readSync"); expect(confirmedSessionEntries(manager, matches)).toEqual(full(file));
-    expect(bytesRead(read)).toBe(64 + before.size);
+    expect(bytesRead(read)).toBe(before.size * 2);
+  });
+
+  it.each(["mtimeNs", "ctimeNs"] as const)("invalidates canonical and derived receipts when only %s escapes Number precision (20527)", async (field) => {
+    // Data safety: model NTFS's 100ns storage unit at a present-day epoch. These
+    // distinct raw timestamps map to the SAME Number milliseconds, without a timer.
+    const base = 1_794_000_000_000_000_000n;
+    const millis = (ns: bigint): number => Number(ns / 1_000_000_000n) * 1_000 + Number(ns % 1_000_000_000n) / 1_000_000;
+    expect(millis(base + 100n)).toBe(millis(base));
+    const native = JSON.stringify({ type: "custom_message", customType: "pi-fabric-agent-message", timestamp: Date.now(),
+      details: { id: "old", from: { id: "session:peer" }, data: { deliveryId: "old", topic: "fleet.work.receipts" } } });
+    const body = native + "\n" + other.repeat(600);
+    const { root, file, manager } = fixture(body);
+    const derivedManager = { ...manager };
+    const identity = fs.statSync(file, { bigint: true });
+    const fstat = fs.fstatSync.bind(fs);
+    let revision = 0n;
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
+      const raw = fstat(fd, { bigint: true });
+      const actual = options?.bigint ? raw : fstat(fd);
+      if (raw.dev !== identity.dev || raw.ino !== identity.ino) return actual;
+      const mtimeNs = base + (field === "mtimeNs" ? revision : 0n);
+      const ctimeNs = base + (field === "ctimeNs" ? revision : 0n);
+      return Object.assign(actual, options?.bigint
+        ? { mtimeNs, ctimeNs, mtimeMs: mtimeNs / 1_000_000n, ctimeMs: ctimeNs / 1_000_000n }
+        : { mtimeMs: millis(mtimeNs), ctimeMs: millis(ctimeNs) });
+    }) as typeof fs.fstatSync);
+    // Isolate nanosecond invalidation from the Windows equal-stat hash fallback.
+    const confirm = () => onPlatform("linux", () => confirmedSessionReceiptSnapshot(manager, matches));
+    const derived = () => onPlatform("linux", () => confirmedRootInboxSession(derivedManager));
+    const before = confirm();
+    const derivedBefore = derived();
+    expect(before.entries.size).toBe(1);
+    expect(derivedBefore.delivered!.size).toBeGreaterThan(0);
+    const replacement = JSON.stringify({ type: "custom", data: "x".repeat(native.length - 27) }).padEnd(native.length, " ");
+    expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(native));
+    fs.writeFileSync(file, replacement + "\n" + other.repeat(600));
+    revision = 100n;
+    const read = vi.spyOn(fs, "readSync");
+    const after = confirm();
+    expect([...after.entries]).toEqual([]);
+    expect(after.count).toBe(before.count);
+    expect(after.update!.generation).not.toBe(before.update!.generation);
+    expect(after.update!.from).toBe(0);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) * 2);
+    read.mockClear();
+    const derivedAfter = derived();
+    expect(derivedAfter.delivered!.size).toBe(0);
+    expect(derivedAfter).not.toBe(derivedBefore);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) * 2);
+    // Exercise the consumer that can otherwise permanently suppress unseen work.
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
+    const me = { id: "session:judge", name: "judge", kind: "main" as const };
+    const inbox = new RootInbox(mesh, me, () => [me.id], { steerGraceMs: 0 });
+    try {
+      inbox.start();
+      const event = await mesh.publish({ topic: "fleet.work.receipts", kind: "handoff", to: me.id,
+        from: { id: "session:peer", name: "peer", kind: "main" }, text: "unseen old work", data: { deliveryId: "old" } });
+      expect((await inbox.next(derivedAfter)).events.map(item => item.id)).toEqual([event.id]);
+    } finally { await inbox.close(); await mesh.closeState(); }
+
+    // A genuine append may keep the same timestamp too: size still drives prefix
+    // verification, and matching old bytes preserve the generation and indices.
+    const append = native.replaceAll('"old"', '"new"') + "\n";
+    fs.appendFileSync(file, append);
+    read.mockClear();
+    const appended = confirm();
+    expect(appended.update!.generation).toBe(after.update!.generation);
+    expect(appended.update!.from).toBe(after.count);
+    expect([...appended.entries.keys()]).toEqual([after.count]);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) + Buffer.byteLength(append));
+    const derivedAppended = derived();
+    expect(derivedAppended.delivered!.size).toBeGreaterThan(0);
+    read.mockClear();
+    const update = vi.spyOn(Hash.prototype, "update");
+    const copy = vi.spyOn(Hash.prototype, "copy");
+    const digest = vi.spyOn(Hash.prototype, "digest");
+    const sync = vi.spyOn(fs, "fsyncSync");
+    expect(onPlatform("linux", () => confirmedSessionReceiptSnapshot(manager, matches))).toBe(appended);
+    expect(onPlatform("linux", () => confirmedRootInboxSession(derivedManager))).toBe(derivedAppended);
+    expect(read).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(copy).not.toHaveBeenCalled();
+    expect(digest).not.toHaveBeenCalled();
+    expect(sync).toHaveBeenCalled();
+  });
+
+  it("hashes the entire unchanged Windows prefix including carry, reusing the exact snapshot without parsing or projection (20527)", () => {
+    const body = receipt("windows-idle") + other.repeat(30_000) + "unfinished carry";
+    const { file, manager } = fixture(body);
+    const filter = vi.fn(matches);
+    const project = vi.fn((entry: unknown) => entry);
+    const confirm = () => onPlatform("win32", () => confirmedSessionReceiptSnapshot(manager, filter, project));
+    const before = confirm();
+    filter.mockClear(); project.mockClear();
+    const read = vi.spyOn(fs, "readSync");
+    const update = vi.spyOn(Hash.prototype, "update");
+    const parse = vi.spyOn(JSON, "parse");
+    const sync = vi.spyOn(fs, "fsyncSync");
+    const after = confirm();
+    expect(after).toBe(before);
+    expect(after.update).toBe(before.update);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body));
+    expect(update.mock.calls.reduce((sum, [bytes]) => sum + (bytes as Buffer).byteLength, 0)).toBe(Buffer.byteLength(body));
+    expect(parse).not.toHaveBeenCalled();
+    expect(filter).not.toHaveBeenCalled();
+    expect(project).not.toHaveBeenCalled();
+    expect(sync).toHaveBeenCalled();
+    expect(fs.statSync(file).size).toBe(Buffer.byteLength(body));
+  });
+
+  it.each(["removed", "added"] as const)("invalidates a Windows receipt %s with an identical full raw stat tuple and unchanged tail (20527)", async (mode) => {
+    const native = JSON.stringify({ type: "custom_message", customType: "pi-fabric-agent-message", timestamp: Date.now(),
+      details: { id: "old", from: { id: "session:peer" }, data: { deliveryId: "old", topic: "fleet.work.receipts" } } });
+    const unrelated = JSON.stringify({ type: "custom", data: "x".repeat(native.length - 27) }).padEnd(native.length, " ");
+    expect(Buffer.byteLength(unrelated)).toBe(Buffer.byteLength(native));
+    const tail = "\n" + other.repeat(600);
+    const body = (mode === "removed" ? native : unrelated) + tail;
+    const { root, file, manager } = fixture(body);
+    const derivedManager = { ...manager };
+    const identity = fs.statSync(file, { bigint: true });
+    const numeric = fs.statSync(file);
+    const fstat = fs.fstatSync.bind(fs);
+    // Deterministically model an actual filesystem collision, not just Number
+    // rounding. Identity, size and BOTH raw ns timestamps are equal on rewrite.
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: { bigint?: boolean }) => {
+      const raw = fstat(fd, { bigint: true });
+      const actual = options?.bigint ? raw : fstat(fd);
+      if (raw.dev !== identity.dev || raw.ino !== identity.ino) return actual;
+      return Object.assign(actual, options?.bigint
+        ? { mtimeNs: identity.mtimeNs, ctimeNs: identity.ctimeNs, mtimeMs: identity.mtimeMs, ctimeMs: identity.ctimeMs }
+        : { mtimeMs: numeric.mtimeMs, ctimeMs: numeric.ctimeMs });
+    }) as typeof fs.fstatSync);
+    const project = vi.fn((entry: unknown) => entry);
+    const confirm = () => onPlatform("win32", () => confirmedSessionReceiptSnapshot(manager, matches, project));
+    const derived = () => onPlatform("win32", () => confirmedRootInboxSession(derivedManager));
+    const before = confirm();
+    const derivedBefore = derived();
+    expect(before.entries.size).toBe(mode === "removed" ? 1 : 0);
+    expect(derivedBefore.delivered!.size > 0).toBe(mode === "removed");
+    fs.writeFileSync(file, (mode === "removed" ? unrelated : native) + tail);
+    expect(identity.size).toBe(BigInt(Buffer.byteLength(body)));
+    expect(fs.statSync(file).size).toBe(Buffer.byteLength(body));
+    const read = vi.spyOn(fs, "readSync");
+    const after = confirm();
+    expect(after.entries.size).toBe(mode === "removed" ? 0 : 1);
+    expect(after.count).toBe(before.count);
+    expect(after.update!.generation).not.toBe(before.update!.generation);
+    expect(after.update!.from).toBe(0);
+    expect([...after.update!.entries]).toEqual([...after.entries]);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) * 2);
+    read.mockClear();
+    const derivedAfter = derived();
+    expect(derivedAfter).not.toBe(derivedBefore);
+    expect(derivedAfter.delivered!.size > 0).toBe(mode === "added");
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) * 2);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
+    const me = { id: "session:judge", name: "judge", kind: "main" as const };
+    const inbox = new RootInbox(mesh, me, () => [me.id], { steerGraceMs: 0 });
+    try {
+      inbox.start();
+      const event = await mesh.publish({ topic: "fleet.work.receipts", kind: "handoff", to: me.id,
+        from: { id: "session:peer", name: "peer", kind: "main" }, text: "old work", data: { deliveryId: "old" } });
+      expect((await inbox.next(derivedAfter)).events.map(item => item.id)).toEqual(mode === "removed" ? [event.id] : []);
+    } finally { await inbox.close(); await mesh.closeState(); }
+
+    // A true append with the same timestamps MUST preserve generation, old
+    // projections and delta indices, and read exactly P+A rather than 2P+A.
+    const append = native.replaceAll('"old"', '"new"') + "\n";
+    fs.appendFileSync(file, append);
+    read.mockClear(); project.mockClear();
+    const appended = confirm();
+    expect(appended.update!.generation).toBe(after.update!.generation);
+    expect(appended.update!.from).toBe(after.count);
+    expect([...appended.update!.entries.keys()]).toEqual([after.count]);
+    expect(appended.entries.get(after.count)).toEqual(JSON.parse(append));
+    expect(project).toHaveBeenCalledTimes(1);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) + Buffer.byteLength(append));
+    const derivedAppended = derived();
+    expect(derivedAppended.delivered!.size).toBeGreaterThan(derivedAfter.delivered!.size);
+    read.mockClear(); project.mockClear();
+    expect(confirm()).toBe(appended);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) + Buffer.byteLength(append));
+    expect(project).not.toHaveBeenCalled();
+    read.mockClear();
+    expect(derived()).toBe(derivedAppended);
+    expect(bytesRead(read)).toBe(Buffer.byteLength(body) + Buffer.byteLength(append));
+  });
+
+  it.each(["complete prefix", "partial carry"])("detects an early mutation in a >1 MiB %s with an unchanged tail", (mode) => {
+    // Data-safety regression #20527: the changed receipt id is over two read buffers
+    // away from both the old complete-line tail and the end of any partial carry.
+    const old = JSON.stringify({ type: "custom_message", customType: "pi-fabric-inbox",
+      details: { ids: ["old"] }, content: "x".repeat((1 << 20) * 2 + 7) });
+    const body = mode === "complete prefix" ? old + "\n" + other.repeat(8) : other + old;
+    const { file, manager } = fixture(body);
+    const project = vi.fn((entry: unknown) => (entry as { details: unknown }).details);
+    const before = confirmedSessionReceiptSnapshot(manager, matches, project);
+    const prefixSize = fs.statSync(file).size;
+    const changed = body.replace('"old"', '"new"') + (mode === "partial carry" ? "\n" : "");
+    fs.writeFileSync(file, changed);
+    const read = vi.spyOn(fs, "readSync");
+    const after = confirmedSessionReceiptSnapshot(manager, matches, project);
+    expect(bytesRead(read)).toBe(prefixSize + Buffer.byteLength(changed));
+    expect([...after.entries.values()]).toEqual([{ ids: ["new"] }]);
+    expect(after.count).toBe(full(file).length);
+    expect(after.update!.generation).not.toBe(before.update!.generation);
+    expect(after.update!.from).toBe(0);
+    expect([...after.update!.entries]).toEqual([...after.entries]);
+    expect([...before.entries.values()]).toEqual(mode === "complete prefix" ? [{ ids: ["old"] }] : []);
+    read.mockClear();
+    const update = vi.spyOn(Hash.prototype, "update");
+    const copy = vi.spyOn(Hash.prototype, "copy");
+    const digest = vi.spyOn(Hash.prototype, "digest");
+    expect(onPlatform("linux", () => confirmedSessionReceiptSnapshot(manager, matches, project))).toBe(after);
+    expect(read).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(copy).not.toHaveBeenCalled();
+    expect(digest).not.toHaveBeenCalled();
+  });
+
+  it("retains generation and projections after metadata-only revalidation, then does no Linux idle reads or hashes", () => {
+    const { file, manager } = fixture();
+    const project = vi.fn((entry: unknown) => (entry as { details: unknown }).details);
+    const before = confirmedSessionReceiptSnapshot(manager, matches, project);
+    const stat = fs.statSync(file);
+    fs.utimesSync(file, stat.atime, new Date(stat.mtimeMs + 10_000));
+    const read = vi.spyOn(fs, "readSync");
+    const after = confirmedSessionReceiptSnapshot(manager, matches, project);
+    expect(bytesRead(read)).toBe(stat.size);
+    expect(after.update!.generation).toBe(before.update!.generation);
+    expect(after.update!.from).toBe(before.count);
+    expect(after.update!.entries.size).toBe(0);
+    expect([...after.entries]).toEqual([...before.entries]);
+    expect(after.entries.get(1)).toBe(before.entries.get(1));
+    expect(project).toHaveBeenCalledTimes(1);
+    read.mockClear();
+    const update = vi.spyOn(Hash.prototype, "update");
+    const copy = vi.spyOn(Hash.prototype, "copy");
+    const digest = vi.spyOn(Hash.prototype, "digest");
+    const sync = vi.spyOn(fs, "fsyncSync");
+    expect(onPlatform("linux", () => confirmedSessionReceiptSnapshot(manager, matches, project))).toBe(after);
+    expect(read).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(copy).not.toHaveBeenCalled();
+    expect(digest).not.toHaveBeenCalled();
+    expect(sync).toHaveBeenCalled();
+    expect(project).toHaveBeenCalledTimes(1);
   });
 
   it("detects a rewritten prefix followed by an append", () => {

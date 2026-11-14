@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { beforeEach, expect, it, vi, type TestContext } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
+import { observeTestAttempt } from "./helpers/test-attempt-lifecycle.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -75,18 +76,7 @@ const waitForAttempt = (signal: AbortSignal) => async (predicate: () => boolean)
   expect(predicate()).toBe(true);
 };
 
-// Vitest rejects a timed-out callback before its asynchronous finally completes,
-// but awaits onTestFinished before retrying. Bound the cleanup join like the
-// test itself; do not let a still-closing host use a retry's prototype spies.
-const observeCleanup = (onTestFinished: TestContext["onTestFinished"], timeout: number) => {
-  let finishCleanup!: () => void;
-  const finished = new Promise<void>(resolve => { finishCleanup = resolve; });
-  onTestFinished(() => finished, timeout);
-  return finishCleanup;
-};
-
-it.for(["project", "session"] as const)("public actor stop retains its live writer's creation commitment and reconciliation IDs until checked writer exit, then collects once (%s scope)", { timeout: 90_000 }, async (scope, { signal, onTestFinished }) => {
-  const waitFor = waitForAttempt(signal);
+it.for(["project", "session"] as const)("public actor stop retains its live writer's creation commitment and reconciliation IDs until checked writer exit, then collects once (%s scope)", { timeout: 90_000 }, async (scope, context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stopped-writer-retention-"));
   const rootId = "session:stopped-writer-retention";
   const meshRoot = path.join(root, "mesh");
@@ -112,7 +102,7 @@ it.for(["project", "session"] as const)("public actor stop retains its live writ
   });
   let due: ReturnType<typeof vi.spyOn> | undefined;
   const remove = vi.spyOn(fs, "rmSync");
-  const finishCleanup = observeCleanup(onTestFinished, 90_000);
+  const { waitFor, isCancelled, finishCleanup } = observeTestAttempt(context, 90_000, waitForAttempt);
   try {
     await participants.start();
     await host.start();
@@ -210,7 +200,7 @@ it.for(["project", "session"] as const)("public actor stop retains its live writ
   } finally {
     try {
       // Never restore a retry's spies after this attempt has been cancelled.
-      if (!signal.aborted) { due?.mockRestore(); sweep.mockRestore(); remove.mockRestore(); vi.restoreAllMocks(); }
+      if (!isCancelled()) { due?.mockRestore(); sweep.mockRestore(); remove.mockRestore(); vi.restoreAllMocks(); }
       // Every run belongs to this isolated fixture. Join them even if setup failed
       // before the original writer ID was observed; actor close alone can await a detached run.
       for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
@@ -227,8 +217,7 @@ it.for(["project", "session"] as const)("public actor stop retains its live writ
 it.skipIf(process.platform === "win32").for([
   ["project", false, "known"], ["session", false, "known"], ["project", true, "known"], ["session", true, "known"],
   ["project", true, "unknown"], ["session", true, "unknown"],
-] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", { timeout: 120_000 }, async ([scope, restart, descendant], { signal, onTestFinished }) => {
-  const waitFor = waitForAttempt(signal);
+] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", { timeout: 120_000 }, async ([scope, restart, descendant], context) => {
   if (restart) installLegacyPrimaryExitReceipt();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
@@ -257,7 +246,7 @@ it.skipIf(process.platform === "win32").for([
   });
   let due: ReturnType<typeof vi.spyOn> | undefined;
   const remove = vi.spyOn(fs, "rmSync");
-  const finishCleanup = observeCleanup(onTestFinished, 120_000);
+  const { waitFor, isCancelled, finishCleanup } = observeTestAttempt(context, 120_000, waitForAttempt);
   const withCompletedOwnershipProof = (assertOwnership: () => void) => {
     // This one-writer fixture fits the real 64-step bound. Remove only elapsed
     // scheduling pressure, not native exit/identity checks or tree-size limits.
@@ -427,7 +416,7 @@ it.skipIf(process.platform === "win32").for([
   } finally {
     try {
       // Restore before any asynchronous cleanup, and never after cancellation.
-      if (!signal.aborted) { due?.mockRestore(); sweep.mockRestore(); remove.mockRestore(); vi.restoreAllMocks(); }
+      if (!isCancelled()) { due?.mockRestore(); sweep.mockRestore(); remove.mockRestore(); vi.restoreAllMocks(); }
       // Gates concern only these fixture processes. Join the child before closing
       // the host, including failures before the test observed its identity.
       fs.writeFileSync(release, "cleanup nested");
@@ -451,8 +440,7 @@ it.skipIf(process.platform === "win32").for([
 // Allow both nested workers to start, then exercise crash/recovery and join cleanup.
 });
 
-it.skipIf(process.platform === "win32").for(["closed", "replacement"] as const)("public recovered durable cleanup retains a real live descendant through the client fallback (%s owner)", { timeout: 120_000 }, async (owner, { signal, onTestFinished }) => {
-  const waitFor = waitForAttempt(signal);
+it.skipIf(process.platform === "win32").for(["closed", "replacement"] as const)("public recovered durable cleanup retains a real live descendant through the client fallback (%s owner)", { timeout: 120_000 }, async (owner, context) => {
   installLegacyPrimaryExitReceipt();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-durable-descendant-cleanup-"));
   const rootId = "session:durable-descendant-cleanup";
@@ -474,7 +462,7 @@ it.skipIf(process.platform === "win32").for(["closed", "replacement"] as const)(
   let host = new ResidentHost(config);
   const participants = mainParticipants(config);
   let client: ResidencyClient | undefined;
-  const finishCleanup = observeCleanup(onTestFinished, 120_000);
+  const { waitFor, isCancelled, finishCleanup } = observeTestAttempt(context, 120_000, waitForAttempt);
   try {
     await participants.start();
     await host.start();
@@ -532,7 +520,7 @@ it.skipIf(process.platform === "win32").for(["closed", "replacement"] as const)(
     }
   } finally {
     try {
-      if (!signal.aborted) vi.restoreAllMocks();
+      if (!isCancelled()) vi.restoreAllMocks();
       fs.writeFileSync(release, "cleanup nested"); fs.writeFileSync(crash, "cleanup primary");
       const waitForCleanup = waitForAttempt(AbortSignal.timeout(30_000));
       try {

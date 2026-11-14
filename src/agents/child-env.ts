@@ -108,14 +108,28 @@ export const checkWritePolicyRequest = (request: AgentWritePolicyRequest): void 
   }
 };
 
-const nearestExisting = (target: string): string => {
+const nearestExistingPath = (target: string): string => {
   let current = target;
   while (!fs.existsSync(current)) {
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
   }
+  return current;
+};
+
+const nearestExisting = (target: string): string => {
+  const current = nearestExistingPath(target);
   return path.join(fs.realpathSync(current), path.relative(current, target));
+};
+
+/** Read-only preflight; without a final cwd (a pending worktree), check only absolute roots. */
+export const checkWritableRootDirectories = (roots: readonly string[] = [], cwd?: string): void => {
+  for (const root of roots) {
+    if (cwd === undefined && !path.isAbsolute(root)) continue;
+    const existing = nearestExistingPath(path.resolve(cwd ?? "", root));
+    if (!fs.statSync(existing).isDirectory()) throw new Error(`Writable root is not a directory: ${root}`);
+  }
 };
 
 export class AgentWriteRootOverlapError extends Error {

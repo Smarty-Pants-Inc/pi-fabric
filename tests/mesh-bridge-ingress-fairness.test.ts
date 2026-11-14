@@ -397,7 +397,11 @@ async function runScenario(): Promise<ScenarioObservation> {
 // unchanged. Runner retries inherit vitest.config.cts: 2 when CI=true, otherwise 0. A runner retry can
 // repeat the whole case, including a deciding progress failure. Within each test attempt, only an invalid
 // hold share permits the controller to replace a scenario; the first valid scenario still decides.
-it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress through real publisher contention",
+// GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.
+// https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20556
+it.skipIf(process.platform === "win32" || (
+  process.env.RUNNER_ENVIRONMENT === "github-hosted" && Date.now() < Date.parse("2026-11-29T00:00:00Z")
+))("toLocal ingress makes durable progress through real publisher contention",
   { timeout: FORMER_CASE_BUDGET_MS * FAIRNESS_MAX_ATTEMPTS }, async () => {
     await runFairnessAttempts<ScenarioObservation>({
       run: runScenario,

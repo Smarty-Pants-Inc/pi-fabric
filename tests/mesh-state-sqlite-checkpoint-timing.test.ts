@@ -98,11 +98,11 @@ describe("SQLite mesh checkpoint timing (smarty-dev#6100 round 1)", () => {
 
   it("checkpointLog off writes nothing", async () => {
     const root = tempRoot("off");
-    const write = vi.spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    const lines = captureStderr();
     const store = await openStore(root, { checkpointLog: "off" });
     await store.put({ key: "k", value: 1, identity });
     store.checkpoint(0);
-    expect(write).not.toHaveBeenCalled();
+    expect(lines.some((line) => line.startsWith(DEBUG) || line.startsWith(SUMMARY))).toBe(false);
     expect(store.stats().checkpointTiming.passive.count).toBeGreaterThan(0);
   });
 

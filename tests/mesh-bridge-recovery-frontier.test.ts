@@ -704,7 +704,10 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 }, 300_000);
 
-it.each([100_000, 3_321])("measures native recovery over a %s-topic one-row archive day", async topicCount => {
+const hostedLinux = process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_ENVIRONMENT === "github-hosted" && process.platform === "linux";
+// Hosted Linux measured 218.9s vs native 45.3s (4.83x); use a rounded 5x deadline only for 100000 topics there. https://github.com/Smarty-Pants-Inc/pi-fabric/pull/1960#issuecomment-6859085592
+for (const topicCount of [100_000, 3_321]) {
+  it(`measures native recovery over a ${topicCount}-topic one-row archive day`, async () => {
   const fixture = createFixture(topicCount);
   const initialCancellation = await runInitialDiscoveryCancellation(fixture);
   const resumedCancellation = topicCount > PAGE_POSITIONS
@@ -824,4 +827,5 @@ it.each([100_000, 3_321])("measures native recovery over a %s-topic one-row arch
     expect(resumedCancellation.native.openFdCount).toBe(0);
     expect(costParseTotal(resumedCancellation.cost!)).toBe(resumedCancellation.native.jsonParseAttempts);
   }
-}, 300_000);
+  }, hostedLinux && topicCount === 100_000 ? 1_500_000 : 300_000);
+}

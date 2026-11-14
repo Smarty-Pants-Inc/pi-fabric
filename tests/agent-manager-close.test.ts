@@ -39,6 +39,7 @@ const heldRoot = (source: string): string => {
   return row.destination;
 };
 const hostedDelete = hostedOnly("AgentManager close deletion");
+const hostedLinux = process.env.GITHUB_ACTIONS === "true" && process.env.RUNNER_ENVIRONMENT === "github-hosted" && process.platform === "linux";
 const managers: AgentManager[] = [];
 const roots: string[] = [];
 const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
@@ -375,7 +376,9 @@ describe("AgentManager close storage", () => {
     expect(fs.existsSync(path.join(caller, ".fabric-owner.json"))).toBe(false);
   });
 
-  it.runIf(hostedDelete).each(["live", "unknown", "exited"] as const)("keeps an evicted parent's owned budget until checked descendant exit (%s)", async (state) => {
+  // Hosted Linux measured 218.9s vs native 45.3s (4.83x); use a rounded 5x deadline only for live there. https://github.com/Smarty-Pants-Inc/pi-fabric/pull/1960#issuecomment-6859085592
+  for (const state of ["live", "unknown", "exited"] as const) {
+    it.runIf(hostedDelete)(`keeps an evicted parent's owned budget until checked descendant exit (${state})`, async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-eviction-"));
     roots.push(tempRoot);
     vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
@@ -453,7 +456,8 @@ describe("AgentManager close storage", () => {
       expect(processAlive(pid)).toBe(false);
       expect(readBudgetLedger(budget.file).cost, "descendant can still append its final accounting after parent close").toBeGreaterThan(before.cost);
     }
-  }, 30_000);
+    }, hostedLinux && state === "live" ? 150_000 : 30_000);
+  }
 
   it("cancels queued admissions on close without launching and retains the active stopped prompt", async () => {
     const { manager, root } = setup(false);

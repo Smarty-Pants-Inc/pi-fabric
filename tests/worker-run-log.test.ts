@@ -896,7 +896,11 @@ describe("worker run log", () => {
         } finally { if (fd !== undefined) fs.closeSync(fd); }
       });
 
-      it.each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
+      // GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.
+      // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20555
+      it.skipIf((capability === "Windows EPERM denial" || capability === "Windows EBUSY denial") && (
+        process.env.RUNNER_ENVIRONMENT === "github-hosted" && Date.now() < Date.parse("2026-11-29T00:00:00Z")
+      )).each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
         const directory = fs.mkdtempSync(path.join(os.tmpdir(), "native-replacement-"));
         directories.push(directory);
         const file = path.join(directory, "events.jsonl");

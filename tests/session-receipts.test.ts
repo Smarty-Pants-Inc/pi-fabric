@@ -1,3 +1,4 @@
+import { Hash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -105,13 +106,14 @@ describe("incremental confirmed session receipts", () => {
     expect(snapshot.count).toBe(151); expect(snapshot.entries.size).toBe(1);
   }, 30_000);
 
-  it("reads only an append plus the 64-byte rewrite guard and preserves full-scan indices", () => {
+  it("verifies the full old prefix, reads the append once, and preserves full-scan indices", () => {
     const { file, manager } = fixture(other + receipt("first") + other.repeat(600));
     const before = confirmedSessionEntries(manager, matches);
+    const prefixSize = fs.statSync(file).size;
     const append = other + "{pi-fabric-inbox malformed}\n\n" + receipt("second");
     fs.appendFileSync(file, append);
     const read = vi.spyOn(fs, "readSync"); const next = confirmedSessionEntries(manager, matches);
-    expect(bytesRead(read)).toBe(Buffer.byteLength(append) + 64);
+    expect(bytesRead(read)).toBe(prefixSize + Buffer.byteLength(append));
     expect(next).toEqual(full(file)); expect(Object.keys(next)).toEqual(["1", "605"]);
     expect(before.length).toBe(602); expect(before[605]).toBeUndefined();
     const inbox = confirmedRootInboxSession(manager);
@@ -151,11 +153,72 @@ describe("incremental confirmed session receipts", () => {
     expect(bytesRead(read)).toBe(fs.statSync(file).size);
   });
 
-  it("detects a same-size rewrite by its trailing window, even with restored mtime", () => {
+  it("detects a same-size prefix rewrite, even with restored mtime", () => {
     const { file, manager } = fixture(other + receipt("first")); confirmedSessionEntries(manager, matches);
     const before = fs.statSync(file); fs.writeFileSync(file, other + receipt("other")); fs.utimesSync(file, before.atime, before.mtime);
     const read = vi.spyOn(fs, "readSync"); expect(confirmedSessionEntries(manager, matches)).toEqual(full(file));
-    expect(bytesRead(read)).toBe(64 + before.size);
+    expect(bytesRead(read)).toBe(before.size * 2);
+  });
+
+  it.each(["complete prefix", "partial carry"])("detects an early mutation in a >1 MiB %s with an unchanged tail", (mode) => {
+    // Data-safety regression #20527: the changed receipt id is over two read buffers
+    // away from both the old complete-line tail and the end of any partial carry.
+    const old = JSON.stringify({ type: "custom_message", customType: "pi-fabric-inbox",
+      details: { ids: ["old"] }, content: "x".repeat((1 << 20) * 2 + 7) });
+    const body = mode === "complete prefix" ? old + "\n" + other.repeat(8) : other + old;
+    const { file, manager } = fixture(body);
+    const project = vi.fn((entry: unknown) => (entry as { details: unknown }).details);
+    const before = confirmedSessionReceiptSnapshot(manager, matches, project);
+    const prefixSize = fs.statSync(file).size;
+    const changed = body.replace('"old"', '"new"') + (mode === "partial carry" ? "\n" : "");
+    fs.writeFileSync(file, changed);
+    const read = vi.spyOn(fs, "readSync");
+    const after = confirmedSessionReceiptSnapshot(manager, matches, project);
+    expect(bytesRead(read)).toBe(prefixSize + Buffer.byteLength(changed));
+    expect([...after.entries.values()]).toEqual([{ ids: ["new"] }]);
+    expect(after.count).toBe(full(file).length);
+    expect(after.update!.generation).not.toBe(before.update!.generation);
+    expect(after.update!.from).toBe(0);
+    expect([...after.update!.entries]).toEqual([...after.entries]);
+    expect([...before.entries.values()]).toEqual(mode === "complete prefix" ? [{ ids: ["old"] }] : []);
+    read.mockClear();
+    const update = vi.spyOn(Hash.prototype, "update");
+    const copy = vi.spyOn(Hash.prototype, "copy");
+    const digest = vi.spyOn(Hash.prototype, "digest");
+    expect(confirmedSessionReceiptSnapshot(manager, matches, project)).toBe(after);
+    expect(read).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(copy).not.toHaveBeenCalled();
+    expect(digest).not.toHaveBeenCalled();
+  });
+
+  it("retains generation and projections after metadata-only revalidation, then does no idle reads or hashes", () => {
+    const { file, manager } = fixture();
+    const project = vi.fn((entry: unknown) => (entry as { details: unknown }).details);
+    const before = confirmedSessionReceiptSnapshot(manager, matches, project);
+    const stat = fs.statSync(file);
+    fs.utimesSync(file, stat.atime, new Date(stat.mtimeMs + 10_000));
+    const read = vi.spyOn(fs, "readSync");
+    const after = confirmedSessionReceiptSnapshot(manager, matches, project);
+    expect(bytesRead(read)).toBe(stat.size);
+    expect(after.update!.generation).toBe(before.update!.generation);
+    expect(after.update!.from).toBe(before.count);
+    expect(after.update!.entries.size).toBe(0);
+    expect([...after.entries]).toEqual([...before.entries]);
+    expect(after.entries.get(1)).toBe(before.entries.get(1));
+    expect(project).toHaveBeenCalledTimes(1);
+    read.mockClear();
+    const update = vi.spyOn(Hash.prototype, "update");
+    const copy = vi.spyOn(Hash.prototype, "copy");
+    const digest = vi.spyOn(Hash.prototype, "digest");
+    const sync = vi.spyOn(fs, "fsyncSync");
+    expect(confirmedSessionReceiptSnapshot(manager, matches, project)).toBe(after);
+    expect(read).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(copy).not.toHaveBeenCalled();
+    expect(digest).not.toHaveBeenCalled();
+    expect(sync).toHaveBeenCalled();
+    expect(project).toHaveBeenCalledTimes(1);
   });
 
   it("detects a rewritten prefix followed by an append", () => {

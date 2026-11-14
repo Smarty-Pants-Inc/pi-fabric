@@ -67,7 +67,7 @@ const installLegacyPrimaryExitReceipt = () => {
 // Observe fixture readiness/status and checked exit, rather than sleeping for a
 // fixed startup delay. Nested cold workers can take >5s to publish under CI load.
 const waitFor = async (predicate: () => boolean) => {
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + (process.env.RUNNER_ENVIRONMENT === "github-hosted" ? 150_000 : 30_000);
   while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
   expect(predicate()).toBe(true);
 };

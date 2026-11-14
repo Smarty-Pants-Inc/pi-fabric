@@ -425,7 +425,7 @@ describe("CI runner admission", () => {
     }
     expect(Object.keys(inventory["test.yml"]!.jobs).sort()).toEqual([
       "check-linux", "check-windows", "idle-wakes", "linux-tests", "nats-state-conformance",
-      "windows-acceptance", "windows-gates", "windows-tests",
+      "windows-acceptance", "windows-gates", "windows-nonrequired", "windows-tests",
     ]);
     const test = inventory["test.yml"]!;
     expect(Object.values(test.jobs).filter((job) => ["check (ubuntu-latest)", "check (windows-latest)"].includes(job.name ?? "")
@@ -436,6 +436,45 @@ describe("CI runner admission", () => {
 });
 
 describe("Public Linux packing and required checks", () => {
+  it("runs the exact Windows retainRuns row every run without making its job required", () => {
+    const { jobs } = workflow();
+    const job = jobs["windows-nonrequired"]!;
+    expect(job.name).toBe("Windows residency retainRuns (non-required)");
+    expect(job["runs-on"]).toBe("windows-latest");
+    expect(job.needs).toBe("windows-gates");
+    expect(job.if).toBeUndefined();
+    expect(job.strategy).toBeUndefined();
+    expect(job["continue-on-error"]).toBeUndefined();
+    expect(job.env).toEqual({ FABRIC_TEST_WINDOWS_NONREQUIRED: "1", FABRIC_TEST_SKIP_NATS: "1" });
+    expect(job.steps?.slice(0, 3)).toEqual(jobs["windows-acceptance"]?.steps?.slice(0, 3));
+    expect(job.steps?.find((step) => step.uses === "./.github/actions/check-setup")?.with)
+      .toEqual({ "dist-artifact": "dist-windows-latest" });
+    const execution = job.steps?.find((step) => step.run?.startsWith("bunx vitest run"));
+    expect(execution?.run).toBe("bunx vitest run tests/residency-live-cleanup-move-aside.test.ts --reporter=verbose --reporter=json --outputFile=windows-nonrequired.json");
+    expect(execution?.if).toBeUndefined();
+    const validation = job.steps?.find((step) => step.name === "Require one executed advisory row");
+    expect(validation?.run).toContain("report.numPassedTests !== 1 || report.numFailedTests !== 0");
+    expect(validation?.run).toContain("Expected exactly one executed non-required Windows row");
+    expect(validation?.if).toBeUndefined();
+    expect(validation?.["continue-on-error"]).toBeUndefined();
+    const executionIndex = job.steps?.indexOf(execution!) ?? -1;
+    const validationIndex = job.steps?.indexOf(validation!) ?? -1;
+    const report = job.steps?.find((step) => step.uses?.startsWith("actions/upload-artifact@"));
+    const reportIndex = job.steps?.indexOf(report!) ?? -1;
+    expect(validationIndex).toBe(executionIndex + 1);
+    expect(reportIndex).toBe(validationIndex + 1);
+    expect(job.steps?.every((step) => step["continue-on-error"] === undefined)).toBe(true);
+    expect(job.steps?.some((step) => step.run?.includes("test:affected"))).toBe(false);
+    expect(report?.if).toBe("always()");
+    expect(report?.with).toEqual({
+      name: "windows-nonrequired-${{ github.sha }}", path: "windows-nonrequired.json",
+      "if-no-files-found": "error", "retention-days": 7,
+    });
+    for (const id of ["check-linux", "check-windows"]) {
+      expect(jobs[id]?.needs).not.toContain("windows-nonrequired");
+    }
+  });
+
   it.each([["linux", "ubuntu-latest"], ["windows", "windows-latest"]])("preserves every %s selected test and required aggregate context", (platform, os) => {
     const { jobs } = workflow();
     const tests = jobs[`${platform}-tests`] as Job;

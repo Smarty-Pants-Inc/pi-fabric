@@ -4,6 +4,7 @@ type UserConfig = import("vitest/config").ViteUserConfig;
 // before cacheDir can take effect. Keep this entry .cts so plain `vitest run` is read-only-install safe.
 const { join } = require("node:path") as typeof import("node:path");
 const { hostedOnly } = require("./scripts/hosted-only.mjs") as typeof import("./scripts/hosted-only.mjs");
+const { windowsNonrequiredPattern } = require("./scripts/windows-nonrequired.mjs") as typeof import("./scripts/windows-nonrequired.mjs");
 const { isolatedTestTemp, isolateTestFleetEnvironment } = require("./scripts/test-temp.ts") as typeof import("./scripts/test-temp.js");
 
 // Assign the caller-owned run root before Vitest snapshots its environment, forks workers,
@@ -73,8 +74,11 @@ const policyConstants = (name: string) => ({
   __FABRIC_HOST_POLICY_PATH__: JSON.stringify(join(temp.TMPDIR, `host-policy-${name}`, "fabric-policy.json")),
 });
 
+const selectedWindowsPattern = windowsNonrequiredPattern(process.platform, process.env, Date.now());
+
 const sharedTests = {
   environment: "node",
+  ...(selectedWindowsPattern === undefined ? {} : { testNamePattern: selectedWindowsPattern }),
   env: { ...temp, ...fleet },
   setupFiles: ["./tests/fleet-isolation-setup.ts"],
   include: ["tests/**/*.test.ts"],

@@ -403,6 +403,34 @@ jobs:
       # Preserve the Windows smoke floor too; the old matrix ran it on both OSes.
       - name: Platform smoke floor
         run: bun run test:smoke
+  windows-nonrequired:
+    # Temporary required-test exception; keep real failures visible in this independent job.
+    # https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20553
+    # https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20555
+    name: Windows residency retainRuns (non-required)
+    needs: windows-gates
+    runs-on: windows-latest
+    env:
+      FABRIC_TEST_WINDOWS_NONREQUIRED: '1'
+      FABRIC_TEST_SKIP_NATS: '1'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/check-setup
+        with:
+          dist-artifact: dist-windows-latest
+      - name: Run exact retainRuns row independently of affected selection
+        run: bunx vitest run tests/residency-live-cleanup-move-aside.test.ts --reporter=verbose --reporter=json --outputFile=windows-nonrequired.json
+      - name: Require one executed advisory row
+        run: node -e "const report = JSON.parse(require('node:fs').readFileSync('windows-nonrequired.json', 'utf8')); if (report.numPassedTests !== 1 || report.numFailedTests !== 0) throw Error('Expected exactly one executed non-required Windows row')"
+      - name: Upload non-required Windows test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-nonrequired-${{ github.sha }}
+          path: windows-nonrequired.json
+          if-no-files-found: error
+          retention-days: 7
   check-linux:
     name: check (ubuntu-latest)
     if: always()

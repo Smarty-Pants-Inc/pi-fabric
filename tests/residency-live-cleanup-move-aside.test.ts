@@ -20,6 +20,7 @@ import * as cloneFirst from "../src/agents/clone-first-worktree.js";
 import { RUN_IDENTITY_FILE } from "../src/agents/run-identity.js";
 import { preserveCancellationOutcome } from "../src/async-settlement.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { createNativeCleanupAttempt, withTestOnlyAclReadback, type NativeCleanupAttempt } from "./helpers/native-cleanup-diagnostics.js";
 
 const { observed, namespaces } = vi.hoisted(() => ({ observed: new Set<string>(), namespaces: new Map<string, Set<string>>() }));
 vi.mock("../src/core/atomic-write.js", async importOriginal => {
@@ -33,6 +34,22 @@ vi.mock("../src/core/atomic-write.js", async importOriginal => {
       "source" in value && typeof value.source === "string" && "id" in value && typeof value.id === "string" &&
       [...namespaces].some(([root, ids]) => (value.source as string).startsWith(root + path.sep) || ids.has(value.id as string))) observed.add(file);
     return result;
+  } };
+});
+vi.mock("../src/agents/worktree-manager.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/agents/worktree-manager.js")>();
+  const diagnostics = await import("./helpers/native-cleanup-diagnostics.js");
+  // Retain the real implementation; this wrapper only captures run-bound phase context.
+  class DiagnosticWorktreeManager extends actual.WorktreeManager {
+    override cleanup(id: string, deleteBranch = false): Promise<boolean> {
+      return diagnostics.withProductCleanupProtection(id, "worktree", () => super.cleanup(id, deleteBranch));
+    }
+  }
+  return { ...actual, WorktreeManager: DiagnosticWorktreeManager, retainCleanupRoot: (...args: Parameters<typeof actual.retainCleanupRoot>) => {
+    const [, , id, reason] = args;
+    const phase = reason === "resident cleanup saved result" ? "saved-result"
+      : reason === "resident cleanup agent metadata" ? "metadata" : "worktree";
+    return diagnostics.withProductCleanupProtection(id, phase, () => actual.retainCleanupRoot(...args));
   } };
 });
 beforeEach(() => installInProcessResidentFence());
@@ -96,7 +113,10 @@ const held = (root: string, source: string, id: string): Move => {
   else {
     // Independent native ACL readback: Unix mode bits cannot establish Windows privacy.
     const probe = aclProbeCommand(container);
-    const acl = JSON.parse(execFileSync(probe.file, probe.args, { encoding: "utf8", env: probe.env }));
+    const readbackPhase = path.basename(path.dirname(source)) === "results" ? "saved-result"
+      : path.basename(path.dirname(source)) === "agents" ? "metadata" : "worktree";
+    const acl = JSON.parse(withTestOnlyAclReadback(id, readbackPhase,
+      () => execFileSync(probe.file, probe.args, { encoding: "utf8", env: probe.env })));
     expect(acl.protected).toBe(true); expect(acl.owner).toBe(acl.current);
     expect(acl.rules.length).toBeGreaterThan(0);
     for (const rule of acl.rules) { expect([acl.current, "S-1-5-18", "S-1-5-32-544"]).toContain(rule.sid); expect(rule.allow).toBe("Allow"); expect(rule.inherited).toBe(false); }
@@ -171,7 +191,7 @@ const fixture = async (retainRuns = false, commandTimeoutMs = 5_000) => {
     return { id: handle.id, run, temporary, externalTemporary, metadata, result, worktree: handle.worktree };
   };
   const noGitDelete = () => expect(gitCalls.filter(args => args[0] === "worktree" && args[1] === "remove" || args[0] === "branch" || args.includes("prune"))).toEqual([]);
-  const dispose = async () => {
+  const dispose = async (diagnostics?: NativeCleanupAttempt) => {
     // Stage inside the launcher's owned TMPDIR before host/wrapper teardown.
     // The outer runner copies and independently hashes this stage before cleanup;
     // these copies do not establish inode custody (the test assertions do).
@@ -207,7 +227,12 @@ const fixture = async (retainRuns = false, commandTimeoutMs = 5_000) => {
         }
         fs.writeFileSync(path.join(evidence, `${path.basename(root)}-export.json`), JSON.stringify({ exports, method: "pre-teardown staging copy; SHA256 source stability and independent destination readback; no inode claim" }));
       }
-    } finally { await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks(); }
+    } finally {
+      if (diagnostics) await diagnostics.measure("dispose.client.close", () => client.close()); else await client.close();
+      if (diagnostics) await diagnostics.measure("dispose.host.close", () => host.close()); else await host.close();
+      if (diagnostics) await diagnostics.measure("dispose.participants.close", () => participants.close()); else await participants.close();
+      vi.restoreAllMocks();
+    }
     console.log(`retained live cleanup fixture: ${root}`);
   };
   return { root, config, host, client, provider, context, launch, dispose, noGitDelete, consumed, failSetup: () => { rejectSetup = true; } };
@@ -306,18 +331,39 @@ describe("live cleanup move-aside custody", () => {
     } finally { for (const fd of fds) fs.closeSync(fd); await f.dispose(); }
   });
 
+  // The fixture's 5s command timeout is test-only: production defaults to 30s (src/residency/client.ts:103,1060),
+  // and the sole production construction supplies no override (src/fabric-runtime-state.ts:1681-1724).
+  // Match the Windows 90s/120s envelope of the metadata EXDEV row below.
   it("retainRuns leaves run and TMPDIR untouched but LIVE host still retains metadata and saved result", async () => {
-    const f = await fixture(true);
+    const f = await fixture(true, process.platform === "win32" ? 90_000 : 5_000);
+    let diagnostics: NativeCleanupAttempt | undefined;
     try {
       const run = await f.launch();
+      if (process.platform === "win32") diagnostics = createNativeCleanupAttempt({ fixture: path.basename(f.root), runId: run.id });
       const metadata = fs.readFileSync(run.metadata), result = fs.readFileSync(run.result);
-      await expect(f.provider.invoke("cleanup", { id: run.id }, f.context)).resolves.toEqual({ cleaned: true });
+      const cleanupPhase = diagnostics?.beginPhase("provider-cleanup");
+      try {
+        await expect(f.provider.invoke("cleanup", { id: run.id }, f.context)).resolves.toEqual({ cleaned: true });
+        if (cleanupPhase) diagnostics?.endPhase(cleanupPhase, "ok");
+      } catch (error) {
+        if (cleanupPhase) diagnostics?.endPhase(cleanupPhase, "error");
+        throw error;
+      }
       const metaHeld = held(f.root, run.metadata, run.id), resultHeld = held(f.root, run.result, run.id);
       expect(fs.readFileSync(metaHeld.destination)).toEqual(metadata); expect(fs.readFileSync(resultHeld.destination)).toEqual(result);
       verify(held(f.root, run.worktree!, run.id).destination);
       verify(run.run); verify(run.temporary); expect(receipts(f.root)).toHaveLength(3); f.noGitDelete();
-    } finally { await f.dispose(); }
-  });
+    } finally {
+      const disposePhase = diagnostics?.beginPhase("dispose.total");
+      try {
+        await f.dispose(diagnostics);
+        if (disposePhase) diagnostics?.endPhase(disposePhase, "ok");
+      } catch (error) {
+        if (disposePhase) diagnostics?.endPhase(disposePhase, "error");
+        throw error;
+      } finally { diagnostics?.close(); }
+    }
+  }, process.platform === "win32" ? 120_000 : undefined);
 
   // Windows cleanup can time out after participant-withdrawal lock contention (smarty-dev#19142).
   it.skipIf(process.platform === "win32")("replacement canonical occupants survive every successful root move", async () => {

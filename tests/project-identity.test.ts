@@ -143,7 +143,8 @@ describe("project identity", () => {
     fs.mkdirSync(path.join(lane, ".local"));
     fs.mkdirSync(path.join(lane, "sub"));
     fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
-    expect(recordedProjectLead(path.join(lane, "sub"), {})).toBe("session:11111111-1111-4111-8111-111111111111");
+    expect(recordedProjectLead(path.join(lane, "sub"), {}, lane)).toBe("session:11111111-1111-4111-8111-111111111111");
+    expect(recordedProjectLead(path.join(lane, "sub"), {})).toBeUndefined(); // no implicit enclosing-lane authority
     expect(recordedProjectLead(lane, { SMARTY_LEAD_SESSION: "session:22222222-2222-4222-8222-222222222222" }))
       .toBe("session:22222222-2222-4222-8222-222222222222");
   });
@@ -206,6 +207,27 @@ describe("project identity", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(recordedProjectLead(lane, {})).toBeUndefined();
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["file", "directory", "unversioned"])("bounds %s lane metadata to the actual lane, never an outer marker", layout => {
+    const outer = markerLane();
+    const lane = path.join(outer, "lane");
+    fs.mkdirSync(lane);
+    fs.writeFileSync(path.join(outer, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111");
+    fs.mkdirSync(path.join(outer, ".git"));
+    if (layout === "file") fs.writeFileSync(path.join(lane, ".git"), "gitdir: ../.git/worktrees/lane\n");
+    if (layout === "directory") fs.mkdirSync(path.join(lane, ".git"));
+    expect(recordedProjectLead(lane, {})).toBeUndefined();
+  });
+
+  it.each(["file", "directory"])("an explicit lane boundary still cannot cross a nested .git %s", layout => {
+    const outer = markerLane(), inner = path.join(outer, "inner"), sub = path.join(inner, "sub");
+    fs.mkdirSync(sub, { recursive: true });
+    fs.writeFileSync(path.join(outer, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111");
+    if (layout === "file") fs.writeFileSync(path.join(inner, ".git"), "gitdir: ../.git/worktrees/inner\n");
+    else fs.mkdirSync(path.join(inner, ".git"));
+    expect(recordedProjectLead(sub, {}, outer)).toBeUndefined();
+    expect(recordedProjectLead(outer, {}, inner)).toBeUndefined(); // never begin outside the known lane
   });
 
   it("#201 bounds marker reads even when a large file begins with a valid id", () => {
@@ -330,13 +352,15 @@ describe("project identity", () => {
       root("session:worktree", { role: "worktree-agent", project: P("/p/smarty-dev"), cwd: P("/p/smarty-dev/worktrees/x") }),
     ];
     expect(resolveProjectAgent(live, P("/p/smarty-dev"), { leadId: "session:dev-lead" }).id).toBe("session:dev-lead");
-    expect(resolveProjectAgent(live, P("/p/knowledge")).id).toBe("session:knowledge");
+    expect(() => resolveProjectAgent(live, P("/p/knowledge")))
+      .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
   });
 
-  it("resolves a moved lane by repository identity, not the lead's local path", () => {
+  it("never elects a moved lane's lead by repository identity without an actual binding", () => {
     const repository = "github.com/smarty-pants-inc/pi-fabric";
-    const lead = { ...root("session:lead", { role: "project-agent", project: P("/lead/checkout") }), repository };
-    expect(resolveProjectAgent([lead], P("/moved/lane"), { repository }).id).toBe(lead.id);
+    const lead = { ...root("session:fork-lead", { role: "project-agent", project: P("/lead/checkout") }), repository };
+    expect(() => resolveProjectAgent([lead], P("/moved/lane"), { repository }))
+      .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
   });
 
   it("uses the recorded launch lead id to resolve ambiguous same-origin roots, including its bridge mirror", () => {
@@ -346,10 +370,10 @@ describe("project identity", () => {
     expect(resolveProjectAgent([other, lead], P("/moved/lane"), { repository, leadId: lead.id }).id).toBe(lead.id);
   });
 
-  it("fails by name on ambiguous project agents instead of selecting the newest", () => {
+  it("fails unresolved without a binding even when several eligible project agents are live", () => {
     const all = [root("session:a", { role: "project-agent", project: P("/p/repo") }),
       root("session:b", { role: "project-agent", project: P("/p/repo"), startedAt: 2 })];
-    expect(() => resolveProjectAgent(all, P("/p/repo"))).toThrow(expect.objectContaining({ name: "FabricProjectAgentAmbiguousError" }));
+    expect(() => resolveProjectAgent(all, P("/p/repo"))).toThrow(expect.objectContaining({ name: "FabricProjectAgentUnresolvedError", code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
   });
 
   describe("#3662 resident actor delivery", () => {
@@ -403,10 +427,9 @@ describe("project identity", () => {
     });
   });
 
-  it("falls back to a root without a role whose cwd is the project checkout, and explains a miss", () => {
+  it("never falls back to a legacy untagged checkout root", () => {
     const older = [root("session:dev-lead", { cwd: P("/p/smarty-dev") }), root("session:worktree", { role: "worktree-agent", project: P("/p/smarty-dev") })];
-    expect(resolveProjectAgent(older, P("/p/smarty-dev")).id).toBe("session:dev-lead");
-    expect(() => resolveProjectAgent([root("session:worktree", { role: "worktree-agent", project: P("/p/smarty-dev") })], P("/p/smarty-dev")))
-      .toThrow(`No live project agent for ${P("/p/smarty-dev")}. Live roots in this project: session:worktree (worktree-agent).`);
+    expect(() => resolveProjectAgent(older, P("/p/smarty-dev")))
+      .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
   });
 });

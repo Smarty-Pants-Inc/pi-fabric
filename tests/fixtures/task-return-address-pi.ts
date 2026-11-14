@@ -50,10 +50,16 @@ input.on("line", async line => {
     control.start(() => ({ accepted: false }));
     outcome.main = await provider.invoke("main", {}, context);
     outcome.spawner = await provider.invoke("spawner", {}, context);
+    const projectAgent = async () => {
+      try { return { ok: true, value: await provider.invoke("projectAgent", {}, context) }; }
+      catch (error) { return { ok: false, name: (error as Error).name, code: (error as any).code }; }
+    };
+    outcome.projectAgent = await projectAgent();
     // The runtime must retain its binding even if ambient env changes after startup.
     process.env.PI_FABRIC_SPAWNER_ID = "session:wrong-after-startup";
     process.env.PI_FABRIC_TASK_ESCALATION_TARGETS = '["session:wrong-after-startup"]';
     outcome.mainAgain = await provider.invoke("main", {}, context);
+    outcome.projectAgentAgain = await projectAgent();
     for (const target of request.targets) {
       try {
         const value = await provider.invoke(target.action, { id: target.id, message: target.message }, context);

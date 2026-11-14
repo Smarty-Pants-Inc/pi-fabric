@@ -115,6 +115,21 @@ describe("spawn-bound task return address through real process transport (#2950)
     expect(f.delivered.every(send => send.from === id)).toBe(true);
   }, 25_000);
 
+  // Keep reason: recorded runners-lead/fork-lead misdelivery. This crosses the actual
+  // process transport -> worker env -> production router snapshot -> public provider.
+  it("projectAgent uses the real worker's immediate Main, not a misleading lane marker or second eligible root", async () => {
+    const f = await fixture();
+    fs.mkdirSync(path.join(f.root, ".local"));
+    fs.writeFileSync(path.join(f.root, ".local", "lead"), `${KATE}\n`);
+    const { report } = await f.spawn([]);
+    expect(report.spawner).toEqual({ id: SPAWNER, kind: "main" });
+    expect(report.main).toMatchObject({ id: SPAWNER, sessionId: SPAWNER.slice(8) });
+    expect(report.projectAgent).toMatchObject({ ok: true, value: { id: SPAWNER } });
+    expect(report.projectAgentAgain).toMatchObject({ ok: true, value: { id: SPAWNER } });
+    expect(f.requester.directory.sessions().some(root => root.id === KATE)).toBe(true);
+    expect(f.delivered).toHaveLength(0);
+  }, 25_000);
+
   it("does not let bare session UUID aliases bypass the Main guard", async () => {
     vi.stubEnv("PI_FABRIC_TASK_ESCALATION_TARGETS", JSON.stringify([ORG]));
     const f = await fixture();
@@ -144,6 +159,8 @@ describe("spawn-bound task return address through real process transport (#2950)
   it("binds nested tasks to their immediate spawner; keeps ancestor and sibling sends unchanged", async () => {
     const f = await fixture();
     const parent = "d".repeat(32), sibling = "e".repeat(32);
+    fs.mkdirSync(path.join(f.root, ".local"));
+    fs.writeFileSync(path.join(f.root, ".local", "lead"), `${KATE}\n`);
     await f.receiver(parent, "agent"); await f.receiver(sibling, "agent");
     vi.stubEnv("PI_FABRIC_PARENT_RUN", parent);
     vi.stubEnv("PI_FABRIC_TASK_PROCESS_CHILD", "1");
@@ -153,6 +170,8 @@ describe("spawn-bound task return address through real process transport (#2950)
       { identityId: parent, spawnerSessionId: "parent-native-session" });
     expect(report.main).toMatchObject({ id: parent, sessionId: "parent-native-session" });
     expect(report.mainAgain.id).toBe(parent);
+    expect(report.projectAgent).toMatchObject({ ok: false, code: "FABRIC_PROJECT_AGENT_UNRESOLVED" });
+    expect(report.projectAgentAgain).toMatchObject({ ok: false, code: "FABRIC_PROJECT_AGENT_UNRESOLVED" });
     expect(report.sends.every((send: any) => send.ok), JSON.stringify(report.sends)).toBe(true);
     expect(f.delivered.filter(send => send.id === parent)).toHaveLength(3);
     expect(f.delivered.filter(send => send.id === SPAWNER)).toHaveLength(3);
@@ -162,12 +181,15 @@ describe("spawn-bound task return address through real process transport (#2950)
   it("does not mistake an actor-spawned task for a durable actor", async () => {
     const f = await fixture();
     const parent = "f".repeat(32);
+    fs.mkdirSync(path.join(f.root, ".local"));
+    fs.writeFileSync(path.join(f.root, ".local", "lead"), `${KATE}\n`);
     vi.stubEnv("PI_FABRIC_ACTOR_ID", parent); vi.stubEnv("PI_FABRIC_ACTOR_NAME", "parent-actor");
     const { report } = await f.spawn(targets(KATE, "actor-child-P0"), { identityId: parent });
     expect(report.env.actorId).toBeUndefined();
     expect(report.env.actorName).toBeUndefined(); // Main #2643 isolates task identity from its actor parent.
     expect(report.spawner).toMatchObject({ id: parent, kind: "actor" });
     expect(report.main.id).toBe(parent);
+    expect(report.projectAgent).toMatchObject({ ok: false, code: "FABRIC_PROJECT_AGENT_UNRESOLVED" });
     for (const send of report.sends) {
       expect(send.ok).toBe(false);
       expect(send.code).toBe("FABRIC_TASK_ESCALATION_TARGET_DENIED");

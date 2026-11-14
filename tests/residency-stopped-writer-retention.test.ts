@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, expect, it, vi } from "vitest";
+import { setTimeout as delay } from "node:timers/promises";
+import { beforeEach, expect, it, vi, type TestContext } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -66,13 +67,26 @@ const installLegacyPrimaryExitReceipt = () => {
 
 // Observe fixture readiness/status and checked exit, rather than sleeping for a
 // fixed startup delay. Nested cold workers can take >5s to publish under CI load.
-const waitFor = async (predicate: () => boolean) => {
+const waitForAttempt = (signal: AbortSignal) => async (predicate: () => boolean) => {
+  signal.throwIfAborted();
   const deadline = Date.now() + 30_000;
-  while (!predicate() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  while (!predicate() && Date.now() < deadline) await delay(10, undefined, { signal });
+  signal.throwIfAborted();
   expect(predicate()).toBe(true);
 };
 
-it.each(["project", "session"] as const)("public actor stop retains its live writer's creation commitment and reconciliation IDs until checked writer exit, then collects once (%s scope)", async scope => {
+// Vitest rejects a timed-out callback before its asynchronous finally completes,
+// but awaits onTestFinished before retrying. Bound the cleanup join like the
+// test itself; do not let a still-closing host use a retry's prototype spies.
+const observeCleanup = (onTestFinished: TestContext["onTestFinished"], timeout: number) => {
+  let finishCleanup!: () => void;
+  const finished = new Promise<void>(resolve => { finishCleanup = resolve; });
+  onTestFinished(() => finished, timeout);
+  return finishCleanup;
+};
+
+it.for(["project", "session"] as const)("public actor stop retains its live writer's creation commitment and reconciliation IDs until checked writer exit, then collects once (%s scope)", { timeout: 90_000 }, async (scope, { signal, onTestFinished }) => {
+  const waitFor = waitForAttempt(signal);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stopped-writer-retention-"));
   const rootId = "session:stopped-writer-retention";
   const meshRoot = path.join(root, "mesh");
@@ -98,6 +112,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
   });
   let due: ReturnType<typeof vi.spyOn> | undefined;
   const remove = vi.spyOn(fs, "rmSync");
+  const finishCleanup = observeCleanup(onTestFinished, 90_000);
   try {
     await participants.start();
     await host.start();
@@ -193,24 +208,27 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
     expect(create).toHaveBeenCalledTimes(1);
   } finally {
-    due?.mockRestore(); sweep.mockRestore(); remove.mockRestore();
-    // Every run belongs to this isolated fixture. Join them even if setup failed
-    // before the original writer ID was observed; actor close alone can await a detached run.
-    for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
-    await control?.close(); await client?.close(); await host.close(); await participants.close();
-    vi.restoreAllMocks();
-    fs.rmSync(root, { recursive: true, force: true });
+    try {
+      // Never restore a retry's spies after this attempt has been cancelled.
+      if (!signal.aborted) { due?.mockRestore(); sweep.mockRestore(); remove.mockRestore(); vi.restoreAllMocks(); }
+      // Every run belongs to this isolated fixture. Join them even if setup failed
+      // before the original writer ID was observed; actor close alone can await a detached run.
+      for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
+      await control?.close(); await client?.close(); await host.close(); await participants.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    } finally { finishCleanup(); }
   }
-}, 90_000);
+});
 
 // POSIX-only: the fixture's nested writer must outlive its crashed primary, which
 // relies on POSIX detached process groups. Windows durable residency is unsupported
 // (src/residency/host.ts, docs/residency-runtime.md), and there the nested child does
 // not survive the primary's exit, so this descendant-tracking claim is not made.
-it.skipIf(process.platform === "win32").each([
+it.skipIf(process.platform === "win32").for([
   ["project", false, "known"], ["session", false, "known"], ["project", true, "known"], ["session", true, "known"],
   ["project", true, "unknown"], ["session", true, "unknown"],
-] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", async (scope, restart, descendant) => {
+] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", { timeout: 120_000 }, async ([scope, restart, descendant], { signal, onTestFinished }) => {
+  const waitFor = waitForAttempt(signal);
   if (restart) installLegacyPrimaryExitReceipt();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nested-writer-retention-"));
   const rootId = "session:nested-writer-retention";
@@ -239,6 +257,22 @@ it.skipIf(process.platform === "win32").each([
   });
   let due: ReturnType<typeof vi.spyOn> | undefined;
   const remove = vi.spyOn(fs, "rmSync");
+  const finishCleanup = observeCleanup(onTestFinished, 120_000);
+  const withCompletedOwnershipProof = (assertOwnership: () => void) => {
+    // This one-writer fixture fits the real 64-step bound. Remove only elapsed
+    // scheduling pressure, not native exit/identity checks or tree-size limits.
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      if (host.agents.retentionReferences({ refresh: true, budgetMs: 5 }).has("*")) {
+        throw new Error("Fresh retention ownership proof did not complete");
+      }
+      assertOwnership();
+      // The callback can itself refresh: wildcard protection is not completion.
+      if (host.agents.retentionReferences().has("*")) {
+        throw new Error("Retention ownership assertion left an incomplete proof");
+      }
+    } finally { clock.mockRestore(); } // Synchronous only; restore before any await.
+  };
   try {
     await participants.start();
     await host.start();
@@ -294,8 +328,10 @@ it.skipIf(process.platform === "win32").each([
     expect(fs.existsSync(decisionPath)).toBe(true);
     expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
     expect(JSON.parse(fs.readFileSync(ackPath, "utf8"))).toEqual(ack);
-    expect(host.agents.retentionReferences().has(writer.id)).toBe(true);
-    expect(host.agents.retentionReferences().has(actor.id)).toBe(true);
+    withCompletedOwnershipProof(() => {
+      expect(host.agents.retentionReferences().has(writer.id)).toBe(true);
+      expect(host.agents.retentionReferences().has(actor.id)).toBe(true);
+    });
     const cancelled = new AbortController();
     registerResidentCancellation(cancelled.signal, config.residencyRoot, command);
     cancelled.abort();
@@ -342,7 +378,9 @@ it.skipIf(process.platform === "win32").each([
       due.mockReturnValue(true);
       await waitFor(() => scans > before);
       due.mockReturnValue(false);
-      expect(host.agents.retentionReferences().has(actor.id)).toBe(true);
+      withCompletedOwnershipProof(() => {
+        expect(host.agents.retentionReferences().has(actor.id)).toBe(true);
+      });
       expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
       expect(JSON.parse(fs.readFileSync(ackPath, "utf8"))).toEqual(ack);
       const late = new AbortController();
@@ -362,11 +400,20 @@ it.skipIf(process.platform === "win32").each([
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ status: "completed", turns: 5 });
     // Explicitly finish a fresh offline proof; idle snapshots may conservatively
     // retain an exited descendant until the next 60-second refresh.
-    expect(host.agents.retentionReferences({ refresh: true, budgetMs: 5 }).has(actor.id)).toBe(false);
+    withCompletedOwnershipProof(() => {
+      expect(host.agents.retentionReferences({ refresh: true, budgetMs: 5 }).has(actor.id)).toBe(false);
+    });
     const before = scans;
     scanTime = (scanTime ?? 0) + 60_001;
     due.mockReturnValue(true);
-    await waitFor(() => scans > before && !fs.existsSync(decisionPath));
+    let attempted = before;
+    await waitFor(() => {
+      if (scans <= before) return false;
+      if (!fs.existsSync(decisionPath)) return true;
+      // Like the public-stop case, retry a veto past the internal sample fence.
+      if (scans > attempted) { attempted = scans; scanTime = (scanTime ?? 0) + 60_001; }
+      return false;
+    });
     due.mockReturnValue(false);
     expect(fs.existsSync(ackPath)).toBe(false);
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
@@ -378,24 +425,34 @@ it.skipIf(process.platform === "win32").each([
     expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(1);
     expect(create).toHaveBeenCalledTimes(1);
   } finally {
-    due?.mockRestore(); sweep.mockRestore(); remove.mockRestore();
-    // Gates concern only these fixture processes. Join the child before closing
-    // the host, including failures before the test observed its identity.
-    fs.writeFileSync(release, "cleanup nested");
-    fs.writeFileSync(crash, "cleanup primary");
-    for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
-    if (fs.existsSync(observation)) {
-      const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
-      await waitFor(() => !processAlive(child.pid));
-    }
-    await control?.close(); await client?.close(); await host.close(); await participants.close();
-    vi.restoreAllMocks();
-    fs.rmSync(root, { recursive: true, force: true });
+    try {
+      // Restore before any asynchronous cleanup, and never after cancellation.
+      if (!signal.aborted) { due?.mockRestore(); sweep.mockRestore(); remove.mockRestore(); vi.restoreAllMocks(); }
+      // Gates concern only these fixture processes. Join the child before closing
+      // the host, including failures before the test observed its identity.
+      fs.writeFileSync(release, "cleanup nested");
+      fs.writeFileSync(crash, "cleanup primary");
+      // Teardown gets one independent bound even when the test signal is aborted.
+      const waitForCleanup = waitForAttempt(AbortSignal.timeout(30_000));
+      try {
+        for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id);
+        if (fs.existsSync(observation)) {
+          const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
+          await waitForCleanup(() => !processAlive(child.pid));
+        }
+      } finally {
+        // A failed cleanup wait must not bypass resource closure. Keep removal
+        // below this block so an unconfirmed child exit still preserves its tree.
+        await control?.close(); await client?.close(); await host.close(); await participants.close();
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    } finally { finishCleanup(); }
   }
 // Allow both nested workers to start, then exercise crash/recovery and join cleanup.
-}, 120_000);
+});
 
-it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)("public recovered durable cleanup retains a real live descendant through the client fallback (%s owner)", async owner => {
+it.skipIf(process.platform === "win32").for(["closed", "replacement"] as const)("public recovered durable cleanup retains a real live descendant through the client fallback (%s owner)", { timeout: 120_000 }, async (owner, { signal, onTestFinished }) => {
+  const waitFor = waitForAttempt(signal);
   installLegacyPrimaryExitReceipt();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-durable-descendant-cleanup-"));
   const rootId = "session:durable-descendant-cleanup";
@@ -417,6 +474,7 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
   let host = new ResidentHost(config);
   const participants = mainParticipants(config);
   let client: ResidencyClient | undefined;
+  const finishCleanup = observeCleanup(onTestFinished, 120_000);
   try {
     await participants.start();
     await host.start();
@@ -473,18 +531,25 @@ it.skipIf(process.platform === "win32").each(["closed", "replacement"] as const)
       expect(() => host.agents.status(handle.id)).toThrow(/no saved terminal result/);
     }
   } finally {
-    fs.writeFileSync(release, "cleanup nested"); fs.writeFileSync(crash, "cleanup primary");
-    for (const run of host.agents?.listForUi() ?? []) {
-      if (!host.agents.isSettled(run.id)) await host.agents.stop(run.id);
-    }
-    if (fs.existsSync(observation)) {
-      const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
-      await waitFor(() => !processAlive(child.pid));
-    }
-    await client?.close(); await host.close(); await participants.close(); vi.restoreAllMocks();
-    fs.rmSync(root, { recursive: true, force: true });
+    try {
+      if (!signal.aborted) vi.restoreAllMocks();
+      fs.writeFileSync(release, "cleanup nested"); fs.writeFileSync(crash, "cleanup primary");
+      const waitForCleanup = waitForAttempt(AbortSignal.timeout(30_000));
+      try {
+        for (const run of host.agents?.listForUi() ?? []) {
+          if (!host.agents.isSettled(run.id)) await host.agents.stop(run.id);
+        }
+        if (fs.existsSync(observation)) {
+          const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { pid: number };
+          await waitForCleanup(() => !processAlive(child.pid));
+        }
+      } finally {
+        await client?.close(); await host.close(); await participants.close();
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    } finally { finishCleanup(); }
   }
-}, 120_000);
+});
 
 it("retention ownership uses checked orphan exit evidence, not terminal status, and fails closed on unknown trees", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-orphan-writer-retention-"));

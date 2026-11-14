@@ -1,0 +1,343 @@
+[
+  {
+    "name": "ROOT_ryzen1",
+    "subjects": [
+      "fabric.root.ryzen1.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_ryzen1",
+    "subjects": [
+      "$KV.STATE_ryzen1.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_ryzen2",
+    "subjects": [
+      "fabric.root.ryzen2.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_ryzen2",
+    "subjects": [
+      "$KV.STATE_ryzen2.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_ryzen3",
+    "subjects": [
+      "fabric.root.ryzen3.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_ryzen3",
+    "subjects": [
+      "$KV.STATE_ryzen3.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_ryzen4",
+    "subjects": [
+      "fabric.root.ryzen4.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_ryzen4",
+    "subjects": [
+      "$KV.STATE_ryzen4.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_ryzen5",
+    "subjects": [
+      "fabric.root.ryzen5.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_ryzen5",
+    "subjects": [
+      "$KV.STATE_ryzen5.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_epyc1",
+    "subjects": [
+      "fabric.root.epyc1.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_epyc1",
+    "subjects": [
+      "$KV.STATE_epyc1.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_m4",
+    "subjects": [
+      "fabric.root.m4.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_m4",
+    "subjects": [
+      "$KV.STATE_m4.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_i9",
+    "subjects": [
+      "fabric.root.i9.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_i9",
+    "subjects": [
+      "$KV.STATE_i9.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "ROOT_m5",
+    "subjects": [
+      "fabric.root.m5.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 268435456,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 100000,
+    "max_consumers": 16,
+    "discard": "new",
+    "duplicate_window": 120000000000,
+    "allow_direct": false
+  },
+  {
+    "name": "KV_STATE_m5",
+    "subjects": [
+      "$KV.STATE_m5.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 134217728,
+    "max_msg_size": 262144,
+    "max_msgs_per_subject": 10,
+    "max_msgs": -1,
+    "max_age": 0,
+    "max_consumers": 16,
+    "discard": "new",
+    "allow_rollup_hdrs": true,
+    "deny_delete": true,
+    "allow_direct": false
+  },
+  {
+    "name": "FLEET",
+    "subjects": [
+      "fabric.fleet.>",
+      "fabric.hub.delivery.>"
+    ],
+    "retention": "limits",
+    "storage": "file",
+    "num_replicas": 3,
+    "max_bytes": 1073741824,
+    "max_msg_size": 262144,
+    "max_age": 604800000000000,
+    "max_msgs": 500000,
+    "max_consumers": 64,
+    "discard": "new",
+    "duplicate_window": 120000000000
+  }
+]

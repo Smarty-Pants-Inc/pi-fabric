@@ -1,0 +1,12 @@
+# Hostd CHILD SPEC only; never install/enable independently; no [Install].
+# Admission owner must stage this relative path in the reviewed factory release.
+# Select exactly one of nats-core or nats-leaf per host, never both on port 4222.
+[Unit]
+Description=Fabric NATS R3 core (Ryzen 1 remains control-plane owner)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/smarty-dev/nats/current/nats-server -c %h/.config/smarty/nats/server.conf
+Restart=always
+RestartSec=5
+TimeoutStopSec=40

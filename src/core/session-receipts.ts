@@ -87,9 +87,12 @@ const identityReceipt: ReceiptProjector = (entry) => entry;
 export interface SessionReceiptSnapshot {
   count: number;
   entries: ReadonlyMap<number, unknown>;
+  /** Opaque confirmed-prefix identity and this snapshot's delta. Absent on legacy hosts. */
+  update?: { generation: object; from: number; entries: ReadonlyMap<number, unknown> };
 }
 interface ReceiptCache extends SessionReceiptSnapshot {
   file: string;
+  sessionId: string | undefined;
   matches: ReceiptMatcher;
   matchesEntry?: ReceiptEntryMatcher;
   project: ReceiptProjector;
@@ -107,6 +110,7 @@ interface MemoryReceiptCache {
   cursor: SessionEntryCursor;
   count: number;
   entries: Map<number, unknown>;
+  snapshot?: SessionReceiptSnapshot;
 }
 const memoryReceiptCaches = new WeakMap<SessionReceiptManager, Map<ReceiptMatcher, Map<ReceiptProjector, Map<ReceiptEntryMatcher | undefined, MemoryReceiptCache>>>>();
 const TAIL_BYTES = 64;
@@ -151,15 +155,21 @@ export const confirmedSessionReceiptSnapshot = (
         byEntryMatcher.set(matchesEntry, cache);
       }
       const read = cache.cursor.read(manager);
-      if (read.reset) { cache.count = 0; cache.entries.clear(); }
+      if (!read.reset && read.entries.length === 0 && cache.snapshot) return cache.snapshot;
+      const generation = !read.reset && cache.snapshot?.update?.generation || {};
+      if (read.reset) { cache.count = 0; cache.entries = new Map(); }
+      const from = cache.count;
+      const appended = new Map<number, unknown>();
       for (const entry of read.entries) {
         const index = cache.count++;
         const line = matchesEntry ? undefined : JSON.stringify(entry);
         if (matchesEntry ? matchesEntry(entry) : typeof line === "string" && matches(line)) {
-          cache.entries.set(index, project(entry));
+          const projected = project(entry);
+          cache.entries.set(index, projected);
+          appended.set(index, projected);
         }
       }
-      return { count: cache.count, entries: cache.entries };
+      return cache.snapshot = { count: cache.count, entries: cache.entries, update: { generation, from, entries: appended } };
     }
     // Older hosts without point lookup methods retain their compatibility behavior.
     const entries = manager.getEntries();
@@ -173,7 +183,8 @@ export const confirmedSessionReceiptSnapshot = (
   try {
     const found = withConfirmedSessionFile(file, (fd, stat) => {
       let previous = receiptCaches.get(manager);
-      if (previous?.file !== file || previous.matches !== matches || previous.matchesEntry !== matchesEntry || previous.project !== project ||
+      const sessionId = manager.getSessionId?.();
+      if (previous?.file !== file || previous.sessionId !== sessionId || previous.matches !== matches || previous.matchesEntry !== matchesEntry || previous.project !== project ||
           previous.stat.dev !== stat.dev || previous.stat.ino !== stat.ino || stat.size < previous.stat.size) {
         previous = undefined;
       }
@@ -194,6 +205,7 @@ export const confirmedSessionReceiptSnapshot = (
       let offset = previous?.offset ?? 0;
       let count = previous?.count ?? 0;
       const entries = new Map(previous?.entries);
+      const appended = new Map<number, unknown>();
       let carry = [...(previous?.carry ?? [])];
       let tail = previous?.tail ?? Buffer.alloc(0);
       let endTail = previous?.partialTail ?? tail;
@@ -214,7 +226,11 @@ export const confirmedSessionReceiptSnapshot = (
             try { entry = JSON.parse(line); parsed = true; } catch { /* Malformed entries are not receipts. */ }
             // Keep only the consumer's receipt fields, not another complete
             // copy of every delivered body. Projection errors fail confirmation.
-            if (parsed && (!matchesEntry || matchesEntry(entry))) entries.set(index, project(entry));
+            if (parsed && (!matchesEntry || matchesEntry(entry))) {
+              const projected = project(entry);
+              entries.set(index, projected);
+              appended.set(index, projected);
+            }
           }
           offset = position + start;
         }
@@ -224,9 +240,11 @@ export const confirmedSessionReceiptSnapshot = (
         position += length;
         if (start < length) carry.push(Buffer.from(view.subarray(start)));
       }
-      snapshot = { count, entries };
-      receiptCaches.set(manager, { file, matches, ...(matchesEntry ? { matchesEntry } : {}), project, stat, offset, count, entries, carry, tail,
-        partialTail: endTail });
+      const update = { generation: previous?.update?.generation ?? {}, from: previous?.count ?? 0, entries: appended };
+      const cache: ReceiptCache = { file, sessionId, matches, ...(matchesEntry ? { matchesEntry } : {}), project, stat, offset, count, entries, update, carry, tail,
+        partialTail: endTail };
+      receiptCaches.set(manager, cache);
+      snapshot = cache;
     });
     if (!found) receiptCaches.delete(manager);
     return snapshot;

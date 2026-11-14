@@ -6,7 +6,7 @@ import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import {
   rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE,
-  rootInboxReceiptIssuer, registerRootInboxReceipt, verifyRootInboxReceipt,
+  rootInboxReceiptIssuer, registerRootInboxReceipt, rootInboxReceiptVerifier,
   type RootInboxBatch, type RootInboxReceiptVerifier, type RootInboxReconcileOptions,
 } from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
@@ -844,8 +844,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // host signal so a cancel after turn_end still invalidates the unreceived queue.
   let rootInboxRunSignal: AbortSignal | undefined;
   // Native drafts authenticate nonce + content, not identity. Only same-manager reloads retain custody.
-  const verifyIssuedInbox: RootInboxReceiptVerifier = (details, carrier, accepted) =>
-    verifyRootInboxReceipt(inboxIssuer, details, carrier, accepted);
+  const verifyIssuedInbox: RootInboxReceiptVerifier = rootInboxReceiptVerifier(() => inboxIssuer);
   const registerIssuedInbox = (details: object, content: unknown): void =>
     registerRootInboxReceipt(inboxIssuer, details, content);
   type InboxQueueMessage = { role?: string; customType?: string; details?: unknown };

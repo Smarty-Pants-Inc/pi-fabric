@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../core/session-receipts.js";
+import { confirmedSessionReceiptSnapshot, type SessionReceiptManager, type SessionReceiptSnapshot } from "../core/session-receipts.js";
 import type { MeshEvent } from "../mesh/store.js";
 
 /**
@@ -107,6 +107,24 @@ export interface RootInboxReceiptIssuer {
   readonly queued: Map<string, number>;
   turn: number;
 }
+// Generation changes include eviction and direct Map mutations, not consumption/queue leases.
+class IssuedReceiptMap extends Map<string, RootInboxReceiptSnapshot> {
+  constructor() { super(); this.changed(); }
+  private changed(): void {
+    (issuerRegistry().receiptGenerations ??= new WeakMap()).set(this, {});
+  }
+  override set(key: string, value: RootInboxReceiptSnapshot): this {
+    super.set(key, value); this.changed(); return this;
+  }
+  override delete(key: string): boolean {
+    const deleted = super.delete(key);
+    if (deleted) this.changed();
+    return deleted;
+  }
+  override clear(): void {
+    if (this.size) { super.clear(); this.changed(); }
+  }
+}
 const ISSUERS_KEY = Symbol.for("pi-fabric.rootInboxReceiptIssuers.v1");
 declare const rootInboxReceiptAuthorityBrand: unique symbol;
 /** Opaque process object: serialized details/nonces cannot reconstruct this authority. */
@@ -117,6 +135,7 @@ interface IssuerRegistry extends WeakMap<object, RootInboxReceiptIssuer> {
   issuers?: WeakSet<RootInboxReceiptIssuer>;
   authorities?: WeakMap<object, { issuer: RootInboxReceiptIssuer; manager?: object; sessionId?: string }>;
   adopted?: WeakMap<object, string>;
+  receiptGenerations?: WeakMap<object, object>;
 }
 const issuerRegistry = (): IssuerRegistry => {
   const host = globalThis as typeof globalThis & { [ISSUERS_KEY]?: IssuerRegistry };
@@ -151,7 +170,7 @@ export const rootInboxReceiptIssuer = (manager?: object, sessionId = "", reload 
   const previous = manager ? resident.get(manager) : undefined;
   const issuer: RootInboxReceiptIssuer = previous &&
     ((reload && previous.sessionId === sessionId) || (manager && resident.adopted?.get(manager) === sessionId))
-    ? previous : { sessionId, receipts: new Map(), consumed: new WeakSet(), queued: new Map(), turn: 0 };
+    ? previous : { sessionId, receipts: new IssuedReceiptMap(), consumed: new WeakSet(), queued: new Map(), turn: 0 };
   (resident.issuers ??= new WeakSet()).add(issuer);
   if (manager) {
     resident.set(manager, issuer);
@@ -183,6 +202,27 @@ export const verifyRootInboxReceipt = (
   if (!snapshot || snapshot.digest !== rootInboxCarrierDigest(carrier)) return undefined;
   accepted.add(nonce);
   return snapshot;
+};
+
+const verifierGenerations = new WeakMap<RootInboxReceiptVerifier, () => object | undefined>();
+/** Explicit opt-in for the resident issuer. Arbitrary verifiers remain scan-local and are
+ * re-run even on unchanged history. The getter follows same-closure issuer replacement. */
+export const rootInboxReceiptVerifier = (issuer: () => RootInboxReceiptIssuer): RootInboxReceiptVerifier => {
+  const verifier: RootInboxReceiptVerifier = (details, carrier, accepted) =>
+    verifyRootInboxReceipt(issuer(), details, carrier, accepted);
+  let previousIssuer: RootInboxReceiptIssuer | undefined, previousGeneration: object | undefined, version = {};
+  verifierGenerations.set(verifier, () => {
+    const current = issuer();
+    // Shared with retained issuers across reloads. Older plain Maps have no capability:
+    // re-verify them instead of assuming that their contents cannot change.
+    const generation = issuerRegistry().receiptGenerations?.get(current.receipts);
+    if (!generation) return undefined;
+    if (current !== previousIssuer || generation !== previousGeneration) {
+      previousIssuer = current; previousGeneration = generation; version = {};
+    }
+    return version;
+  });
+  return verifier;
 };
 
 const trimmedField = (data: unknown, field: string): string | undefined => {
@@ -336,16 +376,70 @@ const verifiedInboxReceipt = (
   });
 };
 
+interface ConfirmedInboxCache {
+  snapshot: SessionReceiptSnapshot;
+  verifier: RootInboxReceiptVerifier | undefined;
+  authority: object | undefined;
+  native: InboxReceiptIndex;
+  inbox: Map<number, unknown>;
+  verified: string;
+  session: RootInboxSession;
+  scannedAt: number;
+  nextTimestampAt: number;
+}
+const confirmedInboxCaches = new WeakMap<SessionReceiptManager, ConfirmedInboxCache>();
+const confirmedInboxViews = new WeakSet<RootInboxSession>();
+/** Only detached canonical views may let an inbox skip a repeated ledger merge. */
+export const isConfirmedRootInboxSession = (session: RootInboxSession): boolean => confirmedInboxViews.has(session);
 export const confirmedRootInboxSession = (
   manager: SessionReceiptManager, verifier?: RootInboxReceiptVerifier,
 ): RootInboxSession => {
   try {
+    // Never put a derived-cache hit ahead of the canonical file's durability barriers.
     const snapshot = confirmedSessionReceiptSnapshot(manager, matchesInboxReceipt, projectRootInboxReceipt, matchesInboxReceiptEntry);
-    return inboxReceiptSession(snapshot.entries, snapshot.count, 500, verifier);
+    const authority = verifier ? verifierGenerations.get(verifier)?.() : noInboxAuthority;
+    const now = Date.now();
+    let previous = confirmedInboxCaches.get(manager);
+    if (previous && (now < previous.scannedAt || now >= previous.native.nextTimestampAt)) previous = undefined;
+    if (previous?.snapshot === snapshot && previous.verifier === verifier && authority && previous.authority === authority &&
+        now < previous.nextTimestampAt) return previous.session;
+    const incremental = previous && snapshot.update && previous.snapshot.update?.generation === snapshot.update.generation &&
+      (previous.snapshot === snapshot || previous.snapshot.count === snapshot.update.from);
+    let native: InboxReceiptIndex;
+    let inbox: Map<number, unknown>;
+    if (incremental) {
+      native = previous!.native;
+      inbox = previous!.inbox;
+    } else {
+      native = emptyInboxReceiptIndex();
+      inbox = new Map();
+    }
+    if (!incremental || previous!.snapshot !== snapshot) {
+      const added = incremental ? snapshot.update!.entries : snapshot.entries;
+      const agents: Array<readonly [number, unknown]> = [];
+      inbox = new Map(inbox);
+      for (const [index, value] of added) {
+        if (inboxObject(value)?.customType === ROOT_INBOX_CUSTOM_TYPE) inbox.set(index, value);
+        else agents.push([index, value]);
+      }
+      if (agents.length) native = inboxReceiptIndex(agents, snapshot.count, 500, undefined, native, now);
+    }
+    // Newest-first replay is essential: a newer same-nonce copy replaces the older
+    // copy's canonical time and lookback position. Unversioned verifiers run EVERY call.
+    const issued = inboxReceiptIndex(inbox, snapshot.count, 500, verifier, undefined, now);
+    const verified = JSON.stringify([[...issued.delivered], [...issued.batchIds], issued.hasBatch]);
+    const session = incremental && previous!.native === native && previous!.verified === verified
+      ? previous!.session : receiptIndexSession(mergeInboxReceiptIndexes(native, issued));
+    confirmedInboxViews.add(session);
+    confirmedInboxCaches.set(manager, { snapshot, verifier, authority, native, inbox, verified, session, scannedAt: now,
+      nextTimestampAt: Math.min(native.nextTimestampAt, issued.nextTimestampAt) });
+    return session;
   } catch {
+    confirmedInboxCaches.delete(manager);
     return rootInboxSession([]);
   }
 };
+const noInboxAuthority = {};
 
 /** A receipt snapshot of canonical entries; async inbox reads must not retain the history.
  * Batch presence retains its compatibility lookback; delivery identity does not. Unsigned inbox
@@ -363,15 +457,54 @@ export const rootInboxSession = (
 };
 
 /** Only canonical native UTC ISO or integer epoch-ms can date a receipt claim. */
-const canonicalReceiptTimestamp = (value: unknown): number | undefined => {
+const receiptTimestamp = (value: unknown): number | undefined => {
   const at = typeof value === "number" ? value
     : typeof value === "string" && value.length === 24 ? Date.parse(value)
     : Number.NaN;
-  if (!Number.isInteger(at) || at <= 0 || at > Date.now() + 60_000) return undefined;
+  if (!Number.isInteger(at) || at <= 0) return undefined;
   if (typeof value === "string" && new Date(at).toISOString() !== value) return undefined;
   return at;
 };
 
+interface InboxReceiptClaim {
+  index: number;
+  order: number;
+  at?: number;
+  atIndex?: number;
+  atOrder?: number;
+}
+interface InboxReceiptIndex {
+  delivered: Map<string, InboxReceiptClaim>;
+  steers: Map<string, Set<string>>;
+  batchIds: Set<string>;
+  hasBatch: boolean;
+  nextTimestampAt: number;
+}
+const emptyInboxReceiptIndex = (): InboxReceiptIndex => ({ delivered: new Map(), steers: new Map(),
+  batchIds: new Set(), hasBatch: false, nextTimestampAt: Number.POSITIVE_INFINITY });
+const mergeClaim = (previous: InboxReceiptClaim | undefined, claim: InboxReceiptClaim): InboxReceiptClaim => ({
+  ...(previous && previous.index >= claim.index ? previous : claim),
+  ...(previous?.at === undefined ? {} : { at: previous.at, atIndex: previous.atIndex, atOrder: previous.atOrder }),
+  ...(claim.at === undefined ? {} : {
+    at: Math.max(previous?.at ?? Number.NEGATIVE_INFINITY, claim.at),
+    atIndex: (previous?.atIndex ?? -1) >= claim.atIndex! ? previous!.atIndex : claim.atIndex,
+    atOrder: (previous?.atIndex ?? -1) >= claim.atIndex! ? previous!.atOrder : claim.atOrder,
+  }),
+});
+const mergeInboxReceiptIndexes = (native: InboxReceiptIndex, inbox: InboxReceiptIndex): InboxReceiptIndex => {
+  const delivered = new Map(native.delivered);
+  for (const [id, claim] of inbox.delivered) delivered.set(id, mergeClaim(delivered.get(id), claim));
+  return { ...inbox, steers: native.steers, delivered };
+};
+const receiptIndexSession = (index: InboxReceiptIndex): RootInboxSession => {
+  const delivered = new Set([...index.delivered].sort((a, b) => b[1].index - a[1].index || a[1].order - b[1].order).map(([id]) => id));
+  const deliveredAt = new Map([...index.delivered].filter(([, claim]) => claim.at !== undefined)
+    .sort((a, b) => b[1].atIndex! - a[1].atIndex! || a[1].atOrder! - b[1].atOrder!).map(([id, claim]) => [id, claim.at!]));
+  return { delivered, deliveredAt,
+    holdsBatch: ids => index.hasBatch && ids.every(id => index.batchIds.has(id)),
+    holdsSteer: (fromId, key, topic) => index.steers.get(fromId)?.has(JSON.stringify([topic, key])) ?? false,
+  };
+};
 const inboxReceiptSession = (
   entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500,
   verifier?: RootInboxReceiptVerifier,
@@ -386,6 +519,63 @@ const inboxReceiptSession = (
     delivered.add(id);
     if (at !== undefined) deliveredAt.set(id, Math.max(deliveredAt.get(id) ?? Number.NEGATIVE_INFINITY, at));
   };
+  for (const [index, value] of [...entries].reverse()) {
+    type Carried = { from?: { id?: unknown }; data?: unknown; id?: unknown; deliveryId?: unknown };
+    const entry = value as { timestamp?: unknown; type?: string; customType?: string; details?: Carried & { ids?: unknown; items?: unknown; receipts?: unknown } } | undefined;
+    if (entry?.type !== "custom_message") continue;
+    const timestamp = receiptTimestamp(entry.timestamp);
+    const at = timestamp !== undefined && timestamp <= Date.now() + 60_000 ? timestamp : undefined;
+    if (entry.customType === ROOT_INBOX_CUSTOM_TYPE) {
+      const receipt = verifiedInboxReceipt(entry, verifier, accepted);
+      if (receipt) {
+        if (index >= Math.max(0, count - lookback)) {
+          hasBatch = true;
+          for (const id of receipt.ids) batchIds.add(id);
+        }
+        for (const id of receipt.ids) remember(eventReceipt(id), at);
+        for (const id of receipt.receipts) remember(id, at);
+      }
+    }
+    const agent = entry.customType === AGENT_MESSAGE_CUSTOM_TYPE;
+    if (agent && Array.isArray(entry.details?.receipts)) {
+      for (const id of entry.details.receipts) if (typeof id === "string") remember(id, at);
+    }
+    if (!agent) continue;
+    const carried: Carried[] = Array.isArray(entry.details?.items) ? entry.details.items as Carried[] : [entry.details ?? {}];
+    for (const item of carried) {
+      const fromId = item?.from?.id;
+      const key = workKey(item?.data);
+      const topic = trimmedField(item?.data, "topic");
+      const explicit = !!deliveryIdentity(item?.data) || (typeof item?.deliveryId === "string" && !!item.deliveryId);
+      if (typeof fromId !== "string") continue;
+      for (const id of workReceipts(fromId, item.data, explicit ? undefined : topic)) remember(id, at);
+      if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
+      if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
+      if (key === undefined || topic === undefined) continue;
+      const keys = steers.get(fromId) ?? new Set<string>();
+      keys.add(JSON.stringify([topic, key]));
+      steers.set(fromId, keys);
+    }
+  }
+  return { delivered, deliveredAt,
+    holdsBatch: ids => hasBatch && ids.every(id => batchIds.has(id)),
+    holdsSteer: (fromId, key, topic) => steers.get(fromId)?.has(JSON.stringify([topic, key])) ?? false,
+  };
+};
+
+const inboxReceiptIndex = (
+  entries: Iterable<readonly [number, unknown]>, count: number, lookback = 500,
+  verifier?: RootInboxReceiptVerifier, previous?: InboxReceiptIndex, now = Date.now(),
+): InboxReceiptIndex => {
+  const result = previous ? { ...previous, delivered: new Map(previous.delivered), steers: new Map(previous.steers) } : emptyInboxReceiptIndex();
+  const { batchIds, steers, delivered } = result;
+  const accepted = new Set<string>();
+  const copiedSteers = new Set<string>();
+  let currentIndex = 0, order = 0;
+  const remember = (id: string, at: number | undefined): void => {
+    const claim = { index: currentIndex, order: order++, ...(at === undefined ? {} : { at, atIndex: currentIndex, atOrder: order - 1 }) };
+    delivered.set(id, mergeClaim(delivered.get(id), claim));
+  };
   // Persisted snapshots contain receipts only, with original history positions. All-history
   // identities/legacy steers are needed for dedup; only batch presence uses a lookback.
   for (const [index, value] of [...entries].reverse()) {
@@ -394,12 +584,15 @@ const inboxReceiptSession = (
     if (entry?.type !== "custom_message") continue;
     // Invalid canonical timestamps never renew a legacy claim at scan time. Exact native
     // identity replay evidence remains available without granting dated fallback authority.
-    const at = canonicalReceiptTimestamp(entry.timestamp);
+    currentIndex = index; order = 0;
+    const timestamp = receiptTimestamp(entry.timestamp);
+    const at = timestamp !== undefined && timestamp <= now + 60_000 ? timestamp : undefined;
+    if (timestamp !== undefined && at === undefined) result.nextTimestampAt = Math.min(result.nextTimestampAt, timestamp - 60_000);
     if (entry.customType === ROOT_INBOX_CUSTOM_TYPE) {
       const receipt = verifiedInboxReceipt(entry, verifier, accepted);
       if (receipt) {
         if (index >= Math.max(0, count - lookback)) {
-          hasBatch = true;
+          result.hasBatch = true;
           for (const id of receipt.ids) batchIds.add(id);
         }
         for (const id of receipt.ids) remember(eventReceipt(id), at);
@@ -431,16 +624,16 @@ const inboxReceiptSession = (
       // sender/topic/key, but only identity-less carriers above can record native-topic receipts.
       // holdsSteer alone never suppresses work; a matching, dated native-topic receipt is mandatory.
       if (key === undefined || topic === undefined) continue;
+      if (previous && !copiedSteers.has(fromId)) {
+        steers.set(fromId, new Set(steers.get(fromId)));
+        copiedSteers.add(fromId);
+      }
       const keys = steers.get(fromId) ?? new Set<string>();
       keys.add(JSON.stringify([topic, key]));
       steers.set(fromId, keys);
     }
   }
-  return {
-    delivered, deliveredAt,
-    holdsBatch: (ids) => hasBatch && ids.every((id) => batchIds.has(id)),
-    holdsSteer: (fromId, key, topic) => steers.get(fromId)?.has(JSON.stringify([topic, key])) ?? false,
-  };
+  return result;
 };
 
 /** Whether a session's recent entries hold the inbox message for these event ids. */

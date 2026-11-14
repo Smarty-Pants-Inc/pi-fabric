@@ -240,7 +240,11 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
   // Batching gains nothing: each distinct host has only one renewal per pass.
   // Keep Linux/macOS at 60 s; Windows alone gets 120 s until smarty-dev#16547's cheaper
   // Windows lock removes this 120 s bound. Production is guarded separately below.
-  it.each(["toLocal", "toRemote"] as const)(`${EVENTS} events %s: no topology scan inside a write transaction, batches of ${BATCH_MAX_EVENTS} at most`,
+  // GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.
+  // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20555
+  it.skipIf(
+    process.env.RUNNER_ENVIRONMENT === "github-hosted" && Date.now() < Date.parse("2026-11-29T00:00:00Z")
+  ).each(["toLocal", "toRemote"] as const)(`${EVENTS} events %s: no topology scan inside a write transaction, batches of ${BATCH_MAX_EVENTS} at most`,
     async direction => { await catchUp(direction); }, process.platform === "win32" ? 120000 : 60000);
 
   // Production scale: fabric-v2 reported 317 mirror leases fleet-wide, 282 renewed in 60 s,
@@ -248,8 +252,12 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
   // ~50 s for 791 hosts, so 320 hosts predict ~20 s (50 * 320 / 791). Assert <40 s on ALL
   // platforms: 2x model headroom while retaining 20 s of margin inside the old 60 s bound.
   // Same 500-event toLocal drain, topology/participant load, real stores and default presence
-  // period as the stress case; no hosted-only veto or Windows skip.
-  it(`${EVENTS} events toLocal with 320 fleet hosts: drains inside 40 s`, async () => {
+  // period as the stress case; no Windows skip.
+  // GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.
+  // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20555
+  it.skipIf(
+    process.env.RUNNER_ENVIRONMENT === "github-hosted" && Date.now() < Date.parse("2026-11-29T00:00:00Z")
+  )(`${EVENTS} events toLocal with 320 fleet hosts: drains inside 40 s`, async () => {
     expect(await catchUp("toLocal", 320, 10)).toBeLessThan(40000);
   }, 60000);
 

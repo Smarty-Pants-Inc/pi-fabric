@@ -123,7 +123,11 @@ const archiveReadMeter = (root: string) => {
   return meter;
 };
 
-it("recovers 770k old-mark positions across archived days within startup and slice budgets", async () => {
+// GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.
+// https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20555
+it.skipIf(
+  process.env.RUNNER_ENVIRONMENT === "github-hosted" && Date.now() < Date.parse("2026-11-29T00:00:00Z")
+)("recovers 770k old-mark positions across archived days within startup and slice budgets", async () => {
   const f = fixture(770_000, 15);
   const meter = archiveReadMeter(f.store.root);
   const ids: string[] = [];

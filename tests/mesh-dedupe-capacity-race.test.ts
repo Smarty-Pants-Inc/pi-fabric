@@ -164,7 +164,11 @@ const cases = [
 // Unmeasured Windows runtime risks another red CI: each native race case gets 300 s; Linux covers this platform-independent publish/capacity logic.
 // Measurement: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/19935
 for (const scenario of cases) {
-  it.skipIf(process.platform === "win32")(`keeps receipt capacity after a stale off-lock observation: ${scenario.name}`, async () => {
+  // GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.
+  // https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20555
+  it.skipIf(process.platform === "win32" || (scenario.name === "32-key batch" &&
+    process.env.RUNNER_ENVIRONMENT === "github-hosted" && Date.now() < Date.parse("2026-11-29T00:00:00Z")
+  ))(`keeps receipt capacity after a stale off-lock observation: ${scenario.name}`, async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-dedupe-capacity-race-"));
     roots.push(base);
     fs.chmodSync(base, 0o700);

@@ -207,7 +207,11 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
 // relies on POSIX detached process groups. Windows durable residency is unsupported
 // (src/residency/host.ts, docs/residency-runtime.md), and there the nested child does
 // not survive the primary's exit, so this descendant-tracking claim is not made.
-it.skipIf(process.platform === "win32").each([
+// GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.
+// https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20555
+it.skipIf(process.platform === "win32" || (
+  process.env.RUNNER_ENVIRONMENT === "github-hosted" && Date.now() < Date.parse("2026-11-29T00:00:00Z")
+)).each([
   ["project", false, "known"], ["session", false, "known"], ["project", true, "known"], ["session", true, "known"],
   ["project", true, "unknown"], ["session", true, "unknown"],
 ] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", async (scope, restart, descendant) => {

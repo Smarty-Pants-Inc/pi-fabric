@@ -62,6 +62,17 @@ export const loadedFabricRoot = (moduleUrl: string): string | undefined => {
   }
 };
 
+/** Capture explicit extension arguments once; an explicit copy must never follow a profile slot. */
+export const explicitExtensions = (): string[] => {
+  const sources: string[] = [];
+  for (let i = 2; i < process.argv.length; i++) {
+    const arg = process.argv[i]!;
+    if (arg === "-e" || arg === "--extension") sources.push(process.argv[++i] ?? "");
+    else if (arg.startsWith("--extension=")) sources.push(arg.slice("--extension=".length));
+  }
+  return sources;
+};
+
 /** The local Fabric package the profile's settings.json activates, if exactly one. */
 export const activeFabricRoot = (settingsPath: string): string | undefined => {
   let packages: unknown;

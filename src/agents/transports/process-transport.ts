@@ -8,7 +8,7 @@ import type {
   AgentTransportHandle,
   AgentTransportLaunch,
 } from "../types.js";
-import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
+import { activeFabricRoot, explicitExtensions, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
@@ -26,8 +26,8 @@ const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
 };
 
-/** Resolve the installer's existing profile selector at the actual launch boundary.
- * Pin both child entrypoints to its canonical release root, never a mutable pointer.
+/** Resolve the installer's profile selector at launch; an explicitly loaded Main takes precedence.
+ * Pin both child entrypoints to a canonical release root, never a mutable pointer.
  * Explicit source/custom workers remain caller-selected (tests and development).
  */
 const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRelease?: string; extensionPath?: string } => {
@@ -39,6 +39,9 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
     return { workerPath, fabricRelease: parent };
   }
   const fallback = { workerPath: canonicalWorker, fabricRelease: parent, extensionPath: path.join(parent, "dist/index.js") };
+  // Explicit pins own their child generation; do not redirect them through another profile release.
+  if (process.env.SMARTY_FABRIC_PIN?.trim()
+    || explicitExtensions().some(source => fabricResourceRoot(source, "extensions") === parent)) return fallback;
   const current = activeFabricRoot(path.join(resolveAgentDir(), "settings.json"));
   if (!current || current === parent) return fallback;
   let version: unknown;

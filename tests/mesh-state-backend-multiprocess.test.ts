@@ -9,6 +9,7 @@ import { MeshStateBusyError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { closeNatsStateBackend } from "../src/mesh/state-backend-nats.js";
 import { itFor, natsMonitorUrl, natsServerUrl, prepareNatsRoot, prepareNatsStream, reportNatsSkip } from "./helpers/nats-state-server.js";
+import { stripAclAdvisory } from "./helpers/acl-advisory.js";
 
 // Four processes write one sqlite-backed (or, on a real nats-server, one NATS-backed: smarty-dev#7504) mesh root
 // concurrently (smarty-dev#6477 L2a). Each child
@@ -58,7 +59,8 @@ interface ChildResult { code: number | null; stdout: string; stderr: string }
 
 // node:sqlite prints "ExperimentalWarning: SQLite is an experimental feature" on Node 22 (CI's
 // runner Node); production does not suppress it, so only these test children silence that one
-// warning class. Every other stderr byte still fails the assertion below.
+// warning class. Only the SQLite row exempts the exact FABRIC_MESH_STATE_ACL_ADVISORY line;
+// the NATS row and every other stderr byte remain strict.
 const runChild = (root: string, count: number, kind: "sqlite" | "nats" = "sqlite"): Promise<ChildResult> => new Promise((resolve, reject) => {
   const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", CHILD, root, String(count), kind],
     { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "",
@@ -94,7 +96,7 @@ describe.each(["sqlite", "nats"] as const)("%s state backend across processes", 
       await new Promise(resolve => setTimeout(resolve, 50));
     } finally { watcher.close(); }
     for (const result of results) {
-      expect(result.stderr).toBe("");
+      expect(kind === "sqlite" ? stripAclAdvisory(result.stderr) : result.stderr).toBe("");
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout.trim())).toMatchObject({ lockAttempts: 0 });
     }

@@ -8,7 +8,7 @@ import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
   INBOX_HORIZON_MS, ROOT_ID_PREFIX, ROOT_INBOX_ACTION_KINDS, compareRootInboxEvents, crossIdentityReceipts, deliveryIdentity,
-  eventReceipt, eventReceipts, rootInboxBudget, topicWorkReceipt, workKey,
+  eventReceipt, eventReceipts, isConfirmedRootInboxSession, rootInboxBudget, topicWorkReceipt, workKey,
   type NativeRecoveryInboxHandoff, type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
@@ -139,6 +139,7 @@ export class RootInbox {
   #wokeAt = Number.NEGATIVE_INFINITY;
   #dueAt = Number.POSITIVE_INFINITY;
   #delivered = new Map<string, number>();
+  #canonicalSession: RootInboxSession | undefined;
   #acks = new Map<string, number>();
   #fallbacks = new Map<string, number>();
   #initialAfter: number | undefined;
@@ -369,7 +370,10 @@ export class RootInbox {
     // renew its ambiguous key/ref claim at read time.
     // T's history can contain several recipients. Do not copy that whole receipt ledger into
     // each predecessor: matched addressed events below retain only their own exact receipts.
-    if (!this.#nativeResult) saveImmediately = this.#remember(session.delivered ?? [], session.deliveredAt, true) || saveImmediately;
+    if (!this.#nativeResult && (session !== this.#canonicalSession || !isConfirmedRootInboxSession(session))) {
+      saveImmediately = this.#remember(session.delivered ?? [], session.deliveredAt, true) || saveImmediately;
+      this.#canonicalSession = isConfirmedRootInboxSession(session) ? session : undefined;
+    }
     let skippedStale = 0;
     const reservations = new Set<string>();
     if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {

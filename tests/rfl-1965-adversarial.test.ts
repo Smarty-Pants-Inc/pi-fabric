@@ -137,8 +137,8 @@ describe('RFL independent receipt-cache adversaries',()=>{
   if(mode==='generation-reset')fs.writeFileSync(path.join(mesh.root,'generation'),'0');
   expect(h.read()).toBe(before);expect((await inbox.next(h.read())).events.map(e=>e.id)).toEqual([event.id]);
  });
- // fabric-store owns these cursor failures: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20542
- for(const mode of ['inode','same-size-in-place','truncate-observed','generation-bump','generation-reset'] as const)(mode==='same-size-in-place'||mode==='truncate-observed'?it.skip:it)(`a warmed mesh cursor sees replacement work after ${mode}`,async()=>{
+ // expected to fail until https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20542 is fixed; it.fails flips red when fixed, forcing removal
+ for(const mode of ['inode','same-size-in-place','truncate-observed','generation-bump','generation-reset'] as const)(mode==='same-size-in-place'||mode==='truncate-observed'?it.fails:it)(`a warmed mesh cursor sees replacement work after ${mode}`,async()=>{
   const h=fixture([native('delivered')]);const mesh=h.mesh(),inbox=h.inbox(mesh);
   fs.writeFileSync(path.join(mesh.root,'generation'),'7');
   const original=await mesh.publish({topic,kind:'handoff',from:peer,to:'session:other',text:'message',data:{deliveryId:'brand-new'}});

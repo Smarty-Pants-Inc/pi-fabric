@@ -299,7 +299,10 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     const program = path.join(f.root, "queued-hello.mjs");
     buildSync({ stdin: { contents: source, resolveDir: process.cwd() }, outfile: program, bundle: true, platform: "node", format: "esm", packages: "external" });
     const child = spawnSync(process.execPath, [program], { encoding: "utf8", timeout: 3_000 });
-    expect({ error: child.error?.message, status: child.status, stderr: child.stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
+    // NODE_OPTIONS makes the local deletion guard announce its hosted-only report mode in
+    // every child. Ignore only that exact harness notice; all other stderr remains strict.
+    const stderr = child.stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "");
+    expect({ error: child.error?.message, status: child.status, stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
     expect(JSON.parse(child.stdout.trim())).toEqual({ installed: 0, active: 0 });
   });
 
@@ -481,19 +484,23 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
   });
 
   it("reconciles finite source expiry once, then becomes timer-free instead of renewing every 5 s", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const f = fixture();
     const lane = await native(f.far, "short-lane", 200);
     const live = await launch(f.bridge);
     expect(f.hub.get(lane.entry.key)).toBeDefined();
+    await vi.advanceTimersByTimeAsync(200);
     await until(() => f.hub.get(lane.entry.key) === undefined);
     expect(readHostLeases(f.hub.root).has(lane.id)).toBe(false);
     await settle();
+    await vi.advanceTimersByTimeAsync(100); // drain the bounded notification coalescing window
     const mirrors = vi.spyOn(f.local, "mirror");
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const timers = vi.spyOn(globalThis, "setTimeout");
     await vi.advanceTimersByTimeAsync(305_001);
     expect(timers).not.toHaveBeenCalled();
     expect(mirrors).not.toHaveBeenCalled();
+    // Startup delivery-age telemetry may flush once, but must not re-arm while idle.
+    expect(vi.getTimerCount()).toBe(0);
     expect(live.failure()).toBeUndefined();
   });
 

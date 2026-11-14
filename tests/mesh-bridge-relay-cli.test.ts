@@ -282,6 +282,8 @@ describe.skipIf(!HOSTED)("real two-process built mesh-bridge relay (hosted Linux
       expect(socket.mode & 0o777).toBe(0o600);
     }
     const diagnostics = f.links.map(link => link.diagnostics()).join("\n");
+    // Built-CLI population includes every successful relay message, not only deferrals.
+    expect(diagnostics.match(/relay dispatch v1 measurement=mirror-slot-wait schedulingDelayMs=\d+ outcome=confirmed/g)).toHaveLength(count);
     for (const marker of [...markers, ackMarker]) expect(diagnostics).not.toContain(marker);
   }, 30_000);
 
@@ -319,7 +321,9 @@ describe.skipIf(!HOSTED)("real two-process built mesh-bridge relay (hosted Linux
     expect(markerFiles(f.runtime, marker)).toEqual([]);
     expect(events(hub, "fabric.control.command")).toEqual([]);
     expect(events(hub, "fabric.control.ack")).toEqual([]);
-    expect(f.links.map(link => link.diagnostics()).join("\n")).not.toContain(marker);
+    const diagnostics = f.links.map(link => link.diagnostics()).join("\n");
+    expect(diagnostics).toContain("relay NAK stage=source reason=destination-unavailable");
+    expect(diagnostics).not.toContain(marker);
   }, 30_000);
 
   it("refuses a same-UID non-bridge connector before receiving a relay body", async () => {

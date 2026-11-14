@@ -8,6 +8,7 @@ import type { BridgePublish } from "./bridge.js";
 import {
   BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, BRIDGE_NATS_HORIZON_MS, BRIDGE_NATS_MACHINE, bridgeNatsAckEnvelopeId,
   bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, BRIDGE_NATS_REFUSAL, type BridgeNatsDirection, type BridgeNatsPortDelivery,
+  type BridgeNatsPortResolved, type BridgeNatsPresenceFailure,
 } from "./bridge-nats-types.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED } from "./control-idempotency.js";
 import type { MeshEvent, MeshIdentity } from "./store.js";
@@ -56,13 +57,23 @@ const RELAY_ERROR_CODES: ReadonlySet<unknown> = new Set([RELAY_DESTINATION_UNAVA
 export type NatsCarrierDirection = BridgeNatsDirection;
 
 /** A live NATS participant: the identity in its KV presence record and its route (machine included). */
-export interface NatsPresenceEntry { readonly identity: MeshIdentity; readonly route: ParticipantRoute }
+export interface NatsPresenceEntry extends Pick<BridgeNatsPortResolved, "leaseLapsed" | "presenceFailure" | "remainingAuthorityMs"> {
+  readonly identity: MeshIdentity; readonly route: ParticipantRoute;
+}
+export interface NatsCarrierSenderDiagnostic {
+  readonly failure: BridgeNatsPresenceFailure;
+  /** Only from validated matching presence; absent when the envelope's sender cannot be verified. */
+  readonly senderId?: string;
+  readonly remainingAuthorityMs?: number;
+}
 /** A live native file participant: its directory identity and the host id its runtime replies from. */
 export interface FilePresenceEntry { readonly identity: MeshIdentity; readonly hostId: string }
 
 export interface NatsCarrierPresence {
   /** Live KV presence only (L1's verified view); undefined when unknown, lapsed or ambiguous. */
   nats(id: string): NatsPresenceEntry | undefined;
+  /** One validated source snapshot. Stale entries classify ONLY; only LIVE entries authenticate. */
+  natsInbound?(id: string): NatsPresenceEntry | undefined;
   /** Live native file presence only; never a record the link mirrored from NATS. */
   file(id: string): FilePresenceEntry | undefined;
 }
@@ -251,9 +262,9 @@ export type NatsInbound =
     readonly record?: NatsCarrierRecord; readonly ack?: Readonly<Record<string, unknown>>;
   }
   /** Malformed or unauthorized: TERM the delivery; it never reaches the file mesh and gets no answer. */
-  | { readonly kind: "refused"; readonly reason: string }
+  | { readonly kind: "refused"; readonly reason: string; readonly senderDiagnostic?: NatsCarrierSenderDiagnostic }
   /** Presence may still be converging: keep the delivery in hand and try again; refuse it after a bound. */
-  | { readonly kind: "wait"; readonly reason: string };
+  | { readonly kind: "wait"; readonly reason: string; readonly senderLeaseLapse?: true; readonly senderDiagnostic?: NatsCarrierSenderDiagnostic };
 
 /** One NATS inbox delivery, as a raw TransportDelivery or L1's BridgeNatsPortDelivery supplies it. */
 export interface NatsCarrierDelivery {
@@ -554,9 +565,24 @@ export class NatsBridgeCarrier {
       return { kind: "refused", reason: "relay refusals do not cross this carrier" };
     }
     // Identity only from live KV presence on the credential-bound source machine.
-    const sender = this.#presence.nats(from.id);
+    // Sample once: a renewal between two lookups must not turn expired -> live into a refusal.
+    const sender = this.#presence.natsInbound ? this.#presence.natsInbound(from.id) : this.#presence.nats(from.id);
     if (!sender?.route.live || sender.route.machine !== delivery.sourceMachine || sender.identity.id !== from.id) {
-      return { kind: "refused", reason: "sender is not live on its source machine" };
+      const observed = sender;
+      const failure: BridgeNatsPresenceFailure = !observed ? "no-route" : observed.identity.id !== from.id ? "identity-mismatch"
+        : observed.route.machine !== delivery.sourceMachine ? "machine-mismatch"
+        : !observed.route.ownerIncarnation ? "incarnation-mismatch" : observed.presenceFailure ?? "not-live";
+      const senderDiagnostic: NatsCarrierSenderDiagnostic = { failure,
+        ...(observed?.identity.id === from.id ? { senderId: observed.identity.id } : {}),
+        ...(Number.isFinite(observed?.remainingAuthorityMs) ? { remainingAuthorityMs: observed!.remainingAuthorityMs! } : {}),
+      };
+      // A different/absent/ambiguous identity or machine is not renewal uncertainty. A stale
+      // record only holds the delivery; neither authorization nor ledger claims run until LIVE.
+      if (!sender?.route.live && observed?.leaseLapsed === true && !observed.route.live && observed.identity.id === from.id &&
+          observed.route.machine === delivery.sourceMachine && observed.route.ownerIncarnation) {
+        return { kind: "wait", reason: "sender is not live on its source machine", senderLeaseLapse: true, senderDiagnostic };
+      }
+      return { kind: "refused", reason: "sender is not live on its source machine", senderDiagnostic };
     }
     const input = { envelope, id: envelope.id, hostId: to.hostId, targetId: envelope.targetId, operation: envelope.operation };
     if (envelope.kind === "ack") return this.#inboundAck(delivery, input, sender, body);

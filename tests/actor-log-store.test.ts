@@ -184,6 +184,66 @@ describe("ActorLogStore", () => {
     if (process.platform !== "win32") expect(fs.statSync(path.join(dest, "nested", "child")).mode & 0o777).toBe(0o700);
   });
 
+  it.skipIf(process.platform === "win32")("accepts an unchanged archive retry while preserving a custody hard link", async () => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), dest = path.join(root, "actor", "runs", "latest");
+    const sourceFile = path.join(source, "events.jsonl"), archiveFile = path.join(dest, "events.jsonl");
+    const heldFile = path.join(root, "custody", "events.jsonl"), bytes = Buffer.from("original trace\n");
+    fs.mkdirSync(source); fs.writeFileSync(sourceFile, bytes);
+    await store.retainRun(actor, "latest", source);
+    fs.mkdirSync(path.dirname(heldFile)); fs.linkSync(archiveFile, heldFile);
+    const identity = (file: string) => { const stat = fs.statSync(file); return { dev: stat.dev, ino: stat.ino }; };
+    const before = [identity(archiveFile), identity(heldFile)];
+
+    await expect(store.retainRun(actor, "latest", source)).resolves.toEqual({ archived: true, receipt: { runId: "latest", directory: dest } });
+    expect(fs.readFileSync(archiveFile)).toEqual(bytes);
+    expect(fs.readFileSync(heldFile)).toEqual(bytes);
+    expect(identity(archiveFile)).toEqual(before[0]);
+    expect(identity(heldFile)).toEqual(before[1]);
+  });
+
+  it.skipIf(process.platform === "win32").each([
+    ["equal-length", "changed trace\n"],
+    ["different-length", "changed trace with additional bytes\n"],
+  ] as const)("refuses a changed source without modifying the archived custody hard link (%s)", async (_kind, changedText) => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), dest = path.join(root, "actor", "runs", "latest");
+    const sourceFile = path.join(source, "events.jsonl"), archiveFile = path.join(dest, "events.jsonl");
+    const heldFile = path.join(root, "custody", "events.jsonl"), original = Buffer.from("initial trace\n");
+    const changed = Buffer.from(changedText);
+    fs.mkdirSync(source); fs.writeFileSync(sourceFile, original);
+    await store.retainRun(actor, "latest", source);
+    fs.mkdirSync(path.dirname(heldFile)); fs.linkSync(archiveFile, heldFile);
+    const identity = (file: string) => { const stat = fs.statSync(file); return { dev: stat.dev, ino: stat.ino }; };
+    const before = [identity(archiveFile), identity(heldFile)];
+    fs.writeFileSync(sourceFile, changed);
+
+    await expect(store.retainRun(actor, "latest", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
+    expect(fs.readFileSync(sourceFile)).toEqual(changed);
+    expect(fs.readFileSync(archiveFile)).toEqual(original);
+    expect(fs.readFileSync(heldFile)).toEqual(original);
+    expect(identity(archiveFile)).toEqual(before[0]);
+    expect(identity(heldFile)).toEqual(before[1]);
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a byte-matching destination symlink without changing its source or target", async () => {
+    const { root, actor, store } = setup();
+    const source = path.join(root, "source"), dest = path.join(root, "actor", "runs", "latest");
+    const sourceFile = path.join(source, "events.jsonl"), archiveFile = path.join(dest, "events.jsonl");
+    const target = path.join(root, "custody-target.jsonl"), bytes = Buffer.from("matching trace\n");
+    fs.mkdirSync(source); fs.mkdirSync(dest, { recursive: true });
+    fs.writeFileSync(sourceFile, bytes); fs.writeFileSync(target, bytes); fs.symlinkSync(target, archiveFile);
+    const before = fs.lstatSync(archiveFile);
+
+    await expect(store.retainRun(actor, "latest", source)).rejects.toBeInstanceOf(ActorRunArchiveRefusedError);
+    expect(fs.readFileSync(sourceFile)).toEqual(bytes);
+    expect(fs.readFileSync(target)).toEqual(bytes);
+    expect(fs.lstatSync(archiveFile).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(archiveFile)).toBe(target);
+    const after = fs.lstatSync(archiveFile);
+    expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino });
+  });
+
   it.skipIf(process.platform === "win32")("throws a typed, logged refusal for a real 0777 volume ancestor and leaves its source intact", async () => {
     const { root, store } = setup();
     const volume = path.join(root, "volume"), source = path.join(root, "source");

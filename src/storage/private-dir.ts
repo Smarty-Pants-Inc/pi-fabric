@@ -260,12 +260,14 @@ export const mkdirPrivate = (directory: string, anchor?: string): void => { open
  * Write one archive entry inside a held private directory (pi-fabric#875 round 4 SEC P1). A directory healed by the
  * self-heal above may hold entries planted while it was writable, so nothing is written through an existing name:
  * - a new entry is created `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, through the held fd;
- * - an existing entry (a re-archive of the same run) is replaced only when an O_NOFOLLOW open proves it a regular file
- *   we own with one link: the bytes go to a fresh O_EXCL temp in the held directory, then rename replaces the name
- *   (rename replaces the link itself and never follows it);
- * - anything else (a symlink, a foreign or hard-linked file, a directory) refuses that entry: false.
+ * - an existing entry (a re-archive of the same run) must be a regular file we own, opened O_NOFOLLOW. If its length
+ *   and exact bytes read through that fd match, it is kept unchanged, including any hard links;
+ * - changed content is replaced only with one link: the bytes go to a fresh O_EXCL temp in the held directory, then
+ *   rename replaces the name (rename replaces the link itself and never follows it);
+ * - anything else (a symlink, a foreign or nonregular file, an unreadable entry, changed hard-linked content) refuses
+ *   that entry: false. A failed comparison read refuses rather than permitting replacement.
  * `bytes` or `source` (read through one O_NOFOLLOW fd; a regular file) gives the content. `durable` fsyncs the file and
- * the held directory.
+ * the held directory, even for an unchanged entry; sync errors propagate.
  */
 export const writeArchiveFile = (held: PrivateDirectory, name: string, content: { bytes: Buffer } | { source: string }, durable = false): boolean => {
   const bytes = "bytes" in content ? content.bytes : (() => {
@@ -292,13 +294,31 @@ export const writeArchiveFile = (held: PrivateDirectory, name: string, content: 
   const syncDirectory = (): void => { if (durable && held.fd !== undefined) fs.fsyncSync(held.fd); };
   try { create(name); syncDirectory(); return true; }
   catch (error) { if (code(error) !== "EEXIST") throw error; }
-  // A re-archive: replace only our own regular file, by rename over it.
+  // A re-archive: keep identical bytes on our own regular file, otherwise replace only a single-link entry.
+  // Windows FlushFileBuffers requires write access, without creating or changing the existing file.
+  const access = process.platform === "win32" && durable ? fs.constants.O_RDWR : fs.constants.O_RDONLY;
+  const entry = path.join(held.path, name);
   let existing: number;
-  try { existing = fs.openSync(path.join(held.path, name), fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)); }
+  try { existing = fs.openSync(entry, access | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)); }
   catch { return false; }
   try {
     const stat = fs.fstatSync(existing);
-    if (!stat.isFile() || stat.nlink !== 1 || (process.getuid && stat.uid !== process.getuid())) return false;
+    // Where O_NOFOLLOW is unavailable, the named entry must still be this regular file, not a symlink's target.
+    let named: fs.Stats;
+    try { named = fs.lstatSync(entry); } catch { return false; }
+    if (!stat.isFile() || !named.isFile() || stat.dev !== named.dev || stat.ino !== named.ino ||
+        (process.getuid && stat.uid !== process.getuid())) return false;
+    let identical = false;
+    if (stat.size === bytes.length) {
+      try { identical = fs.readFileSync(existing).equals(bytes); }
+      catch { return false; }
+    }
+    if (identical) {
+      if (durable) fs.fsyncSync(existing);
+      syncDirectory();
+      return true;
+    }
+    if (stat.nlink !== 1) return false;
   } finally { fs.closeSync(existing); }
   const temp = `.${name}.${process.pid}.${randomUUID()}.tmp`;
   create(temp);

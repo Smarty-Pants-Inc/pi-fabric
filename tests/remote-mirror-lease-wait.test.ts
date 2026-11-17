@@ -442,12 +442,12 @@ describe("remote mirror lease wait (smarty-dev#11703)", () => {
     expect(w.sendMessage).not.toHaveBeenCalled();
   }, 20_000);
 
-  it("a modern fresh source-lapsed sample refuses both provider status and messages immediately, never arming or publishing", async () => {
+  it("a modern fresh source sample beyond grace refuses status and messages immediately, never arming or publishing", async () => {
     const w = await world();
     const lease = readHostLease(w.hub.root, w.target.hostId)!;
     const now = Date.now();
     writeHostLease(w.hub.root, { ...lease, expiresAt: now + 60_000, mirror: { ...lease.mirror!,
-      observedAt: now, sourceObservedAt: now - 60_000, sourceExpiresAt: now - 60_001 } });
+      observedAt: now, sourceObservedAt: now - 60_000, sourceExpiresAt: now - 360_001 } });
     await w.hubDirectory.refreshRoutingView();
     const controller = new AbortController();
     const resources = observeLeaseWait(w.hubDirectory, controller);

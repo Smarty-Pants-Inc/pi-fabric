@@ -69,30 +69,25 @@ const router = (directory: ParticipantDirectory, request = vi.fn(async () => ({ 
 };
 
 describe("native route lease grace (#4383)", () => {
-  it.each(["root", "actor"] as const)("resolves a %s lease late by 2s after file renewal, with no state reads during the wait", async kind => {
-    const f = await fixture(2000, kind); f.renew();
-    const reads = vi.spyOn(fs, "readFileSync");
-    const original = f.sleep.getMockImplementation()!;
-    f.sleep.mockImplementation(async ms => {
-      expect(reads.mock.calls.filter(([file]) => String(file) === path.join(f.root, "state.json"))).toHaveLength(0);
-      await original(ms);
-    });
+  it.each(["root", "actor"] as const)("routes a %s through the measured 235s expiry overrun without waiting for renewal (#20777)", async kind => {
+    const f = await fixture(235_000, kind);
     expect(await f.directory.resolveRoutingLease(f.target)).toBe(true);
-    expect(f.sleep).toHaveBeenCalledTimes(3);
+    expect(f.sleep).not.toHaveBeenCalled();
     expect(f.directory.get(f.target, f.now())?.stale).toBe(false);
+    expect(f.directory.list({ scope: "project" }, f.now()).find(p => p.id === f.target)?.stale).toBe(false);
+    expect(f.directory.get(f.target, f.host.expiresAt + participantLeaseGraceMs())).toBeDefined();
+    expect(f.directory.get(f.target, f.host.expiresAt + participantLeaseGraceMs() + 1)).toBeUndefined();
+    expect(readHostLease(f.root, f.target)?.expiresAt).toBe(f.lease.expiresAt);
   });
 
-  it.each(["followUp", "steer", "status", "actor"] as const)("returns retryable STALE, not Unknown, for a recent unrenewed %s target", async action => {
+  it.each(["followUp", "steer", "status", "actor"] as const)("resolves a recent unrenewed %s target without a renewal wait", async action => {
     const f = await fixture(2000, action === "actor" ? "actor" : "root");
     const send = router(f.directory);
     const result = action === "status" ? send.value.resolveParticipantFresh(f.target) : action === "actor"
       ? send.value.resolveActorTargetFresh(f.target) : send.value.routeMessage(f.target, "unchanged", undefined, action);
-    const error = await result.catch(e => e);
-    expect(error).toMatchObject({ name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
-    expect(error.message).toContain("lease late by 12 s; retry");
-    expect(error.message).not.toContain("Unknown");
-    expect(f.sleep).toHaveBeenCalledTimes(100);
-    expect(send.request).not.toHaveBeenCalled();
+    await expect(result).resolves.toBeDefined();
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(send.request).toHaveBeenCalledTimes(action === "status" || action === "actor" ? 0 : 1);
   });
 
   it.each(["followUp", "steer", "actor"] as const)("recovers a retained actor definition for %s, without replacing its exact owner", async action => {
@@ -101,7 +96,7 @@ describe("native route lease grace (#4383)", () => {
     const send = router(f.directory, undefined, actor);
     const result = action === "actor" ? await send.value.resolveActorTargetFresh(actor.name)
       : await send.value.routeMessage(actor.name, "unchanged", undefined, action, undefined, { idempotencyKey: "actor-retry" });
-    expect(f.sleep).toHaveBeenCalledTimes(3);
+    expect(f.sleep).not.toHaveBeenCalled();
     if (action === "actor") {
       expect(result).toMatchObject({ actor, participant: { id: actor.id, ownerHostId: f.host.id, ownerIdentityId: f.host.identity.id } });
       expect(send.request).not.toHaveBeenCalled();
@@ -113,17 +108,16 @@ describe("native route lease grace (#4383)", () => {
     }
   });
 
-  it.each(["followUp", "steer", "actor"] as const)("returns STALE for a retained unrenewed actor on %s before any activation/publication", async action => {
-    const f = await fixture(2000, "actor");
+  it.each(["followUp", "steer", "actor"] as const)("refuses a beyond-grace retained actor on %s before any activation/publication", async action => {
+    const f = await fixture(participantLeaseGraceMs() + 1_000, "actor");
     const actor = { id: f.target, rootId: "session:reader", name: "retained", residency: "durable", runner: "pi" } as FabricActorInfo;
     const ensureActor = vi.fn(async () => undefined);
     const resident = { hostId: f.host.id, options: { config: { rootId: actor.rootId, meshRoot: f.root } }, ensureActor } as unknown as Ports[6];
     const send = router(f.directory, undefined, actor, resident);
     const result = action === "actor" ? send.value.resolveActorTargetFresh(actor.name)
       : send.value.routeMessage(actor.name, "unchanged", undefined, action, undefined, { idempotencyKey: "actor-retry" });
-    expect(await result.catch(error => error)).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true,
-      ...(action === "actor" ? {} : { idempotencyKey: "actor-retry" }) });
-    expect(f.sleep).toHaveBeenCalledTimes(100);
+    await expect(result).rejects.toThrow(/Unknown/);
+    expect(f.sleep).not.toHaveBeenCalled();
     expect(ensureActor).not.toHaveBeenCalled(); expect(send.request).not.toHaveBeenCalled();
   });
 
@@ -142,7 +136,7 @@ describe("native route lease grace (#4383)", () => {
     send.request.mockRejectedValue(ownerFailure);
     await expect(send.value.routeMessage(f.target, "unchanged", undefined, "followUp")).rejects.toBe(ownerFailure);
     expect(send.request).toHaveBeenCalledOnce();
-    expect(f.sleep).toHaveBeenCalledTimes(3);
+    expect(f.sleep).not.toHaveBeenCalled();
   });
 
   it("never recovers/replays a published STALE for an own-root durable actor, even with dead-lock evidence", async () => {
@@ -162,8 +156,8 @@ describe("native route lease grace (#4383)", () => {
     expect(f.sleep).not.toHaveBeenCalled();
   });
 
-  it("keeps a 120s-lapsed exact target Unknown without polling or redirecting", async () => {
-    const f = await fixture(120000), send = router(f.directory);
+  it("keeps a beyond-grace exact target Unknown without polling or redirecting", async () => {
+    const f = await fixture(participantLeaseGraceMs() + 1_000), send = router(f.directory);
     await expect(send.value.routeMessage(f.target, "never redirect", undefined, "followUp")).rejects.toThrow(`Unknown Fabric participant: ${f.target}`);
     expect(f.sleep).not.toHaveBeenCalled(); expect(send.request).not.toHaveBeenCalled();
   });
@@ -209,12 +203,9 @@ describe("native route lease grace (#4383)", () => {
 
   it("does not revive a replaced owner's incarnation", async () => {
     const f = await fixture();
-    const original = f.sleep.getMockImplementation()!;
-    f.sleep.mockImplementation(async ms => {
-      await original(ms);
-      writeHostLease(f.root, { ...f.lease, startedAt: 2, updatedAt: f.now(), expiresAt: f.now() + 60000 });
-    });
-    await expect(f.directory.resolveRoutingLease(f.target)).rejects.toBeInstanceOf(FabricParticipantStaleError);
+    writeHostLease(f.root, { ...f.lease, startedAt: 2, updatedAt: f.now(), expiresAt: f.now() + 60000 });
+    expect(await f.directory.resolveRoutingLease(f.target)).toBe(false);
+    expect(f.directory.get(f.target, f.now())).toBeUndefined();
   });
 
   it("recovers when the matching owner's file advanced beyond stored state, without a lock signal", async () => {
@@ -222,12 +213,12 @@ describe("native route lease grace (#4383)", () => {
     f.directory.options.routingLease!.lockWaiting = () => false;
     vi.spyOn(f.directory, "writeStalled").mockReturnValue(undefined);
     expect(await f.directory.resolveRoutingLease(f.target)).toBe(true);
-    expect(f.sleep).toHaveBeenCalledTimes(3);
+    expect(f.sleep).not.toHaveBeenCalled();
   });
 
   it("rejects a beyond-grace owner before publishing a new command", async () => {
     const root = temp();
-    const sender = control(root, "sender", { captureOwnerLease: () => () => Date.now() - 120000 });
+    const sender = control(root, "sender", { captureOwnerLease: () => () => Date.now() - participantLeaseGraceMs() - 1_000 });
     await expect(sender.request("owner", "session:target", "followUp", { ownerIncarnation: "fixture:owner" }))
       .rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: expect.any(String) });
     expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(0);
@@ -236,8 +227,10 @@ describe("native route lease grace (#4383)", () => {
   it("accepts a configurable grace without changing lease TTLs", () => {
     expect(participantLeaseGraceMs(45000)).toBe(45000);
     expect(participantLeaseGraceMs(1000)).toBe(1000);
-    expect(participantLeaseGraceMs(Number.NaN)).toBe(45000);
-    expect(participantLeaseGraceMs(-1)).toBe(45000);
+    expect(participantLeaseGraceMs(Number.NaN)).toBe(300000);
+    expect(participantLeaseGraceMs(-1)).toBe(300000);
+    expect(participantLeaseGraceMs(900000)).toBe(600000);
+    expect(participantLeaseGraceMs(0)).toBe(0);
   });
 });
 
@@ -273,7 +266,7 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
     const sender = control(root, "sender", { captureOwnerLease: () => () => expiresAt });
     sender.start(() => ({ accepted: false }));
     const outcome = sender.request("owner", "session:target", "steer", { ownerIncarnation: "fixture:owner" }, "owner", { idempotencyKey: "stable-key" }).catch(e => e);
-    await drainMicrotasks(); expiresAt = Date.now() - 45001;
+    await drainMicrotasks(); expiresAt = Date.now() - participantLeaseGraceMs() - 1;
     await vi.advanceTimersByTimeAsync(20);
     expect(await outcome).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: "stable-key" });
     expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1);
@@ -292,7 +285,7 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
     const first = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", explicit ? { idempotencyKey: "same-message" } : {}).catch(e => e);
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(100);
     expect(deliver).toHaveBeenCalledOnce(); const firstId = command(sender).commandId;
-    expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
+    expiresAt = Date.now() - participantLeaseGraceMs() - 1; await vi.advanceTimersByTimeAsync(20);
     const stale = await first;
     expect(stale).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: explicit ? "same-message" : expect.any(String) });
     expiresAt = Date.now() + 120000; drop = false;
@@ -320,7 +313,7 @@ describe("same-key retry after proven-notRun resend (#4383)", () => {
     owner.start(deliver); await vi.advanceTimersByTimeAsync(500);
     expect(deliver).toHaveBeenCalledOnce(); const admittedId = command(sender).commandId;
     expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(2);
-    expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
+    expiresAt = Date.now() - participantLeaseGraceMs() - 1; await vi.advanceTimersByTimeAsync(20);
     expect(await first).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: "resend-key" });
     expiresAt = Date.now() + 120000; drop = false;
     const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" });
@@ -440,7 +433,7 @@ describe("A4 public-entry delayed-heartbeat N20", () => {
       // A fresh stale-incarnation FILE may not extend canonical successor authority.
       const hostKey = key("topology/hosts/", target.id), storedHost = mesh.get(hostKey, { fresh: true })!.value as Record<string, unknown>;
       const currentLease = readHostLease(meshRoot, target.id)!;
-      await mesh.put({ key: hostKey, identity: target, value: { ...storedHost, expiresAt: Date.now() - 120000 } });
+      await mesh.put({ key: hostKey, identity: target, value: { ...storedHost, expiresAt: Date.now() - participantLeaseGraceMs() - 1_000 } });
       writeHostLease(meshRoot, { ...currentLease, incarnationToken: "stale-file-incarnation", updatedAt: Date.now(), expiresAt: Date.now() + 60000 });
       try {
         await expect(provider.invoke("followUp", { id: target.id, message: "must-not-revive", idempotencyKey: "a4-stale-file" },

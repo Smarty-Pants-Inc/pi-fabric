@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostRoutingExpiry, participantLeaseGraceMs, hostMirrorLease, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
 import { withHostLeaseFileCustody } from "../topology/host-lease-lock.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
@@ -1051,12 +1051,12 @@ export class StoreBridgeSide implements BridgeSide {
 
   relayOrigin(id: string): string | undefined {
     const host = this.#relayProjection(id);
-    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) > this.now() ? host.remoteHost : undefined;
+    return host && hostRoutingExpiry(readHostLeases(this.store.root), host) > this.now() ? host.remoteHost : undefined;
   }
 
   relayStaleOrigin(id: string): string | undefined {
     const host = this.#relayProjection(id);
-    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) <= this.now() ? host.remoteHost : undefined;
+    return host && hostRoutingExpiry(readHostLeases(this.store.root), host) <= this.now() ? host.remoteHost : undefined;
   }
 
   async relayPresence(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
@@ -1070,7 +1070,11 @@ export class StoreBridgeSide implements BridgeSide {
           entry.updatedBy.id !== host.identity.id) continue;
       const liveness = hostLiveness(leases, host);
       const observedAt = this.now();
-      if (liveness.expiresAt > observedAt) hosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt, observedAt });
+      const mirror = hostMirrorLease(leases, host);
+      // Carry the actual translated SOURCE deadline, not hostLiveness's -1 stale
+      // sentinel: otherwise each relay sample would restart the source's grace.
+      const expiresAt = mirror ? mirror.observedAt + mirror.sourceExpiresAt - mirror.sourceObservedAt : liveness.expiresAt;
+      if (hostRoutingExpiry(leases, host) > observedAt) hosts.push({ record: { ...host, ...liveness, expiresAt }, expiresAt, observedAt });
     }
     const owners = new Map(hosts.map(host => [host.record.id, host.record]));
     const participants = this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }).flatMap(entry => {
@@ -1294,7 +1298,7 @@ export class StoreBridgeSide implements BridgeSide {
       }
       if (isNativeNonRootHost(host)) {
         const liveness = hostLiveness(leases, host);
-        if (liveness.expiresAt > now) nonRootHosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt, observedAt: now });
+        if (hostRoutingExpiry(leases, host) > now) nonRootHosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt, observedAt: now });
         continue;
       }
       if (!isAdmissibleRecord("host", host)) {
@@ -1309,7 +1313,8 @@ export class StoreBridgeSide implements BridgeSide {
       const expiresAt = liveness.expiresAt;
       // Carry effective renewal time as well as expiry, with the same incarnation fence.
       const record = { ...host, ...liveness };
-      if (expiresAt > now) hosts.push({ record, expiresAt, observedAt: now });
+      // Membership grace only: carry the ORIGINAL source expiry for readers and reapers.
+      if (hostRoutingExpiry(leases, host) > now) hosts.push({ record, expiresAt, observedAt: now });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
@@ -1611,7 +1616,7 @@ export class StoreBridgeSide implements BridgeSide {
     // valid only under its own id's name: read that one file, not the whole lease directory (a
     // readdir plus a stat per fleet lease, per held event, on Windows where listings are never cached).
     const lease = readHostLease(this.store.root, id);
-    const until = hostLeaseExpiry(new Map<string, FabricHostLease>(lease ? [[id, lease]] : []), host);
+    const until = hostRoutingExpiry(new Map<string, FabricHostLease>(lease ? [[id, lease]] : []), host);
     if (until <= now) return 0;
     if (participantEntry) {
       const participant = participantOf(participantEntry.key, participantEntry.value);
@@ -1731,7 +1736,7 @@ export class StoreBridgeSide implements BridgeSide {
       const host = hostOf(entry.key, entry.value);
       if (!host || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
-      if (expiresAt > now) hosts.push({ record: { ...host, ...hostLiveness(leases, host) }, expiresAt });
+      if (hostRoutingExpiry(leases, host) > now) hosts.push({ record: { ...host, ...hostLiveness(leases, host) }, expiresAt });
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants: FabricParticipantRecord[] = [];
@@ -1947,7 +1952,7 @@ export class StoreBridgeSide implements BridgeSide {
             // represent a root, participant owner or bridge route. Keep their own identity and
             // liveness projection without inheriting the main root's incarnation history.
             const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
-            if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt) ||
+            if (!Number.isFinite(expiresAt) || expiresAt + (sampled ? participantLeaseGraceMs() : 0) <= (sampled ? sourceObservedAt : liveAt) ||
               (sourceObservedAt !== undefined && !sampled)) continue;
             const origin = sampled ? liveAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt) : expiresAt;
             const until = sampled ? origin
@@ -2015,7 +2020,7 @@ export class StoreBridgeSide implements BridgeSide {
           // Keep legacy projection deadlines for older readers, but give current readers the
           // successful per-host observation. A delayed commit never makes that snapshot fresh.
           const sampled = typeof sourceObservedAt === "number" && Number.isFinite(sourceObservedAt);
-          if (!Number.isFinite(expiresAt) || expiresAt <= (sampled ? sourceObservedAt : liveAt) ||
+          if (!Number.isFinite(expiresAt) || expiresAt + (sampled ? participantLeaseGraceMs() : 0) <= (sampled ? sourceObservedAt : liveAt) ||
             (retained && (!Number.isFinite(record.updatedAt) || (sourceObservedAt !== undefined && !sampled)))) {
             // Malformed direct samples were skipped in preflight. A finite expired
             // explicit owner sample is withdrawal; tokenless liveness cannot withdraw it.

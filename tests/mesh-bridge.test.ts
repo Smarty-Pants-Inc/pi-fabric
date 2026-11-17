@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { buildSync } from "esbuild";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
   type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -36,7 +36,7 @@ import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
 import { isMeshRetryableBusy } from "../src/mesh/state-backend.js";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { runBridge, transportCommand } from "../src/mesh-bridge.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { LIVENESS_POLICY_KEY, participantLeaseGraceMs, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFiles, writeParticipantFile } from "../src/topology/participant-files.js";
@@ -50,6 +50,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 const scratch = (): string => {
@@ -416,6 +417,9 @@ describe("real participant directory over a pipe", () => {
 });
 
 describe("presence mirror under contention (smarty-dev#2761)", () => {
+  // Preserve the short-TTL recovery/refusal cases under the supported strict policy.
+  // Default-grace source evidence and its relay bound run in mesh-bridge-lease-loop.test.ts.
+  beforeEach(() => vi.stubEnv("PI_FABRIC_PARTICIPANT_LEASE_GRACE_MS", "0"));
   it.each([
     ["toRemote", "filtered"], ["toRemote", "skip-only"],
     ["toLocal", "filtered"], ["toLocal", "skip-only"],
@@ -1386,11 +1390,11 @@ describe("mesh bridge", () => {
     expect(await farAuthority.owned()).toEqual({ hosts: [], participants: [] });
   });
 
-  it("drops a remote root whose lease lapsed, and never replaces a native record", async () => {
+  it("drops a remote root beyond routing grace, and never replaces a native record", async () => {
     const { hub, far, bridge } = setup();
     await addRoot(hub, "same");
     await addRoot(far, "same"); // collides with the hub's ids: a spoof, never mirrored
-    const gone = await addRoot(far, "gone", -1);
+    const gone = await addRoot(far, "gone", -participantLeaseGraceMs() - 1);
     await bridge.start();
     await bridge.step();
     expect(hub.get(`topology/hosts/${hash(sid("same"))}`)!.value).not.toHaveProperty("remoteHost");

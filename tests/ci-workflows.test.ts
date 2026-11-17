@@ -466,7 +466,7 @@ describe("Public Linux packing and required checks", () => {
       expect(tests.needs).toBeUndefined();
       expect(tests.strategy).toBeUndefined();
       const lanes = tests.steps?.find((step) => step.name === "Run Linux tests in eight logged parallel lanes")?.run ?? "";
-      expect(tests["timeout-minutes"]).toBe(45);
+      expect(tests["timeout-minutes"]).toBe(75);
       expect(lanes).toContain("max_lanes=4");
       expect(lanes).toContain('wait -n -p finished_pid "${lane_pids[@]}"');
       expect(lanes).toContain('while [ "${#lane_pids[@]}" -ge "$max_lanes" ]; do');

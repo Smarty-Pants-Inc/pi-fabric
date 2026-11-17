@@ -289,6 +289,11 @@ const linuxProcesses = (): LinuxGroupMember[] =>
     const member = linuxGroupMember(Number(entry));
     return member && member.state !== "Z" && member.state !== "X" ? [member] : [];
   });
+/** Capped launch host override; invalid values must not remove the admission bound. */
+const scopeAdmissionTimeoutMs = (): number => {
+  const value = Number(process.env.PI_FABRIC_SCOPE_ADMISSION_TIMEOUT_MS);
+  return Number.isSafeInteger(value) && value >= 1_000 && value <= 300_000 ? value : 30_000;
+};
 const STOP_TERM_MS = 2_000;
 const STOP_KILL_MS = 2_000;
 const TREE_CENSUS_MIN_SPACING_MS = 60_000;
@@ -970,7 +975,7 @@ export const spawnDetached = async (
             if (markerIsAdmitted()) finish(true);
             else if (nativeClosed) childClosed();
             else if (authority?.signal?.aborted) aborted();
-            else if (!settled) deadline = setTimeout(() => finishIfMarkerAdmitted("scope admission timed out before an authenticated marker"), 5_000);
+            else if (!settled) deadline = setTimeout(() => finishIfMarkerAdmitted("scope admission timed out before an authenticated marker"), capped ? scopeAdmissionTimeoutMs() : 5_000);
           });
         } catch {
           // An unavailable directory watch uses the checked legacy fallback

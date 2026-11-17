@@ -18,6 +18,7 @@ const roots: string[] = [];
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubEnv("SMARTY_ALPHA", "0");
+  vi.stubEnv("PI_FABRIC_DEBUG", undefined);
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -93,8 +94,9 @@ describe.skipIf(process.platform === "win32" || typeof process.getuid !== "funct
     }
   });
 
-  it("SMARTY_ALPHA=1 opens beneath an unsafe ancestor and warns once with the named reason", async () => {
+  it.each([undefined, "", "1"])("SMARTY_ALPHA=1 admits unsafe ancestors quietly unless debug is enabled (PI_FABRIC_DEBUG=%s)", async debug => {
     vi.stubEnv("SMARTY_ALPHA", "1");
+    vi.stubEnv("PI_FABRIC_DEBUG", debug);
     const { openPrivateStateDb } = await freshGate();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     for (let index = 0; index < 2; index++) {
@@ -112,8 +114,8 @@ describe.skipIf(process.platform === "win32" || typeof process.getuid !== "funct
       }
       expect(fs.statSync(root).mode & 0o777).toBe(0o700);
     }
-    expect(warning).toHaveBeenCalledTimes(1);
-    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/FABRIC_MESH_STATE_ANCESTOR_ALPHA.*ancestor.*SMARTY_ALPHA/));
+    expect(warning).toHaveBeenCalledTimes(debug ? 1 : 0);
+    if (debug) expect(warning).toHaveBeenCalledWith(expect.stringMatching(/FABRIC_MESH_STATE_ANCESTOR_ALPHA.*ancestor.*SMARTY_ALPHA/));
   });
 
   it("SMARTY_ALPHA=0 keeps the original unsafe-ancestor refusal before SQLite opens", async () => {
@@ -209,6 +211,10 @@ describe.skipIf(process.platform === "win32" || typeof process.getuid !== "funct
     const open = () => openPrivateStateDb(file, target => new DatabaseSync(target));
     vi.stubEnv("SMARTY_ALPHA", "1");
     expect(() => open().close()).not.toThrow();
+    expect(warning).not.toHaveBeenCalled();
+    vi.stubEnv("PI_FABRIC_DEBUG", "1");
+    expect(() => open().close()).not.toThrow();
+    expect(warning).toHaveBeenCalledTimes(1);
     vi.stubEnv("SMARTY_ALPHA", "0");
     expect(open).toThrow(/its ancestor .* without the sticky bit/);
     vi.stubEnv("SMARTY_ALPHA", "1");

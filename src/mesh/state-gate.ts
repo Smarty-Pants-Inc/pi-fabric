@@ -426,7 +426,8 @@ const assertPrivateAncestors = (root: string): void => {
   if (process.platform === "win32" || typeof process.getuid !== "function") return;
   // Recheck the shared live setting before warning dedupe; a previous bypass never authorizes an opt-out call.
   if (alphaModeEnabled()) {
-    if (!warnedAncestorAlpha) {
+    // Normal mesh children must stay quiet; use the existing opt-in debug switch for this process-once notice.
+    if (process.env.PI_FABRIC_DEBUG && !warnedAncestorAlpha) {
       warnedAncestorAlpha = true;
       console.warn("[pi-fabric] FABRIC_MESH_STATE_ANCESTOR_ALPHA: skipping mesh SQLite state ancestor ownership/write checks because alpha mode is enabled. "
         + "State-path privacy, file types, pinned-open identity and locks remain enforced. Set SMARTY_ALPHA=0 with no "

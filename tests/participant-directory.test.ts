@@ -90,9 +90,7 @@ const createDirectory = (
   const hostId = identity.kind === "main" ? identity.id : "runtime:" + identity.sessionId;
   const directory = new ParticipantDirectory(
     new MeshStore(meshRoot, 64 * 1024, 1_000),
-    // These legacy expiry/settle cases explicitly exercise the supported strict (zero-grace)
-    // policy. Default-grace routing and the measured 235s overrun live in route-lease-grace.test.ts.
-    { enabled: true, hostId, rootId, identity, ...lease, routingLease: { graceMs: 0 } },
+    { enabled: true, hostId, rootId, identity, ...lease },
   );
   directory.registerSource(source);
   directories.push(directory);
@@ -547,7 +545,7 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
       expect(directory.get(host.rootId, Date.now(), { fresh: true })?.bridgeStale).toBeUndefined();
 
       // Fresh bridge, source lease lapsed on the source clock: lease-stale, the root is gone.
-      const lapsed = sample(Date.now(), Date.now() - 600_000 - 300_001);
+      const lapsed = sample(Date.now(), Date.now() - 600_000 - 1);
       lease(lapsed);
       expect(read()).toEqual({ remoteHost: "forge", expiresAt: lapsed.observedAt - 1, mirror: lapsed });
       expect(mirroredLeaseStatus("forge", read()!.mirror, Date.now())).toBe("lease-stale");
@@ -773,7 +771,7 @@ describe("ParticipantDirectory host leases", () => {
       // A non-main peer: a main also writes a legacy session entry with a fixed 15 s lease.
       const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "peer" ? "actor" : "main", sessionId: name };
       const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 10_000 }), {
-        enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing, routingLease: { graceMs: 0 },
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
       });
       directory.registerSource(() => [{ ...rootRecord(identity.id, identity.id, name), ...(name === "peer" ? { status: peerStatus } : {}) }]);
       directories.push(directory);
@@ -2009,7 +2007,7 @@ describe("ParticipantDirectory", () => {
       const identity: MeshIdentity = { id: `session:${name}`, name: "main", kind: name === "peer" ? "actor" : "main", sessionId: name };
       const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 10_000 });
       const directory = new ParticipantDirectory(mesh, {
-        enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing, routingLease: { graceMs: 0 },
+        enabled: true, hostId: identity.id, rootId: identity.id, identity, ...timing,
       });
       directory.registerSource(() => [rootRecord(identity.id, identity.id, name)]);
       directories.push(directory);

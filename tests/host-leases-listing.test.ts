@@ -118,7 +118,7 @@ describe("state-derived host lease reads", () => {
     const self = { id: "session:observer", name: "observer", kind: "main" as const };
     const peer = { id: "session:peer", name: "peer", kind: "main" as const };
     const directory = new ParticipantDirectory(mesh, { enabled: true, identity: self,
-      hostId: self.id, rootId: self.id, reapDeadHosts: false, routingLease: { graceMs: 0 } });
+      hostId: self.id, rootId: self.id, reapDeadHosts: false });
     const now = Date.now(), key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
     const lease: FabricHostLease = { id: peer.id, rootId: peer.id, identityId: peer.id,
       startedAt: 1, incarnationToken: "peer-token", updatedAt: now - 1000, expiresAt: now - 1 };

@@ -38,7 +38,7 @@ const LEASE_DIR = "host-leases";
 export const DEFAULT_PARTICIPANT_LEASE_GRACE_MS = 300_000;
 export const PARTICIPANT_LEASE_WAIT_MS = 10_000;
 
-/** Routing/membership only, never writer TTL or consumer admission. The 600s cap
+/** Resolution only, never discovery, writer TTL or consumer admission. The 600s cap
  * permits bounded tuning above the measured 235s overrun without unbounded retention. */
 export const participantLeaseGraceMs = (override?: number): number => {
   const value = override ?? (process.env.PI_FABRIC_PARTICIPANT_LEASE_GRACE_MS === undefined
@@ -151,18 +151,12 @@ export const mirroredLeaseStatus = (
 export const mirroredOwnerRoutingStatus = (
   owner: { remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; mirrorLease?: 1; bridgeStale?: true },
   now = Date.now(),
-  graceMs = participantLeaseGraceMs(),
 ): MirroredLeaseStatus => {
   if (owner.bridgeStale) return "bridge-stale";
   // Mixed-release legacy exception: an older bridge proves only its unexpired projection,
   // never source death. Remove ONLY after ALL bridges run a release with mirrorLease.
   const status = owner.mirror || owner.mirrorLease === 1
     ? mirroredLeaseStatus(owner.remoteHost, owner.mirror, now) : "live";
-  const mirror = owner.mirror;
-  // Routing alone tolerates a late source Main. Keep the bridge's 15s freshness
-  // bound and source-clock comparison; raw mirroredLeaseStatus remains strict for reapers.
-  if (status === "lease-stale" && mirror &&
-    mirror.sourceObservedAt - mirror.sourceExpiresAt + (now - mirror.observedAt) <= graceMs) return "live";
   return status === "live" && !(owner.expiresAt > now) ? "bridge-stale" : status;
 };
 
@@ -941,25 +935,6 @@ export const hostLeaseExpiry = (
   leases: ReadonlyMap<string, FabricHostLease>,
   host: HostLeaseOwner,
 ): number => hostLiveness(leases, host).expiresAt;
-
-/** Reader-side deadline only. Never use for custody, reaping, or takeover. */
-export const hostRoutingExpiry = (
-  leases: ReadonlyMap<string, FabricHostLease>, host: HostLeaseOwner, graceMs = participantLeaseGraceMs(),
-): number => {
-  const expiry = hostLeaseExpiry(leases, host);
-  const lease = matchingHostLease(leases, host);
-  if (host.remoteHost) {
-    const mirror = lease?.mirror;
-    // Preserve source/bridge clock separation. A fresh sample of a late Main may
-    // extend routing, never the bridge's freshness bound or the stored projection.
-    return mirror?.remoteHost === host.remoteHost && mirror.sourceExpiresAt <= mirror.sourceObservedAt
-      ? Math.min(mirror.observedAt + MIRROR_FRESH_MS,
-        mirror.observedAt + mirror.sourceExpiresAt - mirror.sourceObservedAt + graceMs)
-      : expiry; // Legacy unsampled bridges cannot prove the source's lease age.
-  }
-  if (leases.has(host.id) && !lease) return expiry;
-  return lease?.reloadUntil !== undefined ? Math.min(expiry, lease.reloadUntil) : expiry + graceMs;
-};
 
 /** Whether the fleet owner has moved lease renewals to files (see LIVENESS_POLICY_KEY). */
 export const fileLeasesOnly = (policy: unknown): boolean =>

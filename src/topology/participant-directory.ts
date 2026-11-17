@@ -31,7 +31,6 @@ import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICI
 import {
   fileLeasesOnly,
   hostLeaseExpiry,
-  hostRoutingExpiry,
   hostLeasePath,
   hostLeasePredecessor,
   hostLiveness,
@@ -43,7 +42,9 @@ import {
   LIVENESS_POLICY_KEY,
   readHostLease,
   readHostLeaseCurrent,
+  readHostLeaseSnapshot,
   participantLeaseGraceMs,
+  waitForHostLeaseRenewal,
   type RoutingLeaseWaitOptions,
   removeHostLeaseIf,
   removeOwnedHostLease,
@@ -594,12 +595,11 @@ const legacyRootFromEntry = (
   now: number,
   meshRoot?: string,
   leases?: ReadonlyMap<string, FabricHostLease>,
-  routingGraceMs = 0,
 ): FabricParticipantInfo | undefined => {
   // Validate metadata without consulting leases first; the captured liveness supplies the TTL.
   if (!isLiveLegacyRootEntry(entry, Number.NEGATIVE_INFINITY) || entry.value.id === localRootId) return undefined;
   const live = leases ? candidateSessionLiveness(entry, leases) : sessionLiveness(entry, meshRoot);
-  if (live.expiresAt + routingGraceMs < now) return undefined;
+  if (live.expiresAt < now) return undefined;
   const value = entry.value;
   return {
     format: 1,
@@ -2041,7 +2041,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
     for (const participant of parsed.participants) {
       // Apply on every list call, after private validation, so cached file/state
       // copies age too without changing ownership/publication consumers.
-      if (participant.kind === "root" && this.#routeEnded(participant, read)) continue;
       if (participant.stopReason === "owner-root-gone" && !retainedTerminalActor(participant, now)) continue;
       const owner = hosts.get(participant.ownerHostId);
       if (!ownerMatches(participant, owner, this.options.hostId)) continue;
@@ -2051,9 +2050,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       const stale =
         !owner ||
-        (owner.remoteHost ? this.#mirrorStatus(owner, now) === "lease-stale"
-          : !this.#nativeRoutingLive(owner, now)) ||
-        (participant.status === "stopping" && owner.expiresAt < now) ||
+        (owner.remoteHost ? this.#mirrorStatus(owner, now) === "lease-stale" : owner.expiresAt < now) ||
         (participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) ||
         owner.identity.id !== participant.ownerIdentityId ||
         owner.rootId !== participant.rootId;
@@ -2077,18 +2074,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const legacyRoots = new Map(
       parsed.legacySessions
         .flatMap((entry) => {
-          const root = legacyRootFromEntry(entry, this.options.rootId, now, this.mesh.root, undefined,
-            participantLeaseGraceMs(this.options.routingLease?.graceMs));
+          const root = legacyRootFromEntry(entry, this.options.rootId, now, this.mesh.root);
           return root ? [[root.id, root] as const] : [];
         }),
     );
     if (options.scope !== "local" && options.scope !== "lineage") {
       if (!options.kinds || options.kinds.includes("root")) {
         for (const root of legacyRoots.values()) {
-          // An expired/reloading/closed native root must not be resurrected by its
-          // older compatibility advertisement (whose lease now also has routing grace).
-          if (!byId.has(root.id) && !parsed.participants.some(p => p.id === root.id && p.kind === "root") &&
-            !this.#sessionEnded(root.id, read)) byId.set(root.id, root);
+          if (!byId.has(root.id)) byId.set(root.id, root);
         }
       }
       if (!options.kinds || options.kinds.includes("actor")) {
@@ -2214,17 +2207,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return hosts;
   }
 
-  #nativeRoutingLive(owner: FabricHostRecord, now: number): boolean {
-    if (owner.expiresAt >= now) return true;
-    if (now - owner.expiresAt > participantLeaseGraceMs(this.options.routingLease?.graceMs)) return false;
-    const lease = readHostLease(this.mesh.root, owner.id);
-    return hostRoutingExpiry(lease ? new Map([[owner.id, lease]]) : new Map(), owner,
-      participantLeaseGraceMs(this.options.routingLease?.graceMs)) >= now;
-  }
-
   #mirrorStatus(owner: FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }, now: number) {
-    return mirroredOwnerRoutingStatus({ ...owner, remoteHost: owner.remoteHost! }, now,
-      participantLeaseGraceMs(this.options.routingLease?.graceMs));
+    return mirroredOwnerRoutingStatus({ ...owner, remoteHost: owner.remoteHost! }, now);
   }
 
   // A mirrored record never shadows a local target (smarty-dev#2004): published participant IDs,
@@ -2409,7 +2393,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!record) return false;
     const now = (this.options.routingLease?.now ?? Date.now)();
     const expiry = this.captureControlOwnerLease(record.owner.id, record.owner.identity.id, id)?.();
-    return expiry !== undefined && this.#nativeRoutingLive({ ...record.owner, expiresAt: expiry }, now);
+    return expiry !== undefined && now - expiry <= participantLeaseGraceMs(this.options.routingLease?.graceMs);
   }
 
   /** Recovery is resolution-only: no mesh write, ownership transfer, or delivery retry here. */
@@ -2422,19 +2406,37 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const options = this.options.routingLease ?? {};
     const now = (options.now ?? Date.now)();
     if (this.#routeEnded(participant, record.read)) return false;
-    const lease = readHostLease(this.mesh.root, owner.id);
+    const snapshot = readHostLeaseSnapshot(this.mesh.root, owner.id);
+    const lease = snapshot?.lease;
     const matching = lease && lease.rootId === owner.rootId && lease.identityId === owner.identity.id &&
       (owner.incarnationToken !== undefined ? lease.incarnationToken === owner.incarnationToken :
         (lease.startedAt === undefined || lease.startedAt === owner.startedAt));
     const expiresAt = hostLeaseExpiry(matching ? new Map([[owner.id, lease]]) : new Map(), owner);
     if (expiresAt >= now) return true;
+    // Grace cannot revive a replaced incarnation or a completed reload.
     if (lease && (!matching || lease.reloadUntil !== undefined && lease.reloadUntil < now)) return false;
     if (now - expiresAt > participantLeaseGraceMs(options.graceMs) ||
       participant.status === "stopping" || participant.status === "reloading") return false;
-    // #20777: renewal itself can be starved for minutes. A ten-second wait followed by
-    // STALE still drops a live Main; route immediately inside the same bounded grace.
-    // Callers retain their fresh ownership/terminal fence and ordinary ACK deadline.
-    return true;
+    // A direct `.lock` observer (smarty-dev#6477 A1 section 4): a heartbeat writer shows there on
+    // the `file` backend only. With state in SQLite this reads the state write-lock signal (L2a).
+    const lockWaiting = options.lockWaiting ?? (() => fs.existsSync(path.join(this.mesh.root, ".lock")));
+    // A replaced lease file newer than the stored ownership record also explains a cached lapse.
+    const advanced = matching && snapshot!.mtimeMs > owner.updatedAt;
+    if (!advanced && !lockWaiting() && !this.writeStalled(now)) return true;
+    await waitForHostLeaseRenewal(id, () => {
+      const current = readHostLease(this.mesh.root, owner.id);
+      return hostLeaseExpiry(current ? new Map([[owner.id, current]]) : new Map(), owner);
+    }, options);
+    // Shared authority and terminal state are rechecked once, not on each file poll.
+    const current = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, participant.id), { fresh: true });
+    const refreshed = current ? participantFromEntry(current) : undefined;
+    const currentOwnerEntry = this.mesh.get(keyFor(HOST_PREFIX, owner.id));
+    const currentOwner = currentOwnerEntry ? hostFromEntry(currentOwnerEntry) : undefined;
+    return !!refreshed && refreshed.ownerHostId === owner.id && refreshed.ownerIdentityId === owner.identity.id &&
+      refreshed.rootId === participant.rootId && !refreshed.remoteHost &&
+      !["stopping", "reloading"].includes(refreshed.status) && currentOwner !== undefined &&
+      (owner.incarnationToken !== undefined ? currentOwner.incarnationToken === owner.incarnationToken : currentOwner.startedAt === owner.startedAt) &&
+      currentOwner.identity.id === owner.identity.id && currentOwner.rootId === owner.rootId && !this.#routeEnded(refreshed);
   }
 
   async #resolveNatsRoutingLease(id: string, signal?: AbortSignal): Promise<boolean> {
@@ -2628,10 +2630,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (
           owner &&
           ownerMatches(participant, owner, this.options.hostId) &&
-          !(participant.status === "stopping" && owner.expiresAt < now) &&
           !(participant.status === "reloading" && (participant.reloadUntil ?? 0) < now) &&
-          (owner.remoteHost ? status !== "lease-stale"
-            : this.#nativeRoutingLive(owner, now)) &&
+          (owner.remoteHost ? status !== "lease-stale" : owner.expiresAt >= now) &&
           owner.identity.id === participant.ownerIdentityId &&
           owner.rootId === participant.rootId
         ) {
@@ -2904,14 +2904,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
     let lapsed = 0;
     for (const host of this.#liveHosts(this.mesh.listAll(HOST_PREFIX)).values()) {
       // A mirrored lease lapses when its bridge stops, which says nothing about this mesh's lock.
-      if (host.id !== this.options.hostId && host.remoteHost === undefined && host.expiresAt > since &&
-        host.expiresAt + participantLeaseGraceMs(this.options.routingLease?.graceMs) < now) lapsed += 1;
+      if (host.id !== this.options.hostId && host.remoteHost === undefined && host.expiresAt > since && host.expiresAt <= now) lapsed += 1;
     }
     for (const entry of this.mesh.listAll(LEGACY_SESSION_PREFIX)) {
       const expiresAt = sessionLiveness(entry, this.mesh.root).expiresAt;
       const id = isObject(entry.value) ? entry.value.id : undefined;
-      if (id !== this.options.rootId && expiresAt > since &&
-        expiresAt + participantLeaseGraceMs(this.options.routingLease?.graceMs) < now) lapsed += 1;
+      if (id !== this.options.rootId && expiresAt > since && expiresAt <= now) lapsed += 1;
     }
     return lapsed;
   }

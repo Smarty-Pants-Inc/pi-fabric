@@ -6,12 +6,12 @@ import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
-import { hostLiveness, hostRoutingExpiry, participantLeaseGraceMs, LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLiveness, LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // A hub with links to two spokes. Fresh source observations may keep a root discoverable
 // until the next source sample, but never renew its recorded native lease (#10068). A dead
-// origin is withdrawn after bounded reader grace plus a bridge freshness window (+ one sync).
+// origin is withdrawn within one bridge freshness window of its source expiry (+ one sync).
 const roots: string[] = [];
 const links: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -87,12 +87,12 @@ describe("mirrored roots retain source lease evidence (#10068)", () => {
       f.spokes.ryzen3.get(hostKey(origin.identity.id))!.value as never).expiresAt;
     const diedAt = f.now() + 30_000;
     let deadline = Infinity;
-    // Cross the full default grace, sampled every second: a relay must not restart it.
-    for (let tick = 0; tick <= 90 + participantLeaseGraceMs() / 1000; tick++) {
+    // One minute after the death, sampled every second; each bridge syncs on its own cadence.
+    for (let tick = 0; tick <= 90; tick++) {
       const at = f.now();
       if (at < diedAt) origin.renew(at);
       for (const keep of [witness, lead]) keep.renew(at);
-      if (at === diedAt) deadline = originExpiry() + participantLeaseGraceMs() + BRIDGE_LEASE_MS + SYNC_MS;
+      if (at === diedAt) deadline = originExpiry() + BRIDGE_LEASE_MS + SYNC_MS;
       for (const bridge of f.bridges) await bridge.step();
       const expiry = originExpiry();
       for (const [name, mesh] of Object.entries(meshes)) {
@@ -100,18 +100,13 @@ describe("mirrored roots retain source lease evidence (#10068)", () => {
         const seen = liveness(mesh, origin.identity.id);
         const root = mesh.get(participantKey(origin.identity.id), { fresh: true });
         if (tick % 5 === 0) trace.push(`t+${(at - diedAt) / 1000}s ${name}: lease ${seen ? `${seen.remoteHost} expires t+${(seen.expiresAt - diedAt) / 1000}s` : "none"}, root ${root ? "present" : "none"} (origin expires t+${(expiry - diedAt) / 1000}s)`);
-        // All fixture clocks agree. Writers still carry raw source TTL, not the routing grace.
-        // hostLiveness may use its historical -1 sentinel for a source-expired observation.
-        const leases = readHostLeases(mesh.root), file = leases.get(origin.identity.id);
-        if (file && file.expiresAt > expiry) violations.push(`${name}: lease writer extended the native TTL`);
-        const host = mesh.get(hostKey(origin.identity.id), { fresh: true });
-        const routeUntil = host ? hostRoutingExpiry(leases, host.value as never) : 0;
-        if (routeUntil > expiry + participantLeaseGraceMs()) violations.push(`${name}: relay restarted grace`);
-        const observation = file?.mirror;
+        // All fixture clocks agree: traffic authority must still not outlive the origin.
+        if (seen && seen.expiresAt > expiry) violations.push(`${name} at t+${(at - diedAt) / 1000}s: mirror expires ${(seen.expiresAt - expiry) / 1000}s after its origin`);
+        const observation = readHostLeases(mesh.root).get(origin.identity.id)?.mirror;
         if (observation && observation.sourceExpiresAt > expiry)
           violations.push(`${name}: mirror invented a source renewal`);
-        if (observation && at > expiry + participantLeaseGraceMs() && routeUntil > at)
-          violations.push(`${name}: mirror admitted a source beyond grace`);
+        if (observation && observation.sourceExpiresAt <= observation.sourceObservedAt && seen && seen.expiresAt > at)
+          violations.push(`${name}: mirror admitted a source-expired root`);
         if (at >= deadline && seen && seen.expiresAt > at) violations.push(`${name} at t+${(at - diedAt) / 1000}s: lease still live`);
         if (at >= deadline && root) violations.push(`${name} at t+${(at - diedAt) / 1000}s: root still mirrored`);
       }

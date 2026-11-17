@@ -273,7 +273,7 @@ describe("sender incarnation fencing (#7514)", () => {
 });
 
 describe("directory availability for live Mains (#2386)", () => {
-  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("revalidates live or grace-period routing without granting writer admission (files=%s, fresh lease=%s)", async (files, freshLease) => {
+  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("revalidates live routing without a writer fence but retains stale-lease refusal (files=%s, fresh lease=%s)", async (files, freshLease) => {
     const f = await mainLeaseFixture(files);
     if (freshLease) {
       const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
@@ -296,9 +296,14 @@ describe("directory availability for live Mains (#2386)", () => {
     fs.writeFileSync(path.join(lock, "owner"), `contended\n${process.pid}\n${Date.now()}\n`);
     try {
       const delivery = send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp");
-      await expect(delivery).resolves.toMatchObject({ queued: true, messageId: "recovered" });
-      expect(request).toHaveBeenCalledOnce();
-      expect(probe).toHaveBeenCalledOnce();
+      if (freshLease) {
+        await expect(delivery).resolves.toMatchObject({ queued: true, messageId: "recovered" });
+        expect(request).toHaveBeenCalledOnce();
+      } else {
+        await expect(delivery).rejects.toMatchObject({ name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
+        expect(request).not.toHaveBeenCalled();
+      }
+      expect(probe).toHaveBeenCalledTimes(freshLease ? 1 : 0);
       expect(send.actors.status).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(lock, { recursive: true, force: true });
@@ -312,7 +317,7 @@ describe("directory availability for live Mains (#2386)", () => {
     await expect(send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp"))
       .resolves.toMatchObject({ queued: true, messageId: "recovered", acknowledged: true });
     expect(probe).toHaveBeenCalledOnce();
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(freshLease ? 2 : 1);
     expect(request.mock.calls[0]?.slice(0, 4)).toEqual([f.target.id, f.target.id, "followUp", expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } })]);
     expect(f.directory.canConsumeMesh()).toBe(false); // Routing did not weaken lease admission.
   });
@@ -591,8 +596,8 @@ describe("Main target lineage delivery (#3686)", () => {
     [false, "steer", "name"], [false, "followUp", "name"], [true, "steer", "name"], [true, "followUp", "name"],
   ] as const)("queues %s file presence / %s / selector=%s during the bounded recent-lease grace", async (files, kind, selector) => {
     const f = await mainLeaseFixture(files);
-    expect(f.directory.get(f.target.id, undefined, { fresh: true })?.stale).toBe(false);
-    expect(f.directory.lastKnown(f.target.id)).toBeUndefined();
+    expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
+    expect(f.directory.lastKnown(f.target.id)?.lapsedMs).toBeGreaterThanOrEqual(2_000);
     expect(f.directory.lineageAlive(f.target.id)).toBe(true);
     const sender = f.plane(identity);
     sender.start(() => ({ accepted: false }));
@@ -624,7 +629,7 @@ describe("Main target lineage delivery (#3686)", () => {
           expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } }),
         ]);
       } else expect(sendMessage).toHaveBeenCalledOnce();
-      expect(f.directory.get(f.target.id, undefined, { fresh: true })?.stale).toBe(false);
+      expect(f.directory.get(f.target.id, undefined, { fresh: true })).toBeUndefined();
     } finally {
       await sender.close();
       await pending;
@@ -690,9 +695,6 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
     await expect(send.value.routeMessage("lead-example", "must not arrive", undefined, "followUp"))
       .rejects.toThrow(`Ambiguous Fabric participant: lead-example (actor actor:named, root ${f.target.id})`);
     status.mockRestore();
-    // Both roots are retained-only here: exercise ambiguity under strict policy,
-    // not live-name precedence over a predecessor with unavailable authority.
-    f.directory.options.routingLease!.graceMs = 0;
     const duplicate = { ...f.presence, id: "session:duplicate", rootId: "session:duplicate", ownerHostId: "session:duplicate", ownerIdentityId: "session:duplicate" };
     const duplicateKey = "topology/participants/" + createHash("sha256").update(duplicate.id).digest("hex");
     const duplicateIdentity: MeshIdentity = { id: duplicate.id, name: "Main", kind: "main" };
@@ -710,7 +712,6 @@ describe.each([false, true])("stale Main name safeguards (files=%s)", (files) =>
 
   it.each(["dead-lineage", "write-stalled"] as const)("does not admit a %s root by stale name", async (state) => {
     const f = await mainLeaseFixture(files);
-    f.directory.options.routingLease!.graceMs = 0; // Retained-only path, not live-within-grace selection.
     const stalled = new Error("Fabric mesh write stalled");
     if (state === "dead-lineage") vi.spyOn(f.directory, "lineageAlive").mockReturnValue(false);
     else {

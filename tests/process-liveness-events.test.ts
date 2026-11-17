@@ -200,15 +200,33 @@ function expectAdmissionCleaned(f: Awaited<ReturnType<typeof fixtureAdmission>>,
 }
 
 describe.skipIf(process.platform !== "linux")("event-driven scope admission marker", () => {
+  // Keep: admission trust boundary and the incident's configurable failure deadline (#20897).
+  it.each([
+    [undefined, 30_000], ["", 30_000], ["invalid", 30_000], ["0", 30_000], ["999", 30_000],
+    ["300001", 30_000], ["1000.5", 30_000], ["Infinity", 30_000], ["NaN", 30_000],
+    ["1000", 1_000], ["45000", 45_000], ["300000", 300_000],
+  ] as const)("bounds the host admission override %s to %i ms", async (value, expected) => {
+    vi.stubEnv("PI_FABRIC_SCOPE_ADMISSION_TIMEOUT_MS", value);
+    const f = await fixtureAdmission();
+    expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([expected]);
+    await vi.advanceTimersByTimeAsync(expected - 1);
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    f.controller.abort();
+    await expect(f.launch).rejects.toThrow("Agent launch aborted");
+    expect(spawn).toHaveBeenCalledOnce();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
   it.each(["admitted", Buffer.from("admitted")])("resolves on a matching directory event without polling (%s)", async filename => {
     const f = await fixtureAdmission();
     expect(f.order).toEqual(["watch", "check"]);
     expect(f.watch).toHaveBeenCalledOnce();
-    expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([5_000]);
+    expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([30_000]);
     expect(vi.getTimerCount()).toBe(1);
     f.watcher.emit("change", "rename", "admitted.cgroup");
     f.watcher.emit("change", "rename", null);
-    await vi.advanceTimersByTimeAsync(4_999);
+    await vi.advanceTimersByTimeAsync(6_000); // busy hosts may need more than the old 5s bound
     expect(f.markerChecks()).toBe(1);
     expect(spawn).toHaveBeenCalledOnce();
     expect(f.watcher.close).not.toHaveBeenCalled();
@@ -264,7 +282,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
 
   it.each(["valid", "symlink", "unowned", "mismatched"] as const)("authenticates a %s marker arriving during teardown without replaying admission", async teardownMarker => {
     const f = await fixtureAdmission({ teardownMarker });
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(30_000);
     const handle = await f.launch;
     expect(handle.pid).toBe(f.children[teardownMarker === "valid" ? 0 : 1]!.pid);
     expect(spawn).toHaveBeenCalledTimes(teardownMarker === "valid" ? 1 : 2);
@@ -292,7 +310,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
   it.each(["deadline", "watcher error"] as const)("keeps an already admitted worker when %s ends the delayed-watch wait", async end => {
     const f = await fixtureAdmission();
     f.writeMarker(); // the scope shim has admitted/exec'd, but inotify has not reached this loop yet
-    if (end === "deadline") await vi.advanceTimersByTimeAsync(5_000);
+    if (end === "deadline") await vi.advanceTimersByTimeAsync(30_000);
     else f.watcher.emit("error", new Error("watch failed after marker publication"));
     const handle = await f.launch;
     expect(handle.pid).toBe(f.children[0]!.pid);
@@ -317,7 +335,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
 
   it("rechecks the marker immediately before teardown when admission races the completed wait", async () => {
     const f = await fixtureAdmission({ admitOnCheck: 3 });
-    await vi.advanceTimersByTimeAsync(5_000); // initial and deadline checks miss it
+    await vi.advanceTimersByTimeAsync(30_000); // initial and deadline checks miss it
     const handle = await f.launch; // the pre-stop check sees the newly published marker
     expect(handle.pid).toBe(f.children[0]!.pid);
     expect(f.markerChecks()).toBe(3);
@@ -328,9 +346,9 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     f.finish();
   });
 
-  it("uses one 5s deadline, closes the watcher, and falls back to an unscoped legacy launch", async () => {
+  it("uses one 30s deadline, closes the watcher, and falls back to an unscoped legacy launch", async () => {
     const f = await fixtureAdmission();
-    await vi.advanceTimersByTimeAsync(4_999);
+    await vi.advanceTimersByTimeAsync(29_999);
     expect(f.markerChecks()).toBe(1);
     expect(f.watcher.close).not.toHaveBeenCalled();
     expect(spawn).toHaveBeenCalledOnce();
@@ -340,7 +358,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     expect(handle.treeClosed).toBeUndefined();
     expect(spawn).toHaveBeenCalledTimes(2);
     expect(vi.mocked(spawn).mock.calls[1]![1]).toEqual([expect.stringContaining("worker.mjs")]);
-    expect(f.timeout.mock.calls.filter(([, ms]) => ms === 5_000)).toHaveLength(1);
+    expect(f.timeout.mock.calls.filter(([, ms]) => ms === 30_000)).toHaveLength(1);
     expect(f.timeout.mock.calls.some(([, ms]) => ms === 10)).toBe(false);
     expect(f.markerChecks()).toBe(4); // initial, deadline, pre-stop, then the no-replay check AFTER teardown
     expect(f.order.indexOf("watch-close")).toBeLessThan(f.order.indexOf("stop"));

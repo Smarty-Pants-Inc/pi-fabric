@@ -296,6 +296,7 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
   });
   it("unconfirmed scope teardown vetoes fallback and retains custody debt", async () => {
+    vi.stubEnv("PI_FABRIC_SCOPE_ADMISSION_TIMEOUT_MS", "1000"); // bound this refusal fixture independently of the host default
     // The stub ignores TERM by design, so the transport leaves it running: record its pid and end it here, or it spins
     // at 100% CPU in its own process group after the root is removed (Ryzen 2: 24 h, smarty-dev#4383).
     const f = fixture(`echo $$ > "\${0%/*}/stub.pid"; trap '' TERM; while :; do :; done`); const debt = vi.fn();

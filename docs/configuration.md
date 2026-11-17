@@ -45,7 +45,7 @@ Only these keys are consumed from root policy; other settings remain in the ordi
 
 **Owner gate:** hosts-lead provisions `/etc/smarty/fabric-policy.json` with each host's **current intended relaxations before install** (for example uid/gid 0, directory mode `0755`, file mode `0644` or `0600`), publishing updates by atomic rename. Per-command escapes are denied by default: set `executor.landlock.allowEscape: true` only with an explicit owner-approved escape grant; an existing escape prefix is not authorization. Fabric-v2 verifies that editing the agent-dir file no longer relaxes authority after install. Revert means restoring the **previous Fabric pin**, not making the root policy writable.
 
-Scoped process launches wait up to 30000 ms for an authenticated admission marker; `PI_FABRIC_SCOPE_ADMISSION_TIMEOUT_MS` overrides this in the host environment (integer milliseconds, 1000–300000; invalid values use 30000). Capped launches still fail closed on expiry, before the worker runs.
+Capped scope launches wait up to 30000 ms for an authenticated admission marker; `PI_FABRIC_SCOPE_ADMISSION_TIMEOUT_MS` overrides this in the host environment (integer milliseconds, 1000–300000; invalid values use 30000). Capped launches still fail closed on expiry, before the worker runs. Uncapped scope launches keep a fixed 5000 ms deadline before their checked legacy fallback.
 
 ## Process task placement
 

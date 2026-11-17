@@ -18,8 +18,8 @@ jobs:
   linux-tests:
     runs-on: ${{ vars.PI_FABRIC_LINUX_RUNNER || 'ubuntu-latest' }}
     # Recent CSV medians total ~86 runner-minutes across lanes; four-way critical path ~27m plus ~3m gates.
-    # The 45m timeout leaves ~15m for fixed setup and runtime variance.
-    timeout-minutes: 45
+    # The 75m timeout leaves ~15m for setup and variance even when a core change doubles the affected set (#1984: 756 vs 436 files).
+    timeout-minutes: 75
     env:
       FABRIC_TEST_SKIP_NATS: '1'
       PI_TEST_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

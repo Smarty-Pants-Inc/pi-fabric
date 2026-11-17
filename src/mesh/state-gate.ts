@@ -1,14 +1,15 @@
 /**
  * The one gate for every SQLite connection to a mesh state root's state.db (smarty-dev#7548): the store
  * (state-sqlite.ts), the backend tool's FenceDb (backend-migration.ts), the file-mode writer fence's meta read
- * (backend-fence.ts) and the projector (state-projector.ts). A leaf module (node:fs, node:path and the Windows ACL
- * reader windows-state-acl.ts, types otherwise), so the file-mode fence can use it without loading the SQLite store.
+ * (backend-fence.ts) and the projector (state-projector.ts). A leaf module (Node builtins, the shared alpha flag and
+ * Windows ACL reader, types otherwise), so the file-mode fence can use it without loading the SQLite store.
  * Windows ACL findings are advisory unless PI_FABRIC_MESH_STATE_ACL_ENFORCE is exactly "1" at call time;
- * filesystem, file-type, inode and POSIX checks remain mandatory.
+ * alpha bypasses only POSIX ancestor checks. Filesystem, state-path privacy, file-type and inode checks stay mandatory.
  */
 import { Console } from "node:console";
 import fs from "node:fs";
 import path from "node:path";
+import { alphaModeEnabled } from "../guards/alpha-mode.js";
 import type { SqliteConnection, SqliteOpener } from "./state-sqlite.js";
 import { windowsStateAclRefusal } from "./windows-state-acl.js";
 
@@ -264,8 +265,8 @@ const fdSnapshot = (): Map<string, string> | undefined => {
 };
 
 /**
- * The ONE gate for every connection to a state root's state.db. A local filesystem, mandatory POSIX
- * privacy checks, advisory Windows ACL checks (enforced only by explicit opt-in), mandatory file-type checks and
+ * The ONE gate for every connection to a state root's state.db. A local filesystem, mandatory POSIX state-path
+ * privacy checks (ancestor checks bypassed in alpha), advisory Windows ACL checks (enforced only by explicit opt-in), mandatory file-type checks and
  * a connection bound to the checked inode (openPinned).
  * `create` (smarty-dev#8920, Windows creation paths only): the exclusive create of a missing state.db, run AFTER the
  * root half (filesystem, ancestors, root, state files and flag directory: the normal root plan) and BEFORE the
@@ -418,10 +419,21 @@ const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): 
 
 // StrictModes (smarty-dev#7548): every ancestor of the root, on the lexical and the real chain, is owned by this
 // uid or root, and a directory among them is not group or other writable unless sticky (like /tmp). Otherwise
-// another user could swap the root out from under the checks.
+// another user could swap the root out from under the checks. Alpha bypasses ONLY this POSIX ancestor guard.
+let warnedAncestorAlpha = false;
 const assertPrivateAncestors = (root: string): void => {
   // Windows: no uid or mode bits; the ACL snapshot (assertWindowsAcl, smarty-dev#8920) judges the ancestors.
   if (process.platform === "win32" || typeof process.getuid !== "function") return;
+  // Recheck the shared live setting before warning dedupe; a previous bypass never authorizes an opt-out call.
+  if (alphaModeEnabled()) {
+    if (!warnedAncestorAlpha) {
+      warnedAncestorAlpha = true;
+      console.warn("[pi-fabric] FABRIC_MESH_STATE_ANCESTOR_ALPHA: skipping mesh SQLite state ancestor ownership/write checks because alpha mode is enabled. "
+        + "State-path privacy, file types, pinned-open identity and locks remain enforced. Set SMARTY_ALPHA=0 with no "
+        + "~/.config/smarty/bash-guard.disabled file to restore ancestor checks.");
+    }
+    return;
+  }
   const uid = process.getuid();
   const above = (dir: string): string[] => {
     const chain: string[] = [];

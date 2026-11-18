@@ -16,6 +16,15 @@ import { legacyReadState8d0af4b0 } from "./fixtures/legacy-mesh-state-8d0af4b0.j
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 
+// Isolate the shared alpha reader from the user's disable file, as in #1912. Default fs/os users stay real.
+const alpha = vi.hoisted(() => ({ home: vi.fn(() => "/fixture-home"), exists: vi.fn(() => false) }));
+vi.mock("node:os", async original => ({
+  ...await original<typeof import("node:os")>(), homedir: alpha.home,
+}));
+vi.mock("node:fs", async original => ({
+  ...await original<typeof import("node:fs")>(), existsSync: alpha.exists,
+}));
+
 // smarty-dev#6477 L4b: import, cutover and rollback with the R1 fence (docs/mesh-lock-plan.md section 5).
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
@@ -35,6 +44,7 @@ const SWITCH_OWNER = "session:0a1b2c3d-0000-4000-8000-00000000c944";
 // Hermetic alarm recipient: a launcher's SMARTY_LEAD_SESSION or PI_FABRIC_MESH_ALARM_TO must not leak in. A test whose
 // accepted-unready switch is expected to succeed sets PI_FABRIC_MESH_ALARM_TO itself.
 beforeEach(() => {
+  vi.stubEnv("SMARTY_ALPHA", "0"); // Legacy refusal coverage explicitly opts out of alpha.
   vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", undefined);
   vi.stubEnv("SMARTY_LEAD_SESSION", undefined);
 });
@@ -402,7 +412,8 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     expect(fs.existsSync(path.join(root, "custody.lock"))).toBe(false);
   });
 
-  it("waits for custody.lock: a held custody lock fences cutover, rollback and abort-rollback", async () => {
+  it.each(["0", "1"])("waits for custody.lock: a held custody lock fences cutover, rollback and abort-rollback (SMARTY_ALPHA=%s)", async enabled => {
+    vi.stubEnv("SMARTY_ALPHA", enabled);
     const root = tempRoot("custody");
     await seedFileRoot(root);
     const release = await acquireMeshCustodyLock(root);

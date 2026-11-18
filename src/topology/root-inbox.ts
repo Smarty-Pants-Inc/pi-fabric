@@ -339,10 +339,10 @@ export class RootInbox {
       }
       this.#dueAt = Math.min(this.#dueAt, inbox.#dueAt);
     }
-    // Another reader/ack or native custody change can land while a later ledger
+    // Another reader's ack/receipt or native custody change can land while a later ledger
     // awaits I/O. Recheck each event against its ORIGINAL ledger before delivery.
     this.#refreshNative();
-    const events = offered.filter(({ inbox, event }) => !inbox.#acked(event) &&
+    const events = offered.filter(({ inbox, event }) => !inbox.#acked(event) && !inbox.#exactlyDelivered(event, session) &&
       !inbox.#nativePending(event.id, eventReceipts(event)) &&
       inbox.#nativeStatus(event.id, eventReceipts(event)) !== "consumed").map(({ event }) => event);
     return { events, through,
@@ -453,7 +453,7 @@ export class RootInbox {
     const batch = this.#unacked(await this.#scan(state.after, session, true, (event, reservations) => {
       saveImmediately = this.#consumeFallback(event, reservations) || saveImmediately;
       saveImmediately = this.#remember(eventReceipts(event)) || saveImmediately;
-    }, priority, reservations));
+    }, priority, reservations), session);
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
@@ -669,12 +669,12 @@ export class RootInbox {
       return true;
     });
     // Keep the pinned prefix offered even at capacity; without lookahead it gets the next turn.
-    return this.#unacked({ ...batch, events: [...batch.events, ...lookahead] });
+    return this.#unacked({ ...batch, events: [...batch.events, ...lookahead] }, session);
   }
 
-  /** Drop what an ack recorded while this read awaited the mesh. */
-  #unacked(batch: RootInboxBatch): RootInboxBatch {
-    const events = batch.events.filter((event) => !this.#acked(event));
+  /** Recheck durable acks and positive exact receipts after I/O, without spending key/ref claims. */
+  #unacked(batch: RootInboxBatch, session: RootInboxSession): RootInboxBatch {
+    const events = batch.events.filter((event) => !this.#acked(event) && !this.#exactlyDelivered(event, session));
     return events.length === batch.events.length ? batch : { ...batch, events };
   }
 
@@ -790,9 +790,14 @@ export class RootInbox {
 
   // Positive delivery evidence only, qualified by sender and this recipient's state key.
   // Before Pi records a native message, its shadow remains recoverable (at least once).
+  #exactlyDelivered(event: MeshEvent, session: RootInboxSession): boolean {
+    const has = (id: string): boolean => this.#delivered.has(id) || session.delivered?.has(id) === true;
+    return eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has);
+  }
+
   #steered(event: MeshEvent, session: RootInboxSession, reservations?: Set<string>): boolean {
     const has = (id: string): boolean => this.#delivered.has(id) || session.delivered?.has(id) === true;
-    if (eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has) || this.#nativeStatus(event.id, eventReceipts(event)) === "consumed") return true;
+    if (this.#exactlyDelivered(event, session) || this.#nativeStatus(event.id, eventReceipts(event)) === "consumed") return true;
     const identity = deliveryIdentity(event.data);
     // An explicit deliveryId/messageId/commandId is a stable event identity. Once the exact receipts above
     // miss, this is distinct work: never let its shared key/ref fall back to a native carrier.

@@ -10,6 +10,7 @@ import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { FabricState } from "../src/fabric-state.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
+import { eventReceipt } from "../src/topology/root-inbox-shared.js";
 import { RootInbox, rootInboxMessage, rootInboxSession, type RootInboxSession } from "../src/topology/root-inbox.js";
 import { filterRootInboxContext } from "../src/topology/root-inbox-context.js";
 import { rootInboxMessage as issuedInboxMessage, verifyIssuedInbox } from "./root-inbox-issued-fixture.js";
@@ -587,7 +588,7 @@ describe("filterRootInboxContext (smarty-dev#8962)", () => {
 });
 
 const me: MeshIdentity = { id: "session:code-voice", name: "code-voice", kind: "main" };
-const setup = (options: { horizonMs?: number } = {}) => {
+const setup = (options: { horizonMs?: number; pageSize?: number } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-ack-"));
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 500);
   cleanups.push(() => { mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); });
@@ -604,6 +605,45 @@ const setup = (options: { horizonMs?: number } = {}) => {
 const ids = (events: readonly MeshEvent[] | undefined) => (events ?? []).map(event => event.id);
 
 describe("root inbox high-water dedup and stale re-delivery (smarty-dev#8962)", () => {
+  // Keep: a canonical-receipt callback may land after a page was collected but before cursor commit.
+  // Gate real async reads; do not make receipt visibility depend on machine speed or a timer.
+  it("rechecks a timestamped canonical receipt learned by another reader across a page await", async () => {
+    const h = setup({ pageSize: 1 });
+    const inbox = h.box();
+    inbox.start();
+    const event = await h.publish();
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      return { promise, resolve };
+    };
+    const aPaused = deferred(), bPaused = deferred(), releaseA = deferred(), releaseB = deferred();
+    const read = h.mesh.readAsync.bind(h.mesh);
+    let starts = 0, pausedA = false;
+    vi.spyOn(h.mesh, "readAsync").mockImplementation(async input => {
+      const page = await read(input);
+      if (input?.after === 0 && ++starts === 2) { bPaused.resolve(); await releaseB.promise; }
+      if (input?.after === event.sequence && !pausedA) { pausedA = true; aPaused.resolve(); await releaseA.promise; }
+      return page;
+    });
+    let a: Promise<unknown> | undefined, b: Promise<unknown> | undefined;
+    try {
+      const first = inbox.next(notHeld);
+      a = first;
+      await aPaused.promise;
+      const receipt = eventReceipt(event.id);
+      b = inbox.next({ ...notHeld, delivered: new Set([receipt]), deliveredAt: new Map([[receipt, Date.now()]]) });
+      await bPaused.promise;
+      releaseA.resolve();
+      expect(ids((await first).events)).not.toContain(event.id);
+    } finally {
+      releaseA.resolve(); releaseB.resolve();
+      await Promise.allSettled([a, b].filter((p): p is Promise<unknown> => p !== undefined));
+    }
+    const reloaded = h.box();
+    reloaded.start();
+    expect(ids((await reloaded.next(notHeld)).events)).not.toContain(event.id);
+  });
   it.each(["next", "wake"] as const)("%s rechecks an ack and its high-water mark across archive-read awaits", async mode => {
     const h = setup();
     const inbox = h.box(); inbox.start();

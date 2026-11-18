@@ -32,14 +32,18 @@ export const STATE_LEASE_RENEW_MS = 10 * 60 * 1000;
 
 const LEASE_DIR = "host-leases";
 
-export const DEFAULT_PARTICIPANT_LEASE_GRACE_MS = 45_000;
+// smarty-dev#20777: R1 2026-11-17, 6,796 renewals / 281 sessions: expiry
+// overruns 2.4s, 3.4s, 103s, 235s (11-15 also ~4min). Allow 65s margin.
+// https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20777
+export const DEFAULT_PARTICIPANT_LEASE_GRACE_MS = 300_000;
 export const PARTICIPANT_LEASE_WAIT_MS = 10_000;
 
-/** Routing grace only: this never changes a writer's TTL or consumer admission. */
+/** Resolution only, never discovery, writer TTL or consumer admission. The 600s cap
+ * permits bounded tuning above the measured 235s overrun without unbounded retention. */
 export const participantLeaseGraceMs = (override?: number): number => {
   const value = override ?? (process.env.PI_FABRIC_PARTICIPANT_LEASE_GRACE_MS === undefined
     ? DEFAULT_PARTICIPANT_LEASE_GRACE_MS : Number(process.env.PI_FABRIC_PARTICIPANT_LEASE_GRACE_MS));
-  return Number.isFinite(value) && value >= 0 ? Math.min(300_000, Math.floor(value)) : DEFAULT_PARTICIPANT_LEASE_GRACE_MS;
+  return Number.isFinite(value) && value >= 0 ? Math.min(600_000, Math.floor(value)) : DEFAULT_PARTICIPANT_LEASE_GRACE_MS;
 };
 
 export class FabricParticipantStaleError extends Error {
@@ -243,6 +247,10 @@ export interface FabricHostLease {
   identityId: string;
   updatedAt: number;
   expiresAt: number;
+  /** Heartbeat callback lateness against its monotonic schedule (not wall-clock age). */
+  renewalLateMs?: number;
+  /** Maximum callback lateness in the trailing 5 minutes; advisory, never authority. */
+  renewalMaxLateMs?: number;
   /** Start-time metadata only; clocks can repeat. */
   startedAt?: number;
   /** Unique incarnation fence; absent only on historical writers. */
@@ -653,6 +661,10 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       ...(typeof value.bridgeSupersededTokenSeen === "object" && value.bridgeSupersededTokenSeen !== null && !Array.isArray(value.bridgeSupersededTokenSeen)
         ? { bridgeSupersededTokenSeen: Object.fromEntries(Object.entries(value.bridgeSupersededTokenSeen)
           .filter(([token, sequence]) => typeof token === "string" && token.length > 0 && Number.isSafeInteger(sequence) && (sequence as number) >= 0)) } : {}),
+      ...(typeof value.renewalLateMs === "number" && Number.isFinite(value.renewalLateMs) && value.renewalLateMs >= 0
+        ? { renewalLateMs: value.renewalLateMs } : {}),
+      ...(typeof value.renewalMaxLateMs === "number" && Number.isFinite(value.renewalMaxLateMs) && value.renewalMaxLateMs >= 0
+        ? { renewalMaxLateMs: value.renewalMaxLateMs } : {}),
       ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
       ...(validMirrorLease(value.mirror) ? { mirror: value.mirror } : {}),

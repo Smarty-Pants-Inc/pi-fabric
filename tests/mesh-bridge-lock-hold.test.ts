@@ -110,9 +110,22 @@ const scratch = () => {
   roots.push(root);
   return root;
 };
-afterEach(() => {
-  for (const store of stores.splice(0)) store.closeState();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+// Live bridge run() loops a test started. They are stopped BEFORE stores close and roots are removed
+// (afterEach runs before onTestFinished), and every run() and stop() outcome is asserted: none may reject
+// once its bridge is stopped first (smarty-dev#21065).
+const live: Array<{ bridge: MeshBridge; run: ReturnType<MeshBridge["run"]> }> = [];
+const settleLive = async (): Promise<void> => {
+  const entries = live.splice(0);
+  const stops = await Promise.allSettled(entries.map(entry => entry.bridge.stop()));
+  const runs = await Promise.allSettled(entries.map(entry => entry.run));
+  expect([...stops, ...runs].flatMap(result => result.status === "rejected" ? [String(result.reason)] : [])).toEqual([]);
+};
+afterEach(async () => {
+  try { await settleLive(); }
+  finally {
+    for (const store of stores.splice(0)) store.closeState();
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 // A hub like the fleet's: SQLite state and the durable event archive.
 const store = () => {
@@ -525,11 +538,13 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
       probeMaxMs: +Math.max(0, ...waits).toFixed(1), inFenceScans: scans.drain, maxBatchEvents: Math.max(0, ...batches), ...drain }));
     // Steady state: the backlog is gone and nothing new arrives. The bridges run their live loop
     // (change notifications, presence deadlines); after it settles, nothing should take the lock.
-    const running = links.map(bridge => bridge.run());
-    // A failed attempt must also stop the live bridges before teardown removes their mesh roots; otherwise
-    // their watchers reject ('mesh root was removed or replaced') with nobody awaiting (smarty-dev#21065).
-    for (const run of running) run.catch(() => undefined);
-    onTestFinished(async () => { await Promise.allSettled(links.map(bridge => bridge.stop())); });
+    // Registered so afterEach stops them before teardown even if this attempt fails; settleLive asserts
+    // each outcome, so a run() rejection is never lost (the handler only defers it to that assertion).
+    for (const bridge of links) {
+      const run = bridge.run();
+      run.catch(() => undefined);
+      live.push({ bridge, run });
+    }
     await new Promise(resolve => setTimeout(resolve, 2000));
     holds = [];
     inFenceScans = 0;
@@ -553,8 +568,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     const busy = report(holds.filter(hold => hold.db === database && hold.site !== PROBE_SITE), busyFrom, performance.now());
     console.log(JSON.stringify({ phase: "idle, busy hub", windowMs: IDLE_MS, published: delivered() - count, ...busy }));
     console.log(JSON.stringify({ inFenceScans: scans }));
-    await Promise.all(links.map(bridge => bridge.stop()));
-    await Promise.allSettled(running);
+    await settleLive();
     const texts = received().map(e => e.text!);
     for (let n = 0; n < SPOKES; n++) {
       expect(texts.filter(text => text.startsWith(`${n}:`))).toEqual(Array.from({ length: EVENTS }, (_, k) => `${n}:${k}`));

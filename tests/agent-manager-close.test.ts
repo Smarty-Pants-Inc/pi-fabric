@@ -453,7 +453,7 @@ describe("AgentManager close storage", () => {
       expect(processAlive(pid)).toBe(false);
       expect(readBudgetLedger(budget.file).cost, "descendant can still append its final accounting after parent close").toBeGreaterThan(before.cost);
     }
-  }, 90_000); // 1,000 real persisted runs plus close/archive: base 2313be04 measured up to 67 s (median ~25 s) unscoped; not a scope-admission budget.
+  }, 30_000);
 
   it("cancels queued admissions on close without launching and retains the active stopped prompt", async () => {
     const { manager, root } = setup(false);

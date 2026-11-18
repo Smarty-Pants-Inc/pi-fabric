@@ -84,7 +84,7 @@ describe("unscoped legacy process liveness", () => {
 });
 
 type MarkerFailure = "symlink" | "unowned" | "directory" | "mismatched" | "empty";
-type AdmissionOptions = { present?: boolean; race?: boolean; armFailure?: boolean; markerFailure?: MarkerFailure; teardownMarker?: "valid" | MarkerFailure; admitOnCheck?: number };
+type AdmissionOptions = { capped?: boolean; present?: boolean; race?: boolean; armFailure?: boolean; markerFailure?: MarkerFailure; teardownMarker?: "valid" | MarkerFailure; admitOnCheck?: number };
 async function fixtureAdmission(options: AdmissionOptions = {}) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
@@ -94,7 +94,7 @@ async function fixtureAdmission(options: AdmissionOptions = {}) {
   const removeAbort = vi.spyOn(controller.signal, "removeEventListener");
   const order: string[] = [];
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn(() => { order.push("watch-close"); }) }) as unknown as fs.FSWatcher;
-  const children = [700_000_020, 700_000_021].map(pid => Object.assign(new EventEmitter(), { pid, unref: vi.fn(), channel: {}, alive: true }));
+  const children = [700_000_020, 700_000_021].map(pid => Object.assign(new EventEmitter(), { pid, unref: vi.fn(), channel: {}, stdio: [], alive: true }));
   const close = (child = children[0]!) => {
     if (!child.alive) return;
     child.alive = false;
@@ -176,7 +176,7 @@ async function fixtureAdmission(options: AdmissionOptions = {}) {
   const timeout = vi.spyOn(globalThis, "setTimeout");
   const warn = vi.fn();
   const launch = spawnDetached(workerPath, [], directory, { signal: controller.signal }, undefined,
-    { executable: "/fixture-systemd-run", slice: "fixture.slice", warn });
+    { executable: "/fixture-systemd-run", slice: "fixture.slice", warn, ...(options.capped ? { memoryMaxBytes: 1024 ** 3 } : {}) });
   void launch.catch(() => undefined);
   await arming;
   return {
@@ -200,6 +200,24 @@ function expectAdmissionCleaned(f: Awaited<ReturnType<typeof fixtureAdmission>>,
 }
 
 describe.skipIf(process.platform !== "linux")("event-driven scope admission marker", () => {
+  // Keep: admission trust boundary and the incident's configurable failure deadline (#20897).
+  it.each([
+    [undefined, 30_000], ["", 30_000], ["invalid", 30_000], ["0", 30_000], ["999", 30_000],
+    ["300001", 30_000], ["1000.5", 30_000], ["Infinity", 30_000], ["NaN", 30_000],
+    ["1000", 1_000], ["45000", 45_000], ["300000", 300_000],
+  ] as const)("bounds the capped host admission override %s to %i ms", async (value, expected) => {
+    vi.stubEnv("PI_FABRIC_SCOPE_ADMISSION_TIMEOUT_MS", value);
+    const f = await fixtureAdmission({ capped: true });
+    expect(f.timeout.mock.calls.map(([, ms]) => ms)).toEqual([expected]);
+    await vi.advanceTimersByTimeAsync(expected - 1);
+    expect(f.watcher.close).not.toHaveBeenCalled();
+    f.controller.abort();
+    await expect(f.launch).rejects.toThrow("Agent launch aborted");
+    expect(spawn).toHaveBeenCalledOnce();
+    expectAdmissionCleaned(f);
+    f.finish();
+  });
+
   it.each(["admitted", Buffer.from("admitted")])("resolves on a matching directory event without polling (%s)", async filename => {
     const f = await fixtureAdmission();
     expect(f.order).toEqual(["watch", "check"]);
@@ -208,7 +226,7 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     expect(vi.getTimerCount()).toBe(1);
     f.watcher.emit("change", "rename", "admitted.cgroup");
     f.watcher.emit("change", "rename", null);
-    await vi.advanceTimersByTimeAsync(4_999);
+    await vi.advanceTimersByTimeAsync(4_000); // uncapped launches retain their original 5s bound
     expect(f.markerChecks()).toBe(1);
     expect(spawn).toHaveBeenCalledOnce();
     expect(f.watcher.close).not.toHaveBeenCalled();
@@ -328,7 +346,8 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
     f.finish();
   });
 
-  it("uses one 5s deadline, closes the watcher, and falls back to an unscoped legacy launch", async () => {
+  it.each([undefined, "1000", "300000"])("uses one 5s deadline, closes the watcher, and falls back to an unscoped legacy launch (override=%s)", async value => {
+    vi.stubEnv("PI_FABRIC_SCOPE_ADMISSION_TIMEOUT_MS", value);
     const f = await fixtureAdmission();
     await vi.advanceTimersByTimeAsync(4_999);
     expect(f.markerChecks()).toBe(1);

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { diagnostics } from "../core/diagnostics.js";
-import { readNativeRecoveryCustody, nativeRecoveryCarrierCustody } from "../core/native-recovery.js";
+import { readNativeRecoveryCustody, nativeRecoveryCarrierCustody, nativeRecoveryCarrierIdentities } from "../core/native-recovery.js";
 import type { NativeRecoveryBinding, NativeRecoveryCustodyReader, NativeRecoveryCustodyResult,
   NativeRecoveryParkIntent, NativeRecoverySessionRef } from "../core/session-receipts.js";
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
@@ -148,6 +148,11 @@ export class RootInbox {
   #nativeBlocked: string | undefined;
   readonly #predecessors = new Map<string, RootInbox>();
   readonly #offered = new Map<string, { inbox: RootInbox; event: MeshEvent }>();
+  /** Native originals are pinned by custody, not the bounded ordinary offer cache. */
+  readonly #nativeOriginals = new Map<string, MeshEvent>();
+  #nativeReceiptIds: ReadonlySet<string> = new Set();
+  /** Cold/reloaded acks mark ids now; their original sequence/outcome settles before any save. */
+  readonly #ackRecovery = new Map<string, { after: number; through: number; since: number }>();
   readonly #reads = new Set<Promise<unknown>>();
   #writes = Promise.resolve();
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
@@ -157,6 +162,8 @@ export class RootInbox {
   async close(): Promise<void> {
     // Reconciliation now awaits archive I/O; finish its saves before closing queues.
     await Promise.allSettled(this.#reads);
+    await this.#writes;
+    await this.#settleAcks();
     await Promise.all([this.#ackWrites.close(), this.#notifications.close(), ...[...this.#predecessors.values()].map(inbox => inbox.close())]);
   }
 
@@ -236,8 +243,11 @@ export class RootInbox {
     this.#predecessors.clear();
     for (const [id, inbox] of readers) this.#predecessors.set(id, inbox);
     this.#native = { scope: { ...scope }, read: readNativeCustody, chain };
-    this.#nativeBlocked = undefined;
     this.#installNativeResult(result);
+    // Restored native carriers can enter context/consume before their first inbox offer.
+    // Resolve their ORIGINAL addresses asynchronously while adoption is still fail-closed.
+    await this.#reading(() => this.#warmNativeOriginals());
+    this.#nativeBlocked = undefined;
   }
 
   #keyFor(rootId: string): string {
@@ -266,8 +276,12 @@ export class RootInbox {
   }
 
   #installNativeResult(result: NativeRecoveryCustodyResult): void {
-    this.#nativeResult = result;
-    for (const inbox of this.#predecessors.values()) inbox.#nativeResult = result;
+    const ids = new Set(result.status === "validated" ? result.transfers.flatMap(transfer =>
+      transfer.occurrences.flatMap(occurrence => nativeRecoveryCarrierIdentities(occurrence.customMessage).inboxIds)) : []);
+    for (const inbox of this.#readers()) {
+      inbox.#nativeResult = result;
+      inbox.#nativeReceiptIds = ids;
+    }
   }
 
   #refreshNative(): void {
@@ -299,23 +313,50 @@ export class RootInbox {
 
   #readers(): RootInbox[] { return [...this.#predecessors.values(), this]; }
 
-  #receiptLedger(id: string, sequence?: number): RootInbox | undefined {
+  #original(id: string): { inbox: RootInbox; event: MeshEvent } | undefined {
     const offered = this.#offered.get(id);
-    if (offered) return offered.inbox;
+    if (offered) return offered;
+    for (const inbox of this.#readers()) {
+      const offered = inbox.#offered.get(id);
+      if (offered) return offered;
+      const event = inbox.#nativeOriginals.get(id);
+      if (event) return { inbox, event };
+    }
+    return undefined;
+  }
+
+  #hasConsumedReceipt(id: string): boolean {
+    return this.#readers().some(inbox => inbox.#acks.has(id) || inbox.#delivered.has(eventReceipt(id)));
+  }
+
+  #receiptLedger(id: string): RootInbox | undefined {
+    const original = this.#original(id);
+    if (original) return original.inbox;
     const pending = this.#readers().find(inbox => inbox.#state?.pending?.ids.includes(id));
     if (pending) return pending;
-    if (!this.#predecessors.size) return this;
-    // A restored native carrier may enter context before RootInbox offered it at T.
-    // Resolve its ORIGINAL event address, never T's unrelated high-water mark.
-    const event = this.#reread(sequence === undefined ? 0 : sequence - 1,
-      { ids: [id], through: sequence ?? this.mesh.latestSequence(), since: this.#now() })[0];
-    if (!event) return undefined;
-    const inbox = event.to === this.identity.id ? this : event.to ? this.#predecessors.get(event.to) : undefined;
-    if (inbox) {
-      this.#offered.set(id, { inbox, event });
-      while (this.#offered.size > MAX_DELIVERED_RECEIPTS) this.#offered.delete(this.#offered.keys().next().value!);
+    // Never borrow T's high-water mark for an unresolved S event. Native originals are
+    // warmed during async adoption/reads; an unavailable original remains fail-closed.
+    return this.#predecessors.size ? undefined : this;
+  }
+
+  #cacheNativeOriginals(page: readonly MeshEvent[]): void {
+    if (!this.#nativeReceiptIds.size) return;
+    for (const event of page) if (event.to === this.identity.id &&
+        (this.#nativeReceiptIds.has(event.id) || eventReceipts(event).some(id => this.#nativeReceiptIds.has(id)))) {
+      this.#nativeOriginals.set(event.id, event);
     }
-    return inbox;
+  }
+
+  async #warmNativeOriginals(): Promise<void> {
+    if (!this.#nativeReceiptIds.size) return;
+    const through = this.mesh.latestSequence(), budget = this.#budget();
+    for (let cursor = 0; cursor < through;) {
+      const page = await this.#readPage(cursor, budget);
+      for (const inbox of this.#predecessors.values()) inbox.#cacheNativeOriginals(page);
+      if (!page.length) break;
+      cursor = Math.max(cursor, page.at(-1)!.sequence);
+      if (page.length < (this.options.pageSize ?? 500)) break;
+    }
   }
 
   async #reading<T>(read: () => Promise<T>): Promise<T> {
@@ -333,8 +374,10 @@ export class RootInbox {
       if (inbox === this) through = batch.through;
       skippedStale += batch.skippedStale ?? 0;
       for (const event of batch.events) {
-        this.#offered.set(event.id, { inbox, event });
-        while (this.#offered.size > MAX_DELIVERED_RECEIPTS) this.#offered.delete(this.#offered.keys().next().value!);
+        // Bound each ledger separately: a multi-predecessor batch can exceed one ledger's
+        // cache cap, but must not evict an earlier ledger's still-unconsumed lookahead.
+        inbox.#offered.set(event.id, { inbox, event });
+        while (inbox.#offered.size > MAX_DELIVERED_RECEIPTS) inbox.#offered.delete(inbox.#offered.keys().next().value!);
         offered.push({ inbox, event });
       }
       this.#dueAt = Math.min(this.#dueAt, inbox.#dueAt);
@@ -354,6 +397,8 @@ export class RootInbox {
    * not hold is delivered again. Ordinary admission stops at the steer grace (priority reads
    * admit through an exact-session event first) and batch bounds, so the cursor never passes
    * work it has not admitted. Ranked lookahead can offer newer work past that pending prefix.
+   * At-least-once API, not a read mutex: concurrent direct next()/wake() can replay a batch.
+   * Exactly-once Main delivery requires the runtime MeshBackgroundRetry.run gate and receipt fences.
    */
   async next(session: RootInboxSession, options: RootInboxReconcileOptions = {}): Promise<RootInboxBatch> {
     this.#dueAt = Number.POSITIVE_INFINITY;
@@ -475,6 +520,7 @@ export class RootInbox {
    * still wakes the root at once. Turn/settle reconciliation brings the batches in order
    * without this idle cooldown, so the cursor never skips an event.
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
+   * Like next(), this is at-least-once; exactly-once Main delivery is owned by the runtime gate.
    */
   async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
     return this.#reading(() => this.#wake(session, idle));
@@ -527,34 +573,43 @@ export class RootInbox {
    */
   ack(ids: readonly string[], receipts: readonly string[] = []): void {
     this.#refreshNative();
-    const groups = new Map<RootInbox, { ids: string[]; receipts: Set<string> }>();
+    const groups = new Map<RootInbox, { ids: string[]; receipts: Set<string>; events: MeshEvent[] }>();
     for (const id of ids) {
       const inbox = this.#receiptLedger(id);
-      if (!inbox) throw new Error("Root inbox receipt has no original addressed ledger");
-      const offered = this.#offered.get(id);
-      const group = groups.get(inbox) ?? { ids: [], receipts: new Set<string>() };
+      if (!inbox) {
+        if (this.#hasConsumedReceipt(id)) continue; // Idempotent replay; never copy it into T's ledger.
+        throw new Error("Root inbox receipt has no original addressed ledger");
+      }
+      const offered = this.#original(id);
+      const group = groups.get(inbox) ?? { ids: [], receipts: new Set<string>(), events: [] };
       group.ids.push(id);
-      if (offered) for (const receipt of eventReceipts(offered.event)) if (receipts.includes(receipt)) group.receipts.add(receipt);
+      if (offered) {
+        group.events.push(offered.event);
+        for (const receipt of eventReceipts(offered.event)) if (receipts.includes(receipt)) group.receipts.add(receipt);
+      }
       groups.set(inbox, group);
     }
-    if (!ids.length) groups.set(this, { ids: [], receipts: new Set(receipts) });
-    for (const [inbox, group] of groups) inbox.#ack(group.ids, groups.size === 1 ? receipts : [...group.receipts]);
+    if (!ids.length) groups.set(this, { ids: [], receipts: new Set(receipts), events: [] });
+    for (const [inbox, group] of groups) inbox.#ack(group.ids, groups.size === 1 ? receipts : [...group.receipts], group.events);
   }
 
-  #ack(ids: readonly string[], receipts: readonly string[]): void {
+  #ack(ids: readonly string[], receipts: readonly string[], offered: readonly MeshEvent[]): void {
     const state = this.#load();
     this.#trimReceipts();
     this.#remember([...ids.map(eventReceipt), ...receipts]);
     const pending = state.pending;
     // smarty-dev#5518: an ack is the inbox carrier entering a turn, so it is native consumption.
-    // Resolve the batch's newly acked events before the cursor moves past them; next() then never
-    // sees them, and the journal dedups an id it already holds (exactly once per event id).
+    // Capture offered originals before the cursor moves; cold metadata resolves asynchronously
+    // from pre-ack bounds before persistence. The outcome journal dedups each event id.
     // Lookahead can be above the pending prefix. Its ack must retain its actual sequence:
     // committing the prefix must not erase an out-of-order consumption receipt.
-    const consumed = ids.filter((id) => !this.#acks.has(id));
+    const consumed = new Set(ids.filter((id) => !this.#acks.has(id)));
     const through = Math.max(pending?.through ?? state.after, this.mesh.latestSequence());
-    const delivered = consumed.length ? this.#reread(state.after, { ids: consumed, through, since: this.#now() }) : [];
+    const delivered = offered.filter(event => consumed.has(event.id));
     const sequences = new Map(delivered.map((event) => [event.id, event.sequence]));
+    for (const id of consumed) if (!sequences.has(id) && !this.#ackRecovery.has(id)) {
+      this.#ackRecovery.set(id, { after: state.after, through, since: this.#now() });
+    }
     for (const id of ids) {
       if (!this.#acks.has(id)) this.#acks.set(id, sequences.get(id) ?? through);
     }
@@ -563,6 +618,32 @@ export class RootInbox {
       delete state.pending;
     }
     this.#syncAcks();
+    this.#recordConsumed(delivered);
+  }
+
+  async #settleAcks(): Promise<void> {
+    while (this.#ackRecovery.size) {
+      const pending = [...this.#ackRecovery];
+      const delivered = await this.#rereadAsync(Math.min(...pending.map(([, bound]) => bound.after)), {
+        ids: pending.map(([id]) => id), through: Math.max(...pending.map(([, bound]) => bound.through)),
+        since: Math.min(...pending.map(([, bound]) => bound.since)),
+      });
+      const found = new Map(delivered.map(event => [event.id, event]));
+      const consumed: MeshEvent[] = [];
+      for (const [id, bound] of pending) {
+        const event = found.get(id);
+        if (event && event.sequence > bound.after && event.sequence <= bound.through) {
+          if (this.#acks.has(id)) this.#acks.set(id, event.sequence);
+          consumed.push(event);
+        }
+        this.#ackRecovery.delete(id);
+      }
+      this.#syncAcks();
+      this.#recordConsumed(consumed);
+    }
+  }
+
+  #recordConsumed(delivered: readonly MeshEvent[]): void {
     for (const event of delivered) {
       try {
         appendDeliveryOutcome(this.mesh.root, { eventId: event.id, to: this.identity.id, from: event.from.id, mode: "publish" },
@@ -576,15 +657,18 @@ export class RootInbox {
 
   /**
    * Whether an event was acknowledged (smarty-dev#8962): its id is in the acked set, or its
-   * sequence is at or below its own high-water mark. Ordinary sessions use cached state only;
-   * native-restored carriers can resolve their original addressed ledger before their first offer.
+   * sequence is at or below its own high-water mark. Cached state only: native adoption/async
+   * reads warm original addressed ledgers before restored carriers enter context, never here.
    */
   acked(id: string, sequence?: number): boolean {
     this.#refreshNative();
     const status = this.#nativeStatus(id);
     if (status === "consumed") return true;
-    const inbox = this.#receiptLedger(id, sequence);
-    if (!inbox || !inbox.#state) return false;
+    const inbox = this.#receiptLedger(id);
+    // A consumed predecessor carrier need not remain in native custody/the offer cache.
+    // An exact id receipt in any adopted ledger is positive proof, unlike an unrelated mark.
+    if (!inbox) return this.#hasConsumedReceipt(id);
+    if (!inbox.#state) return false;
     if (status === "received" || status === "reserved") return inbox.#acks.has(id) || inbox.#delivered.has(eventReceipt(id));
     return inbox.#acks.has(id) || (sequence !== undefined && sequence <= inbox.#mark());
   }
@@ -728,7 +812,9 @@ export class RootInbox {
       await new Promise<void>(resolve => setImmediate(resolve));
       budget.since = performance.now();
     }
-    return this.mesh.readAsync({ after, limit: this.options.pageSize ?? 500 });
+    const page = await this.mesh.readAsync({ after, limit: this.options.pageSize ?? 500 });
+    this.#cacheNativeOriginals(page);
+    return page;
   }
 
   async #scan(
@@ -938,17 +1024,6 @@ export class RootInbox {
     return { ...event, deliveredLate: true, text: `(delivered late: created ${new Date(event.createdAt).toISOString()}, ${hours} h ago) ${event.text ?? ""}` };
   }
 
-  // ack()/acked() retain their synchronous receipt contract. Both drivers use
-  // the same recovery scan; asynchronous reconciliation must not call the sync one.
-  #reread(after: number, pending: NonNullable<RootInboxState["pending"]>): MeshEvent[] {
-    const scan = this.#rereadPages(after, pending);
-    let step = scan.next();
-    try {
-      while (!step.done) step = scan.next(this.mesh.read({ after: step.value, limit: this.options.pageSize ?? 500 }));
-      return step.value;
-    } finally { scan.return([]); }
-  }
-
   async #rereadAsync(after: number, pending: NonNullable<RootInboxState["pending"]>): Promise<MeshEvent[]> {
     const scan = this.#rereadPages(after, pending);
     let step = scan.next();
@@ -1047,6 +1122,9 @@ export class RootInbox {
   }
 
   async #saveState(now: boolean): Promise<void> {
+    // #writes serializes recovery and persistence; a failed read retains its recovery bounds.
+    // Resolve available original sequences/outcomes before persisting bounded fallback marks.
+    while (this.#ackRecovery.size) await this.#settleAcks();
     this.#absorb();
     this.#trimReceipts();
     const text = JSON.stringify(this.#state);

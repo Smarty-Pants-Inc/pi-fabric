@@ -716,10 +716,18 @@ export class RootInbox {
     this.#syncAcks();
   }
 
-  async #readPage(after: number): Promise<MeshEvent[]> {
-    // A resolved live-log read is only a microtask. Give the independent lease
-    // heartbeat a real turn between pages; cold archive reads also yield per chunk.
-    await new Promise<void>(resolve => setImmediate(resolve));
+  /** One scan's yield budget; it starts when the scan starts. */
+  #budget(): { since: number } { return { since: performance.now() }; }
+
+  async #readPage(after: number, budget: { since: number }): Promise<MeshEvent[]> {
+    // Cold archive reads already yield per chunk inside readAsync. A resolved live-log read is
+    // only a microtask, so a long run of live pages yields to the independent lease heartbeat
+    // after 8 ms of work, never before the first page: a small turn-end reconcile still settles
+    // in microtasks, as Pi's turn boundary expects (pi-fabric#2010 review P1).
+    if (performance.now() - budget.since >= 8) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      budget.since = performance.now();
+    }
     return this.mesh.readAsync({ after, limit: this.options.pageSize ?? 500 });
   }
 
@@ -740,8 +748,9 @@ export class RootInbox {
     // Active-turn reconciles keep the grace, so a steer into a running turn still wins.
     let bypassThrough = Number.NEGATIVE_INFINITY;
     const priorityReservations = new Set(reservations);
+    const budget = this.#budget();
     if (priority) for (let cursor = after; ;) {
-      const page = await this.#readPage(cursor);
+      const page = await this.#readPage(cursor, budget);
       for (const event of page) {
         cursor = Math.max(cursor, event.sequence);
         if (event.createdAt > cutoff && this.#exact(event) && !this.#acked(event) && !this.#steered(event, session, priorityReservations)) {
@@ -757,7 +766,7 @@ export class RootInbox {
     const seen = new Set<string>();
     const result = (): RootInboxBatch => ({ events, through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) });
     for (;;) {
-      const page = await this.#readPage(through);
+      const page = await this.#readPage(through, budget);
       for (const event of page) {
         // Native reservation is neither delivery nor expiry, and never advances this ledger.
         if (addressed(event) && !this.#acked(event) && this.#nativePending(event.id, eventReceipts(event)) &&
@@ -943,8 +952,9 @@ export class RootInbox {
   async #rereadAsync(after: number, pending: NonNullable<RootInboxState["pending"]>): Promise<MeshEvent[]> {
     const scan = this.#rereadPages(after, pending);
     let step = scan.next();
+    const budget = this.#budget();
     try {
-      while (!step.done) step = scan.next(await this.#readPage(step.value));
+      while (!step.done) step = scan.next(await this.#readPage(step.value, budget));
       return step.value;
     } finally { scan.return([]); }
   }

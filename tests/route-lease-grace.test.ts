@@ -69,6 +69,22 @@ const router = (directory: ParticipantDirectory, request = vi.fn(async () => ({ 
 };
 
 describe("native route lease grace (#4383)", () => {
+  it.each([59_000, 235_000])("recovers the exact owner %s ms late without extending discovery (#20777)", async late => {
+    const f = await fixture(late);
+    // Only resolution gets the 300s default; list/get remain expired before renewal.
+    expect(f.directory.get(f.target, f.now())).toBeUndefined();
+    expect(f.directory.list({ scope: "project" }, f.now()).some(p => p.id === f.target)).toBe(false);
+    expect(f.directory.list({ scope: "project", includeStale: true }, f.now()).find(p => p.id === f.target)?.stale).toBe(true);
+    expect(readHostLease(f.root, f.target)?.expiresAt).toBe(f.lease.expiresAt);
+    f.renew();
+    const send = router(f.directory);
+    await expect(send.value.routeMessage(f.target, "same owner", undefined, "followUp"))
+      .resolves.toMatchObject({ acknowledged: true, messageId: "only-once" });
+    expect(f.sleep).toHaveBeenCalledTimes(3);
+    expect(send.request).toHaveBeenCalledOnce();
+    expect(send.request.mock.calls[0]?.slice(0, 3)).toEqual([f.target, f.target, "followUp"]);
+  });
+
   it.each(["root", "actor"] as const)("resolves a %s lease late by 2s after file renewal, with no state reads during the wait", async kind => {
     const f = await fixture(2000, kind); f.renew();
     const reads = vi.spyOn(fs, "readFileSync");
@@ -162,8 +178,9 @@ describe("native route lease grace (#4383)", () => {
     expect(f.sleep).not.toHaveBeenCalled();
   });
 
-  it("keeps a 120s-lapsed exact target Unknown without polling or redirecting", async () => {
-    const f = await fixture(120000), send = router(f.directory);
+  it("keeps a beyond-grace exact target Unknown without polling or redirecting", async () => {
+    // Pure routing refusal follows the configurable resolution window, not discovery expiry.
+    const f = await fixture(participantLeaseGraceMs() + 1_000), send = router(f.directory);
     await expect(send.value.routeMessage(f.target, "never redirect", undefined, "followUp")).rejects.toThrow(`Unknown Fabric participant: ${f.target}`);
     expect(f.sleep).not.toHaveBeenCalled(); expect(send.request).not.toHaveBeenCalled();
   });
@@ -227,7 +244,8 @@ describe("native route lease grace (#4383)", () => {
 
   it("rejects a beyond-grace owner before publishing a new command", async () => {
     const root = temp();
-    const sender = control(root, "sender", { captureOwnerLease: () => () => Date.now() - 120000 });
+    // Message publication uses the resolution-only grace, never consumer admission.
+    const sender = control(root, "sender", { captureOwnerLease: () => () => Date.now() - participantLeaseGraceMs() - 1_000 });
     await expect(sender.request("owner", "session:target", "followUp", { ownerIncarnation: "fixture:owner" }))
       .rejects.toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: expect.any(String) });
     expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(0);
@@ -236,8 +254,11 @@ describe("native route lease grace (#4383)", () => {
   it("accepts a configurable grace without changing lease TTLs", () => {
     expect(participantLeaseGraceMs(45000)).toBe(45000);
     expect(participantLeaseGraceMs(1000)).toBe(1000);
-    expect(participantLeaseGraceMs(Number.NaN)).toBe(45000);
-    expect(participantLeaseGraceMs(-1)).toBe(45000);
+    // Invalid overrides use the new 300s default; valid overrides remain bounded at 600s.
+    expect(participantLeaseGraceMs(Number.NaN)).toBe(300000);
+    expect(participantLeaseGraceMs(-1)).toBe(300000);
+    expect(participantLeaseGraceMs(900000)).toBe(600000);
+    expect(participantLeaseGraceMs(0)).toBe(0);
   });
 });
 
@@ -273,7 +294,8 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
     const sender = control(root, "sender", { captureOwnerLease: () => () => expiresAt });
     sender.start(() => ({ accepted: false }));
     const outcome = sender.request("owner", "session:target", "steer", { ownerIncarnation: "fixture:owner" }, "owner", { idempotencyKey: "stable-key" }).catch(e => e);
-    await drainMicrotasks(); expiresAt = Date.now() - 45001;
+    // Pending-ACK ownership uses the same resolution-only grace as message publication.
+    await drainMicrotasks(); expiresAt = Date.now() - participantLeaseGraceMs() - 1;
     await vi.advanceTimersByTimeAsync(20);
     expect(await outcome).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", retryable: true, idempotencyKey: "stable-key" });
     expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(1);
@@ -292,7 +314,8 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
     const first = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", explicit ? { idempotencyKey: "same-message" } : {}).catch(e => e);
     await drainMicrotasks(); await vi.advanceTimersByTimeAsync(100);
     expect(deliver).toHaveBeenCalledOnce(); const firstId = command(sender).commandId;
-    expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
+    // Same-key retry starts only after the configured routing/ACK window has lapsed.
+    expiresAt = Date.now() - participantLeaseGraceMs() - 1; await vi.advanceTimersByTimeAsync(20);
     const stale = await first;
     expect(stale).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: explicit ? "same-message" : expect.any(String) });
     expiresAt = Date.now() + 120000; drop = false;
@@ -320,7 +343,8 @@ describe("same-key retry after proven-notRun resend (#4383)", () => {
     owner.start(deliver); await vi.advanceTimersByTimeAsync(500);
     expect(deliver).toHaveBeenCalledOnce(); const admittedId = command(sender).commandId;
     expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(2);
-    expiresAt = Date.now() - 45001; await vi.advanceTimersByTimeAsync(20);
+    // The resend's pending ACK retains the same bounded resolution grace.
+    expiresAt = Date.now() - participantLeaseGraceMs() - 1; await vi.advanceTimersByTimeAsync(20);
     expect(await first).toMatchObject({ code: "FABRIC_PARTICIPANT_STALE", idempotencyKey: "resend-key" });
     expiresAt = Date.now() + 120000; drop = false;
     const retry = sender.request("owner", "session:target", "followUp", { message: "unchanged", ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "resend-key" });

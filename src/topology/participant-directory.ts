@@ -909,6 +909,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #claimedPeerLabel: string | undefined;
   #refreshScheduled = false;
   #refreshAgain = false;
+  // The heartbeat event is the normal renewal source; no extra polling/timer for metrics.
+  #renewalLateMs = 0;
+  #renewalLateness: { at: number; lateMs: number }[] = [];
+  static readonly #renewalLatenessWindowMs = 5 * 60_000;
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
   #publicationRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #publicationRetrying: Promise<void> | undefined;
@@ -1245,10 +1249,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // the sampled bounded recovery deadline, including an earlier failed turn;
     // never replace it with a constant tick or a zero-delay budget loop.
     if (budget !== undefined && budget > 0) delay = Math.min(delay, budget);
+    const scheduledAt = now + Math.max(1, Math.floor(delay));
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       this.#heartbeatDueAt = undefined;
       if (this.#closed || this.#suspended || this.#transportLost) return;
+      const ranAt = performance.now();
+      this.#renewalLateMs = Math.max(0, Math.floor(ranAt - scheduledAt));
+      // A trailing five-minute window, pruned also when serializing a lease after silence.
+      this.#renewalLateness = this.#renewalLateness.filter(sample => ranAt - sample.at <= ParticipantDirectory.#renewalLatenessWindowMs);
+      this.#renewalLateness.push({ at: ranAt, lateMs: this.#renewalLateMs });
+      if (this.#renewalLateMs > this.#leaseMs) console.warn(
+        `[fabric] host lease renewal ${this.options.hostId} ran ${this.#renewalLateMs} ms late (TTL ${this.#leaseMs} ms)`,
+      );
       // Arm before work so suspend/close during the tick can cancel its successor.
       // Renewals keep their existing coalescing; a slow write does not shift the cadence.
       this.#armHeartbeat();
@@ -2400,6 +2413,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         (lease.startedAt === undefined || lease.startedAt === owner.startedAt));
     const expiresAt = hostLeaseExpiry(matching ? new Map([[owner.id, lease]]) : new Map(), owner);
     if (expiresAt >= now) return true;
+    // Grace cannot revive a replaced incarnation or a completed reload.
+    if (lease && (!matching || lease.reloadUntil !== undefined && lease.reloadUntil < now)) return false;
     if (now - expiresAt > participantLeaseGraceMs(options.graceMs) ||
       participant.status === "stopping" || participant.status === "reloading") return false;
     // A direct `.lock` observer (smarty-dev#6477 A1 section 4): a heartbeat writer shows there on
@@ -4088,7 +4103,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #fileLease(leaseAt: number): FabricHostLease {
     const root = this.#localRecords.get(this.options.rootId);
+    const now = performance.now();
+    this.#renewalLateness = this.#renewalLateness.filter(sample => now - sample.at <= ParticipantDirectory.#renewalLatenessWindowMs);
     return {
+      renewalLateMs: this.#renewalLateMs,
+      renewalMaxLateMs: this.#renewalLateness.reduce((max, sample) => Math.max(max, sample.lateMs), 0),
       id: this.options.hostId,
       rootId: this.options.rootId,
       identityId: this.options.identity.id,

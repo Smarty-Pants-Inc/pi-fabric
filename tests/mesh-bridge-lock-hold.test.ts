@@ -526,6 +526,10 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     // Steady state: the backlog is gone and nothing new arrives. The bridges run their live loop
     // (change notifications, presence deadlines); after it settles, nothing should take the lock.
     const running = links.map(bridge => bridge.run());
+    // A failed attempt must also stop the live bridges before teardown removes their mesh roots; otherwise
+    // their watchers reject ('mesh root was removed or replaced') with nobody awaiting (smarty-dev#21065).
+    for (const run of running) run.catch(() => undefined);
+    onTestFinished(async () => { await Promise.allSettled(links.map(bridge => bridge.stop())); });
     await new Promise(resolve => setTimeout(resolve, 2000));
     holds = [];
     inFenceScans = 0;

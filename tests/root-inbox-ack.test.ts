@@ -604,6 +604,31 @@ const setup = (options: { horizonMs?: number } = {}) => {
 const ids = (events: readonly MeshEvent[] | undefined) => (events ?? []).map(event => event.id);
 
 describe("root inbox high-water dedup and stale re-delivery (smarty-dev#8962)", () => {
+  it.each(["next", "wake"] as const)("%s rechecks an ack and its high-water mark across archive-read awaits", async mode => {
+    const h = setup();
+    const inbox = h.box(); inbox.start();
+    const event = await h.publish("ack during asynchronous recovery"); h.advance(1);
+    expect(ids((await inbox.next(notHeld)).events)).toEqual([event.id]);
+    const read = h.mesh.readAsync.bind(h.mesh);
+    let entered!: () => void, resume!: () => void;
+    const reading = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    vi.spyOn(h.mesh, "readAsync").mockImplementationOnce(async input => {
+      const page = await read(input);
+      entered(); await gate;
+      return page;
+    });
+    const pending = mode === "next" ? inbox.next(notHeld) : inbox.wake(notHeld, () => true);
+    try {
+      await reading;
+      await inbox.consume([event.id]);
+      resume();
+      expect(ids((await pending)?.events)).toEqual([]);
+      expect((h.mesh.get(inbox.key, { fresh: true })!.value as { after: number }).after).toBeGreaterThanOrEqual(event.sequence);
+      expect((await h.box().next(notHeld)).events).toEqual([]);
+    } finally { resume(); await pending; }
+  });
+
   it("does not re-inject an acknowledged event when a stale writer saves an older cursor and a restart re-scans", async () => {
     const h = setup();
     const before = h.box(); before.start();
@@ -631,8 +656,8 @@ describe("root inbox high-water dedup and stale re-delivery (smarty-dev#8962)", 
     const kept = await h.publish("kept"); const gone = await h.publish("gone"); h.advance(1);
     expect(ids((await inbox.next(notHeld)).events)).toEqual([kept.id, gone.id]);
     // The live log stops returning one pending event (retention/rotation): it is neither delivered nor expired yet.
-    const read = h.mesh.read.bind(h.mesh);
-    vi.spyOn(h.mesh, "read").mockImplementation(input => read(input).filter(event => event.id !== gone.id));
+    const read = h.mesh.readAsync.bind(h.mesh);
+    vi.spyOn(h.mesh, "readAsync").mockImplementation(async input => (await read(input)).filter(event => event.id !== gone.id));
     h.advance(61_000);
     // Never acked, not held, past the horizon: re-delivery injects nothing and reports it stale once.
     const redelivery = await h.box().next(notHeld);

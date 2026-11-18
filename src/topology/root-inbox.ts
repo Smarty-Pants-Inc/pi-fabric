@@ -155,6 +155,8 @@ export class RootInbox {
   readonly #ackWrites = new MeshBackgroundQueue("root inbox ack");
 
   async close(): Promise<void> {
+    // Reconciliation now awaits archive I/O; finish its saves before closing queues.
+    await Promise.allSettled(this.#reads);
     await Promise.all([this.#ackWrites.close(), this.#notifications.close(), ...[...this.#predecessors.values()].map(inbox => inbox.close())]);
   }
 
@@ -324,7 +326,7 @@ export class RootInbox {
   }
 
   async #collect(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
-    const events: RootInboxEvent[] = [];
+    const offered: Array<{ inbox: RootInbox; event: RootInboxEvent }> = [];
     let through = this.#load().after, skippedStale = 0;
     for (const inbox of this.#readers()) {
       const batch = await inbox.#next(session, options, priority);
@@ -333,10 +335,16 @@ export class RootInbox {
       for (const event of batch.events) {
         this.#offered.set(event.id, { inbox, event });
         while (this.#offered.size > MAX_DELIVERED_RECEIPTS) this.#offered.delete(this.#offered.keys().next().value!);
-        events.push(event);
+        offered.push({ inbox, event });
       }
       this.#dueAt = Math.min(this.#dueAt, inbox.#dueAt);
     }
+    // Another reader/ack or native custody change can land while a later ledger
+    // awaits I/O. Recheck each event against its ORIGINAL ledger before delivery.
+    this.#refreshNative();
+    const events = offered.filter(({ inbox, event }) => !inbox.#acked(event) &&
+      !inbox.#nativePending(event.id, eventReceipts(event)) &&
+      inbox.#nativeStatus(event.id, eventReceipts(event)) !== "consumed").map(({ event }) => event);
     return { events, through,
       ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) };
   }
@@ -384,13 +392,15 @@ export class RootInbox {
     const held = state.pending;
     if (held) {
       // Acked ids are never delivered again (smarty-dev#8962); a fully acked batch commits.
-      const unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
-      const holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
+      let unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
+      let holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
       if (options.commitOnly && !holdsBatch) {
         await this.#save(saveImmediately);
         return { events: [], through: state.after };
       }
-      const reread = this.#reread(state.after, held);
+      const reread = await this.#rereadAsync(state.after, held);
+      unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
+      holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
       const pending = reread.filter((event) => !this.#acked(event));
       if (holdsBatch) {
         // smarty-dev#5518: only the session's own inbox carrier is native consumption; an ack-only commit is not.
@@ -440,14 +450,14 @@ export class RootInbox {
       await this.#save(saveImmediately);
       return { events: [], through: state.after };
     }
-    const batch = this.#scan(state.after, session, true, (event, reservations) => {
+    const batch = this.#unacked(await this.#scan(state.after, session, true, (event, reservations) => {
       saveImmediately = this.#consumeFallback(event, reservations) || saveImmediately;
       saveImmediately = this.#remember(eventReceipts(event)) || saveImmediately;
-    }, priority, reservations);
+    }, priority, reservations));
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
-      state.after = batch.through;
+      state.after = Math.max(state.after, batch.through);
       // Expiry and new receipts are durable immediately: a restart must not repeat the summary.
       await this.#save(saveImmediately || skippedStale > 0);
       return batch;
@@ -475,7 +485,8 @@ export class RootInbox {
     this.#refreshNative();
     const cooldownEnd = this.#wokeAt + (this.options.wakeCooldownMs ?? wakeCooldownMs());
     const cooling = this.#now() < cooldownEnd;
-    const peeked = this.#readers().flatMap(inbox => inbox.#peek(session));
+    const peeked: RootInboxEvent[] = [];
+    for (const inbox of this.#readers()) peeked.push(...await inbox.#peek(session));
     const urgent = peeked.some((event) => URGENT_KINDS.has(event.kind));
     // Work addressed to this exact session wakes at once too (smarty-dev#4313), unless delivered late.
     const exact = peeked.some((event) => this.#readers().some(inbox => inbox.#exact(event)) && !event.deliveredLate);
@@ -587,14 +598,14 @@ export class RootInbox {
   }
 
   /** Every event `next` would bring now or in later batches, without the batch bounds or a save. */
-  #peek(session: RootInboxSession): RootInboxEvent[] {
+  async #peek(session: RootInboxSession): Promise<RootInboxEvent[]> {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     const reservations = new Set<string>();
-    return [...(pending ? this.#reread(state.after, pending).filter((event) =>
+    return [...(pending ? (await this.#rereadAsync(state.after, pending)).filter((event) =>
       !this.#acked(event) && !this.#nativePending(event.id, eventReceipts(event)) && !this.#stale(event) && !this.#steered(event, session, reservations)).map((event) => this.#late(event)) : []),
-    ...this.#scan(after, session, false, undefined, true, reservations).events];
+    ...(await this.#scan(after, session, false, undefined, true, reservations)).events];
   }
 
   /** Addressed to this session's own id on a work topic (not a name or alias). */
@@ -616,9 +627,9 @@ export class RootInbox {
    * so a full lookahead window leaves enough headroom for the pinned prefix to make progress.
    * Only the prefix is pending state; no cursor crosses intervening undisplayed work.
    */
-  #offer(
+  async #offer(
     batch: RootInboxBatch, session: RootInboxSession, priority: boolean, reservations: Set<string>,
-  ): RootInboxBatch {
+  ): Promise<RootInboxBatch> {
     const seen = new Set<string>();
     const actions: RootInboxEvent[] = [], candidates: RootInboxEvent[] = [];
     const consider = (event: RootInboxEvent): void => {
@@ -638,7 +649,7 @@ export class RootInbox {
     batch.events.forEach(consider);
     // Reuse MAIN's scan protocol, including exact-session priority and one-use fallback claims.
     // This is observational lookahead: suppressed tail events are consumed only on admission.
-    this.#scan(batch.through, session, false, undefined, priority, reservations).events.forEach(consider);
+    (await this.#scan(batch.through, session, false, undefined, priority, reservations)).events.forEach(consider);
     const window: RootInboxEvent[] = [];
     let bytes = 0;
     for (const event of candidates) {
@@ -705,11 +716,18 @@ export class RootInbox {
     this.#syncAcks();
   }
 
-  #scan(
+  async #readPage(after: number): Promise<MeshEvent[]> {
+    // A resolved live-log read is only a microtask. Give the independent lease
+    // heartbeat a real turn between pages; cold archive reads also yield per chunk.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    return this.mesh.readAsync({ after, limit: this.options.pageSize ?? 500 });
+  }
+
+  async #scan(
     after: number, session: RootInboxSession, bounded = true,
     onDelivered?: (event: MeshEvent, reservations: ReadonlySet<string>) => void, priority = false,
     reservations = new Set<string>(),
-  ): RootInboxBatch {
+  ): Promise<RootInboxBatch> {
     const now = this.#now();
     const names = new Set(this.names().filter((name) =>
       name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
@@ -723,7 +741,7 @@ export class RootInbox {
     let bypassThrough = Number.NEGATIVE_INFINITY;
     const priorityReservations = new Set(reservations);
     if (priority) for (let cursor = after; ;) {
-      const page = this.mesh.read({ after: cursor, limit: pageSize });
+      const page = await this.#readPage(cursor);
       for (const event of page) {
         cursor = Math.max(cursor, event.sequence);
         if (event.createdAt > cutoff && this.#exact(event) && !this.#acked(event) && !this.#steered(event, session, priorityReservations)) {
@@ -739,7 +757,7 @@ export class RootInbox {
     const seen = new Set<string>();
     const result = (): RootInboxBatch => ({ events, through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) });
     for (;;) {
-      const page = this.mesh.read({ after: through, limit: pageSize });
+      const page = await this.#readPage(through);
       for (const event of page) {
         // Native reservation is neither delivery nor expiry, and never advances this ledger.
         if (addressed(event) && !this.#acked(event) && this.#nativePending(event.id, eventReceipts(event)) &&
@@ -906,12 +924,32 @@ export class RootInbox {
     return { ...event, deliveredLate: true, text: `(delivered late: created ${new Date(event.createdAt).toISOString()}, ${hours} h ago) ${event.text ?? ""}` };
   }
 
+  // ack()/acked() retain their synchronous receipt contract. Both drivers use
+  // the same recovery scan; asynchronous reconciliation must not call the sync one.
   #reread(after: number, pending: NonNullable<RootInboxState["pending"]>): MeshEvent[] {
+    const scan = this.#rereadPages(after, pending);
+    let step = scan.next();
+    try {
+      while (!step.done) step = scan.next(this.mesh.read({ after: step.value, limit: this.options.pageSize ?? 500 }));
+      return step.value;
+    } finally { scan.return([]); }
+  }
+
+  async #rereadAsync(after: number, pending: NonNullable<RootInboxState["pending"]>): Promise<MeshEvent[]> {
+    const scan = this.#rereadPages(after, pending);
+    let step = scan.next();
+    try {
+      while (!step.done) step = scan.next(await this.#readPage(step.value));
+      return step.value;
+    } finally { scan.return([]); }
+  }
+
+  *#rereadPages(after: number, pending: NonNullable<RootInboxState["pending"]>): Generator<number, MeshEvent[], MeshEvent[]> {
     const ids = new Set(pending.ids);
     const found: MeshEvent[] = [];
     const pageSize = this.options.pageSize ?? 500;
     for (let cursor = after; cursor < pending.through;) {
-      const page = this.mesh.read({ after: cursor, limit: pageSize });
+      const page = yield cursor;
       if (page.length === 0) break;
       for (const event of page) {
         if (event.sequence > pending.through) return found;

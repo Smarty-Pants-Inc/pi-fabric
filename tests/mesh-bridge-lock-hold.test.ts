@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -489,6 +489,9 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     stores.push(probe);
     const probeIdentity: MeshIdentity = { id: "session:probe", name: "probe", kind: "main" };
     let probing = true;
+    // A failed or retried attempt must not leave the probe loop writing after afterEach closes the store
+    // (an unhandled 'state backend is closed' rejection fails the run; smarty-dev#21065).
+    onTestFinished(() => { probing = false; });
     const probeEvery = async (ms: number, waits: number[] = []) => {
       for (let n = 0; probing; n++) {
         const asked = performance.now();
@@ -500,6 +503,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     };
     const waits: number[] = [];
     const probes = probeEvery(25, waits);
+    probes.catch(() => undefined); // handled here; the awaited copy below still throws on a real failure
     const batches = countBatches(hub);
     const scans = { drain: 0, idle: 0, busy: 0 };
     holds = [];
@@ -537,6 +541,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     inFenceScans = 0;
     const busyFrom = performance.now();
     const busyProbes = probeEvery(100);
+    busyProbes.catch(() => undefined);
     await new Promise(resolve => setTimeout(resolve, IDLE_MS));
     probing = false;
     await busyProbes;

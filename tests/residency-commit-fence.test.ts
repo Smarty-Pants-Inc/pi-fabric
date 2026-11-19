@@ -1,3 +1,4 @@
+// A/B probe (smarty-dev#21065, pi-fabric#2010): runs this hosted-only suite on unmodified main. Do not land.
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 import * as childProcess from "node:child_process";

@@ -1,3 +1,4 @@
+// A/B probe (pi-fabric#2010 main red): run this file on main BEFORE #2010. Do not land.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";

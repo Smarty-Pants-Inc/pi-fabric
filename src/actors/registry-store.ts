@@ -224,6 +224,9 @@ export class ActorRegistryStore {
     };
     const encoded = metadata.map(encode);
     const serialized = `{"format":1,"actors":[${encoded.join(",")}]}`;
+    // update() still validates the generation and caller under custody. Only soft
+    // equal bytes may skip staging/rename; durable saves still owe fresh barriers.
+    const unchanged = !durable && serialized === snapshot.bytes;
     // Detach only changed rows before caching; unchanged actors require neither
     // another parse nor another serialization. All decoding stays outside custody.
     const changedHeads: Record<string, unknown>[] = [];
@@ -236,7 +239,7 @@ export class ActorRegistryStore {
     }));
     const temporary = `${this.#registryPath}.${process.pid}.${randomUUID()}.prepared`;
     // File data and pre-rename namespace barriers happen outside custody.
-    try { writeFileAtomic(temporary, serialized, { durable }); }
+    try { if (!unchanged) writeFileAtomic(temporary, serialized, { durable }); }
     catch (error) {
       try { fs.rmSync(temporary, { force: true }); } catch { /* Preserve the failed preparation barrier. */ }
       throw error;
@@ -259,11 +262,15 @@ export class ActorRegistryStore {
        */
       commit: (options: { deferBarrier?: boolean } = {}): void => {
         try {
-          payload.commit();
-          renameAtomic(temporary, this.#registryPath);
-          renamed = true;
-          if (durable && options.deferBarrier !== true) syncDirectoryChain(this.#actorRoot);
-          this.#payloads.publishHeads(changedHeads);
+          if (!unchanged) {
+            payload.commit();
+            renameAtomic(temporary, this.#registryPath);
+            renamed = true;
+            if (durable && options.deferBarrier !== true) syncDirectoryChain(this.#actorRoot);
+          }
+          if (!unchanged || !this.#payloads.headsUnchanged(metadata)) {
+            this.#payloads.publishHeads(unchanged ? metadata : changedHeads);
+          }
           payload.accept(changedHeads, accepted);
           committedGeneration = this.fingerprint();
           barrierDue = durable && options.deferBarrier === true;
@@ -297,7 +304,7 @@ export class ActorRegistryStore {
           }, undefined, "barrier");
         }
       },
-      dispose: () => fs.rmSync(temporary, { force: true }),
+      dispose: () => { if (!unchanged) fs.rmSync(temporary, { force: true }); },
     };
   }
 
@@ -651,6 +658,9 @@ export class ActorRegistryStore {
     });
     const serialized = JSON.stringify({ format: 1, actors: metadata }, null, 2);
     try {
+      // Keep this inside the finally so even a no-op invalidates shared reads.
+      // An identical durable save may still owe its file/namespace fsync receipt.
+      if (!durable && serialized === previous && this.#payloads.headsUnchanged(metadata)) return;
       this.#writer.write(serialized, { durable });
       this.#payloads.publishHeads(metadata);
     } catch (error) {

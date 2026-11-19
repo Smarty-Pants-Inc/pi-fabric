@@ -48,7 +48,7 @@ Queued, parked, overflow, settled-window, pending delivery outcomes, dead-letter
 work and stop archives refuse with `FABRIC_ACTOR_QUEUED_WORK` and counts (nonempty
 dead-letter and stop-archive files are counted as files, not guessed item totals). This
 offline check is conservative: all nonempty dead-letter files and stop archives,
-and any in-flight/preparing/removing actor, refuse instead of guessing whether
+and any in-flight/preparing/removing actor, refuse; the check never guesses whether
 recovery is complete. Resolve/adopt that work first. There is **no `--drop-queued`
 or `--actor` option** for residency retirement. Neither actor registries nor actor
 directories outside the residency are changed.

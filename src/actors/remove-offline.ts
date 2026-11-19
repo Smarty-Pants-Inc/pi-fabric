@@ -193,7 +193,7 @@ const deadHolder = (file: string, optional = false): boolean => {
 /** A blocked flock request on this inode: a host is waking on this root (/proc/locks `->` lines).
  * Same approach as the retention sweep's lockWaiter. ponytail: matched by inode only; a collision on
  * another device refuses (fail safe). */
-const lockWaiter = (fd: number): boolean => {
+export const residentLockHasWaiter = (fd: number): boolean => {
   const inode = fs.fstatSync(fd).ino;
   try {
     return fs.readFileSync("/proc/locks", "utf8").split("\n")
@@ -202,7 +202,7 @@ const lockWaiter = (fd: number): boolean => {
 };
 
 /** Claim a dead resident's host.lock as the retention sweep does; throws unless the fence is ours. */
-const claimFence = async (directory: string): Promise<number> => {
+export const claimDeadResidentFence = async (directory: string): Promise<number> => {
   const lock = path.join(directory, "host.lock");
   if (process.platform !== "linux") throw new Error("Offline removal needs Linux flock fences");
   if (!ownedStat(lock)?.isFile() || !deadHolder(lock) || !deadHolder(path.join(directory, "owner.json"), true)) {
@@ -212,7 +212,7 @@ const claimFence = async (directory: string): Promise<number> => {
   try { fd = await lockFile(lock, 0, true); }
   catch (error) { throw new Error(`Root resident host.lock is held: ${error instanceof Error ? error.message : String(error)}`); }
   try {
-    if (lockWaiter(fd)) throw new Error("A host is waking on this root (host.lock has a waiter); it wins");
+    if (residentLockHasWaiter(fd)) throw new Error("A host is waking on this root (host.lock has a waiter); it wins");
     if (!deadHolder(lock) || !deadHolder(path.join(directory, "owner.json"), true)) throw new Error("Root resident holder changed");
     return fd;
   } catch (error) { fs.closeSync(fd); throw error; }
@@ -290,13 +290,13 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     throw new Error(`Root resident startup claim is busy (a resident host is starting): ${error instanceof Error ? error.message : String(error)}`);
   }
   let fd: number;
-  try { fd = await claimFence(directory); }
+  try { fd = await claimDeadResidentFence(directory); }
   catch (error) { fs.closeSync(startupClaim); throw error; }
   let mesh: MeshStore | undefined;
   let releaseFence: (() => void) | undefined;
   try {
     const recheck = (): void => {
-      if (lockWaiter(fd)) throw new Error("A host is waking on this root (host.lock has a waiter); it wins");
+      if (residentLockHasWaiter(fd)) throw new Error("A host is waking on this root (host.lock has a waiter); it wins");
     };
     const config2 = readOwned(path.join(directory, "config.json"));
     if (config2.format !== 1 || config2.rootId !== config.rootId || typeof config2.residencyRoot !== "string" ||

@@ -3157,7 +3157,8 @@ export class ActorManager {
 
   /** smarty-dev#9890: an explicit reset is the documented repair for a hard block (auth, config,
    * unknown): it ends the block and its failure streak, so routing presence reads idle again. A
-   * transient block keeps its own expiry. Context rotation also ends a typed overflow block after
+   * transient block keeps its own expiry. Instruction re-apply uses the same rollback only for
+   * failing-preparation; it never clears other hard blocks. Context rotation also ends a typed overflow block after
    * that activation settled; it never clears auth/config/security failures. Returns an undo for a
    * reset whose commit failed; it reports whether it restored the exact prior hard block and streak
    * (never over a newer failure recorded meanwhile). */
@@ -3406,8 +3407,24 @@ export class ActorManager {
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor, true);
-    return this.#publicInfo(actor);
+    // smarty-dev#6829: factory re-apply refreshes instructions in place. Only a
+    // preparation block authorizes a fresh preparation attempt; never infer this
+    // from reason text or clear safety/custody/worker failures on a config write.
+    const preparationBlock = actor.activationBlocked?.code === "failing-preparation" ? actor.activationBlocked : undefined;
+    const restore = preparationBlock ? this.#clearHardBlockForReset(actor) : undefined;
+    try {
+      await this.#publishPresence(actor, true);
+    } catch (error) {
+      restore?.();
+      throw error;
+    }
+    const live = this.#liveActor(actor);
+    if (preparationBlock) {
+      logDiagnostic("src/actors/manager.ts", `[pi-fabric] actor ${actor.id} re-apply cleared activation block: code=${preparationBlock.code}; reason=${preparationBlock.reason}`);
+      this.#forgetRealarm(live);
+      if (live.queue.length > 0) this.#requestDrain(live);
+    }
+    return this.#publicInfo(live);
   }
 
   tell(
@@ -7394,6 +7411,7 @@ export class ActorManager {
       classification, ...(transient ? { retryAt: now + backoffMs, backoffMs } : {}),
       ...(code === "context-overflow" ? { overflowEvidence: { version: 1 as const, ...(typeof runId === "string" ? { runId } : {}), complete: contextOverflowCode && typeof runId === "string" && !saturatedWarningEvidence(evidence) } } : {}),
     };
+    logDiagnostic("src/actors/manager.ts", `[pi-fabric] actor ${actor.id} activation blocked: code=${code}; reason=${reason}; class=${activationBlockClass(code)}; count=${count}`);
     this.#armActivationBlockExpiry(actor, now);
     actor.updatedAt = now;
     void this.#publishPresence(actor).catch(() => undefined);

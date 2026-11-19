@@ -1590,6 +1590,16 @@ times and backoff are stored in the actor registry, so they survive a restart. O
 re-classifies an older `unknown` or `failing-preparation` block from its stored reason with the
 current rules. So an actor that an older host blocked for good on a transient cause recovers
 without being re-created.
+
+After repairing a hard `failing-preparation` cause, re-apply the actor's instructions with
+`agents.setInstructions({ id, instructions })` (or the verified file form). This is the
+in-place refresh used by factory activation. A successful refresh clears only that preparation
+block and its failure streak, even when the instruction text is unchanged, and lets retained
+work retry preparation. It does not reset the session, discard queued work, or clear any other
+activation block, custody hold or dead-letter state. A refused or failed refresh keeps the
+block. Setting a block and clearing it by re-apply both write the block's code and reason to
+private Fabric diagnostics; `activationBlocked.reason` remains available on the actor while blocked.
+
 A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
 does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
 the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a

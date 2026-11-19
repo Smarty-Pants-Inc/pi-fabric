@@ -6,6 +6,7 @@ import { ActorManager, ActorPreparationError } from "../src/actors/manager.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { MeshStore } from "../src/mesh/store.js";
 
 // Keep reason: accepted-work data safety / smarty-dev#14378 and #14215. The registry's
@@ -14,7 +15,9 @@ import { MeshStore } from "../src/mesh/store.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  await flushFabricDiagnostics();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 const setup = (options: NonNullable<ConstructorParameters<typeof ActorManager>[6]> = {}) => {
@@ -196,6 +199,124 @@ describe("real registry preparation and callerless subscription retention", () =
     expect(run.mock.calls.filter(([request]) => request.task.includes(event.id))).toHaveLength(1);
     expect(queue(actor.sessionFile!)).toEqual([]);
     expect(actors.status(actor.id).activationBlocked).toBeUndefined();
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/6829#issuecomment-6966581717
+  it.each([false, true])("re-apply clears only the preparation block and activates retained work (unchanged instructions=%s)", async unchanged => {
+    let rejectBroken = false;
+    const { actors, mesh, root } = setup({ preparationRetryMs: 5, resolvePiModel: model => {
+      if (rejectBroken && model === "provider/test") throw new Error("configured model no longer available");
+      return model;
+    } });
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "diagnostics"));
+    configureFabricDiagnostics("reapply-preparation");
+    const actor = await create(actors);
+    rejectBroken = true;
+    const blocked = settled(actors, actor.id, () => actors.status(actor.id).activationBlocked !== undefined);
+    const event = await publish(mesh);
+    await blocked;
+    const block = actors.status(actor.id).activationBlocked!;
+    expect(block).toMatchObject({ code: "failing-preparation", class: "hard", reason: expect.stringContaining("configured model no longer available") });
+    const retained = queue(actor.sessionFile!);
+    expect(retained).toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: event.id }), attempts: 0, preparationAttempts: 1 })]);
+    expect(outputs(actors, actor.id)).toEqual([]);
+    // The re-apply repairs the project model before refreshing its instructions.
+    await actors.setModel(actor.id, "provider/fixed", "project");
+    expect(actors.status(actor.id).activationBlocked).toEqual(block);
+    const recovered = settled(actors, actor.id, () => outputs(actors, actor.id).length === 1);
+    const applied = await actors.setInstructions(actor.id, unchanged ? "Reply deterministically." : "Reply using the repaired config.");
+    expect(applied.activationBlocked).toBeUndefined();
+    await recovered;
+    expect(actors.status(actor.id)).toMatchObject({ id: actor.id, status: "idle", queued: 0, model: "provider/fixed" });
+    expect(actors.status(actor.id).activationBlocked).toBeUndefined();
+    expect(outputs(actors, actor.id)).toHaveLength(1);
+    expect(queue(actor.sessionFile!)).toEqual([]);
+    // Read the real private diagnostic sink, not logger call counts.
+    await flushFabricDiagnostics();
+    const log = fs.readFileSync(fabricDiagnosticsFile("reapply-preparation"), "utf8");
+    expect(log).toContain(`actor ${actor.id} activation blocked: code=failing-preparation; reason=${block.reason}`);
+    expect(log).toContain(`actor ${actor.id} re-apply cleared activation block: code=failing-preparation; reason=${block.reason}`);
+    const registry = new ActorRegistryStore(path.join(root, "actors")).snapshot();
+    expect(registry.actors.find(row => row.id === actor.id)).not.toHaveProperty("activationBlocked");
+  });
+
+  it("logs a preparation block's reason when it is set, before any re-apply", async () => {
+    let unavailable = false;
+    const { actors, mesh, root } = setup({ resolvePiModel: model => {
+      if (unavailable) throw new Error("extension preparation rejected configured model");
+      return model;
+    } });
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "diagnostics"));
+    configureFabricDiagnostics("preparation-block");
+    const actor = await create(actors);
+    unavailable = true;
+    const done = settled(actors, actor.id, () => actors.status(actor.id).activationBlocked !== undefined);
+    await publish(mesh);
+    await done;
+    const block = actors.status(actor.id).activationBlocked!;
+    await flushFabricDiagnostics();
+    const file = fabricDiagnosticsFile("preparation-block");
+    expect(fs.existsSync(file)).toBe(true);
+    expect(fs.readFileSync(file, "utf8")).toContain(`actor ${actor.id} activation blocked: code=${block.code}; reason=${block.reason}`);
+  });
+
+  it("re-apply preserves a non-preparation safety block even when its text mentions preparation", async () => {
+    const { actors, agents } = setup();
+    const actor = await create(actors);
+    vi.spyOn(agents, "run").mockRejectedValue(new Error("security policy denied preparation"));
+    await expect(actors.ask(actor.id, "safety failure")).rejects.toThrow("security policy denied preparation");
+    await settled(actors, actor.id, () => true);
+    const block = actors.status(actor.id).activationBlocked!;
+    expect(block).toMatchObject({ class: "hard" });
+    expect(block.code).toBe("security-policy");
+    const applied = await actors.setInstructions(actor.id, "Re-applied configuration.");
+    expect(applied.activationBlocked).toEqual(block);
+    expect(actors.status(actor.id).activationBlocked).toEqual(block);
+  });
+
+  it("a refused re-apply does not clear a preparation block", async () => {
+    let unavailable = false;
+    const { actors, mesh } = setup({ resolvePiModel: model => {
+      if (unavailable) throw new Error("configured model no longer available");
+      return model;
+    } });
+    const actor = await create(actors);
+    unavailable = true;
+    const done = settled(actors, actor.id, () => actors.status(actor.id).activationBlocked !== undefined);
+    await publish(mesh);
+    await done;
+    const block = actors.status(actor.id).activationBlocked;
+    await expect(actors.setInstructions(actor.id, "Repaired.", () => { throw new Error("apply refused"); })).rejects.toThrow("apply refused");
+    expect(actors.status(actor.id).activationBlocked).toEqual(block);
+  });
+
+  it("a failed re-apply registry commit restores the preparation block and does not log a clear", async () => {
+    let unavailable = false;
+    const { actors, mesh, root } = setup({ resolvePiModel: model => {
+      if (unavailable) throw new Error("configured model no longer available");
+      return model;
+    } });
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "diagnostics"));
+    configureFabricDiagnostics("refused-reapply");
+    const actor = await create(actors);
+    unavailable = true;
+    const done = settled(actors, actor.id, () => actors.status(actor.id).activationBlocked !== undefined);
+    await publish(mesh);
+    await done;
+    const block = actors.status(actor.id).activationBlocked;
+    const retained = queue(actor.sessionFile!);
+    unavailable = false;
+    await actors.setModel(actor.id, "provider/fixed", "project");
+    vi.spyOn(ActorRegistryStore.prototype, "update").mockRejectedValueOnce(new Error("apply registry commit refused"));
+    await expect(actors.setInstructions(actor.id, "Repaired.")).rejects.toThrow("apply registry commit refused");
+    expect(actors.status(actor.id).activationBlocked).toEqual(block);
+    expect(queue(actor.sessionFile!)).toEqual(retained);
+    // Join the rollback's save before reading the actual persistent record.
+    await actors.setModel(actor.id, "provider/fixed", "project");
+    expect(new ActorRegistryStore(path.join(root, "actors")).snapshot().actors.find(row => row.id === actor.id)?.activationBlocked).toEqual(block);
+    await flushFabricDiagnostics();
+    const file = fabricDiagnosticsFile("refused-reapply");
+    expect(fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "").not.toContain("re-apply cleared");
   });
 
   it("retains a hard-preparation batch while failed and successful ask probes bypass it without absorbing members", async () => {

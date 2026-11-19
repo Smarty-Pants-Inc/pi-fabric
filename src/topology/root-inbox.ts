@@ -156,6 +156,9 @@ export class RootInbox {
   readonly #reads = new Set<Promise<unknown>>();
   #writes = Promise.resolve();
   #closed = false;
+  /** Bumped by every ack; a save records the generation its snapshot included. */
+  #ackGeneration = 0;
+  #ackGenerationSaved = 0;
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
   /** An ack is one-shot: its own queue retries a mesh lock timeout instead of dropping it. */
   readonly #ackWrites = new MeshBackgroundQueue("root inbox ack");
@@ -169,7 +172,9 @@ export class RootInbox {
       // Queue admission confirms only an attempt, not a durable receipt. A generic read
       // or put failure can leave the ack dirty after that notification was dropped.
       // Retry the whole obligation (recovery AND persistence); a failed flush rejects.
-      if (this.#state) await this.#save(true);
+      // Only an ack not yet confirmed durable is owed here: cursor-only progress stays
+      // best-effort at exit, so a busy mesh lock never turns shutdown into an error.
+      if (this.#state && (this.#ackGeneration !== this.#ackGenerationSaved || this.#ackRecovery.size)) await this.#save(true);
     } finally {
       await Promise.all([this.#ackWrites.close(), this.#notifications.close(), ...[...this.#predecessors.values()].map(inbox => inbox.close())]);
     }
@@ -603,6 +608,7 @@ export class RootInbox {
   }
 
   #ack(ids: readonly string[], receipts: readonly string[], offered: readonly MeshEvent[]): void {
+    this.#ackGeneration++;
     const state = this.#load();
     this.#trimReceipts();
     this.#remember([...ids.map(eventReceipt), ...receipts]);
@@ -1137,11 +1143,13 @@ export class RootInbox {
     this.#absorb();
     this.#trimReceipts();
     const text = JSON.stringify(this.#state);
-    if (text === this.#saved) return;
+    const generation = this.#ackGeneration;
+    if (text === this.#saved) { if (!this.#ackRecovery.size) this.#ackGenerationSaved = generation; return; }
     if (!now && this.#now() - this.#savedAt < SAVE_INTERVAL_MS) return;
     const immediate = immediateSnapshot(this.#state);
     await this.mesh.put({ key: this.key, value: JSON.parse(text) as RootInboxState, identity: this.identity });
     this.#saved = text;
+    if (!this.#ackRecovery.size) this.#ackGenerationSaved = generation;
     this.#savedImmediate = immediate;
     this.#savedAt = this.#now();
   }

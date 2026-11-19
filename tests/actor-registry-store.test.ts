@@ -53,7 +53,7 @@ describe("ActorRegistryStore", () => {
       expect(writer).not.toHaveBeenCalled();
       expect(heads).not.toHaveBeenCalled();
       expect(staged.mock.calls.some(([file]) => String(file).startsWith(`${registryPath}.`) &&
-        !String(file).endsWith("/owner"))).toBe(false);
+        path.basename(String(file)) !== "owner")).toBe(false); // lock owner record, any separator (Windows: \\owner)
 
       store.read(); // Prime the shared read cache before a real change.
       await save(store, store.records().map(row => ({ ...row, status: "running" })));

@@ -7411,7 +7411,6 @@ export class ActorManager {
       classification, ...(transient ? { retryAt: now + backoffMs, backoffMs } : {}),
       ...(code === "context-overflow" ? { overflowEvidence: { version: 1 as const, ...(typeof runId === "string" ? { runId } : {}), complete: contextOverflowCode && typeof runId === "string" && !saturatedWarningEvidence(evidence) } } : {}),
     };
-    logDiagnostic("src/actors/manager.ts", `[pi-fabric] actor ${actor.id} activation blocked: code=${code}; reason=${reason}; class=${activationBlockClass(code)}; count=${count}`);
     this.#armActivationBlockExpiry(actor, now);
     actor.updatedAt = now;
     void this.#publishPresence(actor).catch(() => undefined);

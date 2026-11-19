@@ -234,13 +234,14 @@ describe("real registry preparation and callerless subscription retention", () =
     // Read the real private diagnostic sink, not logger call counts.
     await flushFabricDiagnostics();
     const log = fs.readFileSync(fabricDiagnosticsFile("reapply-preparation"), "utf8");
-    expect(log).toContain(`actor ${actor.id} activation blocked: code=failing-preparation; reason=${block.reason}`);
     expect(log).toContain(`actor ${actor.id} re-apply cleared activation block: code=failing-preparation; reason=${block.reason}`);
     const registry = new ActorRegistryStore(path.join(root, "actors")).snapshot();
     expect(registry.actors.find(row => row.id === actor.id)).not.toHaveProperty("activationBlocked");
   });
 
-  it("logs a preparation block's reason when it is set, before any re-apply", async () => {
+  // Setting a block writes no diagnostics file: the activation path stays free of new file I/O
+  // (mesh-retry-gates' virtual-fs gate). The reason is on the actor record while blocked.
+  it("records a preparation block's reason on the actor when it is set, before any re-apply", async () => {
     let unavailable = false;
     const { actors, mesh, root } = setup({ resolvePiModel: model => {
       if (unavailable) throw new Error("extension preparation rejected configured model");
@@ -254,10 +255,7 @@ describe("real registry preparation and callerless subscription retention", () =
     await publish(mesh);
     await done;
     const block = actors.status(actor.id).activationBlocked!;
-    await flushFabricDiagnostics();
-    const file = fabricDiagnosticsFile("preparation-block");
-    expect(fs.existsSync(file)).toBe(true);
-    expect(fs.readFileSync(file, "utf8")).toContain(`actor ${actor.id} activation blocked: code=${block.code}; reason=${block.reason}`);
+    expect(block).toMatchObject({ code: "failing-preparation", reason: expect.stringContaining("extension preparation rejected configured model") });
   });
 
   it("re-apply preserves a non-preparation safety block even when its text mentions preparation", async () => {

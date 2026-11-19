@@ -4,7 +4,7 @@ import path from "node:path";
 import { MeshStore, type MeshEvent, type MeshPublishInput } from "../../src/mesh/store.js";
 
 // Bundle this narrow fixture, not the extension entrypoint, and execute it in native Node.
-const [role, root, control, writer, countText, capText, timeoutText, variantFlag, variant] = process.argv.slice(2);
+const [role, root, control, writer, countText, capText, timeoutText, budgetText, variantFlag, variant] = process.argv.slice(2);
 assert(role && root && control && writer, "worker requires role, root, control directory and writer");
 assert.equal(variantFlag, "--variant");
 assert(variant === "offlock" || variant === "base-late", "unknown scheduling variant");
@@ -16,11 +16,13 @@ const lockTimeoutMs = Number(timeoutText);
 assert(Number.isSafeInteger(count) && count > 0);
 assert(Number.isSafeInteger(cap) && cap > count);
 assert(Number.isSafeInteger(lockTimeoutMs) && lockTimeoutMs > 0);
+const budgetMs = Number(budgetText);
+assert(Number.isSafeInteger(budgetMs) && budgetMs > 0);
 const directory = path.join(root, "event-receipts");
 const checkpoint = path.join(control, `${writer}.prefixes.jsonl`);
 const ready = path.join(control, `${writer}.ready.json`);
 const release = path.join(control, role === "fill" ? "fill-go" : "stale-release");
-const deadline = Date.now() + 300_000;
+const deadline = Date.now() + budgetMs;
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
 const writeCompleted = (file: string, value: unknown): void => {
   const temporary = `${file}.${process.pid}.tmp`;

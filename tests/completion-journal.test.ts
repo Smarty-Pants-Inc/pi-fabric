@@ -104,14 +104,26 @@ const measureSynchronousSections = async (operation: (finishSlice: () => void) =
   // Windows CPU accounting is tick-quantized; keep CPU time as a Linux-only diagnostic.
   return { syncMaxMs, syncCpuMaxMs: process.platform === "linux" ? syncCpuMaxMs : undefined, syncSamples };
 };
-const assertSynchronousWork = (measured: Awaited<ReturnType<typeof measureSynchronousSections>>, platform: NodeJS.Platform = process.platform): void => {
+// WAIVER (owner fabric-store, smarty-dev#21065, expires 2026-11-29T00:00:00Z): on GitHub-hosted Linux the
+// real-scan guard bounds main-thread CPU time instead of wall time. Measured cause: shared-runner preemption,
+// 20.26 ms wall on main 4396d791 (Test run 44312314139, linux-tests); on a loaded host the same scan read
+// 740 ms wall against 3.2 ms CPU. Waived assertion: ONLY the 16 ms wall bound, ONLY for real scans (calls that
+// omit the platform); the 16 ms bound still gates them, on CPU time. Self-tests pass an explicit platform and
+// keep the strict wall policy; self-hosted Linux keeps it for real scans too.
+const HOSTED_CPU_BOUND = process.platform === "linux" && process.env.RUNNER_ENVIRONMENT === "github-hosted" &&
+  Date.now() < Date.parse("2026-11-29T00:00:00Z");
+const assertSynchronousWork = (measured: Awaited<ReturnType<typeof measureSynchronousSections>>, explicitPlatform?: NodeJS.Platform): void => {
+  const platform = explicitPlatform ?? process.platform;
   expect(measured.syncSamples).toBeGreaterThan(0);
   // ponytail: smarty-dev#4640 tracks a Windows latency SLO on real hosts.
   // Parse/validate use the same main-thread JavaScript on every platform; awaited
   // fs.promises I/O is excluded. Shared Windows runners preempt for 17–690 ms,
   // and CPU accounting is quantized to 15.6 ms, so Windows timing is diagnostic
   // only. Linux enforces every slice in one pass, never a best-of-N minimum.
-  if (platform === "linux") {
+  if (platform === "linux" && explicitPlatform === undefined && HOSTED_CPU_BOUND) {
+    expect(measured.syncCpuMaxMs ?? Number.POSITIVE_INFINITY,
+      "scan synchronous CPU time must stay below 16 ms (hosted Linux; wall bound waived until 2026-11-29, smarty-dev#21065)").toBeLessThan(16);
+  } else if (platform === "linux") {
     expect(measured.syncMaxMs,
       "scan synchronous wall time must stay below 16 ms under the linux policy").toBeLessThan(16);
   }
@@ -160,7 +172,7 @@ const measureIdlePass = async (label: string, prepare: () => () => Promise<void>
   verify?.(measured);
   return measured;
 };
-const assertIdleLatency = (measured: Awaited<ReturnType<typeof measureIdleSlices>>, platform: NodeJS.Platform = process.platform): void => {
+const assertIdleLatency = (measured: Awaited<ReturnType<typeof measureIdleSlices>>, platform?: NodeJS.Platform): void => {
   assertSynchronousWork(measured, platform);
   expect(measured.samples).toBeGreaterThan(0);
 };

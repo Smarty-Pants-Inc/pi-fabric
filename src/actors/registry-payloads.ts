@@ -147,10 +147,13 @@ export class ActorRegistryPayloads {
     })].slice(-HISTORY_LIMIT);
   }
 
-  /** Complete before acknowledging the registry commit, under its shared lock.
-   * Explicit registry heads still win, including during an interrupted publish.
-   * Failed publishes restore checkpoints as well as the registry. */
-  publishHeads(rows: readonly Row[]): void {
+  /** Compare the actual checkpoints too: matching registry bytes alone cannot
+   * prove that a missing/interrupted checkpoint publication needs no repair. */
+  headsUnchanged(rows: readonly Row[]): boolean {
+    return this.#headUpdates(rows).length === 0;
+  }
+
+  #headUpdates(rows: readonly Row[]) {
     const updates: Array<{ file: string; previous: string | undefined; next: string }> = [];
     for (const row of rows) {
       const ref = history(row.messageHistory);
@@ -162,6 +165,14 @@ export class ActorRegistryPayloads {
       const next = JSON.stringify(ref);
       if (previous !== next) updates.push({ file, previous, next });
     }
+    return updates;
+  }
+
+  /** Complete before acknowledging the registry commit, under its shared lock.
+   * Explicit registry heads still win, including during an interrupted publish.
+   * Failed publishes restore checkpoints as well as the registry. */
+  publishHeads(rows: readonly Row[]): void {
+    const updates = this.#headUpdates(rows);
     const attempted: typeof updates = [];
     try {
       for (const update of updates) {

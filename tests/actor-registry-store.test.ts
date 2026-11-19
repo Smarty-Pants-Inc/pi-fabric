@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorRegistryPayloads } from "../src/actors/registry-payloads.js";
+import { AtomicFileWriter } from "../src/core/atomic-write.js";
 
 const roots: string[] = [];
 const setup = () => {
@@ -26,6 +28,104 @@ afterEach(() => {
 });
 
 describe("ActorRegistryStore", () => {
+  describe.each(["write", "update"] as const)("identical saves through %s", (method) => {
+    const save = (store: ActorRegistryStore, actors: readonly Record<string, unknown>[], durable = false) =>
+      method === "write"
+        ? store.withLock(() => store.write(actors, { durable }))
+        : store.update(() => ({ actors, durable, value: true }));
+
+    it("skips identical soft registry and checkpoint publication, but still writes changed state", async () => {
+      const { store, registryPath, actorRoot } = setup();
+      const id = "a".repeat(32);
+      await save(store, [{ id, status: "idle", messages: [{ id: "message" }] }]);
+      const checkpoint = path.join(actorRoot, id, "registry", "messages-head.json");
+      const identity = (file: string) => {
+        const stat = fs.statSync(file, { bigint: true });
+        return [stat.ino, stat.mtimeNs, stat.ctimeNs];
+      };
+      const registryBefore = identity(registryPath), headBefore = identity(checkpoint);
+      const writer = vi.spyOn(AtomicFileWriter.prototype, "write");
+      const heads = vi.spyOn(ActorRegistryPayloads.prototype, "publishHeads");
+      const staged = vi.spyOn(fs, "writeFileSync");
+      await save(store, store.records());
+      expect(identity(registryPath)).toEqual(registryBefore);
+      expect(identity(checkpoint)).toEqual(headBefore);
+      expect(writer).not.toHaveBeenCalled();
+      expect(heads).not.toHaveBeenCalled();
+      expect(staged.mock.calls.some(([file]) => String(file).startsWith(`${registryPath}.`) &&
+        path.basename(String(file)) !== "owner")).toBe(false); // lock owner record, any separator (Windows: \\owner)
+
+      store.read(); // Prime the shared read cache before a real change.
+      await save(store, store.records().map(row => ({ ...row, status: "running" })));
+      expect(identity(registryPath)).not.toEqual(registryBefore);
+      expect(store.read()).toMatchObject({ actors: [{ id, status: "running" }] });
+      expect(identity(checkpoint)).toEqual(headBefore);
+    });
+
+    it.each(["explicit", "removal", "adoption"] as const)("retains file and directory barriers for an identical %s durable save", async (kind) => {
+      const { store, registryPath } = setup();
+      const actor = { id: "same", ...(kind === "removal" ? { removal: { requestedAt: 1 } } : {}),
+        ...(kind === "adoption" ? { adoptedAt: 1 } : {}) };
+      await save(store, [actor]);
+      const previous = fs.readFileSync(registryPath, "utf8");
+      const synced: string[] = [];
+      const sync = fs.fsyncSync.bind(fs);
+      vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+        synced.push(fs.fstatSync(fd).isDirectory() ? "directory" : "file");
+        sync(fd);
+      });
+      await save(store, store.records(), kind === "explicit");
+      expect(fs.readFileSync(registryPath, "utf8")).toBe(previous);
+      expect(synced).toContain("file");
+      if (process.platform !== "win32") expect(synced).toContain("directory");
+    });
+
+    it("does not acknowledge an identical durable save when its file barrier fails", async () => {
+      const { store, registryPath } = setup();
+      await save(store, [{ id: "same" }]);
+      const previous = fs.readFileSync(registryPath, "utf8");
+      const sync = fs.fsyncSync.bind(fs);
+      let fail = true;
+      vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+        if (fail && fs.fstatSync(fd).isFile()) {
+          fail = false;
+          throw new Error("identical save barrier unavailable");
+        }
+        sync(fd);
+      });
+      await expect(save(store, store.records(), true)).rejects.toThrow("identical save barrier unavailable");
+      expect(fail).toBe(false);
+      expect(fs.readFileSync(registryPath, "utf8")).toBe(previous);
+    });
+
+    it("repairs a missing checkpoint even when the soft registry bytes match", async () => {
+      const { store, registryPath, actorRoot } = setup();
+      const id = "a".repeat(32);
+      await save(store, [{ id, messages: [{ id: "message" }] }]);
+      const checkpoint = path.join(actorRoot, id, "registry", "messages-head.json");
+      const expected = fs.readFileSync(checkpoint, "utf8"), before = store.fingerprint();
+      fs.unlinkSync(checkpoint);
+      await save(store, store.records());
+      expect(fs.readFileSync(checkpoint, "utf8")).toBe(expected);
+      expect(store.fingerprint()).toBe(before);
+      expect(store.messages(store.records()[0]!)).toEqual([{ id: "message" }]);
+      expect(fs.existsSync(registryPath)).toBe(true);
+    });
+  });
+
+  it("reselects an identical update after a registry generation race instead of dropping the racing row", async () => {
+    const { store, registryPath } = setup();
+    await store.update(() => ({ actors: [{ id: "same" }], value: true }));
+    let selections = 0;
+    const result = await store.update(actors => {
+      if (++selections === 1) fs.writeFileSync(registryPath, JSON.stringify({ format: 1, actors: [...actors, { id: "racer" }] }));
+      return { actors, value: "accepted" };
+    });
+    expect(result).toBe("accepted");
+    expect(selections).toBe(2);
+    expect(store.records().map(row => row.id)).toEqual(["same", "racer"]);
+  });
+
   // smarty-dev#6100 (org option B): a durable update stages and fsyncs its file before the fence, and the post-rename
   // directory barrier runs after the fence is released; under custody only the generation check and the rename.
   it("runs no fsync while holding the registry fence on a durable update, fast path and contended path", async () => {

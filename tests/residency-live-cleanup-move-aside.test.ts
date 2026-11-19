@@ -441,7 +441,7 @@ describe("live cleanup move-aside custody", () => {
       expect(foreground).not.toHaveBeenCalled();
       expect(f.client.hasAgent(run.id)).toBe(true); f.noGitDelete();
     } finally { await f.dispose(); }
-    }, process.platform === "win32" && row.kind === "metadata" && row.crossDevice === false ? 120_000 : undefined);
+    }, process.platform === "win32" && (row.kind === "metadata" || row.kind === "result") && row.crossDevice === false ? 120_000 : undefined);
   });
 
   it.each((process.platform === "win32" ? ["run", "metadata", "result"] : ["run", "temporary", "metadata", "result"]) as Array<"run" | "temporary" | "metadata" | "result">)("post-move receipt failure at %s leaves immutable prepared receipt and original inode held, never rolled back", async kind => {

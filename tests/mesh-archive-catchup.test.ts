@@ -8,6 +8,10 @@ import { StoreBridgeSide } from "../src/mesh/bridge.js";
 import { RecoveryReader } from "../src/mesh/recovery-reader.js";
 import { MeshSnapshotRetriesExhaustedError } from "../src/core/atomic-write.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshLockTicket, meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { readHostLeaseCurrent } from "../src/topology/host-leases.js";
+import { RootInbox, type RootInboxSession } from "../src/topology/root-inbox.js";
 
 // Keep: data safety and the real bridge archived-history startup stall. Expectations come
 // from the pre-change reader below, not the new range index, stream parser, or merge logic.
@@ -821,6 +825,98 @@ const archivedStore = (bridgeStamps = false, dayCount = 16) => {
   stores.push(store);
   return { ...f, store, side: new StoreBridgeSide(store, "hub") };
 };
+
+describe("root inbox archive scans and independent lease renewal", () => {
+  // Keep: real archive bytes + real FIFO admission + unchanged host-lease ownership.
+  // This local scheduling counterexample is not proof of the fleet's missing call stack.
+  it.each(["next", "wake", "pending"] as const)("%s services a renewal turn before its first archive page finishes", async mode => {
+    const f = archivedStore(false, 2);
+    const identity: MeshIdentity = { id: "session:receiver", name: "receiver", kind: "main" };
+    const directory = new ParticipantDirectory(f.store, { enabled: true, identity,
+      hostId: identity.id, rootId: identity.id, reapDeadHosts: false, heartbeatMs: 1_000 });
+    let name = "receiver";
+    directory.registerSource(() => [{ format: 1, id: identity.id, kind: "root", rootId: identity.id,
+      ownerHostId: identity.id, ownerIdentityId: identity.id, name, status: "running", runner: "pi",
+      transport: "host", capabilities: [], controlProtocol: "v1", startedAt: 1, updatedAt: 1 }]);
+    const inbox = new RootInbox(f.store, identity, () => [identity.id], {
+      steerGraceMs: 0, now: () => Date.UTC(2026, 0, 4), horizonMs: 7 * 86_400_000, pageSize: 47,
+    });
+    const session: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
+    let head: MeshLockTicket | undefined;
+    let beat: ReturnType<typeof setInterval> | undefined;
+    let publication: Promise<unknown> | undefined;
+    let renewal: Promise<unknown> | undefined;
+    let scanning: Promise<unknown> | undefined;
+    try {
+      await directory.start();
+      await f.store.put({ key: inbox.key, identity, value: { after: 0 } });
+      inbox.start();
+      if (mode === "pending") expect((await inbox.next(session)).events.length).toBeGreaterThan(0);
+      head = new MeshLockTicket(f.root, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 10_000);
+      expect(head.mayContend()).toBe(true);
+      beat = setInterval(() => head?.mayContend(), 25);
+      name = "receiver-changed";
+      let published = false;
+      publication = directory.refresh().finally(() => { published = true; });
+      // Observe the real follower receipt, not a mocked publication/admission promise.
+      for (let turn = 0; turn < 1_000 && fs.readdirSync(meshLockQueueDirectory(f.root)).length < 2; turn++) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      expect(fs.readdirSync(meshLockQueueDirectory(f.root)).length).toBeGreaterThanOrEqual(2);
+      expect(published).toBe(false);
+      const before = readHostLeaseCurrent(f.root, identity.id)!;
+      const confirmedAt = directory.confirmedAt();
+      await new Promise<void>(resolve => setTimeout(resolve, 2));
+      let firstPageFinished = false;
+      let firstPageStarted!: () => void;
+      let armed = false;
+      let observed: { pageFinished: boolean; published: boolean; renewed: boolean; confirmedAt: number } | undefined;
+      const turn = new Promise<void>(resolve => {
+        firstPageStarted = () => {
+          if (armed) return;
+          armed = true;
+          setImmediate(() => {
+            // Explicit refresh enters the same #renewFileLease lane as the heartbeat;
+            // its shared confirmation still waits behind our live FIFO head.
+            renewal = directory.refresh();
+            const lease = readHostLeaseCurrent(f.root, identity.id)!;
+            observed = { pageFinished: firstPageFinished, published,
+              renewed: lease.updatedAt > before.updatedAt && lease.incarnationToken === before.incarnationToken &&
+                lease.expiresAt - lease.updatedAt === before.expiresAt - before.updatedAt,
+              confirmedAt: directory.confirmedAt() };
+            head?.close();
+            resolve();
+          });
+        };
+      });
+      const syncRead = f.store.read.bind(f.store), asyncRead = f.store.readAsync.bind(f.store);
+      // Arm only once the first real page has STARTED. A yield before a still-
+      // synchronous archive scan must not satisfy this liveness counterexample.
+      vi.spyOn(f.store, "read").mockImplementation(input => {
+        firstPageStarted();
+        const page = syncRead(input); firstPageFinished = true; return page;
+      });
+      vi.spyOn(f.store, "readAsync").mockImplementation(async input => {
+        firstPageStarted();
+        const page = await asyncRead(input); firstPageFinished = true; return page;
+      });
+      scanning = mode === "wake" ? inbox.wake(session, () => true) : inbox.next(session);
+      const batch = await scanning as Awaited<ReturnType<RootInbox["next"]>> | undefined;
+      await turn;
+      await Promise.all([publication, renewal]);
+      expect(observed).toEqual({ pageFinished: false, published: false, renewed: true, confirmedAt });
+      expect(batch?.events.length).toBeGreaterThan(0);
+      expect(batch?.events.every(value => value.to === identity.id &&
+        f.events.some(original => JSON.stringify(original) === JSON.stringify(value)))).toBe(true);
+    } finally {
+      if (beat) clearInterval(beat);
+      head?.close();
+      await Promise.allSettled([publication, renewal, scanning].filter(value => value !== undefined));
+      await inbox.close();
+      await directory.close();
+    }
+  });
+});
 
 describe("real MeshStore → StoreBridgeSide archived catch-up", () => {
   it("readAsync matches synchronous store filters and returns detached event data", async () => {

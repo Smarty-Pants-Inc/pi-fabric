@@ -583,5 +583,8 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     expect(drain.heldPct).toBeLessThanOrEqual(CEILING_DRAIN_PCT);
     expect(idle.heldPct).toBeLessThanOrEqual(CEILING_IDLE_PCT);
     expect(busy.heldPct).toBeLessThanOrEqual(CEILING_IDLE_PCT);
-  }, 240000);
+  // Hosted-runner budget (smarty-dev#21065): the drain phase alone measured 201.8 s on main 776d17a1
+  // (passed only on retry) and 184.6 s on pi-fabric#2010; with the idle phases that crosses 240 s.
+  // Timing only: every hold, scan, batch and delivery assertion above is unchanged.
+  }, 480000);
 });

@@ -48,7 +48,7 @@ Queued, parked, overflow, settled-window, pending delivery outcomes, dead-letter
 work and stop archives refuse with `FABRIC_ACTOR_QUEUED_WORK` and counts (nonempty
 dead-letter and stop-archive files are counted as files, not guessed item totals). This
 offline check is conservative: all nonempty dead-letter files and stop archives,
-and any in-flight/preparing/removing actor, refuse rather than guessing whether
+and any in-flight/preparing/removing actor, refuse instead of guessing whether
 recovery is complete. Resolve/adopt that work first. There is **no `--drop-queued`
 or `--actor` option** for residency retirement. Neither actor registries nor actor
 directories outside the residency are changed.
@@ -80,7 +80,7 @@ lock files and creates no files or directories. It reports current refusals just
 as execution does; it does not reserve the destination or promise the same
 random/time suffix on a later invocation. Check the JSON exit status before
 assuming retirement happened. If a namespace-sync failure occurs after rename,
-the error names the retained tree and audit; inspect them rather than restarting
+the error names the retained tree and audit; inspect them before restarting
 the old root.
 
 To inspect, use the printed archive path directly. Any restore is a separate

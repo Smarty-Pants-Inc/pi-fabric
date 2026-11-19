@@ -155,16 +155,25 @@ export class RootInbox {
   readonly #ackRecovery = new Map<string, { after: number; through: number; since: number }>();
   readonly #reads = new Set<Promise<unknown>>();
   #writes = Promise.resolve();
+  #closed = false;
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
   /** An ack is one-shot: its own queue retries a mesh lock timeout instead of dropping it. */
   readonly #ackWrites = new MeshBackgroundQueue("root inbox ack");
 
   async close(): Promise<void> {
-    // Reconciliation now awaits archive I/O; finish its saves before closing queues.
-    await Promise.allSettled(this.#reads);
-    await this.#writes;
-    await this.#settleAcks();
-    await Promise.all([this.#ackWrites.close(), this.#notifications.close(), ...[...this.#predecessors.values()].map(inbox => inbox.close())]);
+    if (this.#closed) return;
+    try {
+      // Reconciliation now awaits archive I/O; finish its saves before closing queues.
+      await Promise.allSettled(this.#reads);
+      await this.#writes;
+      // Queue admission confirms only an attempt, not a durable receipt. A generic read
+      // or put failure can leave the ack dirty after that notification was dropped.
+      // Retry the whole obligation (recovery AND persistence); a failed flush rejects.
+      if (this.#state) await this.#save(true);
+    } finally {
+      await Promise.all([this.#ackWrites.close(), this.#notifications.close(), ...[...this.#predecessors.values()].map(inbox => inbox.close())]);
+    }
+    this.#closed = true;
   }
 
   constructor(

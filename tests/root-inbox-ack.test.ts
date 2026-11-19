@@ -12,7 +12,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 import { archiveFileName, MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { hasDeliveryOutcome } from "../src/mesh/delivery-outcomes.js";
 import { deliverRootInbox } from "../src/topology/root-inbox-delivery.js";
-import { eventReceipt } from "../src/topology/root-inbox-shared.js";
+import { eventReceipt, eventReceipts } from "../src/topology/root-inbox-shared.js";
 import { RootInbox, rootInboxMessage, rootInboxSession, type RootInboxSession } from "../src/topology/root-inbox.js";
 import { filterRootInboxContext } from "../src/topology/root-inbox-context.js";
 import { rootInboxMessage as issuedInboxMessage, verifyIssuedInbox } from "./root-inbox-issued-fixture.js";
@@ -646,6 +646,58 @@ const setup = (options: { horizonMs?: number; pageSize?: number } = {}) => {
 const ids = (events: readonly MeshEvent[] | undefined) => (events ?? []).map(event => event.id);
 
 describe("root inbox cold archive consumption (pi-fabric#2010 RFL F1)", () => {
+  // catch: https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2010#issuecomment-6999716694
+  // RFL's real-archive probe: notification admission is not a durable ack obligation.
+  it.each(["transient read", "persistent read", "transient put", "persistent put"] as const)(
+    "close retries the cold ack obligation after %s EIO, or rejects truthfully", async failure => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-eio-close-"));
+      const meshRoot = path.join(root, "mesh"), archive = path.join(root, "archive");
+      fs.mkdirSync(meshRoot);
+      const now = Date.now();
+      const events: MeshEvent[] = Array.from({ length: 30 }, (_, i) => ({
+        id: `eio-close-${i + 1}`, sequence: i + 1, topic: TOPIC, kind: i === 21 ? "blocked" : "report",
+        from: peer, to: me.id, createdAt: now, text: `row ${i} ${"x".repeat(2048)}`,
+        data: { deliveryId: `work-${i + 1}` },
+      }));
+      const file = path.join(archive, "2026/01/01", archiveFileName(TOPIC));
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, events.map(event => JSON.stringify(event) + "\n").join(""));
+      fs.writeFileSync(path.join(meshRoot, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archive }));
+      fs.writeFileSync(path.join(archive, "MESH.json"), JSON.stringify({ version: 1, firstSequence: 1, meshRoot }));
+      fs.writeFileSync(path.join(meshRoot, "events.jsonl"), events.slice(-8).map(event => JSON.stringify(event) + "\n").join(""));
+      fs.writeFileSync(path.join(meshRoot, "sequence"), "30");
+      const mesh = new MeshStore(meshRoot, 64 * 1024, 500, { stateBackend: "file" });
+      const box = () => new RootInbox(mesh, me, () => [me.id], { steerGraceMs: 0 });
+      const first = box(), cold = box();
+      cleanups.push(() => { mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); });
+      cleanups.push(async () => { await cold.close(); await first.close(); });
+      await mesh.put({ key: first.key, identity: me, value: { after: 0 } });
+      const event = events[21]!;
+      expect(ids((await first.next(notHeld)).events)).toContain(event.id);
+      cold.start();
+      const eio = Object.assign(new Error(`injected cold-ack ${failure} EIO`), { code: "EIO" });
+      const persistent = failure.startsWith("persistent");
+      const fault = failure.endsWith("read") ? vi.spyOn(mesh, "readAsync") : vi.spyOn(mesh, "put");
+      if (persistent) fault.mockRejectedValue(eio); else fault.mockRejectedValueOnce(eio);
+      // The historical queue API may fulfil after the failed first attempt. Close must
+      // independently retry the still-owed durable state, not merely its recovery read.
+      await cold.consume([event.id], eventReceipts(event));
+      try {
+        if (persistent) await expect(cold.close()).rejects.toThrow(eio.message);
+        else {
+          await cold.close();
+          const persisted = mesh.get(cold.key, { fresh: true })!.value as { acked: Array<[string, number]> };
+          expect(persisted.acked).toContainEqual([event.id, event.sequence]);
+          mesh.closeState();
+          const reopenedMesh = new MeshStore(meshRoot, 64 * 1024, 500, { stateBackend: "file" });
+          const reopened = new RootInbox(reopenedMesh, me, () => [me.id], { steerGraceMs: 0 });
+          try {
+            expect(ids((await reopened.next(notHeld)).events)).not.toContain(event.id);
+          } finally { await reopened.close(); reopenedMesh.closeState(); }
+        }
+      } finally { fault.mockRestore(); }
+    });
+
   // catch: https://github.com/Smarty-Pants-Inc/pi-fabric/pull/2010
   // Real storage, not delayed/mock pages: append invalidates the warmed archive range identity.
   it.each(["offered", "reloaded"] as const)("%s ack does not synchronously rescan a 50 MB archive after an append", async mode => {

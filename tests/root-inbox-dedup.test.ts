@@ -154,7 +154,7 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     const event = await h.publish(); h.advance(1);
     expect((await inbox.next(h.session())).events.map(e => e.id)).toEqual([event.id]);
-    const read = vi.spyOn(h.mesh, "read").mockReturnValue([]);
+    const read = vi.spyOn(h.mesh, "readAsync").mockResolvedValue([]);
     expect((await inbox.next(h.session())).events).toEqual([]);
     expect((h.mesh.get(inbox.key)?.value as { pending?: unknown }).pending).toBeDefined();
     read.mockRestore();

@@ -390,9 +390,15 @@ describe("live cleanup move-aside custody", () => {
   });
 
   // smarty-dev#19142: this row's inner 5s residency wait becomes 90s; outer timeout is 120s, and the guard stays enabled. This does not claim resolution.
+  // The Windows 'result' row joins it (pi-fabric#2010, Test run 44406413837 'Windows affected 6/10', 6/6): request 04:10:55.401Z,
+  // worktree moved +1.6 s, run +3.5 s, result EXDEV emitted +5.43 s, past the 5 s wait. The cost is the per-container synchronous
+  // Windows ACL calls on the cleanup path (residency/host.ts -> agents/manager.ts 5724-5780), which root-inbox never enters.
+  // Earlier #2010 heads never ran this file (affected selection 127 files without it vs 627 with it), so they are not a pass.
+  // 9a37c0cd then failed 'metadata' (cross-device=true) the same way: the cost is per Windows cleanup, not per row, so every
+  // Windows row of this group gets the 90 s inner / 120 s outer wait. Assertions and the guard are unchanged.
   ((process.platform === "win32" ? ["worktree", "run", "metadata", "result"] : ["worktree", "run", "temporary", "metadata", "result"]) as Array<"worktree" | "run" | "temporary" | "metadata" | "result">).flatMap(kind => [false, true].map(crossDevice => ({ kind, crossDevice }))).forEach(row => {
     it.each([row])("partial EXDEV at $kind (cross-device metadata=$crossDevice) retains originals and structured committed outcome", async ({ kind, crossDevice }) => {
-    const f = await fixture(false, process.platform === "win32" && kind === "metadata" && crossDevice === false ? 90_000 : 5_000);
+    const f = await fixture(false, process.platform === "win32" ? 90_000 : 5_000);
     try {
       const run = await f.launch(); const target = run[kind]!;
       const foreground = vi.spyOn(f.host.agents, "markForeground");
@@ -437,7 +443,7 @@ describe("live cleanup move-aside custody", () => {
       expect(foreground).not.toHaveBeenCalled();
       expect(f.client.hasAgent(run.id)).toBe(true); f.noGitDelete();
     } finally { await f.dispose(); }
-    }, process.platform === "win32" && row.kind === "metadata" && row.crossDevice === false ? 120_000 : undefined);
+    }, process.platform === "win32" ? 120_000 : undefined);
   });
 
   it.each((process.platform === "win32" ? ["run", "metadata", "result"] : ["run", "temporary", "metadata", "result"]) as Array<"run" | "temporary" | "metadata" | "result">)("post-move receipt failure at %s leaves immutable prepared receipt and original inode held, never rolled back", async kind => {

@@ -11,7 +11,10 @@ import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
 // Keep reason: F1 data safety, https://github.com/Smarty-Pants-Inc/pi-fabric/pull/1927.
 // A names-only advisory observation cannot reserve capacity against arbitrary intervening
 // writers. These are real 10k-key native-process regressions, not mocked receipt counts.
-const BUDGET_MS = 300_000;
+// The 10k real keyed writes are fsync-bound, not a 10s lock acquisition. With two
+// CPUs and 5ms per real sync, fillers still advance at 300s and finish within 600s.
+// Keep the native worker's overall deadline on this same budget; lock timeouts stay unchanged.
+const BUDGET_MS = 600_000;
 const READY_MS = 30_000;
 const TOPIC = "mesh.dedupe-capacity-race";
 const baseControl = process.env.FABRIC_CAPACITY_RACE_BASE_CONTROL === "1";
@@ -42,7 +45,7 @@ const startWorker = (bundle: string, base: string, role: string, writer: string,
   // Vitest ordinarily runs under Node; explicitly avoid inheriting Bun as the worker runtime.
   const node = process.versions.bun ? "node" : process.execPath;
   const child = spawn(node, [bundle, role, path.join(base, "mesh"), path.join(base, "control"), writer,
-    String(count), String(cap), String(lockTimeoutMs), "--variant", baseControl ? "base-late" : "offlock"], {
+    String(count), String(cap), String(lockTimeoutMs), String(BUDGET_MS), "--variant", baseControl ? "base-late" : "offlock"], {
     stdio: ["ignore", "pipe", "pipe"], cwd: process.cwd(),
     env: { ...process.env, PI_CODING_AGENT_DIR: base, PI_FABRIC_MESH_ROOT: path.join(base, "mesh"),
       PI_FABRIC_LOCK_STATS: "0", PI_FABRIC_MESH_CHECKPOINT_LOG: "off" },
@@ -161,7 +164,7 @@ const cases = [
   { name: "single publish with the normal 10s lock timeout", role: "stale-single", staleCount: 1, cap: 10_003, lockTimeoutMs: 10_000 },
 ] as const;
 
-// Unmeasured Windows runtime risks another red CI: each native race case gets 300 s; Linux covers this platform-independent publish/capacity logic.
+// Unmeasured Windows runtime risks another red CI; Linux covers this platform-independent publish/capacity logic.
 // Measurement: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/19935
 for (const scenario of cases) {
   // GitHub-hosted quarantine through 2026-11-28; auto-expires after that UTC date.

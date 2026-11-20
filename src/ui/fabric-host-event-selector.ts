@@ -45,7 +45,7 @@ const EVENT_LABELS: Record<FabricActorHostEvent, string> = {
   context: "assembled messages before an LLM request",
   before_provider_headers: "outbound provider headers assembled; secrets redacted",
   before_provider_request: "provider payload assembled before sending",
-  after_provider_response: "provider response status and headers received",
+  after_provider_response: "provider response status received; headers withheld",
   tool_execution_start: "tool execution started",
   tool_call: "validated tool call before execution",
   tool_execution_update: "streaming tool progress",

@@ -66,7 +66,7 @@ export default function (pi: ExtensionAPI) {
       runId: process.env.PI_FABRIC_PARENT_RUN ?? "main", actorId: process.env.PI_FABRIC_ACTOR_ID ?? null,
       depth: Number(process.env.PI_FABRIC_DEPTH ?? "0"), sessionId: context.sessionManager.getSessionId(),
       model: context.model ? `${context.model.provider}/${context.model.id}` : null, thinking: pi.getThinkingLevel(),
-      prompt: event.prompt, nativeChanges: context.sessionManager.getEntries().filter((entry) => entry.type === "model_change" || entry.type === "thinking_level_change"),
+      prompt: event.messageType === "user" ? event.prompt : "", nativeChanges: context.sessionManager.getEntries().filter((entry) => entry.type === "model_change" || entry.type === "thinking_level_change"),
     };
     fs.appendFileSync(process.env.POLICY_PROBE_RECEIPTS!, `${JSON.stringify(receipt)}\n`);
   });

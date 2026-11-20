@@ -49,14 +49,14 @@ async function runtime(): Promise<Runtime> {
     const require = createRequire(import.meta.url);
     for (const name of ["@earendil-works/pi-durable", "@earendil-works/chord"]) {
       const metadata = require(`${name}/package.json`) as { version?: string };
-      if (metadata.version !== "1.1.0") throw new Error(`Unsupported ${name} version ${metadata.version ?? "unknown"}; expected 1.1.0`);
+      if (metadata.version !== "1.2.0") throw new Error(`Unsupported ${name} version ${metadata.version ?? "unknown"}; expected 1.2.0`);
     }
     return Promise.all([import("@earendil-works/pi-durable"), import("@earendil-works/chord/context")]);
   })
     .then(([durable, context]) => ({ durable, context }))
     .catch((cause: unknown) => {
       runtimePromise = undefined;
-      throw new Error(`Pi durable runner requires pinned dependencies @earendil-works/pi-durable@1.1.0 and @earendil-works/chord@1.1.0: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      throw new Error(`Pi durable runner requires pinned dependencies @earendil-works/pi-durable@1.2.0 and @earendil-works/chord@1.2.0: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     });
 }
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");

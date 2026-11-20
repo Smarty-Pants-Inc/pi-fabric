@@ -320,7 +320,7 @@ export const runBridge = async (
         try {
           const startedRelay = await startBridgeRelay({ localName, remoteName, meshRoot: local.store.root,
             bridgeScriptPath: fs.realpathSync(fileURLToPath(new URL("../bin/mesh-bridge", import.meta.url))),
-            deliver: (sourceRemote, event) => running.deliverRelay(sourceRemote, event) });
+            deliver: (sourceRemote, event, budget) => running.deliverRelay(sourceRemote, event, budget), log });
           if (signal.aborted) {
             await startedRelay.close().catch(() => undefined);
             return;

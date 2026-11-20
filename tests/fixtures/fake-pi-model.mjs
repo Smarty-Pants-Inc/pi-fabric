@@ -56,15 +56,20 @@ process.stdin.on("data", chunk => {
         } : {}),
       });
     } else if (frame.type === "prompt") {
-      emit({ type: "agent_start" });
       const actual = behavior === "drift" ? wrong : model;
       const message = { role: "assistant", provider: actual.provider, model: actual.id, content: [{ type: "text", text: behavior === "refusal" ? "I refuse this judgment." : "correct model ran" }], stopReason: "stop", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } };
-      emit({ type: "message_start", message });
-      emit({ type: "message_end", message });
+      const events = [
+        { type: "agent_start" },
+        { type: "message_start", message },
+        { type: "message_end", message },
+      ];
       // Late events must never erase the model mismatch failure.
-      emit({ type: "agent_start" });
-      emit({ type: "agent_end" });
-      emit({ type: "agent_settled" });
+      if (behavior === "drift") events.push({ type: "agent_start" });
+      events.push(
+        { type: "agent_end" },
+        { type: "agent_settled" },
+      );
+      process.stdout.write(events.map(event => JSON.stringify(event)).join("\n") + "\n");
     }
   }
 });

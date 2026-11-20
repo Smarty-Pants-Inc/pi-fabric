@@ -23,14 +23,14 @@ jobs:
         env:
           FABRIC_NATIVE_CC_PINNED: '1'
         run: bun run build
-      - name: FIFO test x15 alone, then x15 under 3 parallel load lanes
+      - name: FIFO test WHOLE FILE x8 alone, then x8 under load
         shell: bash
         run: |
           set -u
           T='admits queued workers in FIFO order while preserving concurrency and nice'
           pass=0; fail=0
-          for i in $(seq 1 15); do
-            if bunx vitest run tests/agents-provider.test.ts -t "$T" > "$RUNNER_TEMP/alone-$i.log" 2>&1; then pass=$((pass+1)); echo "alone $i PASS"; else fail=$((fail+1)); echo "alone $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/alone-$i.log"; fi
+          for i in $(seq 1 8); do
+            if bunx vitest run tests/agents-provider.test.ts  > "$RUNNER_TEMP/alone-$i.log" 2>&1; then pass=$((pass+1)); echo "alone $i PASS"; else fail=$((fail+1)); echo "alone $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/alone-$i.log"; fi
           done
           echo "ALONE pass=$pass fail=$fail"
           ( while true; do bunx vitest run tests/actor-preparation.test.ts > /dev/null 2>&1; done ) &
@@ -40,9 +40,9 @@ jobs:
           ( while true; do bunx vitest run tests/mesh-bridge.test.ts > /dev/null 2>&1; done ) &
           L3=$!
           lp=0; lf=0
-          for i in $(seq 1 15); do
-            if bunx vitest run tests/agents-provider.test.ts -t "$T" > "$RUNNER_TEMP/load-$i.log" 2>&1; then lp=$((lp+1)); echo "load $i PASS"; else lf=$((lf+1)); echo "load $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/load-$i.log"; fi
+          for i in $(seq 1 8); do
+            if bunx vitest run tests/agents-provider.test.ts  > "$RUNNER_TEMP/load-$i.log" 2>&1; then lp=$((lp+1)); echo "load $i PASS"; else lf=$((lf+1)); echo "load $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/load-$i.log"; fi
           done
           kill $L1 $L2 $L3 2>/dev/null || true
           echo "LOADED pass=$lp fail=$lf"
-          echo "RESULT tree=$(git rev-parse HEAD) alone=$pass/15 loaded=$lp/15"
+          echo "RESULT tree=$(git rev-parse HEAD) alone=$pass/8 loaded=$lp/8"

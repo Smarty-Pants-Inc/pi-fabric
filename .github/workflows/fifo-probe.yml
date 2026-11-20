@@ -1,0 +1,48 @@
+name: FIFO probe (fabric-store, temporary; smarty-dev#4605 #2017)
+on:
+  push:
+    branches: ['fabric-store/fifo-probe-*']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      FABRIC_TEST_SKIP_NATS: '1'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/check-setup
+        with:
+          runner-environment: github-hosted
+      - uses: ./.github/actions/check-systemd
+      - name: Fetch the pinned native toolchain
+        run: node scripts/native-toolchain.mjs fetch
+      - name: Build
+        env:
+          FABRIC_NATIVE_CC_PINNED: '1'
+        run: bun run build
+      - name: FIFO test x15 alone, then x15 under 3 parallel load lanes
+        shell: bash
+        run: |
+          set -u
+          T='admits queued workers in FIFO order while preserving concurrency and nice'
+          pass=0; fail=0
+          for i in $(seq 1 15); do
+            if bunx vitest run tests/agents-provider.test.ts -t "$T" > "$RUNNER_TEMP/alone-$i.log" 2>&1; then pass=$((pass+1)); echo "alone $i PASS"; else fail=$((fail+1)); echo "alone $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/alone-$i.log"; fi
+          done
+          echo "ALONE pass=$pass fail=$fail"
+          ( while true; do bunx vitest run tests/actor-preparation.test.ts > /dev/null 2>&1; done ) &
+          L1=$!
+          ( while true; do bunx vitest run tests/residency-wake-backoff.test.ts > /dev/null 2>&1; done ) &
+          L2=$!
+          ( while true; do bunx vitest run tests/mesh-bridge.test.ts > /dev/null 2>&1; done ) &
+          L3=$!
+          lp=0; lf=0
+          for i in $(seq 1 15); do
+            if bunx vitest run tests/agents-provider.test.ts -t "$T" > "$RUNNER_TEMP/load-$i.log" 2>&1; then lp=$((lp+1)); echo "load $i PASS"; else lf=$((lf+1)); echo "load $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/load-$i.log"; fi
+          done
+          kill $L1 $L2 $L3 2>/dev/null || true
+          echo "LOADED pass=$lp fail=$lf"
+          echo "RESULT tree=$(git rev-parse HEAD) alone=$pass/15 loaded=$lp/15"

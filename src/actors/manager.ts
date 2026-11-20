@@ -1054,6 +1054,8 @@ export class ActorManager {
   /** Residents publish both scopes through their one registry-fenced host heartbeat. */
   readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
   readonly #presenceRevisions = new Map<string, object>();
+  /** Only foreground recovery waits for proof of its own actor put in a committed batch. */
+  readonly #requiredPresenceCommits = new Map<string, { revision: object; committed: boolean }>();
   /** Serialized presence this instance committed through the host heartbeat. A new
    * instance (restart) starts empty, so its first full heartbeat republishes all once. */
   readonly #publishedPresence = new Map<string, string>();
@@ -2497,6 +2499,8 @@ export class ActorManager {
         for (const [id, revision] of pending) {
           // A mutation while the shared write waited belongs to the next refresh.
           if (this.#presenceRevisions.get(id) !== revision) continue;
+          const required = this.#requiredPresenceCommits.get(id);
+          if (required && required.revision === revision && written.get(id) !== undefined) required.committed = true;
           this.#pendingPresence.delete(id);
           this.#presenceRevisions.delete(id);
           this.#orphanPresence.delete(id);
@@ -3166,11 +3170,16 @@ export class ActorManager {
     const blocked = actor.activationBlocked;
     if (!blocked || activationBlockClass(blocked.code) !== "hard") return () => false;
     const streak = actor.failureStreak;
+    const lineage = this.#lineage(actor);
     delete actor.activationBlocked;
     delete actor.failureStreak;
     this.#armActivationBlockExpiry(actor);
     return () => {
-      if (actor.activationBlocked || actor.failureStreak) return false;
+      // Publication can reload the registry and replace the object we cleared.
+      // Restore the live generation, never a successor's custody or a newer failure.
+      const live = this.#actors.get(actor.id);
+      if (!live || this.#lineage(live) !== lineage || live.activationBlocked || live.failureStreak) return false;
+      actor = live;
       actor.activationBlocked = blocked;
       if (streak) actor.failureStreak = streak;
       this.#armActivationBlockExpiry(actor);
@@ -9825,11 +9834,14 @@ export class ActorManager {
   async #writePresenceNow(id: string, requireCommit = false): Promise<void> {
     if (this.#presencePublisher) {
       this.#pendingPresence.add(id);
-      this.#presenceRevisions.set(id, {});
+      const revision = {};
+      this.#presenceRevisions.set(id, revision);
+      const required = requireCommit ? { revision, committed: false } : undefined;
+      if (required) this.#requiredPresenceCommits.set(id, required);
       try {
         await this.#presencePublisher.refresh();
-        // A publisher may resolve without writing while its shared retry is deferred.
-        if (requireCommit && this.#pendingPresence.has(id)) throw new Error("Actor presence publication deferred");
+        // Clearing pending ids is not proof: ownership selection can omit this actor.
+        if (required && (!required.committed || this.#pendingPresence.has(id))) throw new Error("Actor presence publication deferred");
       } catch (error) {
         // The failed acquisition wrote nothing. The host's next heartbeat carries
         // every pending id, with no per-actor timer, extra retry, or warning storm.
@@ -9839,6 +9851,8 @@ export class ActorManager {
           diagnostics.warn("src/actors/manager.ts", `[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
         }
         if (requireCommit) throw error;
+      } finally {
+        if (required) this.#requiredPresenceCommits.delete(id);
       }
       return;
     }

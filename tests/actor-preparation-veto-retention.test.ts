@@ -422,6 +422,60 @@ describe("real registry preparation and callerless subscription retention", () =
     expect(mesh.get(`actors/veto-retention/${actor.id}`)?.value).toMatchObject({ activationBlocked: block });
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21355
+  it.each([false, true])("a re-apply refuses a committed shared batch that omits its actor (unchanged instructions=%s)", async unchanged => {
+    let available = true, unavailable = false, omit = false;
+    let actors!: ActorManager, mesh!: MeshStore;
+    let omitted: { ops: unknown[]; actorIds: string[] } | undefined;
+    const state = setup({ canManageActor: () => available, resolvePiModel: model => {
+      if (unavailable) throw new Error("configured model no longer available");
+      return model;
+    }, presencePublisher: { refresh: async () => {
+      if (omit) available = false;
+      try {
+        const batch = actors.presenceBatch(false);
+        if (omit) omitted = { ops: batch.ops, actorIds: batch.actorIds };
+        await mesh.writeBatch({ ops: batch.ops, identity: { id: "session:veto-retention", name: "main", kind: "main" } });
+        batch.committed();
+      } finally { available = true; }
+    }, schedule() {} } });
+    ({ actors, mesh } = state);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(state.root, "diagnostics"));
+    configureFabricDiagnostics("omitted-presence-reapply");
+    const actor = await create(actors);
+    unavailable = true;
+    const done = settled(actors, actor.id, () => actors.status(actor.id).activationBlocked !== undefined);
+    await publish(mesh);
+    await done;
+    const block = actors.status(actor.id).activationBlocked;
+    const retained = queue(actor.sessionFile!);
+    const instructions = unchanged ? "Reply deterministically." : "Recovery after omitted presence.";
+    omit = true;
+    await expect(actors.setInstructions(actor.id, instructions)).rejects.toThrow("Actor presence publication deferred");
+    await pause(180);
+    expect(omitted).toEqual({ ops: [], actorIds: [] });
+    expect(actors.status(actor.id).activationBlocked).toEqual(block);
+    expect(queue(actor.sessionFile!)).toEqual(retained);
+    await flushFabricDiagnostics();
+    const diagnostic = fs.readFileSync(fabricDiagnosticsFile("omitted-presence-reapply"), "utf8");
+    expect(diagnostic).not.toContain("re-apply cleared");
+    expect(diagnostic).toContain(`actor ${actor.id} re-apply publication refused`);
+    // A refused acknowledgement leaves ordinary callers best-effort and the
+    // serialized chain usable; a later real actor commit can authorize recovery.
+    unavailable = false;
+    await actors.setModel(actor.id, "provider/test", "project");
+    expect(actors.status(actor.id).activationBlocked).toEqual(block);
+    expect(new ActorRegistryStore(path.join(state.root, "actors")).snapshot().actors
+      .find(row => row.id === actor.id)?.activationBlocked).toEqual(block);
+    omit = false;
+    const recovered = settled(actors, actor.id, () => outputs(actors, actor.id).length === 1);
+    await actors.setInstructions(actor.id, instructions);
+    await recovered;
+    expect(actors.status(actor.id)).toMatchObject({ status: "idle", queued: 0 });
+    expect(actors.status(actor.id).activationBlocked).toBeUndefined();
+    expect(queue(actor.sessionFile!)).toEqual([]);
+  });
+
   it("retains a hard-preparation batch while failed and successful ask probes bypass it without absorbing members", async () => {
     let unavailable = false;
     const { actors, agents, mesh } = setup({ preparationRetryMs: 5, resolvePiModel: async model => {

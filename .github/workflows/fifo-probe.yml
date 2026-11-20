@@ -1,4 +1,4 @@
-name: FIFO probe (fabric-store, temporary; smarty-dev#4605 #2017)
+name: FIFO probe CI-set (fabric-store, temporary; #2017)
 on:
   push:
     branches: ['fabric-store/fifo-probe-*']
@@ -7,6 +7,10 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
     timeout-minutes: 75
     env:
       FABRIC_TEST_SKIP_NATS: '1'
@@ -23,26 +27,14 @@ jobs:
         env:
           FABRIC_NATIVE_CC_PINNED: '1'
         run: bun run build
-      - name: FIFO test WHOLE FILE x8 alone, then x8 under load
+      - name: CI affected set (#2017 vs 0596428c) + agents-provider in one vitest run
         shell: bash
         run: |
           set -u
-          T='admits queued workers in FIFO order while preserving concurrency and nice'
-          pass=0; fail=0
-          for i in $(seq 1 8); do
-            if bunx vitest run tests/agents-provider.test.ts  > "$RUNNER_TEMP/alone-$i.log" 2>&1; then pass=$((pass+1)); echo "alone $i PASS"; else fail=$((fail+1)); echo "alone $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/alone-$i.log"; fi
-          done
-          echo "ALONE pass=$pass fail=$fail"
-          ( while true; do bunx vitest run tests/actor-preparation.test.ts > /dev/null 2>&1; done ) &
-          L1=$!
-          ( while true; do bunx vitest run tests/residency-wake-backoff.test.ts > /dev/null 2>&1; done ) &
-          L2=$!
-          ( while true; do bunx vitest run tests/mesh-bridge.test.ts > /dev/null 2>&1; done ) &
-          L3=$!
-          lp=0; lf=0
-          for i in $(seq 1 8); do
-            if bunx vitest run tests/agents-provider.test.ts  > "$RUNNER_TEMP/load-$i.log" 2>&1; then lp=$((lp+1)); echo "load $i PASS"; else lf=$((lf+1)); echo "load $i FAIL"; grep -m3 -E "AssertionError|expected" "$RUNNER_TEMP/load-$i.log"; fi
-          done
-          kill $L1 $L2 $L3 2>/dev/null || true
-          echo "LOADED pass=$lp fail=$lf"
-          echo "RESULT tree=$(git rev-parse HEAD) alone=$pass/8 loaded=$lp/8"
+          files=$(for f in $(cat .github/fifo-probe-files.txt) tests/agents-provider.test.ts; do [ -f "$f" ] && echo "$f"; done)
+          echo "files: $(echo "$files" | wc -l)"
+          bunx vitest run $files > "$RUNNER_TEMP/set.log" 2>&1; rc=$?
+          grep -E "FAIL .*agents-provider|admits queued workers in FIFO" "$RUNNER_TEMP/set.log" | head -5
+          grep -E "^ *(Test Files|Tests) " "$RUNNER_TEMP/set.log" | tail -2
+          grep -E " FAIL " "$RUNNER_TEMP/set.log" | sort -u | head -20
+          echo "RESULT tree=$(git rev-parse HEAD) rep=${{ matrix.rep }} rc=$rc fifo_fail=$(grep -c 'FAIL .*FIFO order' "$RUNNER_TEMP/set.log")"

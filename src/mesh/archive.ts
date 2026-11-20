@@ -821,11 +821,12 @@ export class MeshArchive {
 
   /** Same snapshot/order/publication rules as readAfter, with asynchronous bounded payload reads.
    * Every file and every 64 KiB data read yields, even on a cold index build.
-   * Metadata/stat/catalog work and each event's JSON.parse still run on the main thread.
+   * Skips the advisory aggregate catalog; sibling metadata/stats and each event's JSON.parse
+   * still run on the main thread.
    */
   // TODO(pi-fabric#2010 F2): move metadata reads/stats and JSON parsing off-thread; ABORTED metadata is not size-bounded.
   async readAfterAsync(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): Promise<MeshEvent[]> {
-    const scan = this.#readAfterSteps(after, through, matches, limit, topic);
+    const scan = this.#readAfterSteps(after, through, matches, limit, topic, false);
     const empty = Buffer.alloc(0);
     try {
       let step = scan.next();
@@ -850,11 +851,11 @@ export class MeshArchive {
     } finally { scan.return([]); }
   }
 
-  *#readAfterSteps(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): ArchiveReadSteps<MeshEvent[]> {
+  *#readAfterSteps(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string, useCatalog = true): ArchiveReadSteps<MeshEvent[]> {
     // An async read may overlap an old writer's cutback/replacement. Discard raced results,
     // never advance a caller's cursor with a partial page. Bound retries under a busy writer.
     for (let attempt = 0; ; attempt++) {
-      try { return yield* this.#readAfterSnapshot(after, through, matches, limit, topic); }
+      try { return yield* this.#readAfterSnapshot(after, through, matches, limit, topic, useCatalog); }
       catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged)) throw error;
         if (attempt + 1 >= ARCHIVE_READ_ATTEMPTS) throw new MeshSnapshotRetriesExhaustedError(attempt + 1);
@@ -863,7 +864,7 @@ export class MeshArchive {
     }
   }
 
-  *#readAfterSnapshot(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): ArchiveReadSteps<MeshEvent[]> {
+  *#readAfterSnapshot(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string, useCatalog = true): ArchiveReadSteps<MeshEvent[]> {
     const found: MeshEvent[] = [];
     for (const day of this.#days()) {
       const directory = path.join(this.dir, day);
@@ -875,10 +876,13 @@ export class MeshArchive {
       const aborted = abortedStat ? this.#readJson<Record<string, string>>(`${day}/ABORTED.json`) : undefined;
       const nameSnapshot = topic === undefined ? this.#readDayNames(directory) : undefined;
       const names = nameSnapshot?.names ?? [archiveFileName(topic!)];
-      const catalog = this.#readRangeCatalog(day);
+      // Aggregate decode/checksum/copy/save can block Main for hundreds of milliseconds.
+      // Async reads use the same fenced sibling/data reader without building an aggregate.
+      const catalog = useCatalog ? this.#readRangeCatalog(day) : undefined;
       const pendingIndexes: Array<{ file: string; index: ArchiveRangeIndex }> = [];
       let catalogChanged = false;
       const remember = (name: string, hint: ArchiveRangeHint): void => {
+        if (!catalog) return;
         const prior = catalog.get(name);
         if (prior?.[1] === hint.identity && prior[2] === hint.min && prior[3] === hint.max &&
             (prior[4] !== undefined || hint.blocks === undefined)) return;
@@ -911,7 +915,7 @@ export class MeshArchive {
         const identity = stat ? fileIdentity(stat) : "missing";
         identities.push({ absolute, identity });
         if (!stat) continue;
-        const saved = catalog.get(name);
+        const saved = catalog?.get(name);
         const hint = saved?.[1] === identity && saved[4] !== undefined
           ? { identity, min: saved[2], max: saved[3], blocks: saved[4] } : undefined;
         if (hint && rangeOutside(hint.min, hint.max, after, through)) continue;
@@ -972,11 +976,11 @@ export class MeshArchive {
         this.#saveRangeIndex(file, index);
         yield undefined; // Async readers yield between installs; the sync driver continues immediately.
       }
-      if (topic === undefined && catalog.size > names.length) {
+      if (catalog && topic === undefined && catalog.size > names.length) {
         const present = new Set(names);
         for (const name of catalog.keys()) if (!present.has(name)) { catalog.delete(name); catalogChanged = true; }
       }
-      if (catalogChanged) this.#saveRangeCatalog(day, catalog);
+      if (catalog && catalogChanged) this.#saveRangeCatalog(day, catalog);
       for (const candidate of trim(candidates)) found.push(candidate.event);
       if (found.length >= limit) break;
     }

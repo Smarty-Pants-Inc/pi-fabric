@@ -411,6 +411,59 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     if (rpc) expect(f.requests).toContain("hello");
   });
 
+  // Regression: state-only source activity must not spend remote RPCs reading an unchanged log.
+  // Real stores and the stdio agent exercise both state.json and SQLite WAL notifications.
+  it.each([undefined, "sqlite"] as const)("does no idle tails during state-only heartbeats, then forwards promptly (%s)", async stateBackend => {
+    const f = fixture(true, stateBackend);
+    const lead = await native(f.hub, "idle-lead");
+    const lane = await native(f.far, "idle-lane");
+    const writer = new MeshStore(f.far.root, 64 * 1024, 2, stateBackend ? { stateBackend } : {});
+    cleanups.push(() => writer.closeState());
+    await (f.remote as RemoteBridgeSide).hello(); // Negotiate the live CLI's offset-tail path.
+    const toLocal = vi.spyOn(f.agent, "tail");
+    const changes: string[] = [];
+    const subscribe = f.agent.subscribeChanges.bind(f.agent);
+    vi.spyOn(f.agent, "subscribeChanges").mockImplementation((changed, failed, log) =>
+      subscribe(kind => { changes.push(kind); changed(kind); }, failed, log));
+    const live = await launch(f.bridge);
+    await until(() => toLocal.mock.calls.length > 0);
+    await settle();
+    toLocal.mockClear();
+    changes.length = 0;
+    const started = performance.now();
+    const beats = 16;
+    for (let index = 0; index < beats; index++) {
+      const now = Date.now();
+      writeHostLease(f.far.root, { id: lane.id, rootId: lane.id, identityId: lane.id,
+        startedAt: lane.host.startedAt, updatedAt: now, expiresAt: now + 60_000 });
+      // Participant activity is presence state, not an event. A separate store writer commits
+      // the state backend (including WAL), while the lease renewal exercises its sidecar watch.
+      await writer.put({ key: lane.entry.key, value: { ...lane.entry.value as object, updatedAt: now }, identity: lane.identity });
+      await sleep(200);
+    }
+    await settle();
+    const idlePages = toLocal.mock.calls.length;
+    const idleEvents = (await Promise.all(toLocal.mock.results.map(result => result.value)))
+      .reduce((count, page) => count + page.events.length, 0);
+    const idleMs = Math.round(performance.now() - started);
+    const idleNotifications = changes.reduce<Record<string, number>>((counts, kind) => {
+      counts[kind] = (counts[kind] ?? 0) + 1; return counts;
+    }, {});
+    expect(f.far.latestSequence()).toBe(0); // The source has written only state/leases so far.
+    expect(changes).toContain("presence"); // The actual filesystem subscription observed the writes.
+    const sentAt = performance.now();
+    await f.far.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: lead.id,
+      data: { version: 1, commandId: "idle-heartbeat-message", replyTo: lane.id, targetId: lead.id, operation: "steer" } });
+    await until(() => events(f.hub).some(event => (event.data as { commandId?: string } | undefined)?.commandId === "idle-heartbeat-message"));
+    const latencyMs = Math.round(performance.now() - sentAt);
+    console.log("bridge-idle-evidence", JSON.stringify({ stateBackend: stateBackend ?? "file", beats, idleMs,
+      idleNotifications, idlePages, idleEvents, latencyMs }));
+    expect(live.failure()).toBeUndefined();
+    expect(idleEvents).toBe(0);
+    expect(latencyMs).toBeLessThan(1_000);
+    expect(idlePages).toBe(0);
+  }, 15_000);
+
   it("latches an append after its direction drained, while an RPC pass is still in flight", async () => {
     const f = fixture();
     const lead = await native(f.hub, "lead");

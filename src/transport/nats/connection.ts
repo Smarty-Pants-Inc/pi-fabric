@@ -10,11 +10,17 @@ import { legacyRoleTemplateWithPathB, PATH_B_OPERATOR_MACHINE_PATTERN, roleTempl
 import { validateMachine } from "./subjects.js";
 import { TransportUnavailableError } from "../types.js";
 
-/** Persistent identity/scope verification failure. The connection is closed, not retried. */
+/** NATS authentication or scope failure. Only a connect-time credential rejection is retryable after a disconnect. */
 export class NatsAuthorizationError extends Error {
   readonly code = "FABRIC_NATS_AUTHORIZATION";
   readonly persisted = false;
-  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = "NatsAuthorizationError"; }
+  /** A reconnect may reread a rotated credentials file and authenticate successfully. */
+  readonly retryable: boolean;
+  constructor(message: string, options?: ErrorOptions, retryable = false) {
+    super(message, options);
+    this.name = "NatsAuthorizationError";
+    this.retryable = retryable;
+  }
 }
 
 export type NatsStatusListener = (status: Status) => void;
@@ -69,12 +75,12 @@ export interface NatsConnectionHandle {
   close(): Promise<void>;
 }
 
-const connectionFailure = (cause: unknown, message: string): Error => {
+const connectionFailure = (cause: unknown, message: string, retryableAuthorization = false): Error => {
   let error = cause;
   for (let depth = 0; error && depth < 6; depth += 1) {
     if (error instanceof NatsAuthorizationError) return error;
     if (error instanceof AuthorizationError || error instanceof PermissionViolationError) {
-      return new NatsAuthorizationError(message, { cause });
+      return new NatsAuthorizationError(message, { cause }, retryableAuthorization);
     }
     error = error instanceof Error ? error.cause : undefined;
   }
@@ -373,7 +379,7 @@ const open = async (
     inboxPrefix: `_INBOX.${auth.subject}`,
   }).catch((cause: unknown) => {
     signal?.throwIfAborted();
-    throw connectionFailure(cause, "NATS connection failed");
+    throw connectionFailure(cause, "NATS connection failed", true);
   });
   // Official connect has no signal option: its timeout bounds dialing. Once a handle exists,
   // cancellation closes it immediately, including during USER.INFO and provisioning awaits.

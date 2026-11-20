@@ -130,7 +130,11 @@ await store.closeState();
 `;
 type Receipt = { id: number; count: number; times: number[]; pid: number; locked: boolean };
 type Command = { ops?: MeshBatchOperation[]; lease?: Record<string, unknown>; inspect?: boolean };
-const writer = async (root: string, startupTimeoutMs = 4_000) => {
+// Writer startup = a cold `jiti` load of a 107-file import graph before it prints "ready". Hosted and loaded hosts
+// measured 4025-4193 ms at the old 4 s deadline, on main before pi-fabric#2010 as often as after (fs-sfab-1120:
+// 10x base/head under taskset -c 0,1 + load + JITI_FS_CACHE=false: startup failures base 4/90, head 1/90). 10 s keeps
+// the wait inside the 15 s test timeout. Timing only; every assertion is unchanged.
+const writer = async (root: string, startupTimeoutMs = 10_000) => {
   const control = scratch();
   const child: ChildProcessWithoutNullStreams = spawn(process.execPath, ["--input-type=module", "-e", WRITER, root, control], {
     cwd: process.cwd(), env: { ...process.env, PI_FABRIC_MESH_ROOT: root, PI_FABRIC_MESH_STATE_BACKEND: "file", PI_FABRIC_LOCK_STATS: "0" },

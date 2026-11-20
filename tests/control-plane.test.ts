@@ -1546,12 +1546,22 @@ describe("FabricControlPlane", () => {
     );
     const unknown = "the outcome is unknown and it may still be delivered, so a retry can deliver it twice";
 
-    it("reports an expired legacy projection as bridge-stale, publishes once and cancels once", async () => {
+    it("retains an expired published legacy projection to the original bound, then reports bridge-stale and cancels once", async () => {
       const f = await setup();
-      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
+      vi.useFakeTimers();
+      const startedAt = Date.now();
+      let settled = false;
+      const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"))
+        .then(result => { settled = true; return result; });
       const { commandId } = await f.command();
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
+      await vi.advanceTimersByTimeAsync(44_999 - (Date.now() - startedAt));
+      expect(settled).toBe(false);
+      expect(f.sender.mesh.read({ topic: "fabric.control.command" }).map(event => event.kind)).toEqual(["steer"]);
+      await vi.advanceTimersByTimeAsync(1);
       const { error } = await outcome;
+      expect(Date.now() - startedAt).toBe(45_000);
+      vi.useRealTimers();
       expect(error?.message).toContain("bridge-stale for remote host forge, target agent:target");
       expect(error?.message).not.toContain("lapsed");
       expect(error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
@@ -1664,8 +1674,10 @@ describe("FabricControlPlane", () => {
       await f.once(0);
     });
 
-    it("returns the lapse error without waiting for an in-flight cancellation", async () => {
+    it("returns the stale-bridge error at the original bound without waiting for an in-flight cancellation", async () => {
       const f = await setup();
+      vi.useFakeTimers();
+      const startedAt = Date.now();
       const publish = f.sender.mesh.publish.bind(f.sender.mesh);
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -1677,7 +1689,9 @@ describe("FabricControlPlane", () => {
       const { commandId } = await f.command();
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       try {
+        await vi.advanceTimersByTimeAsync(45_000 - (Date.now() - startedAt));
         const { error } = await outcome;
+        vi.useRealTimers();
         expect(error?.message).toContain("bridge-stale");
         expect(error?.message).not.toContain("lapsed");
         await f.ack(commandId);
@@ -1815,11 +1829,15 @@ describe("FabricControlPlane", () => {
 
     it("never adopts an unvalidated replacement link label", async () => {
       const f = await setup();
+      vi.useFakeTimers();
+      const startedAt = Date.now();
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 200 });
       const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
       await f.command();
       f.setLease({ remoteHost: "forged-label", expiresAt: Date.now() + 60_000 });
+      await vi.advanceTimersByTimeAsync(45_000 - (Date.now() - startedAt));
       const { error } = await outcome;
+      vi.useRealTimers();
       expect(error?.message).toContain("remote host forge");
       expect(error?.message).not.toContain("forged-label");
       await f.once(1);
@@ -2044,6 +2062,30 @@ describe("FabricControlPlane", () => {
       } finally { await f.dispose(); }
     });
 
+    it.each(["renewal", "read-failure", "replacement"] as const)("uses the ordinary UNKNOWN timeout when the final observation is %s, not current bridge-stale proof", async state => {
+      const f = await setup();
+      try {
+        let settled = false;
+        const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"))
+          .then(result => { settled = true; return result; });
+        await vi.advanceTimersByTimeAsync(44_999);
+        expect(settled).toBe(false);
+        expect(f.commands().map(event => event.kind)).toEqual(["steer"]);
+        if (state === "read-failure") f.failReads();
+        else f.setLease({ remoteHost: state === "renewal" ? "forge" : "replacement", expiresAt: Date.now() + 60_000 });
+        await vi.advanceTimersByTimeAsync(1); // No intervening watchdog tick before the ORIGINAL timer.
+        const { error } = await outcome;
+        expect(error?.constructor).toBe(Error);
+        expect(error?.message).toContain("Fabric mesh bridge to remote host forge is not responding");
+        expect(error?.message).toContain("the outcome is unknown");
+        expect(error?.message).not.toMatch(/bridge-stale|replacement|lapsed/);
+        expect(error).not.toHaveProperty("notRun");
+        expect(f.commands().map(event => event.kind)).toEqual(["steer", "cancel"]);
+        await f.sender.close();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { await f.dispose(); }
+    });
+
     it.each(["abort", "close", "lapse"] as const)("clears admission timer on %s while blocked, then cancels once after commit", async (winner) => {
       const f = await setup(true);
       const controller = new AbortController();
@@ -2243,14 +2285,18 @@ describe("FabricControlPlane", () => {
       expect(f.commands().filter((event) => event.kind === "cancel")).toHaveLength(0);
     });
 
-    it("does not revive a settled mirrored request when its original ACK arrives", async () => {
+    it("does not revive a mirrored request settled at its original bound when its original ACK arrives", async () => {
       const f = await setup();
+      vi.useFakeTimers();
+      const startedAt = Date.now();
       const outcome = f.sender.request(f.ownerId, f.ownerId, "steer", { ownerIncarnation: fixtureOwnerIncarnation }).then(
         () => undefined, (error: Error) => error,
       );
       const { commandId } = await f.command();
       await f.advertise("forge", Date.now() - 1);
+      await vi.advanceTimersByTimeAsync(45_000 - (Date.now() - startedAt));
       const error = await outcome;
+      vi.useRealTimers();
       expect(error?.message).toContain("bridge-stale for remote host forge, target X");
       expect(error?.message).not.toContain("lapsed");
       expect(error).not.toHaveProperty("notRun");

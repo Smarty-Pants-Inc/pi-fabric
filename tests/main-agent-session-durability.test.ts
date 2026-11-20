@@ -297,6 +297,28 @@ describe("native recovery recipient-scoped root inbox handoff", () => {
     await Promise.all([source.close(), target.close()]);
   });
 
+  it("answers an old consumed predecessor id from its exact cached receipt without native carrier metadata", async () => {
+    const f = setup(), source = f.inbox("source"), target = f.inbox("target");
+    try {
+      source.start();
+      const event = await f.publish();
+      await source.next(rootInboxSession([]));
+      await source.consume([event.id], eventReceipts(event));
+      const edge = f.binding(), handoff = await source.parkForNativeRecovery(f.intent(edge));
+      target.start();
+      await target.adoptNativeRecoveryInbox(handoff, () => ({ status: "validated", transfers: [f.committed(edge)] }));
+      // No pending/native occurrence/offer identifies this old event. Its durable exact receipt
+      // is still positive consumption proof; do not require an archive lookup or borrow T's mark.
+      const syncRead = vi.spyOn(f.mesh, "read").mockImplementation(() => { throw new Error("synchronous old-receipt recovery"); });
+      try {
+        expect(target.acked(event.id, event.sequence)).toBe(true);
+        await target.consume([event.id], eventReceipts(event)); // Idempotent callback after adoption.
+        expect((f.mesh.get(target.key)!.value as { delivered?: string[] }).delivered ?? []).not.toContain(eventReceipt(event.id));
+        expect(syncRead).not.toHaveBeenCalled();
+      } finally { syncRead.mockRestore(); }
+    } finally { await Promise.all([source.close(), target.close()]); }
+  });
+
   it("routes a native restored receipt to its original ledger even before T ever offered that event", async () => {
     const f = setup(), source = f.inbox("source"), target = f.inbox("target");
     source.start();
@@ -306,14 +328,52 @@ describe("native recovery recipient-scoped root inbox handoff", () => {
     const transfer = f.committed(edge);
     transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: { customType: "pi-fabric-inbox", details: { ids: [event.id] } } }];
     await target.adoptNativeRecoveryInbox(handoff, () => ({ status: "validated", transfers: [transfer] }));
+    // Adoption warmed the ORIGINAL ledger asynchronously. Neither the context query nor
+    // native consumption before first offer may fall back to a synchronous archive scan.
+    const syncRead = vi.spyOn(f.mesh, "read").mockImplementation(() => { throw new Error("synchronous receipt recovery"); });
     expect(target.acked(event.id, event.sequence)).toBe(false);
     await target.consume([event.id], eventReceipts(event));
+    expect(syncRead).not.toHaveBeenCalled();
+    syncRead.mockRestore();
     expect(target.acked(event.id, event.sequence)).toBe(true);
     expect((f.mesh.get(source.key)!.value as { delivered: string[] }).delivered).toContain(eventReceipt(event.id));
     expect((f.mesh.get(target.key)!.value as { delivered: string[] }).delivered).not.toContain(eventReceipt(event.id));
     expect((await target.next(rootInboxSession([]))).events).toEqual([]);
     await Promise.all([source.close(), target.close()]);
   });
+
+  it("keeps every ledger's current offers when a recovered batch exceeds the ordinary cache cap", async () => {
+    // pi-fabric#2010: cache-first ack routing must not evict another ledger's unconsumed tail.
+    const f = setup(), boxes = Array.from({ length: 6 }, (_, index) => f.inbox(`ledger-${index}`));
+    const transfers: NativeRecoveryTransfer[] = [];
+    let handoff: Awaited<ReturnType<RootInbox["parkForNativeRecovery"]>> | undefined;
+    const expected: string[] = [];
+    try {
+      for (let index = 0; index < 5; index++) {
+        const source = boxes[index]!;
+        if (handoff) await source.adoptNativeRecoveryInbox(handoff, () => ({ status: "validated", transfers: [...transfers] }));
+        source.start();
+        for (let row = 0; row < 256; row++) expected.push((await f.mesh.publish({
+          topic: "fleet.work.done", kind: "blocked", from: actor, to: source.identity.id, text: `action ${index}/${row}`,
+        })).id);
+        const edge = f.binding(`ledger-${index}`, `ledger-${index + 1}`);
+        handoff = await source.parkForNativeRecovery(f.intent(edge));
+        transfers.push(f.committed(edge));
+      }
+      const target = boxes[5]!;
+      target.start();
+      await target.adoptNativeRecoveryInbox(handoff!, () => ({ status: "validated", transfers: [...transfers] }));
+      const batch = await target.next(rootInboxSession([]));
+      expect(batch.events.map(event => event.id)).toEqual(expected); // 1280 > the 1024-entry per-ledger cap.
+      const syncRead = vi.spyOn(f.mesh, "read").mockImplementation(() => { throw new Error("synchronous multi-ledger ack recovery"); });
+      try {
+        await target.consume(expected, batch.events.flatMap(eventReceipts));
+        for (const event of batch.events) expect(target.acked(event.id, event.sequence)).toBe(true);
+        expect((await target.next(rootInboxSession([]))).events).toEqual([]);
+        expect(syncRead).not.toHaveBeenCalled();
+      } finally { syncRead.mockRestore(); }
+    } finally { await Promise.all(boxes.map(box => box.close())); }
+  }, 30_000);
 
   it("rejects a failed park save but leaves a pre-PREPARED source ordinary with its original boundary", async () => {
     const f = setup(), source = f.inbox("source"), target = f.inbox("target");

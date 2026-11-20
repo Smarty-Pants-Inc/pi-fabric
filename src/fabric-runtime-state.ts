@@ -261,6 +261,8 @@ export class FabricRuntimeState {
   #disposableMeshWrites: AbortController | undefined;
   #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
   readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor")
+    // An idle async read has no natural next tick after EIO: use the watch's one-shot deadline.
+    .backoffFailures(100, 5_000)
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.#mesh, from: this.#identity })));
   #identity: MeshIdentity | undefined;
   /** Durable decisions for headless approvals and routed child dialogs; mesh-enabled sessions only. */
@@ -502,7 +504,7 @@ export class FabricRuntimeState {
       // Only a read made by this call reports a deadline: a skipped read must not rearm a timer.
       const due = this.#inboxReads !== reads ? inbox.wakeDueAt : undefined;
       if (due !== undefined) deadlines.push(due);
-      // A typed mesh lock failure: the existing bounded backoff owns the explicit retry.
+      // Typed mesh failures and generic read failures both own a bounded idle retry deadline.
       if (this.#inboxRetry.waitMs > 0) deadlines.push(now + this.#inboxRetry.waitMs);
       return deadlines.length ? Math.min(...deadlines) : undefined;
     });

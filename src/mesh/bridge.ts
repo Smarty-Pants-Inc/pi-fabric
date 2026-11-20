@@ -5474,7 +5474,9 @@ export class MeshBridge {
         }
       }
       if (!backingOff) this.#wake?.();
-      wakeDirections();
+      // Presence can release a membership-held event, but says nothing about either log's head.
+      // Keep idle drains asleep; event notifications and verified reconnects still drain both.
+      wakeDirections(kind === "presence");
     };
     const failed = (error: Error): void => {
       this.#notificationError ??= error;

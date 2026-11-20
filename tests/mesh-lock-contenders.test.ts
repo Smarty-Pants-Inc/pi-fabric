@@ -5,6 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { buildSync } from "esbuild";
 import { expect, it } from "vitest";
+import { stripAclAdvisory } from "./helpers/acl-advisory.js";
 import { importMeshState } from "../src/mesh/backend-migration.js";
 import { MeshStore } from "../src/mesh/store.js";
 // Data-safety probe for L01/L02: real CAS claims plus the FILE control/event carrier, not FIFO order.
@@ -52,9 +53,8 @@ type Report = { pid: number; claimed: Claim[]; published: { key: string; id: str
   conflicts: string[]; waits: number[]; timeout: null | { phase: string; key: string; code: string; name: string } };
 
 function childResultSucceeded(code: number | null, stderr: string): boolean {
-  return code === 0 && stderr
-    .replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "")
-    .replace(/^\[pi-fabric\] FABRIC_MESH_STATE_ACL_ADVISORY: [^\r\n]*(?:\r?\n|$)/gm, "") === "";
+  return code === 0 && stripAclAdvisory(stderr)
+    .replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "") === "";
 }
 
 it("child result gate ignores only mesh ACL advisory lines and the exact deletion guard announcement", () => {

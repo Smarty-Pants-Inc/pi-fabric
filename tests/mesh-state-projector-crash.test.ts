@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { stripAclAdvisory } from "./helpers/acl-advisory.js";
 import { projectorDatabaseRoot, StateProjector } from "../src/mesh/state-projector.js";
 import { openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -117,7 +118,7 @@ describe("state projector crash", () => {
 
     // Killed while applying the 4th of 7 generations, after three committed.
     const child = await runChild(root, "record", 3);
-    expect(child.stderr).toBe("");
+    expect(stripAclAdvisory(child.stderr)).toBe("");
     expectKilled(child);
     expect(child.stdout).toBe("dying\n");
     expect(Number(meta(root, "commit_no"))).toBe(seeded.commit + 3);

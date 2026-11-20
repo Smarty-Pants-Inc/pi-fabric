@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { activeFabricRoot, loadedFabricRoot, releaseLabel, resolveAgentDir, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
+import { activeFabricRoot, explicitExtensions, loadedFabricRoot, releaseLabel, resolveAgentDir, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
 import type { ResourceBinding } from "./reload-target-profile.js";
 import { extensionContextLive } from "../session-liveness.js";
 import { notifyDiagnostic } from "../core/diagnostics.js";
@@ -119,16 +119,6 @@ interface ReloadCandidate {
   resource?: string;
   requestId?: string;
 }
-/** Capture explicit extension arguments once; an explicit copy must never follow a profile slot. */
-const explicitExtensions = (): string[] => {
-  const sources: string[] = [];
-  for (let i = 2; i < process.argv.length; i++) {
-    const arg = process.argv[i]!;
-    if (arg === "-e" || arg === "--extension") sources.push(process.argv[++i] ?? "");
-    else if (arg.startsWith("--extension=")) sources.push(arg.slice("--extension=".length));
-  }
-  return sources;
-};
 // ponytail: a process-global handoff, like stopped-runs' (smarty-dev#1882). A reload replaces this
 // module but keeps the process and the session id; the next runtime reports what it replaced.
 const HANDOFF = Symbol.for("pi-fabric.self-reload");

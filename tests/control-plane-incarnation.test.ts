@@ -1,10 +1,11 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
-import { CONTROL_STALE_INCARNATION, FabricControlPlane, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
+import { CONTROL_STALE_INCARNATION, FabricControlPlane, STALE_INCARNATION_ERROR, type FabricControlCommand } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { controlProviderParticipant } from "../src/topology/provider-participants.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -425,6 +426,225 @@ it("actual bridge: a mirrored owner restart refuses the queued epoch and a fresh
   await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce()); await bridge.step();
   await expect(live).resolves.toMatchObject({ messageId: "fresh", acknowledged: true });
   await bridge.step(); await bridge.step(); expect(handler).toHaveBeenCalledOnce(); expect(commands(remote)).toHaveLength(2);
+});
+
+// Keep reason: late expiry confirmation crosses the file claim, bridge and ACK trust boundaries.
+describe("late bridged message confirmation", () => {
+  const gate = () => {
+    let open!: () => void;
+    const promise = new Promise<void>(resolve => { open = resolve; });
+    return { promise, open };
+  };
+  const until = (check: () => void) => vi.waitFor(check, { timeout: 3_000, interval: 20 });
+  const setup = async (operation: "steer" | "followUp" = "followUp", accepted = true) => {
+    const root = temp(), local = store(path.join(root, "local")), remote = store(path.join(root, "remote"));
+    const senderId = "session:sender0000", ownerId = "session:owner00000";
+    const localDirectory = directory(local, senderId), remoteDirectory = directory(remote, ownerId);
+    await localDirectory.refresh(); await remoteDirectory.refresh();
+    const owner = plane(remote, ownerId, remoteDirectory);
+    const sender = new FabricControlPlane(local, identity(senderId), { enabled: true, hostId: senderId, pollMs: 20,
+      acknowledgementTimeoutMs: 5_000,
+      // Hold the source's healthy route constant while independently delaying command/ACK progress.
+      readMirroredOwner: () => ({ remoteHost: "Remote", expiresAt: Date.now() + 120_000, ownerIncarnation: owner.incarnation }) });
+    planes.push(sender); sender.start(() => ({ accepted: false }));
+    const receive = vi.fn(() => accepted ? { accepted: true, messageId: "delivered-once" }
+      : { accepted: false, error: "handler rejected after execution" });
+    const bridge = new MeshBridge({ localName: "Local", remoteName: "Remote", local: new StoreBridgeSide(local, "Remote"),
+      remote: new StoreBridgeSide(remote, "Local"), cursorPath: path.join(root, "bridge.cursor.json"), presenceMs: 60_000 });
+    bridges.push(bridge); await bridge.start();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const resendLogs = () => warning.mock.calls.map(args => args.join(" ")).filter(line => line.includes("Control notRun resend"));
+    const startedAt = Date.now();
+    const advanceTo = (elapsedMs: number) => vi.advanceTimersByTimeAsync(startedAt + elapsedMs - Date.now());
+    const step = async () => {
+      // Real presence and bridge authority are refreshed before each manually driven transport pass.
+      await localDirectory.refresh(); await remoteDirectory.refresh();
+      await bridge.syncPresence(); await bridge.step(); await vi.advanceTimersByTimeAsync(0);
+    };
+    const messages = (mesh = local) => commands(mesh).filter(event => event.kind === operation);
+    const send = (signal?: AbortSignal) => {
+      let settled = false;
+      const outcome = sender.request(ownerId, ownerId, operation, { message: "deliver once", ownerIncarnation: owner.incarnation }, ownerId,
+        { routedRemoteHost: "Remote", idempotencyKey: "late-confirmation", ...(signal ? { signal } : {}) }).then(
+        value => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }),
+      ).then(result => { settled = true; return result; });
+      return { outcome, settled: () => settled };
+    };
+    const holdClaims = (count: number) => {
+      const held = Array.from({ length: count }, gate), put = remote.put.bind(remote);
+      let entered = 0;
+      vi.spyOn(remote, "put").mockImplementation(async input => {
+        const result = await put(input); // The real create-only shared claim commits first.
+        if (input.key.startsWith("topology/control-seen/") && input.ifVersion === 0 && entered < held.length) {
+          const pause = held[entered++]!;
+          await pause.promise; // Model a paused owner after CAS, before its deadline recheck.
+        }
+        return result;
+      });
+      return { held, entered: () => entered, release: () => held.forEach(pause => pause.open()) };
+    };
+    return { local, remote, owner, sender, receive, operation, senderId, ownerId, startedAt, advanceTo, step, messages, send, holdClaims, resendLogs };
+  };
+
+  it.each([
+    { operation: "steer", renew: false }, { operation: "steer", renew: true },
+    { operation: "followUp", renew: false }, { operation: "followUp", renew: true },
+  ] as const)("late notRun resends $operation exactly once with a fresh deadline and one handler delivery (commit renewal=$renew)", async ({ operation, renew }) => {
+    const f = await setup(operation), claims = f.holdClaims(1);
+    f.owner.start(f.receive);
+    const request = f.send();
+    try {
+      await until(() => expect(f.messages()).toHaveLength(1));
+      await f.advanceTo(29_700); // Cross the real bridge with less than one second left.
+      await f.step(); expect(f.messages(f.remote)).toHaveLength(1);
+      await until(() => expect(claims.entered()).toBe(1));
+      const first = f.messages()[0]!.data as FabricControlCommand;
+      expect(first.deadlineAt! - first.requestedAt).toBe(30_000);
+      await f.advanceTo(45_000);
+      expect(request.settled()).toBe(false);
+      await f.advanceTo(46_000); claims.release();
+      await until(() => expect(acks(f.remote)).toHaveLength(1));
+      expect(acks(f.remote)[0]!.data).toMatchObject({ accepted: false, notRun: true, error: "Fabric control command expired" });
+      expect(f.receive).not.toHaveBeenCalled(); // The post-CAS owner deadline fence really ran.
+      // The retry passes admission, then sees a lapsed mirror under the publication
+      // lock. Renewal of the same route/epoch must retain THIS attempt's wait budget,
+      // not inherit the logical origin's already exhausted admission/ACK window.
+      const readMirror = f.sender.options.readMirroredOwner!;
+      let mirrorReads = 0;
+      f.sender.options.readMirroredOwner = (...args) => {
+        const current = readMirror(...args)!;
+        return ++mirrorReads === 2 && renew ? { ...current, expiresAt: Date.now() - 1 } : current;
+      };
+      await f.step(); await vi.advanceTimersByTimeAsync(100);
+      await until(() => expect(f.messages()).toHaveLength(2));
+      const second = f.messages()[1]!.data as FabricControlCommand;
+      expect(mirrorReads).toBeGreaterThanOrEqual(renew ? 4 : 2);
+      expect(second.deadlineAt! - Date.now()).toBeGreaterThan(29_000);
+      expect(request.settled()).toBe(false);
+      expect(second.requestedAt).toBeGreaterThan(first.deadlineAt!);
+      expect(second.deadlineAt! - second.requestedAt).toBe(29_950);
+      expect(second).toMatchObject({ requestCreatedAt: first.requestCreatedAt, ownerIncarnation: first.ownerIncarnation,
+        destinationRemoteHost: "Remote", message: first.message });
+      // Both stable attempt IDs derive from the same caller key, not two logical sends.
+      for (const [attempt, command] of [first, second].entries()) expect(command.commandId).toBe(createHash("sha256")
+        .update(JSON.stringify([f.senderId, f.ownerId, f.ownerId, f.ownerId, operation, "late-confirmation", attempt])).digest("hex"));
+      await f.step(); await until(() => expect(f.receive).toHaveBeenCalledOnce());
+      await until(() => expect(acks(f.remote)).toHaveLength(2)); await f.step();
+      expect(await request.outcome).toMatchObject({ value: { acknowledged: true, messageId: "delivered-once" } });
+      await vi.advanceTimersByTimeAsync(60_000); await f.step();
+      expect(f.messages()).toHaveLength(2); expect(f.messages(f.remote)).toHaveLength(2);
+      expect(f.receive).toHaveBeenCalledOnce();
+      expect(commands(f.local).filter(event => event.kind === "cancel")).toEqual([]);
+      expect(f.resendLogs()).toEqual([expect.stringContaining("outcome=retry"), expect.stringContaining("outcome=accepted")]);
+    } finally { claims.release(); await vi.advanceTimersByTimeAsync(0); }
+  });
+
+  it.each([true, false])("late executed outcome (accepted=%s) stays unknown without retry", async accepted => {
+    const f = await setup("followUp", accepted), release = gate(), publish = f.remote.publish.bind(f.remote);
+    vi.spyOn(f.remote, "publish").mockImplementation(async input => {
+      if (input.topic === "fabric.control.ack") await release.promise;
+      return publish(input);
+    });
+    f.owner.start(f.receive);
+    const request = f.send();
+    try {
+      await until(() => expect(f.messages()).toHaveLength(1)); await f.step();
+      await until(() => expect(f.receive).toHaveBeenCalledOnce());
+      await f.advanceTo(45_000); expect(request.settled()).toBe(false);
+      await f.advanceTo(46_000); release.open();
+      await until(() => expect(acks(f.remote)).toHaveLength(1)); await f.step();
+      await until(() => expect(request.settled()).toBe(true));
+      const result = await request.outcome;
+      expect(result.value).toBeUndefined();
+      expect(result.error?.message).toContain("the outcome is unknown");
+      expect(acks(f.remote)[0]!.data).not.toHaveProperty("notRun");
+      await vi.advanceTimersByTimeAsync(60_000); await f.step();
+      expect(f.messages()).toHaveLength(1); expect(f.receive).toHaveBeenCalledOnce();
+      expect(f.resendLogs()).toEqual([]);
+    } finally { release.open(); await vi.advanceTimersByTimeAsync(0); }
+  });
+
+  it("no ACK ends with bounded unknown and a later notRun cannot revive it", async () => {
+    const f = await setup(); f.owner.start(f.receive);
+    const request = f.send();
+    await until(() => expect(f.messages()).toHaveLength(1));
+    await f.advanceTo(45_000); expect(request.settled()).toBe(false);
+    await f.advanceTo(49_999); expect(request.settled()).toBe(false);
+    await f.advanceTo(50_000); expect(request.settled()).toBe(true);
+    const result = await request.outcome;
+    expect(result.error?.message).toContain("the outcome is unknown");
+    expect(result.error).not.toHaveProperty("notRun");
+    expect(result.error).toHaveProperty("idempotencyKey", "late-confirmation");
+    await vi.advanceTimersByTimeAsync(1); await f.step();
+    await until(() => expect(acks(f.remote)).toHaveLength(1)); await f.step();
+    expect(acks(f.remote)[0]!.data).toMatchObject({ accepted: false, notRun: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.messages()).toHaveLength(1); expect(f.receive).not.toHaveBeenCalled();
+    expect(commands(f.local).filter(event => event.kind === "cancel")).toHaveLength(1);
+    expect(await request.outcome).toBe(result);
+    expect(f.resendLogs()).toEqual([]);
+  });
+
+  it.each(["abort", "close"] as const)("%s during late confirmation prevents a late notRun resend", async winner => {
+    const f = await setup(), controller = new AbortController(); f.owner.start(f.receive);
+    const request = f.send(controller.signal);
+    await until(() => expect(f.messages()).toHaveLength(1));
+    await f.advanceTo(45_000); expect(request.settled()).toBe(false);
+    if (winner === "abort") controller.abort();
+    else await f.sender.close();
+    expect((await request.outcome).error?.message).toContain(winner === "abort" ? "cancelled" : "closed");
+    await f.advanceTo(46_000); await f.step();
+    await until(() => expect(acks(f.remote)).toHaveLength(1)); await f.step();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.messages()).toHaveLength(1); expect(f.receive).not.toHaveBeenCalled();
+    expect(f.resendLogs()).toEqual([]);
+  });
+
+  it("ignores wrong owner, route, incarnation and target proofs during late confirmation", async () => {
+    const f = await setup(), request = f.send();
+    await until(() => expect(f.messages()).toHaveLength(1));
+    const command = f.messages()[0]!.data as FabricControlCommand;
+    await f.advanceTo(45_000);
+    const proof = { version: 1, commandId: command.commandId, targetId: f.ownerId, ownerIncarnation: f.owner.incarnation,
+      accepted: false, error: "Fabric control command expired", notRun: true, bridge: { from: "Remote" } };
+    for (const [from, data] of [[identity("session:unrelated"), proof], [identity(f.ownerId), { ...proof, bridge: { from: "Other" } }],
+      [identity(f.ownerId), { ...proof, ownerIncarnation: "unrelated" }], [identity(f.ownerId), { ...proof, targetId: "session:unrelated" }]] as const) {
+      await f.local.publish({ topic: "fabric.control.ack", kind: "rejected", from, to: f.senderId, data });
+    }
+    // This valid ordinary ACK is a reader barrier behind every forged proof, not permission to retry.
+    await f.local.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity(f.ownerId), to: f.senderId,
+      data: { ...proof, accepted: true, notRun: undefined, messageId: "too-late" } });
+    await until(() => expect(request.settled()).toBe(true));
+    expect((await request.outcome).error?.message).toContain("the outcome is unknown");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.messages()).toHaveLength(1); expect(f.resendLogs()).toEqual([]);
+  });
+
+  it("a second late notRun cannot trigger a third attempt", async () => {
+    const f = await setup(), claims = f.holdClaims(2);
+    f.owner.start(f.receive);
+    const request = f.send();
+    try {
+      await until(() => expect(f.messages()).toHaveLength(1)); await f.step();
+      await until(() => expect(claims.entered()).toBe(1));
+      await f.advanceTo(46_000); claims.held[0]!.open();
+      await until(() => expect(acks(f.remote)).toHaveLength(1)); await f.step();
+      await vi.advanceTimersByTimeAsync(100); await until(() => expect(f.messages()).toHaveLength(2));
+      await f.step(); await until(() => expect(claims.entered()).toBe(2));
+      const second = f.messages()[1]!.data as FabricControlCommand;
+      await f.advanceTo(second.requestedAt - f.startedAt + 46_000);
+      expect(request.settled()).toBe(false);
+      claims.held[1]!.open(); await until(() => expect(acks(f.remote)).toHaveLength(2)); await f.step();
+      await until(() => expect(request.settled()).toBe(true));
+      expect((await request.outcome).error).toMatchObject({ notRun: true, message: "Fabric control command expired; not delivered, safe to resend." });
+      await vi.advanceTimersByTimeAsync(60_000); await f.step();
+      expect(f.messages()).toHaveLength(2); expect(f.messages(f.remote)).toHaveLength(2);
+      expect(f.receive).not.toHaveBeenCalled();
+      expect(f.resendLogs()).toEqual([expect.stringContaining("outcome=retry"), expect.stringContaining("outcome=not-run")]);
+    } finally { claims.release(); await vi.advanceTimersByTimeAsync(0); }
+  });
 });
 
 // Upstream 0.110.1 (a8d2714b) owner-incarnation cases, fitted to main's per-activation

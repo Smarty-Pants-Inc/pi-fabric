@@ -1,4 +1,4 @@
-# Stop or remove a dead Main's durable actor
+# Stop/remove a dead Main's actor or retire its offline residency
 
 Run on the resident's machine, as its OS user, from any Fabric session or shell:
 
@@ -9,6 +9,85 @@ fabric-actors stop --resident <directory-or-prefix> --actor <id-or-name> --confi
 fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --confirm-dead-root <rootId> \
   --main-stopped --evidence-file <herdr-and-ps-check.txt>
 ```
+
+## Retire an offline residency of a dead Main (smarty-dev#20687)
+
+Use this **Linux-only, manual, offline** operation when the root Main and its resident
+are already gone but the retained residency keeps attracting wake attempts or
+`ResidentWakeConfigMismatch` alarms. It does not stop or signal a running launcher,
+Pi, actor or worker. It is not automatic retirement, actor adoption, disk reclamation
+or release handover. For a live resident, use its owning Main and the appropriate
+[drain operation](resident-drain.md); do not use retirement to force it offline.
+
+After the manual Main/session/process check below, run on the resident's machine,
+as the OS user who owns its files:
+
+```sh
+fabric-actors retire-residency --resident <directory-or-unique-hex-prefix> \
+  --mesh-root <mesh-directory> --confirm-dead-root <exact-rootId> \
+  --main-stopped --evidence-file <herdr-and-ps-check.txt>
+# Add --dry-run to inspect the same checks and the planned actions without changing files.
+```
+
+`--main-stopped` remains an **operator attestation**, not automatic death detection.
+Both execution and dry-run require the exact root confirmation, attestation and
+nonempty evidence (`--evidence <text>` also works, with the same 64-KiB cap). The
+same strict root lease, participant freshness, local Main PID/birth identity and
+ownership checks as offline `remove` apply. A missing Main identity, foreign-host
+record, malformed custody data, a retained wake actor without a matching registry
+identity, or unsupported kernel fence refuses; confirmation
+cannot override it. A clean resident may have withdrawn `owner.json`; its absence
+is allowed, but `host.lock` must still contain a proven-dead PID.
+
+It refuses a live owner/host-lock/Main-generation PID, held startup/host/wake/intent/handover or Main
+publication fence, a blocked lock waiter, live recorded launcher, or retained
+watchdog custody. Pending requests, processing, delivery-outbox entries and
+unconfirmed runs/tasks also refuse. It reads both configured actor registries and
+their on-disk queue checkpoints without starting a host or restoring an actor.
+Queued, parked, overflow, settled-window, pending delivery outcomes, dead-letter
+work and stop archives refuse with `FABRIC_ACTOR_QUEUED_WORK` and counts (nonempty
+dead-letter and stop-archive files are counted as files, not guessed item totals). This
+offline check is conservative: all nonempty dead-letter files and stop archives,
+and any in-flight/preparing/removing actor, refuse; the check never guesses whether
+recovery is complete. Resolve/adopt that work first. There is **no `--drop-queued`
+or `--actor` option** for residency retirement. Neither actor registries nor actor
+directories outside the residency are changed.
+
+On success the result prints `retired:true`, `archive` and `auditFile`. ONE
+same-filesystem directory rename moves the selected residency to
+`<mesh>/residency-retired/<hash>.<time>.<uuid>/tree`; an exclusively reserved
+parent prevents overwrite or merging. EXDEV refuses, with no copy fallback.
+`operator.json` beside the tree keeps the evidence, operator identity, root,
+time, tool observations and exact plan. The source inode and every original
+file/byte stay linked in that tree, including nested `runs-retired/`, config,
+owner/custody records and **all `*.jsonl` traces**. No original residency or actor
+file is deleted, truncated, compressed or rewritten. Disk usage does not shrink. New empty fence files may
+be created; their inodes are retained, including the inert Main publication fence
+outside the moved tree. A refusal after creating an audit/fence directory keeps
+those added files too; it never cleans up by deleting data.
+
+The destination is **outside** `<mesh>/residency/`, so ordinary publication,
+dormant-control and retry discovery no longer find its config/wake routes. No
+wake journal or archived mesh event is edited by this command. Existing retry
+maintenance can acknowledge its now-absent path through its normal path; the
+moved failure receipts and traces remain untouched. This is not a tombstone:
+do not restart/resume the old Main or explicitly start its former config. A new
+explicit start can create a new residency for that root.
+
+`--dry-run` prints `retired:false` and `plan` with the exact proposed rename,
+audit path, paths execution would create, and `delete:[]`. It probes only existing
+lock files and creates no files or directories. It reports current refusals just
+as execution does; it does not reserve the destination or promise the same
+random/time suffix on a later invocation. Check the JSON exit status before
+assuming retirement happened. If a namespace-sync failure occurs after rename,
+the error names the retained tree and audit; inspect them before restarting
+the old root.
+
+To inspect, use the printed archive path directly. Any restore is a separate
+manual maintenance action: first establish that all owners remain stopped, then
+rename `tree` back on the **same filesystem** into an absent original slot. Never
+overwrite a new/live residency. Restoring routing metadata re-enables wakes.
+There is no automatic restore or archive deletion operation.
 
 ## Stop and remove never drop queued work silently (smarty-dev#16416)
 

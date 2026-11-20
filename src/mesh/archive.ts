@@ -819,11 +819,10 @@ export class MeshArchive {
     } finally { scan.return([]); }
   }
 
-  /** Same snapshot/order/publication rules as readAfter, with asynchronous bounded payload reads.
-   * Every file and every 64 KiB data read yields, even on a cold index build.
-   * Metadata/stat/catalog work and each event's JSON.parse still run on the main thread.
+  /** Same snapshot/order/publication rules as readAfter, with asynchronous bounded reads.
+   * Metadata is bounded and synchronous; every file and every 64 KiB data read yields, even
+   * on a cold index build. One oversized JSON event still needs one indivisible JSON.parse.
    */
-  // TODO(pi-fabric#2010 F2): move metadata reads/stats and JSON parsing off-thread; ABORTED metadata is not size-bounded.
   async readAfterAsync(after: number, through: number, matches: (event: MeshEvent) => boolean, limit: number, topic?: string): Promise<MeshEvent[]> {
     const scan = this.#readAfterSteps(after, through, matches, limit, topic);
     const empty = Buffer.alloc(0);

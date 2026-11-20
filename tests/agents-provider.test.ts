@@ -3146,7 +3146,7 @@ describe("AgentsProvider runner support", () => {
     ["incarnation-required", "FabricControlIncarnationRequiredError", "FABRIC_CONTROL_INCARNATION_REQUIRED"],
     ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
     ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
-    ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
+    ["unbound-roots", "FabricProjectAgentUnresolvedError", "FABRIC_PROJECT_AGENT_UNRESOLVED"],
     ["unresolved", "FabricProjectAgentUnresolvedError", "FABRIC_PROJECT_AGENT_UNRESOLVED"],
   ])("#201 preserves %s error metadata through normal TypeScript Fabric execution", async (scenario, name, code) => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-guest-error-"));
@@ -3158,7 +3158,7 @@ describe("AgentsProvider runner support", () => {
       role: "project-agent", project: projectOf(lane) } as FabricParticipantInfo;
     const members = scenario === "incarnation-required" ? [{ ...base, ownerIncarnation: "" }]
       : scenario === "non-interactive" ? [{ ...base, interactive: false }]
-      : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
+      : scenario === "unbound-roots" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
     const { provider, participants } = setup(peers, members, undefined, { cwd: lane });
     if (scenario === "directory-unavailable") {
@@ -3171,7 +3171,7 @@ describe("AgentsProvider runner support", () => {
     config.executor.kernel = "typescript";
     config.executor.runtime = "quickjs";
     const service = new FabricExecutionService(registry, config);
-    const call = scenario === "ambiguous" || scenario === "unresolved" ? "agents.projectAgent()"
+    const call = scenario === "unbound-roots" || scenario === "unresolved" ? "agents.projectAgent()"
       : `agents.followUp({ id: ${JSON.stringify(id)}, message: "hello" })`;
     try {
       const result = await service.execute({
@@ -3211,14 +3211,13 @@ describe("AgentsProvider runner support", () => {
     );
   });
 
-  it.each(["session:11111111-1111-4111-8111-111111111111", "11111111-1111-4111-8111-111111111111"])("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch: %s", async (marker) => {
+  it.each(["session:11111111-1111-4111-8111-111111111111", "11111111-1111-4111-8111-111111111111"])("projectAgent resolves a moved lane's exact remote lead using the marker read at invocation: %s", async (marker) => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-moved-lane-"));
     roots.push(lane);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: lane, stdio: "ignore" });
     git("init", "-q");
     git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
     fs.mkdirSync(path.join(lane, ".local"));
-    fs.writeFileSync(path.join(lane, ".local", "lead"), `${marker}\n`);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const base = { ownerIncarnation: "fixture:owner", format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false,
@@ -3226,15 +3225,14 @@ describe("AgentsProvider runner support", () => {
     const lead = { ...base, id: "session:11111111-1111-4111-8111-111111111111", rootId: "session:11111111-1111-4111-8111-111111111111", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
     const other = { ...base, id: "session:newer", rootId: "session:newer", ownerHostId: "other", ownerIdentityId: "other", startedAt: 99 } as FabricParticipantInfo;
     const { provider } = setup([], [other, lead], undefined, { cwd: lane });
-    expect(fs.readFileSync(path.join(lane, ".local", "lead"), "utf8")).toBe(`${marker}\n`);
-    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:newer\n"); // must not change launch identity
+    fs.writeFileSync(path.join(lane, ".local", "lead"), `${marker}\n`); // launcher metadata arrived after construction
     await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
     expect(warn).not.toHaveBeenCalled();
     lead.repository = "github.com/foreign/repo";
     await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
   });
 
-  // smarty-dev#784: a worktree agent finds its project agent by role and project.
+  // A worktree agent resolves only its actual binding, never a role/project election.
   // smarty-dev#7554: run outside the checkout, whose lane may carry its own .local/lead marker.
   const leaderlessProject = () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-project-"));
@@ -3242,7 +3240,7 @@ describe("AgentsProvider runner support", () => {
     return { cwd, project: projectOf(cwd), context: { ...context, cwd } };
   };
 
-  it("returns this session's project agent", async () => {
+  it("does not elect this repository's project agent without a binding", async () => {
     const { cwd, project, context } = leaderlessProject();
     const base = {
       format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
@@ -3258,13 +3256,13 @@ describe("AgentsProvider runner support", () => {
       sessionId: "other", role: "project-agent", project: "/elsewhere", cwd: "/elsewhere",
     } as FabricParticipantInfo;
     const { provider } = setup([], [other, lead], undefined, { cwd });
-    await expect(provider.invoke("projectAgent", {}, context)).resolves.toMatchObject({ id: "session:lead" });
+    await expect(provider.invoke("projectAgent", {}, context)).rejects.toMatchObject({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" });
     expect((await provider.describe("projectAgent", context))?.risk).toBe("read");
   });
 
   // smarty-dev#2045 (security review F1 on pi-fabric#132): a mirrored root's role and project are
   // the remote's own claims and never make it this project's leader.
-  it("never returns a mirrored root as the project agent, even newer than the native one", async () => {
+  it("never elects a native or mirrored project agent without an exact binding", async () => {
     const { cwd, project, context } = leaderlessProject();
     const base = {
       format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
@@ -3280,7 +3278,7 @@ describe("AgentsProvider runner support", () => {
       sessionId: "remote", startedAt: 99, remoteHost: "forge",
     } as FabricParticipantInfo;
     await expect(setup([], [lead, mirrored], undefined, { cwd }).provider.invoke("projectAgent", {}, context))
-      .resolves.toMatchObject({ id: "session:lead" });
+      .rejects.toMatchObject({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" });
     await expect(setup([], [mirrored], undefined, { cwd }).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
     // Resident delivery never elects a replacement: even a recorded integrator cannot inherit

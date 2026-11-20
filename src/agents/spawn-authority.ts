@@ -20,6 +20,9 @@ const workerMarkerKeys = [
   "PI_FABRIC_AGENT_RUN_DIR",
   "PI_FABRIC_AGENT_NAME",
   "PI_FABRIC_SPAWNER_KIND",
+  "PI_FABRIC_SPAWNER_ID",
+  "PI_FABRIC_SPAWNER_RUN",
+  "PI_FABRIC_SPAWNER_SESSION_ID",
   "SMARTY_ROLE",
 ] as const;
 
@@ -30,7 +33,7 @@ export const snapshotAgentSpawnEnvironment = (
   workerMarkerKeys.flatMap(key => environment[key] === undefined ? [] : [[key, environment[key]!]]),
 );
 
-const hasWorkerMarker = (environment: NodeJS.ProcessEnv): boolean => {
+export const hasWorkerMarker = (environment: NodeJS.ProcessEnv): boolean => {
   if (environment.PI_FABRIC_PARENT_RUN !== undefined) return true;
   if (environment.PI_FABRIC_ACTOR_ID !== undefined) return true;
   if (environment.PI_FABRIC_LINEAGE !== undefined) return true;

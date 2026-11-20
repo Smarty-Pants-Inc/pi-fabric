@@ -483,7 +483,9 @@ describe("lossless archived-history catch-up", () => {
   });
 
   it.each([
-    ["sibling", "sync"], ["catalog", "sync"], ["sibling", "async"], ["catalog", "async"],
+    // Async reads no longer install aggregate catalogs; retain the sync catalog trigger
+    // and the async sibling trigger at the actual deferred-install boundary.
+    ["sibling", "sync"], ["catalog", "sync"], ["sibling", "async"],
   ] as const)("does not rebind old names after a new JSONL arrives during deferred %s installation (%s)", async (target, mode) => {
     const f = setup();
     const file = segment(f.dir, "2026/01/01", "fleet.work.a", [event(90, "fleet.work.a")]);
@@ -592,14 +594,14 @@ describe("lossless archived-history catch-up", () => {
     }
   });
 
-  it.each(["sync", "async"] as const)("validates catalogs independently, including combined catalog/sibling corruption (%s)", async mode => {
+  it("validates catalogs independently, including combined catalog/sibling corruption (sync)", async () => {
     const f = setup();
     const file = segment(f.dir, "2026/01/01", "fleet.work.catchup", [event(10), event(90), event(20)]);
     const directory = path.dirname(file), catalogFile = path.join(directory, ".ranges.json");
     const sibling = path.join(directory, `.range-${createHash("sha256").update(path.basename(file)).digest("hex")}.json`);
     const read = async () => {
       const reopened = new MeshArchive(f.dir, f.root);
-      return mode === "sync" ? reopened.readAfter(50, 100, all, 100) : reopened.readAfterAsync(50, 100, all, 100);
+      return reopened.readAfter(50, 100, all, 100);
     };
     exact(await read(), [event(90)]);
     const saved = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
@@ -634,6 +636,40 @@ describe("lossless archived-history catch-up", () => {
     fs.writeFileSync(sibling, "{torn");
     exact(await read(), [event(90)]);
     expect(JSON.parse(fs.readFileSync(catalogFile, "utf8")).checksum).not.toContain("!");
+  });
+
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/21233 — async aggregate bypass with denied installs.
+  it.each(["present", "absent"] as const)("async reads leave %s aggregate catalogs untouched with aggregate writes disabled", async state => {
+    const f = setup();
+    const values = [event(10), event(90), event(20)];
+    const file = segment(f.dir, "2026/01/01", values[0]!.topic, values);
+    exact(f.archive.readAfter(0, 100, all, 100), [values[0]!, values[2]!, values[1]!]);
+    const directory = path.dirname(file), catalogFile = path.join(directory, ".ranges.json");
+    const saved = fs.readFileSync(catalogFile, "utf8");
+    if (state === "absent") fs.unlinkSync(catalogFile);
+    // Force the sibling/data path to cold-build, then reuse its hints on the next page.
+    for (const name of fs.readdirSync(directory)) if (name.startsWith(".range-")) fs.unlinkSync(path.join(directory, name));
+    const open = fs.openSync, rename = fs.renameSync;
+    let catalogOpens = 0, catalogInstalls = 0;
+    vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+      if (String(args[0]) === catalogFile) catalogOpens++;
+      return open(...args);
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "renameSync").mockImplementation((...args: Parameters<typeof fs.renameSync>) => {
+      if (String(args[1]) === catalogFile) {
+        catalogInstalls++;
+        throw Object.assign(new Error("aggregate writes disabled"), { code: "EACCES" });
+      }
+      return rename(...args);
+    });
+    const read = (after: number, topic?: string) => new MeshArchive(f.dir, f.root).readAfterAsync(after, 100, all, 1, topic);
+    exact(await read(0), [values[0]!]);
+    exact(await read(10), [values[2]!]);
+    exact(await read(20, values[0]!.topic), [values[1]!]);
+    expect(catalogOpens).toBe(0);
+    expect(catalogInstalls).toBe(0);
+    if (state === "present") expect(fs.readFileSync(catalogFile, "utf8")).toBe(saved);
+    else expect(fs.existsSync(catalogFile)).toBe(false);
   });
 
   it("reuses only exact-current validated catalogs across fromRoot/new objects, checking real segments every read", () => {

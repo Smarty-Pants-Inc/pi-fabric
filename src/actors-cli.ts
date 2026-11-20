@@ -3,12 +3,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { MAIN_STOPPED_AUDIT_REQUIRED, MAIN_STOPPED_EVIDENCE_MAX_BYTES, mainStoppedAudit, removeActorOffline } from "./actors/remove-offline.js";
 import { ResidentActorClient } from "./residency/actor-client.js";
+import { retireResidency } from "./residency/retire.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
 import { windowsSecurityPowerShell } from "./storage/windows-powershell.js";
 
-const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--drop-queued] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
+const usage = "Usage: fabric-actors stop|remove|retire-residency --resident <directory-or-prefix> [--actor <id-or-name> (stop/remove only)] [--mesh-root <dir>] [--dry-run] [--drop-queued (stop/remove only)] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
 const help = `${usage}
+
+retire-residency is Linux-only, offline and rename-only: it needs --confirm-dead-root <rootId>,
+--main-stopped and --evidence-file <path> (or --evidence <text>). It refuses live/unknown custody,
+held startup/host/wake/handover fences and held actor work. It moves the entire residency into
+<mesh>/residency-retired/<unique>/tree, stopping route discovery, with operator.json beside it.
+No files are deleted or traces edited. --dry-run creates nothing and prints the exact rename/audit plan.
+There is no --actor or --drop-queued for retirement. Stop a live resident through its owner first.
 
 stop refuses an actor that holds work (queued, parked, overflow, pending settled-window or dead-letter work) and
 names the counts; the activation in flight alone never refuses it (its callerless item is archived). With stop,
@@ -136,7 +144,7 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
   try {
     if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) { io.out(help + "\n"); return 0; }
     const [action, ...rest] = argv;
-    if (action !== "stop" && action !== "remove") throw new Error(usage);
+    if (action !== "stop" && action !== "remove" && action !== "retire-residency") throw new Error(usage);
     const values: Record<string, string> = {};
     let dryRun = false;
     let dropQueued = false;
@@ -151,10 +159,11 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
           !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
       values[option] = rest[++index]!;
     }
-    if (!values["--resident"] || !values["--actor"]) throw new Error(usage);
+    if (!values["--resident"] || (action !== "retire-residency" && !values["--actor"]) ||
+        (action === "retire-residency" && (values["--actor"] !== undefined || dropQueued))) throw new Error(usage);
     const evidenceGiven = values["--evidence"] !== undefined || values["--evidence-file"] !== undefined;
     if ((values["--evidence"] !== undefined && values["--evidence-file"] !== undefined) || (evidenceGiven && !mainStopped) ||
-        (mainStopped && action !== "remove")) throw new Error(usage);
+        (mainStopped && action === "stop")) throw new Error(usage);
     if (mainStopped && !evidenceGiven) throw new Error(MAIN_STOPPED_AUDIT_REQUIRED);
     let evidence = values["--evidence"];
     if (values["--evidence-file"] !== undefined) {
@@ -168,21 +177,32 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
       path.join(process.env.PI_FABRIC_PROJECT_ROOT ?? process.cwd(), ".pi", "fabric", "mesh"));
     const directory = resolveResidentDirectory(values["--resident"], meshRoot);
     // Local OS user boundary, independent of the invoking Fabric session's root.
-    assertResidentChannelOwned([directory, path.join(directory, "config.json"), path.join(directory, "owner.json"),
-      path.join(directory, "requests"), path.join(directory, "responses")], ownerProbe);
+    // A cleanly exited resident withdraws owner.json; offline retirement must not require it.
+    const optionalChannels = ["owner.json", "requests", "responses"].map(name => path.join(directory, name));
+    assertResidentChannelOwned([directory, path.join(directory, "config.json"),
+      ...(action === "retire-residency" ? [path.join(directory, "host.lock"), ...optionalChannels.filter(file => fs.lstatSync(file, { throwIfNoEntry: false }))] : optionalChannels)], ownerProbe);
     const config = JSON.parse(fs.readFileSync(path.join(directory, "config.json"), "utf8")) as ResidentHostConfig;
-    const owner = JSON.parse(fs.readFileSync(path.join(directory, "owner.json"), "utf8")) as ResidentHostOwner;
+    const ownerFile = path.join(directory, "owner.json");
+    const owner = action === "retire-residency" && !fs.lstatSync(ownerFile, { throwIfNoEntry: false }) ? undefined :
+      JSON.parse(fs.readFileSync(ownerFile, "utf8")) as ResidentHostOwner;
     if (typeof config.rootId !== "string" || typeof config.meshRoot !== "string" ||
-        typeof config.residencyRoot !== "string" || owner.hostId !== residentHostId(config.rootId) ||
+        typeof config.residencyRoot !== "string" || (owner && owner.hostId !== residentHostId(config.rootId)) ||
+        fs.realpathSync(config.meshRoot) !== fs.realpathSync(meshRoot) ||
         fs.realpathSync(config.residencyRoot) !== directory || fs.realpathSync(residentRoot(config.meshRoot, config.rootId)) !== directory) {
       throw new Error("Resident directory/config/owner identity mismatch");
     }
     const confirmation = { ...(values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {}),
       ...(mainStopped ? { mainStoppedAudit: mainStoppedAudit(config.rootId, evidence ?? "") } : {}) };
+    if (action === "retire-residency") {
+      const response = await retireResidency(directory, config, { dryRun, ...confirmation });
+      io.out(JSON.stringify({ resident: directory, action, ...response }) + "\n");
+      return 0;
+    }
+    if (!owner) throw new Error("Root resident owner is unavailable");
     if (!residentProcessAlive(owner.pid, owner.processStartTime)) {
       // smarty-dev#7817: a dead resident cannot carry out the removal; do it offline under its host.lock fence.
       if (action !== "remove") throw new Error("Root resident host is not live");
-      const response = await removeActorOffline(directory, config, values["--actor"], { dryRun, ...confirmation });
+      const response = await removeActorOffline(directory, config, values["--actor"]!, { dryRun, ...confirmation });
       io.out(JSON.stringify({ resident: directory, action, ...response }) + "\n");
       return response.cleaned === false ? 1 : 0;
     }
@@ -195,7 +215,7 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     const keepAlive = setTimeout(() => {}, client.commandTimeoutMs + 1_000);
     try {
       const response = await client.operatorActor(action,
-        values["--actor"], { dryRun, ...(dropQueued ? { dropQueued: true } : {}),
+        values["--actor"]!, { dryRun, ...(dropQueued ? { dropQueued: true } : {}),
           ...(confirmation.confirmDeadRoot !== undefined ? { confirmDeadRoot: confirmation.confirmDeadRoot } : {}) });
       io.out(JSON.stringify({ resident: directory, action, dryRun, ...response }) + "\n");
       return 0;

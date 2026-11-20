@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { waitForBridgeCheckpoint } from "./fixtures/bridge-checkpoint.js";
 import { MeshBridge, parseBridgeUnaddressedRefreshMs, StoreBridgeSide, type BridgeSide } from "../src/mesh/bridge.js";
 import type { BridgeChange } from "../src/mesh/change-notifier.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -222,8 +223,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     const events = await Promise.all(Array.from({ length: K }, (_, index) =>
       work(f.hub, hubLead, knownOther.id, `known-other-${index}`)));
     const lastSequence = Math.max(...events.map(event => event.sequence));
-    await until(() => cursor(f.cursorPath).toRemote.after >= lastSequence,
-      "pure known-other burst reached its durable source cursor without an inline sample");
+    await waitForBridgeCheckpoint(f.cursorPath, saved => saved.toRemote.after >= lastSequence);
     expect(actualSamples.mock.calls.length - samplesBefore).toBe(0);
     now += 15_000;
     await run.bridge.step();
@@ -379,6 +379,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     expect(actualSamples).toHaveBeenCalledTimes(2); // Coalesced unknown, then inline known mirror.
     expect(cursorAtSample.every(after => after < event.sequence)).toBe(true);
     expect(deliveredFromHub(f.far)).toEqual([]);
+    await waitForBridgeCheckpoint(f.cursorPath, saved => saved.toRemote.after === event.sequence);
     expect(cursor(f.cursorPath).toRemote.after).toBe(event.sequence);
     expect(f.local.mirrored(expiredPeer)).toBe(true);
     expect(f.local.holds(expiredPeer)).toBe(false);
@@ -466,10 +467,11 @@ describe("real-store bridge membership refresh coalescing", () => {
     expect(now - startedAt).toBeLessThanOrEqual(30_000);
     expect(deliveredFromHub(f.far)).toHaveLength(50);
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual(events.map(event => event.id));
-    expect(cursor(f.cursorPath).toRemote.after).toBe(events.at(-1)!.sequence);
     await bridge.step();
     expect(samples).toHaveBeenCalledTimes(1);
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual(events.map(event => event.id));
+    await bridge.stop();
+    expect(cursor(f.cursorPath).toRemote.after).toBe(events.at(-1)!.sequence);
   }, 90_000);
 
   // Keep reason: #1651 control head-of-line delay. A second successful presence pass
@@ -495,6 +497,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     await bridge.syncPresence(); // The post-miss sample covers both events.
     await bridge.syncPresence(); // A notification/resample can finish before the drain runs.
     expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    await waitForBridgeCheckpoint(f.cursorPath, saved => saved.toRemote.after === command.sequence);
     expect(cursor(f.cursorPath).toRemote.after).toBe(command.sequence);
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([command.id]);
     await bridge.step();
@@ -535,6 +538,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     now += 15_000;
     expect(await bridge.step()).toMatchObject({ toRemote: 0, dropped: 0 });
     expect(samples).toHaveBeenCalledTimes(1); // No inline sample for the new unknown recipient.
+    await waitForBridgeCheckpoint(f.cursorPath, saved => saved.toRemote.after === held.sequence);
     expect(cursor(f.cursorPath).toRemote.after).toBe(held.sequence);
     expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(later.sequence);
     expect(deliveredFromHub(f.far)).toEqual([]);
@@ -547,6 +551,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
     expect(samples).toHaveBeenCalledTimes(2);
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([later.id]);
+    await waitForBridgeCheckpoint(f.cursorPath, saved => saved.toRemote.after === later.sequence);
     expect(cursor(f.cursorPath).toRemote.after).toBe(later.sequence);
     await bridge.step();
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([later.id]);
@@ -612,6 +617,7 @@ describe("real-store bridge membership refresh coalescing", () => {
       "a fresh post-change sample admitted and delivered the event");
     expect(sourceSamples.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(f.local.holds(newcomerId)).toBe(true);
+    await waitForBridgeCheckpoint(f.cursorPath, saved => saved.toRemote.after === event.sequence);
     expect(cursor(f.cursorPath).toRemote.after).toBe(event.sequence);
     expect(deliveredFromHub(f.far).filter(delivered => bridgeStampId(delivered) === event.id)).toHaveLength(1);
 
@@ -644,6 +650,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     expect(result.toRemote).toBe(0);
     expect(deliveredFromHub(f.far).some(delivered => bridgeStampId(delivered) === event.id)).toBe(false);
     expect(f.hub.get(hostKey(targetId))?.updatedBy.id).toBe(targetId);
+    await bridge.stop();
     expect(cursor(f.cursorPath).toRemote.after).toBe(event.sequence);
   });
 
@@ -702,9 +709,10 @@ describe("real-store bridge membership refresh coalescing", () => {
     try {
       releaseTail.resolve();
       await until(() => publishEntered, "addressed batch admission reached its commit seam without a presence sample");
+      await waitForBridgeCheckpoint(f.cursorPath, saved => saved.toRemote.after >= prefix.at(-64)!.sequence);
       const gatedCursor = cursor(f.cursorPath).toRemote.after;
-      // Discards checkpoint every 64 events OR 1 s. A timed checkpoint can split
-      // this prefix, so batch admission need not coincide with its final event.
+      // The timer persists only the consumed discard prefix while addressed admission
+      // remains pending. It must never persist the pending addressed event/page end.
       expect(gatedCursor).toBeGreaterThanOrEqual(prefix.at(-64)!.sequence);
       expect(gatedCursor).toBeLessThanOrEqual(prefix.at(-1)!.sequence);
       expect(gatedCursor).toBeLessThan(addressed[0]!.sequence);

@@ -232,8 +232,10 @@ describe("mirror custody re-audit regressions (smarty-dev#13645 WIP 5)", () => {
       }
       return leaseCustody(gate, operation as () => unknown, timeoutMs, options as never);
     }) as typeof hub.leaseCustody;
+    // An actual source renewal reaches custody; an unchanged lease set now skips that work.
     // The host row still reads mirror-owned, so the renewal's row checks pass; the lease is native.
-    await settle(() => side.mirror(presence));
+    const renewed = { ...presence, hosts: presence.hosts.map(host => ({ ...host, expiresAt: host.expiresAt + 1_000 })) };
+    await settle(() => side.mirror(renewed));
     expect(claimed).toBe(true);
     expect(readHostLeaseCurrent(hub.root, identity.id)).toMatchObject({ incarnationToken: "native-claim-token",
       session: { id: "native-session" } });
@@ -579,6 +581,7 @@ describe("startup recovery budgets do not replace the last busy refusal", () => 
         const received = b.hub.read({ after: 0, limit: 100 }).filter(event => event.topic === b.original.topic);
         expect(received).toHaveLength(1);
         expect(received[0]).toMatchObject({ data: { bridge: { id: b.original.id } } });
+        await b.bridge.stop();
         expect(JSON.parse(fs.readFileSync(b.cursorPath, "utf8")).toLocal.after).toBe(b.original.sequence);
       }
     } finally { await b.bridge.stop(); }

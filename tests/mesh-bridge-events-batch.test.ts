@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BridgeOwnershipError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { waitForBridgeCheckpoint } from "./fixtures/bridge-checkpoint.js";
+import { performance as monotonicClock } from "node:perf_hooks";
+import { BRIDGE_CURSOR_CHECKPOINT_MS, BridgeOwnershipError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import { BRIDGE_BATCH_MAX_EVENTS, BRIDGE_BATCH_MAX_MS } from "../src/mesh/event-log.js";
@@ -58,6 +60,7 @@ const setup = async (wire: boolean) => {
   const options = { localName: "dev1", remoteName: "forge", local, remote, cursorPath, presenceMs: 60000 };
   const bridge = new MeshBridge(options);
   await bridge.start();
+  closes.unshift(() => bridge.stop());
   return { hub, far, local, agent, remote, localId, remoteId, bridge, cursorPath, options };
 };
 
@@ -123,7 +126,7 @@ describe("bounded durable bridge event batches", () => {
   it.each([false, true])("forwards both directions in bounded ordered batches (wire=%s)", async (wire) => {
     const { hub, far, bridge, local, agent, cursorPath, localId, remoteId } = await setup(wire);
     const batchIn = vi.spyOn(local, "publishBatch"), batchOut = vi.spyOn(agent, "publishBatch");
-    const originals = [];
+    const originals: MeshEvent[] = [];
     for (let index = 0; index < 12; index++) {
       originals.push(await hub.publish({ topic: "fleet.work.batch", kind: "ask", from: localId, to: remoteId.id, text: `out-${index}` }));
       originals.push(await far.publish({ topic: "fleet.work.batch", kind: "ask", from: remoteId, to: localId.id, text: `in-${index}` }));
@@ -135,6 +138,7 @@ describe("bounded durable bridge event batches", () => {
       const bridged = mesh.read({ limit: 500 }).filter(e => e.verification === "bridge");
       expect(bridged.map(e => e.text)).toEqual(Array.from({ length: 12 }, (_, index) => `${mesh === hub ? "in" : "out"}-${index}`));
     }
+    await waitForBridgeCheckpoint(cursorPath, saved => saved.toRemote.after >= originals.at(-2)!.sequence && saved.toLocal.after >= originals.at(-1)!.sequence);
     const saved = JSON.parse(fs.readFileSync(cursorPath, "utf8"));
     expect(saved.toRemote.after).toBeGreaterThanOrEqual(originals.at(-2)!.sequence);
     expect(saved.toLocal.after).toBeGreaterThanOrEqual(originals.at(-1)!.sequence);
@@ -143,12 +147,13 @@ describe("bounded durable bridge event batches", () => {
 
   it("checkpoints only a committed prefix before a suffix lock timeout, then retries without duplicates", async () => {
     const { hub, far, local, remoteId, localId, bridge, cursorPath } = await setup(false);
-    const sent = [];
+    const sent: MeshEvent[] = [];
     for (const text of ["one", "two", "three"]) sent.push(await far.publish({ topic: "fleet.work.batch", kind: "ask", from: remoteId, to: localId.id, text }));
     const batch = local.publishBatch.bind(local);
     vi.spyOn(local, "publishBatch").mockImplementationOnce(input => batch(input.slice(0, 1)));
     vi.spyOn(local, "publish").mockRejectedValueOnce(Object.assign(new Error("busy"), { code: "FABRIC_MESH_LOCK_TIMEOUT" }));
     await expect(bridge.step()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    await waitForBridgeCheckpoint(cursorPath, saved => saved.toLocal.after === sent[0]!.sequence);
     expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).toLocal.after).toBe(sent[0]!.sequence);
     expect(hub.read().map(e => e.text)).toEqual(["one"]);
     expect(await bridge.step()).toMatchObject({ toLocal: 2 });
@@ -158,6 +163,8 @@ describe("bounded durable bridge event batches", () => {
   it("restart reconciles a whole committed batch after a failed cursor checkpoint", async () => {
     const { hub, far, remoteId, localId, bridge, cursorPath, options } = await setup(false);
     for (const text of ["one", "two", "three"]) await far.publish({ topic: "fleet.work.batch", kind: "ask", from: remoteId, to: localId.id, text });
+    const now = monotonicClock.now.bind(monotonicClock);
+    vi.spyOn(monotonicClock, "now").mockImplementation(() => now() + BRIDGE_CURSOR_CHECKPOINT_MS);
     const rename = fs.renameSync.bind(fs);
     vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
       if (String(target) === cursorPath) throw new Error("checkpoint failed");
@@ -168,6 +175,7 @@ describe("bounded durable bridge event batches", () => {
     expect(committed.length).toBeGreaterThan(0);
     vi.restoreAllMocks();
     const restarted = new MeshBridge(options);
+    closes.unshift(() => restarted.stop());
     await restarted.start();
     await restarted.step();
     expect(hub.read().map(e => e.text)).toEqual(["one", "two", "three"]);
@@ -186,6 +194,7 @@ describe("bounded durable bridge event batches", () => {
     const before = hub.read().map(e => e.id);
     vi.restoreAllMocks();
     const restarted = new MeshBridge(options);
+    closes.unshift(() => restarted.stop());
     await restarted.start();
     await restarted.step();
     expect(hub.read().map(e => e.text)).toEqual(["one", "two", "three"]);

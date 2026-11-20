@@ -93,13 +93,15 @@ describe("bridge drain instrumentation ordering", () => {
     expect(await f.bridge.step()).toEqual({ toRemote: 0, toLocal: 2, dropped: 0 });
     mark("done"); generation++;
     expect(delivered).toEqual(["fabric.control.command", "fabric.control.ack"]);
-    expect(JSON.parse(fs.readFileSync(f.cursorPath, "utf8")).toLocal.after).toBe(2);
-    // Captured on main with the same BridgeSide promises; no wall-clock deadline is involved.
+    expect(JSON.parse(fs.readFileSync(f.cursorPath, "utf8")).toLocal.after).toBe(0);
+    // Dirty checkpoints do not add microtasks. Only synchronous fsync trace entries
+    // disappear; routing continuations and existing event-loop yields stay identical.
     expect(trace).toEqual([
       "read-0:0", "head:1", "presence:2", "owned:2", "membership:7", "presence:9", "owned:9",
-      "fabric.control.command:15", "checkpoint-1:4", "fabric.control.ack:1", "checkpoint-2:4",
-      "checkpoint-2:1", "read-2:0", "done:3",
+      "fabric.control.command:15", "fabric.control.ack:1", "read-2:0", "done:3",
     ]);
+    await f.bridge.stop();
+    expect(JSON.parse(fs.readFileSync(f.cursorPath, "utf8")).toLocal.after).toBe(2);
   });
 
   // Keep: a fatal notification while a destination receipt is pending is not cheap to reach live.

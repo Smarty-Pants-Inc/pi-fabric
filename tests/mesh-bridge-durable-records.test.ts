@@ -175,6 +175,7 @@ describe("unaddressed durable WAIT/ETA records reach the hub factory (smarty-dev
     expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
     expect(bridgedIds(hub, TOPIC)).toEqual([wait.id, eta.id]);
     expect(on(hub, TOPIC).map((event) => [event.kind, event.to])).toEqual([["wait", "factory"], ["eta", "factory"]]);
+    await bridge.stop(); // Flush the dirty confirmed prefix before inspecting its durable cursor.
     expect(toLocalAfter()).toBeGreaterThanOrEqual(eta.sequence);
   });
 

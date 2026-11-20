@@ -5,7 +5,8 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
+import { waitForBridgeCheckpoint } from "./fixtures/bridge-checkpoint.js";
+import { BRIDGE_CURSOR_CHECKPOINT_MS, BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -126,6 +127,7 @@ const fixture = async (targetTtl = 60_000, targetToken?: string,
   for (const { bridge } of links) await bridge.start();
   for (const { bridge } of links) await bridge.syncPresence();
   const drain = async () => { for (const { bridge } of links) await bridge.step(); };
+  closers.unshift(async () => { for (const { bridge } of links) await bridge.stop(); });
   return { dir, stores, mains, links, drain };
 };
 
@@ -259,6 +261,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
       await destinationLink.bridge.step();
       await sourceLink.bridge.step();
       await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "relay-1-recovered-on-B" });
+      await waitForBridgeCheckpoint(sourceLink.bridge.options.cursorPath, saved => saved.toLocal.after >= command.sequence);
       expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
       expect(receive).toHaveBeenCalledOnce();
       expect(receive.mock.calls[0]).toEqual(expect.arrayContaining([expect.objectContaining({ message: marker }),
@@ -272,6 +275,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
       await a.publish({ topic: command.topic, kind: command.kind, from: source.identity, to: target.identity.id, data: command.data });
       await sourceLink.bridge.step();
       // Rewind the checkpoint: real body-free receipts and durable dedupe must win.
+      await waitForBridgeCheckpoint(sourceLink.bridge.options.cursorPath, saved => saved.toLocal.after >= a.latestSequence());
       fs.writeFileSync(sourceLink.bridge.options.cursorPath, checkpoint);
       sourceLink.bridge = new MeshBridge({ ...sourceLink.bridge.options,
         local: new StoreBridgeSide(new MeshStore(hub.root, 64 * 1024, 100), "ryzen3", () => Date.now()) });
@@ -326,6 +330,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
       expect(readHostLease(b.root, target.identity.id)!.expiresAt).toBeGreaterThan(now);
       await sourceLink.bridge.syncPresence();
       await sourceLink.bridge.step();
+      await waitForBridgeCheckpoint(sourceLink.bridge.options.cursorPath, saved => saved.toLocal.after >= command.sequence);
       expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
       expect(events(a, "fabric.control.ack")).toHaveLength(1);
       expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
@@ -430,14 +435,17 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     expect(events(a, "fabric.control.ack")).toEqual([]);
     expect(events(b, "fabric.control.command")).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
-    await observe(() => (events(a, "fabric.control.ack").length === 1 && sourceCursor(link.bridge) >= command.sequence) || failure !== undefined);
+    await observe(() => events(a, "fabric.control.ack").length === 1 || failure !== undefined);
     expect(Date.now()).toBe(deadline);
     expect(failure).toBeUndefined();
-    expect(sourceCursor(link.bridge)).toBeGreaterThanOrEqual(command.sequence);
-    expect(cursor().toLocal.relayGrace).toBeUndefined();
     expect(events(a, "fabric.control.ack")[0]).toMatchObject({ createdAt: deadline, verification: "bridge",
       to: source.identity.id, from: { id: "bridge:ryzen1" }, data: { accepted: false, retryable: true,
         errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1", id: command.id } } });
+    // The exact grace ACK deadline is unchanged; only its consumed cursor/metadata
+    // cleanup may wait for the independent durability interval.
+    await vi.advanceTimersByTimeAsync(BRIDGE_CURSOR_CHECKPOINT_MS);
+    expect(sourceCursor(link.bridge)).toBeGreaterThanOrEqual(command.sequence);
+    expect(cursor().toLocal.relayGrace).toBeUndefined();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(events(a, "fabric.control.ack")).toHaveLength(1);
     expect(events(b, "fabric.control.command")).toEqual([]);
@@ -461,6 +469,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
         requestedAt: Date.now(), deadlineAt: Date.now() + 60_000, destinationRemoteHost: "ryzen2", message: marker } });
     const command = events(a, "fabric.control.command")[0]!;
     await sourceLink.bridge.step();
+    await waitForBridgeCheckpoint(sourceLink.bridge.options.cursorPath, saved => saved.toLocal.after >= command.sequence);
     expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
     expect(events(a, "fabric.control.ack")).toHaveLength(1);
     expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
@@ -568,6 +577,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
         retained();
         now = boundedFrom + BRIDGE_LEASE_MS;
         await step();
+        await waitForBridgeCheckpoint(sourceLink.bridge.options.cursorPath, saved => saved.toLocal.after >= command.sequence);
         expect(sourceCursor(sourceLink.bridge)).toBeGreaterThanOrEqual(command.sequence);
         expect(events(a, "fabric.control.ack")).toHaveLength(1);
         expect(events(a, "fabric.control.ack")[0]).toMatchObject({ verification: "bridge", to: source.identity.id,
@@ -732,6 +742,7 @@ describe("spoke-to-spoke roots and addressed control through the hub", () => {
     expect(await destination.options.local.tail!(boundary.through, boundary.offset)).toEqual({
       events: [], through: hub.latestSequence(), offset: hub.latestOffset(),
     });
+    await waitForBridgeCheckpoint(destination.options.cursorPath, saved => saved.toRemote.after === hub.latestSequence());
     const cursor = JSON.parse(fs.readFileSync(destination.options.cursorPath, "utf8"));
     expect(cursor.toRemote.after).toBe(hub.latestSequence());
     expect(logs).toEqual([]); // in particular, no per-event "not allowed" refusals

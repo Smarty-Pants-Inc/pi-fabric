@@ -190,16 +190,23 @@ describe("bridge transaction cap (smarty-dev#10391), real SQLite stores", () => 
     const committed = f.target.read({ limit: 1000 });
     expect(committed.length).toBeGreaterThan(0);
     expect(committed.length).toBeLessThanOrEqual(MAX_EVENTS);
-    const cursor = JSON.parse(fs.readFileSync(f.cursorPath, "utf8")).toLocal;
-    expect(cursor.after).toBe(crash === "between" ? f.originals[committed.length - 1]!.sequence : 0);
+    const durableBeforeCrash = fs.readFileSync(f.cursorPath, "utf8");
+    const cursor = JSON.parse(durableBeforeCrash).toLocal;
+    // Even an acknowledged prefix can still be inside the coalesced replay window.
+    expect(cursor.after).toBe(0);
+    // Retire test timers, then restore the exact crash-time bytes (exclude stop's fsync).
+    await f.bridge.stop();
+    fs.writeFileSync(f.cursorPath, durableBeforeCrash);
     f.side.failBefore = f.side.failAfter = Infinity;
-    const restarted = new MeshBridge(f.options);
+    const restarted = new MeshBridge({ ...f.options,
+      local: new StoreBridgeSide(f.options.local.store, "far"), remote: new StoreBridgeSide(f.options.remote.store, "hub") });
     await restarted.start();
     await restarted.step();
     const all = f.target.read({ limit: 1000 });
     expect(all.map(e => e.text)).toEqual(Array.from({ length: 500 }, (_, index) => String(index)));
     expect(new Set(all.map(e => (e.data as BridgePublish["data"]).bridge.id)).size).toBe(500);
     expect(all.slice(0, committed.length).map(e => e.id)).toEqual(committed.map(e => e.id));
+    await restarted.stop();
     expect(JSON.parse(fs.readFileSync(f.cursorPath, "utf8")).toLocal.after).toBe(f.originals.at(-1)!.sequence);
     console.log(JSON.stringify({ crash, committedBeforeCrash: committed.length, resumed: all.length, uniqueSourceIds: 500 }));
   }, 30000);

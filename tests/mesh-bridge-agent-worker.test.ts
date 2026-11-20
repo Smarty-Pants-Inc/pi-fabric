@@ -407,7 +407,7 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
       await new Promise(resolve => setTimeout(resolve, 75));
       expect(tailCalls).toBe(1);
       expect(fs.readFileSync(cursorPath, "utf8")).toBe(before);
-      const advanced = waitForJsonFile<{ toLocal: { after: number; offset?: number } }>(cursorPath, 2_000,
+      const advanced = waitForJsonFile<{ toLocal: { after: number; offset?: number } }>(cursorPath, 7_000,
         "cursor after busy-tail release", value => value.toLocal.after === appended.sequence);
       busy = false;
       expect(changed).toBeDefined();

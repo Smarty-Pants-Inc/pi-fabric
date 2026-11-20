@@ -58,7 +58,7 @@ const changed = <T>(root: string, read: () => T | undefined): Promise<T> => new 
   };
   const watcher = fs.watch(root, probe);
   watcher.once("error", finish);
-  const timer = setTimeout(() => finish(new Error("checkpoint/delivery notification missing")), 5_000);
+  const timer = setTimeout(() => finish(new Error("checkpoint/delivery notification missing")), 7_000);
   probe();
 });
 const hash = (id: string) => createHash("sha256").update(id).digest("hex");

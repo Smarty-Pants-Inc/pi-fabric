@@ -10,7 +10,7 @@ import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
 import { withHostLeaseFileCustody } from "../topology/host-lease-lock.js";
-import { meshDirectoryStamp } from "../topology/publication-generation.js";
+import { meshDirectoryStamp, publicationGeneration } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles, withParticipantFileDirectoryCustody } from "../topology/participant-files.js";
@@ -54,6 +54,8 @@ const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** Freshness bound for an observation from one physical bridge peer. */
 export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
+/** Bound the replay window and idle fsync rate; well below the directional watchdog's 180 s. */
+export const BRIDGE_CURSOR_CHECKPOINT_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
@@ -916,6 +918,10 @@ export class StoreBridgeSide implements BridgeSide {
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
   readonly #reportedUnreadable = new Set<string>();
   #recoveryReader: RecoveryReader | undefined;
+  #leaseSnapshot: { stamp: string; leases: ReadonlyMap<string, FabricHostLease> } | undefined;
+  #presenceCache: { generation: string; at: number; until: number; value: BridgePresence } | undefined;
+  #relayCache: { generation: string; at: number; until: number; value: Pick<BridgePresence, "hosts" | "participants"> } | undefined;
+  #mirrorCache: { generation: string; digest: string; at: number; until: number; deadlines: number[] } | undefined;
   /** Visible-position costs and actual native work for the last attempted recovery page, including failure. */
   recoveryReadCost: RecoveryReadCost | undefined;
 
@@ -1060,8 +1066,16 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async relayPresence(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
+    const generation = this.#presenceGeneration();
+    const now = this.now();
+    const cached = this.#relayCache;
+    if (generation !== undefined && cached?.generation === generation && now >= cached.at && now < cached.until) {
+      const value = structuredClone(cached.value);
+      for (const host of value.hosts) host.observedAt = now;
+      return value;
+    }
     const hosts: BridgeHost[] = [];
-    const leases = readHostLeases(this.store.root);
+    const leases = this.#readLeases();
     for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
       const host = hostOf(entry.key, entry.value);
       if (!host || host.remoteHost === undefined || host.remoteHost === this.peer || host.bridgeVia !== undefined ||
@@ -1080,12 +1094,47 @@ export class StoreBridgeSide implements BridgeSide {
         participant.bridgeVia === undefined && participant.id === owner.id && participant.rootId === owner.rootId &&
         participant.ownerIdentityId === owner.identity.id && entry.updatedBy.id === owner.identity.id ? [participant] : [];
     });
-    return { hosts, participants };
+    const value = { hosts, participants };
+    this.#relayCache = this.#leaseSnapshot !== undefined && generation !== undefined && generation === this.#presenceGeneration()
+      ? { generation, at: now, until: Math.min(Infinity, ...hosts.map(host => host.expiresAt)), value: structuredClone(value) }
+      : undefined;
+    return value;
+  }
+
+  /** Atomic lease writers replace directory entries. Unknown/read-failed stamps never grant reuse.
+   * The returned map is private/read-only; destructive custody checks still read exact file bytes. */
+  #readLeases(): ReadonlyMap<string, FabricHostLease> {
+    const stamp = hostLeaseDirectoryStamp(this.store.root);
+    if (stamp !== undefined && this.#leaseSnapshot?.stamp === stamp) return this.#leaseSnapshot.leases;
+    const problems: string[] = [];
+    const leases = readHostLeases(this.store.root, problems);
+    this.#leaseSnapshot = problems.length === 0 && stamp !== undefined && stamp === hostLeaseDirectoryStamp(this.store.root)
+      ? { stamp, leases } : undefined;
+    return leases;
+  }
+
+  #presenceGeneration(): string | undefined {
+    try { return publicationGeneration(this.store); }
+    catch { return undefined; } // Unknown is a miss, never permission to keep stale authority.
   }
 
   #presenceSnapshot(): BridgePresence {
-    return this.#presence(this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries(),
-      this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }));
+    const generation = this.#presenceGeneration();
+    const now = this.now();
+    const cached = this.#presenceCache;
+    if (generation !== undefined && cached?.generation === generation && now >= cached.at && now < cached.until) {
+      const value = structuredClone(cached.value);
+      // This is a fresh observation of unchanged files, not a replay of the earlier TTL sample.
+      for (const host of value.hosts) host.observedAt = now;
+      return value;
+    }
+    const handoffs = this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true });
+    const value = this.#presence(this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries(), handoffs);
+    // Handoffs have additional live/dead predicates. Leave that uncommon path uncached.
+    this.#presenceCache = this.#leaseSnapshot !== undefined && handoffs.length === 0 && generation !== undefined && generation === this.#presenceGeneration()
+      ? { generation, at: now, until: Math.min(Infinity, ...value.hosts.map(host => host.expiresAt)), value: structuredClone(value) }
+      : undefined;
+    return value;
   }
 
   subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void, log?: (message: string) => void): () => void {
@@ -1269,7 +1318,7 @@ export class StoreBridgeSide implements BridgeSide {
     capturedLeases?: ReadonlyMap<string, FabricHostLease>,
   ): { presence: BridgePresence; voided: MeshStateEntry[]; leases: ReadonlyMap<string, FabricHostLease>; now: number } {
     const now = this.now();
-    const leases = capturedLeases ?? readHostLeases(this.store.root);
+    const leases = capturedLeases ?? this.#readLeases();
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
     const reserved = new Set<string>(handoffs.reserved);
     const hosts: BridgeHost[] = [];
@@ -1759,6 +1808,20 @@ export class StoreBridgeSide implements BridgeSide {
     // observedAt counts as now: NaN would admit every lapsed host and -Infinity would resurrect
     // one for a full lease (independent review, P2).
     const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
+    const generation = this.#presenceGeneration();
+    // Observation timestamps are not lease versions. Keep the earlier confirmed deadline on a
+    // repeat sample; a shortened deadline, cap-renewal edge or any namespace change takes the
+    // ordinary custody/plan path. Publication authority never uses this cache.
+    const deadlines = presence.hosts.map(host => host.observedAt === undefined
+      ? Math.min(host.expiresAt, liveAt + BRIDGE_LEASE_MS)
+      : liveAt + Math.min(BRIDGE_LEASE_MS, host.expiresAt - host.observedAt));
+    const digest = contentDigest({ ...presence, fromHub, hosts: presence.hosts.map(({ observedAt: sampledAt, ...host }) =>
+      ({ ...host, sampled: sampledAt !== undefined })) });
+    const cached = this.#mirrorCache;
+    if (!final && !presenceIsPartial(presence) && generation !== undefined && cached?.generation === generation &&
+      cached.digest === digest && now >= cached.at && now < cached.until &&
+      deadlines.every((deadline, index) => deadline >= cached.deadlines[index]!)) return;
+    this.#mirrorCache = undefined;
     const incomingAuthorityIds = new Set<string>();
     for (const { record } of presence.hosts) {
       incomingAuthorityIds.add(record.id);
@@ -2167,6 +2230,24 @@ export class StoreBridgeSide implements BridgeSide {
     // a pass, as from main's early plan) are taken from it: every plan is made again on a custody snapshot.
     const committed = halted() ? undefined : this.store.stateRevision() !== undefined ? this.store.stateView() : undefined;
     const lockFreeView = committed?.view ?? (halted() ? undefined : committedStateView(this.store));
+    const rememberUnchangedMirror = (): void => {
+      // Only a stable no-row/no-file-write pass can certify reuse. Capturing merely after
+      // our writes would bless an unrelated mutation that raced the plan. First installs,
+      // recovery, partial/skip passes and handoffs all keep their existing full path.
+      if (final || partial || halted() || skippedRoots.size > 0 || generation === undefined ||
+        generation !== this.#presenceGeneration() || this.#outbox.hasUnconfirmed() ||
+        this.#leaseSnapshot === undefined || !lockFreeView || lockFreeView.listAll(BRIDGE_HANDOFF_PREFIX).length > 0) return;
+      const until = Math.min(Infinity, ...deadlines.map((deadline, index) => {
+        const host = presence.hosts[index]!;
+        const capped = host.observedAt === undefined ? host.expiresAt > liveAt + BRIDGE_LEASE_MS
+          : host.expiresAt - host.observedAt > BRIDGE_LEASE_MS;
+        // A repeated sample may have kept the earlier confirmed file deadline. Never
+        // cache through that deadline merely because the latest sample could extend it.
+        const confirmed = this.#leaseSnapshot?.leases.get(host.record.id)?.expiresAt ?? deadline;
+        return Math.min(deadline, confirmed) - (capped ? 1_000 : 0);
+      }));
+      this.#mirrorCache = { generation, digest, at: now, until, deadlines };
+    };
     const recovering = !partial && !this.#recovered;
     const probeEligible = (view: MeshBatchView | undefined): boolean => this.#hasCommittedPass && !halted() &&
       view !== undefined && view.listAll(BRIDGE_HANDOFF_PREFIX).length === 0 && !this.#outbox.hasUnconfirmed();
@@ -2241,6 +2322,7 @@ export class StoreBridgeSide implements BridgeSide {
           if (!partial) this.#recovered = true;
         }
         reportUnreadable();
+        rememberUnchangedMirror();
         return;
       }
     }
@@ -2546,6 +2628,7 @@ export class StoreBridgeSide implements BridgeSide {
     }
     reportUnreadable();
     if (effectBusy && !halted()) throw effectBusy.error;
+    rememberUnchangedMirror();
   }
 
   // Independent watch renewals must not mutate a full mirror pass's authority-recheck latch.
@@ -2627,8 +2710,15 @@ export class StoreBridgeSide implements BridgeSide {
     const repaired = { ...leaseFields,
       ...(history.tokens.length > 0 ? { bridgeSupersededTokens: history.tokens } : {}),
       ...(Object.keys(history.seen).length > 0 ? { bridgeSupersededTokenSeen: history.seen } : {}) };
-    if (sameIncarnation && onDisk && onDisk.updatedAt === repaired.updatedAt && onDisk.expiresAt === repaired.expiresAt &&
-        JSON.stringify(onDisk.mirror) === JSON.stringify(repaired.mirror) &&
+    // An unchanged origin version does not need a new file solely because we sampled it again.
+    // Keep the older (never later) confirmed deadline, except when the 15 s cap needs renewal.
+    // A shorter sample, changed owner/history/process evidence or real source renewal still writes.
+    const repeatedSample = onDisk?.mirror && repaired.mirror && repaired.expiresAt >= onDisk.expiresAt &&
+      this.now() < onDisk.expiresAt - (onDisk.mirror.sourceExpiresAt - onDisk.mirror.sourceObservedAt > BRIDGE_LEASE_MS ? 1_000 : 0) &&
+      JSON.stringify({ ...onDisk.mirror, observedAt: undefined, sourceObservedAt: undefined }) ===
+        JSON.stringify({ ...repaired.mirror, observedAt: undefined, sourceObservedAt: undefined });
+    if (sameIncarnation && onDisk && onDisk.updatedAt === repaired.updatedAt &&
+        ((onDisk.expiresAt === repaired.expiresAt && JSON.stringify(onDisk.mirror) === JSON.stringify(repaired.mirror)) || repeatedSample) &&
         JSON.stringify(history.tokens) === JSON.stringify(bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens)) &&
         JSON.stringify(history.seen) === JSON.stringify(bridgeSupersededSeenOf(onDisk.bridgeSupersededTokenSeen))) return;
     const current = this.store.get(key, { fresh: true });
@@ -3627,7 +3717,13 @@ const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<
 
 export class MeshBridge {
   #cursor: CursorFile | undefined;
+  #savedCursor: string | undefined;
+  #cursorSavedAt = Number.NEGATIVE_INFINITY;
+  #cursorTimer: ReturnType<typeof setTimeout> | undefined;
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
+  // Only newly delivered IDs retire at a successful checkpoint; recovery IDs remain intact.
+  readonly #checkpointSeen: Record<Direction, string[]> = { toRemote: [], toLocal: [] };
+  #progressAfter: Partial<Record<Direction, number>> = {};
   #presenceAt = Number.NEGATIVE_INFINITY;
   #presenceSync: Promise<void> | undefined;
   /** One trailing refresh obligation; a sample begun before its latest miss cannot clear it. */
@@ -4006,7 +4102,10 @@ export class MeshBridge {
     }
     if (saved) {
       this.#cursor = saved;
+      this.#savedCursor = JSON.stringify(saved);
+      this.#cursorSavedAt = monotonicClock.now();
       this.#lastCursorAfter = { toRemote: saved.toRemote.after, toLocal: saved.toLocal.after };
+      this.#progressAfter = { ...this.#lastCursorAfter };
     } else {
       const [localHead, remoteHead]: [BridgeHead, BridgeHead] = await Promise.all([
         local.latestCursor?.() ?? local.latestSequence().then(through => ({ through })),
@@ -4017,7 +4116,7 @@ export class MeshBridge {
         toRemote: { after: localHead.through, ...(localHead.offset !== undefined ? { offset: localHead.offset } : {}), mark: remoteHead.through },
         toLocal: { after: remoteHead.through, ...(remoteHead.offset !== undefined ? { offset: remoteHead.offset } : {}), mark: localHead.through },
       };
-      this.#save();
+      this.#save(true);
     }
     await this.#reconcileSeen(recoveryBudgetMs);
     // Read CURRENT natives (including participants/ files), never a saved projection set.
@@ -4129,16 +4228,56 @@ export class MeshBridge {
     if (!Number.isSafeInteger(receipt?.sequence) || receipt.sequence <= 0) throw relayUnavailable();
   }
 
-  #save(): void {
-    fs.mkdirSync(path.dirname(this.options.cursorPath), { recursive: true, mode: 0o700 });
-    writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600, durable: true });
+  #save(immediate = false): void {
+    if (immediate && this.#cursorTimer !== undefined) {
+      clearTimeout(this.#cursorTimer);
+      this.#cursorTimer = undefined;
+    }
     if (!this.#cursor) return;
+    const serialized = JSON.stringify(this.#cursor);
+    if (serialized === this.#savedCursor) return;
     const now = Date.now();
+    const monotonicAt = monotonicClock.now();
+    // A confirmed consumed prefix is directional progress even before its coalesced fsync.
+    // Do not turn a short watchdog setting or backward wall-clock adjustment into a false stall.
     for (const direction of ["toRemote", "toLocal"] as const) {
       const after = this.#cursor[direction].after;
-      const previous = this.#lastCursorAfter[direction];
+      if (this.#progressAfter[direction] === undefined || after > this.#progressAfter[direction]!) {
+        this.#progressAfter[direction] = after;
+        this.#noteDirectionSuccess(direction, now, monotonicAt);
+      }
+    }
+    const remaining = this.#cursorSavedAt + BRIDGE_CURSOR_CHECKPOINT_MS - monotonicAt;
+    if (!immediate && !this.#stopped && remaining > 0) {
+      // Anchor at the last durable save, not the latest change: continuous churn cannot
+      // postpone durability. The timer also covers a last moved pass followed by total idle.
+      if (this.#cursorTimer === undefined) {
+        this.#cursorTimer = setTimeout(() => {
+          this.#cursorTimer = undefined;
+          try { this.#save(true); }
+          catch (error) {
+            this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
+            this.#wake?.();
+            for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
+          }
+        }, remaining);
+        this.#cursorTimer.unref?.();
+      }
+      return;
+    }
+    if (this.#cursorTimer !== undefined) clearTimeout(this.#cursorTimer);
+    this.#cursorTimer = undefined;
+    fs.mkdirSync(path.dirname(this.options.cursorPath), { recursive: true, mode: 0o700 });
+    writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600, durable: true });
+    // The old on-disk mark remains the replay lower bound until this atomic checkpoint.
+    // A publish still in flight has not advanced after/mark, so cannot be skipped on crash.
+    this.#savedCursor = serialized;
+    this.#cursorSavedAt = monotonicAt;
+    for (const direction of ["toRemote", "toLocal"] as const) {
+      const after = this.#cursor[direction].after;
       this.#lastCursorAfter[direction] = after;
-      if (previous === undefined || after > previous) this.#noteDirectionSuccess(direction, now, monotonicClock.now());
+      for (const id of this.#checkpointSeen[direction]) this.#seen[direction].delete(id);
+      this.#checkpointSeen[direction].length = 0;
     }
   }
 
@@ -4543,6 +4682,7 @@ export class MeshBridge {
 
   /** One pass: presence when due, then every new event in both directions. */
   async step(): Promise<BridgeStepResult> {
+    if (this.#notificationError) throw this.#notificationError;
     if (!this.#cursor) await this.start();
     if (this.#unaddressedRefreshDue()) await this.#refreshUnaddressedMembership();
     else if (this.#presenceDue()) await this.syncPresence();
@@ -4992,16 +5132,15 @@ export class MeshBridge {
               this.#factoryTokens -= spent.length;
               this.#factoryBytes -= spent.reduce((sum, size) => sum + size, 0);
               const ids = page.events.slice(index, index + committed.length).map(item => item.id);
-              for (const id of ids) seen.add(id);
+              for (const id of ids) { seen.add(id); this.#checkpointSeen[direction].push(id); }
               cursor.mark = Math.max(cursor.mark, ...committed.map(result => result.sequence));
               cursor.after = page.events[index + committed.length - 1]!.sequence;
               forwarded += committed.length;
               checkpoint(); // Advance only after the destination confirms the prefix durably.
               this.#clearStallOnProgress(direction);
-              for (const id of ids) seen.delete(id);
               this.#reportUnaddressed();
               index += committed.length - 1;
-              // Locks are released and the durable prefix is checkpointed. Yield a real event-loop
+              // Locks are released and the confirmed prefix is retained for checkpoint. Yield a real event-loop
               // turn (not a microtask) before reacquiring, so local writers and transport I/O run.
               const end = phase("idleMs");
               try { await new Promise<void>(resolve => setImmediate(resolve)); } finally { end(); }
@@ -5090,6 +5229,8 @@ export class MeshBridge {
               return { forwarded, dropped };
             }
             if (result.delivered) {
+              seen.add(event.id);
+              this.#checkpointSeen[direction].push(event.id);
               if (result.sequence !== undefined) cursor.mark = Math.max(cursor.mark, result.sequence);
               forwarded += 1;
               this.#clearStallOnProgress(direction);
@@ -5098,7 +5239,6 @@ export class MeshBridge {
           }
           cursor.after = event.sequence;
           checkpoint();
-          seen.delete(event.id);
           const end = phase("idleMs");
           try { await new Promise<void>(resolve => setImmediate(resolve)); } finally { end(); }
           continue;
@@ -5173,13 +5313,13 @@ export class MeshBridge {
               this.#factoryBytes -= factorySpend;
             }
             seen.add(event.id);
+            this.#checkpointSeen[direction].push(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
             forwarded += 1;
             checkpoint();
             this.#clearStallOnProgress(direction);
-            // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
-            seen.delete(event.id);
+            // #save retires this ID only when the coalesced checkpoint is actually durable.
             this.#reportUnaddressed();
             // Legacy/singleton drains must also give waiting writers a turn after checkpoint.
             const end = phase("idleMs");
@@ -5216,7 +5356,7 @@ export class MeshBridge {
         // stays at the page start until every event has been consumed below.
         if (cursor.after > (this.#lastCursorAfter[direction] ?? start) &&
           (++discardedSinceCheckpoint >= 64 || monotonicClock.now() - discardCheckpointAt >= 1_000)) {
-          checkpoint(); // Records directional progress only after the durable checkpoint.
+          checkpoint(); // Records confirmed progress now; the dirty prefix is durable within the interval.
         }
       }
       // The page may end in events the allow-list filtered out; a page that moved may have more.
@@ -5283,7 +5423,7 @@ export class MeshBridge {
     // Repair legacy/malformed/future records from the local clock, never a peer timestamp.
     if (!sameEvent || !validStart) {
       cursor.relayGrace = { sequence: event.sequence, startedAt: now, id: event.id };
-      this.#save();
+      this.#save(true); // The grace-start fence must survive a crash before any relay attempt.
       return true;
     }
     return now < retained.startedAt + BRIDGE_LEASE_MS;
@@ -5589,6 +5729,7 @@ export class MeshBridge {
       this.#notificationMode = false;
       this.#deliveryAge.close();
       await this.#watchdogTask?.catch(() => undefined);
+      this.#save(true);
     }
   }
 
@@ -5636,6 +5777,7 @@ export class MeshBridge {
     await within(Promise.allSettled([...this.#relayDeliveries]));
     await within(localFence);
     this.#deliveryAge.close();
+    this.#save(true);
   }
 }
 

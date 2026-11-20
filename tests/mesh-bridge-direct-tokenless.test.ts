@@ -960,7 +960,10 @@ describe("direct tokenless presence through MeshBridge RPC", () => {
       expect(f.work.get(hostKey(target.host.id), { fresh: true })).toBeDefined();
       expect(f.work.get(participantKey(target.participant.id), { fresh: true })).toBeDefined();
       expect(readHostLease(f.work.root, target.host.id)?.expiresAt).toBeGreaterThanOrEqual(now + BRIDGE_LEASE_MS);
-      expect(readHostLease(f.hub.root, peerRoot.host.id)?.expiresAt).toBeGreaterThanOrEqual(now + BRIDGE_LEASE_MS);
+      // Unchanged sampled peer authority keeps its earlier confirmed cap until renewal is due.
+      const peerExpiry = readHostLease(f.hub.root, peerRoot.host.id)!.expiresAt;
+      expect(peerExpiry).toBeGreaterThan(now);
+      expect(peerExpiry).toBeLessThanOrEqual(now + BRIDGE_LEASE_MS);
       expect(mirroredHubIds()).toEqual(beforeHosts);
       expect(mirroredParticipantIds()).toEqual(beforeParticipants);
     }

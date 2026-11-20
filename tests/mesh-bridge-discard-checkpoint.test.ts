@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { waitForBridgeCheckpoint } from "./fixtures/bridge-checkpoint.js";
 import {
+  BRIDGE_CURSOR_CHECKPOINT_MS,
   BRIDGE_DIRECTION_STALL_AFTER_MS,
   BRIDGE_PAGE_BYTES,
   MeshBridge,
@@ -18,6 +20,9 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
 const roots: string[] = [];
 const cleanups: Array<() => Promise<void>> = [];
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+// Retain the original 20 s work budget plus the two newly coalesced durability
+// waits (held prefix and drained suffix). Routing/watchdog observation bounds stay unchanged.
+const CHECKPOINT_CASE_MS = 20_000 + 2 * BRIDGE_CURSOR_CHECKPOINT_MS;
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   vi.restoreAllMocks();
@@ -77,7 +82,7 @@ function launch(f: Fixture, overrides: Partial<MeshBridgeOptions> = {}) {
   return { bridge, running, failure: () => failure };
 }
 
-async function until(check: () => boolean, timeoutMs = 5_000): Promise<void> {
+async function until(check: () => boolean, timeoutMs = 7_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 2));
   expect(check(), "condition did not become true before the test deadline").toBe(true);
@@ -188,6 +193,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
     });
     try {
       await waitForGate(slow.entered);
+      await waitForBridgeCheckpoint(f.cursorPath, cursor => cursor.toRemote.after === expected[398]!.sequence);
       const durable = readCursor(f).toRemote.after;
       expect(slow.refreshes()).toBe(1);
       expect(slow.logicalMs()).toBeGreaterThan(BRIDGE_DIRECTION_STALL_AFTER_MS);
@@ -207,7 +213,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
       await live.bridge.stop();
       await live.running;
     }
-  }, 20_000);
+  }, CHECKPOINT_CASE_MS);
 
   // Keep reason: #16879 data safety; a restart must honor only the durable prefix and resume the real page suffix.
   it("restarts at the durable sequence checkpoint without replaying it or losing the suffix/byte offset", async () => {
@@ -223,6 +229,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
     const first = launch(f, { debug: line => { slow.debug(line); firstPass.push(line); } });
     try {
       await waitForGate(slow.entered);
+      await waitForBridgeCheckpoint(f.cursorPath, cursor => cursor.toRemote.after === expected[398]!.sequence);
       const checkpoint = readCursor(f).toRemote.after;
       expect(checkpoint).toBeGreaterThan(0);
       expect(checkpoint).toBe(expected[398]!.sequence);
@@ -261,7 +268,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
       await first.bridge.stop();
       await first.running;
     }
-  }, 20_000);
+  }, CHECKPOINT_CASE_MS);
 
   // Keep reason: #16879 data safety; a held event remains unread across restart,
   // and a newly admitted recipient receives it exactly once, not zero or twice.
@@ -274,6 +281,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
     const first = launch(f, { debug: slow.debug });
     try {
       await waitForGate(slow.entered);
+      await waitForBridgeCheckpoint(f.cursorPath, cursor => cursor.toRemote.after === expected[398]!.sequence);
       const saved = readCursor(f).toRemote;
       expect(saved.after).toBe(expected[398]!.sequence);
       expect(saved.after).toBeLessThan(held.sequence);
@@ -316,7 +324,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
       await first.bridge.stop();
       await first.running;
     }
-  }, 20_000);
+  }, CHECKPOINT_CASE_MS);
 
   // Keep reason: #16879 safety boundary; discard checkpoints may not cross a still-unconfirmed addressed publication.
   it("does not checkpoint past an unconfirmed publication and keeps the existing 180 s watchdog effective", async () => {
@@ -373,6 +381,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
     const live = launch(f, { debug: slow.debug });
     try {
       await waitForGate(slow.entered);
+      await waitForBridgeCheckpoint(f.cursorPath, cursor => cursor.toRemote.after === expected[398]!.sequence);
       expect(readCursor(f).toRemote.after).toBe(expected[398]!.sequence);
       slow.reject(new Error("membership refresh failed at the retained boundary"));
       await until(() => live.failure() !== undefined);
@@ -387,5 +396,5 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
       await live.bridge.stop();
       await live.running;
     }
-  }, 20_000);
+  }, 20_000 + BRIDGE_CURSOR_CHECKPOINT_MS);
 });

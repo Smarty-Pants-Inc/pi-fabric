@@ -6,6 +6,8 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { waitForBridgeCheckpoint } from "./fixtures/bridge-checkpoint.js";
+import { performance as monotonicClock } from "node:perf_hooks";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
   type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -18,6 +20,7 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import {
   type BridgeSide,
   BRIDGE_LEASE_MS,
+  BRIDGE_CURSOR_CHECKPOINT_MS,
   BridgeOwnershipError,
   BridgeMirrorDeferredError,
   checkBridgePublish,
@@ -173,6 +176,7 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
     ...(options.factoryRate ? { factoryRate: options.factoryRate } : {}),
     ...(options.walCapRetryMinMs === undefined ? {} : { walCapRetryMinMs: options.walCapRetryMinMs }),
   });
+  cleanups.unshift(() => bridge.stop());
   return { hub, far, remote, bridge, logs, debugs, gate };
 };
 
@@ -735,6 +739,7 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
     await bridge.syncPresence();
     expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
     expect(on(hub, "fabric.control.ack").map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([source.id]);
+    await waitForBridgeCheckpoint(bridge.options.cursorPath, cursor => cursor.toLocal.after >= source.sequence);
     expect(saved().toLocal.after).toBeGreaterThanOrEqual(source.sequence);
     expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
     expect(on(hub, "fabric.control.ack")).toHaveLength(1);
@@ -1141,6 +1146,7 @@ describe("mesh bridge", () => {
       expect(received).toHaveLength(1);
       expect(received[0]).toMatchObject({ verification: "bridge" });
       expect(received.map((event) => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([sent.id]);
+      await bridge.stop(); // Stop flushes the confirmed prefix even before the interval.
       const cursor = JSON.parse(fs.readFileSync(bridge.options.cursorPath, "utf8")) as { toLocal: { after: number } };
       expect(cursor.toLocal.after).toBeGreaterThanOrEqual(sent.sequence);
       expect(logs.some((line) => line.includes(" (toLocal); retrying in "))).toBe(false);
@@ -1177,6 +1183,8 @@ describe("mesh bridge", () => {
     try {
       expect(await bridge.step()).toMatchObject({ [where === "local" ? "toLocal" : "toRemote"]: sent.length, dropped: 0 });
       expect(observed.size).toBe(1);
+      for (const seen of observed) expect(sent.every((event) => seen.has(event.id))).toBe(true);
+      await bridge.stop();
       for (const seen of observed) expect(sent.filter((event) => seen.has(event.id))).toEqual([]);
       const saved = JSON.parse(fs.readFileSync(cursorPath, "utf8"));
       expect(saved[where === "local" ? "toLocal" : "toRemote"].after).toBe(sent.at(-1)!.sequence);
@@ -1213,6 +1221,8 @@ describe("mesh bridge", () => {
       const result = await publish(...args);
       fs.renameSync(cursorDir, backup);
       fs.writeFileSync(cursorDir, "blocks checkpoint mkdir");
+      const now = monotonicClock.now.bind(monotonicClock);
+      vi.spyOn(monotonicClock, "now").mockImplementation(() => now() + BRIDGE_CURSOR_CHECKPOINT_MS);
       return result;
     };
     try {
@@ -1558,6 +1568,7 @@ describe("mesh bridge", () => {
       expect(deliveredIds()).toEqual(pending.map(event => event.id));
       expect(on(destination, "fabric.control.command").map(event => event.kind)).toEqual(["ask", "cancel"]);
       expect(on(destination, "fabric.control.command")[1]!.data).toMatchObject({ cancelCommandId: "pending-ask" });
+      await waitForBridgeCheckpoint(cursorPath, cursor => cursor[direction].after === 9);
       expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))[direction].after).toBe(9);
 
       // Only now does the second compaction write land; it must neither lose nor repeat work.
@@ -1566,6 +1577,7 @@ describe("mesh bridge", () => {
       expect(await resumed.step()).toMatchObject({ [direction]: 1, dropped: 0 });
       expect(deliveredIds()).toEqual([...pending.map(event => event.id), next.id]);
       expect(await resumed.step()).toEqual({ toRemote: 0, toLocal: 0, dropped: 0 });
+      await resumed.stop();
       expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))[direction].offset).toBe(source.latestOffset());
     } finally { await resumed.stop(); }
   });
@@ -1579,7 +1591,8 @@ describe("mesh bridge", () => {
     const before = fs.readFileSync(cursorPath, "utf8");
     const recovered = await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
     expect(await first.bridge.step()).toMatchObject({ toRemote: 1 });
-    // A crash after the publish, before the cursor save: the cursor file is the older one.
+    // Retire test timers, then restore the exact pre-stop crash-time checkpoint.
+    await first.bridge.stop();
     fs.writeFileSync(cursorPath, before);
 
     const toAgent = new PassThrough();
@@ -1603,12 +1616,15 @@ describe("mesh bridge", () => {
       expect(on(first.far, "fabric.control.command")).toHaveLength(1);
       const fresh = await first.hub.publish({ topic: "fabric.control.command", kind: "steer", from: lane.identity, to: forgeRoot.hostId, data: command(forgeRoot.identity.id, lane.hostId) });
       expect(await second.step()).toMatchObject({ toRemote: 1 });
+      expect(recoverySeen?.has(fresh.id)).toBe(true); // Retained until a real durability barrier.
+      await second.stop();
       expect(recoverySeen?.has(recovered.id)).toBe(true); // No blanket recovery-set clear.
       expect(recoverySeen?.has(fresh.id)).toBe(false);
       expect(on(first.far, "fabric.control.command").map((event) => (event.data as { bridge: { id: string } }).bridge.id))
         .toEqual([recovered.id, fresh.id]);
     } finally {
       Set.prototype.add = add;
+      await second.stop();
     }
   });
 
@@ -2410,7 +2426,8 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
 
     expect(await bridge.step()).toMatchObject({ toLocal: 60, dropped: 0 });
     expect(crossed()).toEqual(Array.from({ length: 60 }, (_, index) => `w${index + 1}`));
-    expect(savedAfter()).toBe(sequenceOf("w60")); // durable, and not past the first deferred event
+    await waitForBridgeCheckpoint(cursorPath, cursor => cursor.toLocal.after === sequenceOf("w60"));
+    expect(savedAfter()).toBe(sequenceOf("w60")); // durable within the interval, never past the deferred event
     expect(rateLines()).toEqual([expect.stringMatching(
       /^toLocal: factory rate bound \(30\/min, burst 60; 524288 bytes\/min, burst 1048576\): 1 deferrals; waiting at fleet\.work\.smarty-dev\.61 \S+, retry in 2000 ms; nothing dropped$/)]);
 
@@ -2423,6 +2440,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
     expect(tail).toHaveBeenCalledTimes(1);
     expect(crossed().at(-1)).toBe("w61");
+    await waitForBridgeCheckpoint(cursorPath, cursor => cursor.toLocal.after === sequenceOf("w61"));
     expect(savedAfter()).toBe(sequenceOf("w61"));
     expect(rateLines()).toHaveLength(1); // the second deferral, within the minute, is counted, not logged
 
@@ -2714,6 +2732,7 @@ describe("pi-fabric#876 security pass (round 3)", () => {
       `toRemote: dropped idempotency conflict sequence ${conflict.sequence} event ${conflict.id} key reused-command-key`,
     ]);
     expect(logs.join(" ")).not.toContain("edited private body");
+    await waitForBridgeCheckpoint(cursorPath, cursor => cursor.toRemote.after === next.sequence);
     expect(JSON.parse(fs.readFileSync(cursorPath, "utf8")).toRemote.after).toBe(next.sequence);
     const later = await publishCommand("after-conflict-key", "still live");
     expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });

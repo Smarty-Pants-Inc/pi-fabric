@@ -95,7 +95,7 @@ type ChildState = {
 };
 type HoldInterval = { began: string; ended: string };
 type ScenarioObservation = {
-  result: Record<string, unknown>;
+  result: Record<string, unknown> & { ingressSequence: number };
   heldPct: number;
   progressAtMs: number | undefined;
   intervals: HoldInterval[];
@@ -176,12 +176,10 @@ const native = async (mesh: MeshStore, id: string): Promise<MeshIdentity> => {
   return identity;
 };
 
-const progressFor = (mesh: MeshStore, cursorPath: string, sequence: number, text: string): boolean => {
-  let cursor: { toLocal?: { after?: number } } | undefined;
-  try { cursor = JSON.parse(fs.readFileSync(cursorPath, "utf8")) as typeof cursor; } catch { return false; }
-  if ((cursor?.toLocal?.after ?? 0) < sequence) return false;
-  return mesh.read({ topic: "fleet.work.hold", limit: 1000 }).some(event => event.text === text);
-};
+// Keep the existing ingress delivery budget. Cursor durability now has its own
+// five-second interval/stop contract; it must not redefine delivery/fairness latency.
+const progressFor = (mesh: MeshStore, text: string): boolean =>
+  mesh.read({ topic: "fleet.work.hold", limit: 1000 }).some(event => event.text === text);
 
 const holdShare = (intervals: HoldInterval[], from: bigint, durationMs: number): { heldMs: number; heldPct: number } => {
   const until = from + BigInt(durationMs) * 1_000_000n;
@@ -336,7 +334,7 @@ async function runScenario(): Promise<ScenarioObservation> {
   const observationEnd = scenarioStartedPerf + OBSERVATION_WINDOW_MS;
   let progressAtMs: number | undefined;
   while (performance.now() < scenarioEndPerf) {
-    if (progressFor(hub, cursorPath, ingress.sequence, ingressText)) {
+    if (progressFor(hub, ingressText)) {
       progressAtMs = performance.now() - scenarioStartedPerf;
       break;
     }
@@ -407,13 +405,15 @@ it.skipIf(process.platform === "win32" || (
       run: runScenario,
       heldPct: observation => observation.heldPct,
       report: (record, invalid) => console.log(fairnessAttemptLine(record, invalid, record.observation.result)),
-      verify: async ({ meshBridge, runner, intervals, sqliteBusyBegins, sqliteWrites }) => {
+      verify: async ({ meshBridge, runner, intervals, sqliteBusyBegins, sqliteWrites, result }) => {
         restoreExec?.();
         restoreExec = undefined;
         await meshBridge.stop();
         bridge = undefined;
         await withTimeout(runner, 10_000, "bridge shutdown");
         bridgeRun = undefined;
+        const saved = JSON.parse(fs.readFileSync(meshBridge.options.cursorPath, "utf8"));
+        expect(saved.toLocal.after).toBeGreaterThanOrEqual(result.ingressSequence);
         expect(intervals).toHaveLength(WORKER_PUBLICATIONS);
         expect(sqliteBusyBegins, "the real intermittent SQLite writer must refuse the held ingress BEGIN IMMEDIATE")
           .toBeGreaterThan(0);
@@ -426,7 +426,7 @@ it.skipIf(process.platform === "win32" || (
         expect(heldPct, "production-shaped publishers must hold canonical .lock for 50–70% of the measured scenario")
           .toBeLessThanOrEqual(70);
         expect(progressAtMs ?? Number.POSITIVE_INFINITY,
-          `toLocal ingress must have a durable destination event and cursor checkpoint within ${OBSERVATION_WINDOW_MS} ms`)
+          `toLocal ingress must have a durable destination event within ${OBSERVATION_WINDOW_MS} ms; cursor flushes within its checkpoint interval or stop`)
           .toBeLessThanOrEqual(OBSERVATION_WINDOW_MS);
       },
     });

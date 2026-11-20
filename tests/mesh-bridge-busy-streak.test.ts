@@ -100,7 +100,17 @@ const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Er
       log?.(message);
     } });
   let running: Promise<void> | undefined, failure: unknown;
-  cleanups.push(async () => { await bridge.stop(); await running; await closeTransport?.(); hub.closeState(); far.closeState(); });
+  cleanups.push(async () => {
+    await bridge.stop();
+    await running;
+    // Delivery no longer fsyncs eagerly; the stop barrier must persist every confirmed prefix.
+    if ((inbound ? hub : far).read({ topic: TOPIC, after: 0 }).length) {
+      expect(JSON.parse(fs.readFileSync(cursorPath, "utf8"))[direction].after).toBe(sent.sequence);
+    }
+    await closeTransport?.();
+    hub.closeState();
+    far.closeState();
+  });
   await bridge.start();
   const sent = await (inbound ? far : hub).publish({ topic: TOPIC, kind: "ask", from: inbound ? receiver : sender,
     to: inbound ? sender.id : receiver.id, text: "deliver once" });
@@ -134,7 +144,7 @@ type Fixture = Awaited<ReturnType<typeof fixture>>;
 const assertDelivered = (f: Fixture) => {
   expect(f.failure()).toBeUndefined();
   expect(f.received()).toMatchObject([{ text: "deliver once", verification: "bridge", data: { bridge: { id: f.sent.id } } }]);
-  expect(f.cursor()).toBe(f.sent.sequence);
+  // The fixture checks the durable cursor after stop, not before the coalescing interval.
 };
 const summary = (count: number, elapsed: number, first: string, last: string) =>
   `; ${count} failed direction attempts, elapsed ${elapsed} ms; first=${first}; last=${last}; retainedOffLockMs=0`;

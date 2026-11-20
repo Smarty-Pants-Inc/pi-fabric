@@ -466,6 +466,9 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
     const started = performance.now();
     await waitFor(() => f.stallAlarms().length > 0, stallAfterMs + 2_000);
     expect(performance.now() - started).toBeLessThan(stallAfterMs + 2_000);
+    // This deliberately short stall window is below the checkpoint interval. The
+    // moving peer's confirmed prefix becomes durable when the failed run closes.
+    await waitFor(() => f.bridge.exitCode !== null);
     const after = cursor();
     expect(after[direction].after).toBe(before[direction].after);
     expect(after[opposite].after).toBeGreaterThan(before[opposite].after);

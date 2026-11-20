@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  BRIDGE_LEASE_MS, BridgeMirrorDeferredError, BridgeOwnershipError, MeshBridge, RemoteBridgeSide,
+  BRIDGE_CURSOR_CHECKPOINT_MS, BRIDGE_LEASE_MS, BridgeMirrorDeferredError, BridgeOwnershipError, MeshBridge, RemoteBridgeSide,
   serveBridgeAgent, StoreBridgeSide, type BridgePresence, type BridgePublish, type BridgeSide,
 } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -27,8 +27,8 @@ const deferred = <T,>() => {
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
 };
-const until = async (check: () => boolean) => {
-  const deadline = performance.now() + 4_000;
+const until = async (check: () => boolean, timeoutMs = 4_000) => {
+  const deadline = performance.now() + timeoutMs;
   while (!check() && performance.now() < deadline) await sleep(5);
   expect(check(), "bounded bridge observation").toBe(true);
 };
@@ -263,6 +263,7 @@ describe("fixed1s retained membership safety wakes", () => {
       expect(f.delivered).toHaveLength(1);
       expect(f.delivered[0]).toMatchObject({ from: { id: sid("safety-lane") },
         data: { commandId: "fixed1s-retained", bridge: { from: "far", id: "fixed1s-retained-command" } } });
+      await vi.advanceTimersByTimeAsync(BRIDGE_CURSOR_CHECKPOINT_MS);
       expect(f.cursor().toLocal.after).toBe(1);
       await vi.advanceTimersByTimeAsync(1);
       expect(f.delivered).toHaveLength(1);
@@ -277,6 +278,7 @@ describe("fixed1s retained membership safety wakes", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await new Promise<void>(resolve => setImmediate(resolve)); // the drain yields after its durable checkpoint
     expect(f.delivered).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(BRIDGE_CURSOR_CHECKPOINT_MS);
     expect(f.cursor().toLocal.after).toBe(1);
     expect(f.logs.some(line => line.includes("safety wakes advancing retained boundaries 1"))).toBe(true);
     expect(f.failure()).toBeUndefined();
@@ -357,7 +359,7 @@ describe("canonical membership admission while mirrors are deferred", () => {
         from: newcomer, to: f.lead.id, data: { bridge: { from: "elsewhere", id: "intentional-work-echo" } } });
       const echoId = events(f.far).find(event => event.sequence === echo.sequence)!.id;
       const barrier = await f.far.publish({ topic: "unrelated", kind: "barrier", from: newcomer });
-      await until(() => f.cursor().toLocal.after >= barrier.sequence);
+      await until(() => f.cursor().toLocal.after >= barrier.sequence, 7_000);
       expect(f.logs.some(line => line.includes(echoId))).toBe(false);
       expect(events(f.hub).map(stampId)).toEqual(sent.map(event => event.id));
       expect(f.logs.some(line => sent.some(event => line.includes(event.id) && /dropped|refused/.test(line)))).toBe(false);
@@ -443,9 +445,10 @@ describe("canonical membership admission while mirrors are deferred", () => {
     now += BRIDGE_LEASE_MS + 1;
     await f.bridge.syncPresence();
     expect(await f.bridge.step()).toMatchObject({ toLocal: 0, dropped: 2 });
-    expect(f.cursor().toLocal.after).toBeGreaterThanOrEqual(sent[1]!.sequence);
     expect(events(f.hub)).toEqual([]);
     expect(await f.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    await f.bridge.stop();
+    expect(f.cursor().toLocal.after).toBeGreaterThanOrEqual(sent[1]!.sequence);
   });
 
   it("does not turn a late expired snapshot into sender authority or renew it by replaying the same sample", async () => {

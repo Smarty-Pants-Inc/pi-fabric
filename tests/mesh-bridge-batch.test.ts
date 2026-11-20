@@ -62,10 +62,17 @@ const perRecord = async (store: MeshStore, presence: BridgePresence, now: number
       ? now - Number(before.updatedAt) < STATE_LEASE_RENEW_MS : before.updatedAt === value.updatedAt)) continue;
     await store.put({ key: k, value, identity });
   }
+  const priorLeases = readHostLeases(store.root);
   for (const host of presence.hosts) {
     const { record, expiresAt, observedAt } = host;
     // Mirror leases carry the origin's incarnation (L2b owner review: owner-matched unlease).
     // Only sampled origins carry the required-evidence marker and this link's source observation.
+    const prior = priorLeases.get(record.id);
+    // Repeat observations are not origin lease versions. Keep the earlier confirmed
+    // deadline/source clocks rather than issuing a lease-file renewal for timestamp churn.
+    if (observedAt !== undefined && prior?.mirror && prior.startedAt === record.startedAt &&
+      prior.identityId === record.identity.id && prior.mirror.sourceUpdatedAt === record.updatedAt &&
+      prior.mirror.sourceExpiresAt === expiresAt && until(host) >= prior.expiresAt && now < prior.expiresAt) continue;
     writeHostLease(store.root, { id: record.id, rootId: record.rootId, identityId: record.identity.id, startedAt: record.startedAt,
       updatedAt: observedAt === undefined ? Math.min(record.updatedAt, now) : record.updatedAt, expiresAt: until(host),
       ...(observedAt === undefined ? {} : { mirrorLease: 1, mirror: { remoteHost: "forge", observedAt: now, sourceObservedAt: observedAt,

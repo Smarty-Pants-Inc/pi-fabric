@@ -6,7 +6,7 @@ import type {
   NatsCarrierRecord, NatsPresenceEntry,
 } from "../../src/mesh/bridge-nats-carrier.js";
 import type {
-  BridgeNatsMirrorSet, BridgeNatsPort, BridgeNatsPortDelivery, BridgeNatsPortResolved, BridgeNatsPresenceRecord, BridgeNatsPresenceView,
+  BridgeNatsEventRefusal, BridgeNatsMirrorSet, BridgeNatsPort, BridgeNatsPortDelivery, BridgeNatsPortResolved, BridgeNatsPresenceRecord, BridgeNatsPresenceView,
 } from "../../src/mesh/bridge-nats-types.js";
 import type { MeshIdentity } from "../../src/mesh/store.js";
 import { TransportUncertainError, type TransportEnvelope, type TransportSent } from "../../src/transport/types.js";
@@ -22,6 +22,11 @@ export const linkIdentity: MeshIdentity = { id: `bridge:${LINK}`, name: "mesh-br
 
 /** In-memory carrier ledger with L3's claim table (bridge-nats-ledger.ts claim + bridgeNatsClaimAction). */
 export class MemoryLedger implements NatsCarrierLedger {
+  readonly refusals = new Map<string, BridgeNatsEventRefusal>();
+  refusal(eventId: string): BridgeNatsEventRefusal | undefined { return this.refusals.get(eventId); }
+  async refuse(eventId: string, refusal: BridgeNatsEventRefusal): Promise<void> {
+    if (!this.refusals.has(eventId)) this.refusals.set(eventId, { ...refusal });
+  }
   readonly records = new Map<string, NatsCarrierRecord>();
   readonly settled = new Map<string, NatsCarrierOutcome>();
   readonly sentKeys = new Set<string>();

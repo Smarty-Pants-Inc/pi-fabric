@@ -204,12 +204,13 @@ export class BridgeDeliveryAgeMonitor {
   }
 
   /** Track one destination append without making telemetry part of the publish result path. */
-  async track<T extends { sequence: number; createdAt?: number }>(direction: BridgeDeliveryDirection, event: DeliveryAgeEvent,
+  async track<T extends { sequence: number; createdAt?: number; kind?: "refused" }>(direction: BridgeDeliveryDirection, event: DeliveryAgeEvent,
     publish: () => Promise<T>, cursorLagSequences = 0): Promise<T> {
     const receipt = this.begin(direction, event, cursorLagSequences);
     try {
       const result = await publish();
-      receipt?.complete(result.createdAt);
+      if (result.kind === "refused") receipt?.cancel();
+      else receipt?.complete(result.createdAt);
       return result;
     } catch (error) {
       receipt?.cancel();

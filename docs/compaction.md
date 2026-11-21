@@ -25,7 +25,21 @@ Configure Pi's continuity tail in Pi's `settings.json`:
 }
 ```
 
-Use `{ "compaction": { "engine": "pi" } }` to disable the Fabric engine.
+Use `{ "compaction": { "engine": "pi" } }` to disable the Fabric engine,
+including its threshold vetoes. Existing provider hooks such as better-compaction
+can supply the summary; when they yield, Pi runs its default summarizer. Fabric
+no longer generates a separate oversized-kept-tail summary or writes synthetic
+`fabric.kept-tail-boundary` entries. Historical journal entries remain readable;
+Pi owns native projection repair.
+
+The existing `fabric.session.compaction_failed` alarm reports terminal failures,
+including cancellations whose context is still live and not revoked. Pi pin
+`05254d40` does not distinguish an extension veto from owner cancellation in
+that event, so the alarm says **owner cancellation or extension veto**, not which
+extension vetoed or why. A revoked context stays quiet. Publication is best effort:
+only a resolved publish latches a `(sessionId, reason)` pair, and session validity
+is rechecked afterward. Failed publication schedules no retry; a later failure
+event can publish again. Concurrent observations may publish duplicates.
 
 `/fabric settings` also exposes a **Threshold** for the active model. It
 supports two modes: a window-occupancy percent or an exact token count

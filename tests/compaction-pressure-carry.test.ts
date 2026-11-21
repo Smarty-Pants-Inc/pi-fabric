@@ -225,7 +225,7 @@ describe("headroom trigger", () => {
     await expect(compactAtConfiguredThreshold(context, structuredClone(DEFAULT_FABRIC_CONFIG))).resolves.toBe(false);
   });
 
-  it("does not defer Pi's threshold compaction once the reserve is breached", () => {
+  it("never defers the pi engine's threshold compaction, with or without a reserve", () => {
     let handler: ((event: SessionBeforeCompactEvent, context: ExtensionContext) => unknown) | undefined;
     const pi = {
       on(name: string, candidate: unknown) {
@@ -240,7 +240,7 @@ describe("headroom trigger", () => {
     });
     const context = { model: { provider: "anthropic", id: "sonnet", contextWindow: 100_000 } } as unknown as ExtensionContext;
     const event = { reason: "threshold", preparation: { tokensBefore: 80_000 }, branchEntries: [] } as unknown as SessionBeforeCompactEvent;
-    expect(handler?.(event, context)).toEqual({ cancel: true });
+    expect(handler?.(event, context)).toBeUndefined();
     reserve = 30_000;
     expect(handler?.(event, context)).toBeUndefined();
   });

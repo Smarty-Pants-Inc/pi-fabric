@@ -78,15 +78,16 @@ describe("lazy compaction registration", () => {
     expect(loaded).toHaveBeenCalledTimes(1);
   });
 
-  it("preserves threshold cancellation even when Pi is the selected engine", async () => {
-    const h = await harness({ getEngine: () => "pi", getThresholdTokens: () => 2000 });
-    expect(await h.emit("session_before_compact", compactEvent({ reason: "threshold" }))).toEqual({ cancel: true });
-    expect(await h.emit("session_before_compact", compactEvent({ reason: "manual" }))).toBeUndefined();
-    expect(loaded).toHaveBeenCalledTimes(1);
+  it("leaves Pi's engine free of Fabric thresholds and engine loading", async () => {
+    const h = await harness({ getEngine: () => "pi", getThresholdTokens: () => { throw new Error("Fabric threshold read"); } });
+    for (const reason of ["threshold", "manual", "overflow"]) {
+      expect(await h.emit("session_before_compact", compactEvent({ reason }))).toBeUndefined();
+    }
+    expect(loaded).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("carries lazy veto provenance and the actual operation signal (aborted=%s)", async (aborted) => {
-    const h = await harness({ getEngine: () => "pi", getThresholdTokens: () => 2000 });
+    const h = await harness({ getEngine: () => "fabric", getThresholdTokens: () => 2000 });
     const { takeCompactionDecline } = await import("../src/compaction/cancellation.js");
     const operation = new AbortController();
     if (aborted) operation.abort();

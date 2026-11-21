@@ -37,7 +37,7 @@ describe("model-linked compaction thresholds", () => {
       },
     } as unknown as ExtensionAPI;
     registerCompactionHook(pi, {
-      getEngine: () => "pi",
+      getEngine: () => "fabric",
       getThresholdContextRatio: (key) => key === "anthropic/sonnet" ? 0.8 : undefined,
     });
     const context = {
@@ -46,14 +46,15 @@ describe("model-linked compaction thresholds", () => {
     const event = {
       reason: "threshold",
       preparation: { tokensBefore: 70_000 },
-      branchEntries: [],
+      branchEntries: [{ type: "message", id: "user", parentId: null, timestamp: "2026-11-21T00:00:00Z",
+        message: { role: "user", content: "Continue the task", timestamp: 1 } }],
     } as unknown as SessionBeforeCompactEvent;
 
     expect(handler?.(event, context)).toEqual({ cancel: true });
     expect(handler?.({ ...event, preparation: { tokensBefore: 80_000 } } as SessionBeforeCompactEvent, context))
-      .toBeUndefined();
+      .toHaveProperty("compaction");
     expect(handler?.({ ...event, reason: "overflow" } as SessionBeforeCompactEvent, context))
-      .toBeUndefined();
+      .toHaveProperty("compaction");
   });
 
   it("compacts when token usage reaches a configured token threshold", async () => {
@@ -89,7 +90,7 @@ describe("model-linked compaction thresholds", () => {
       },
     } as unknown as ExtensionAPI;
     registerCompactionHook(pi, {
-      getEngine: () => "pi",
+      getEngine: () => "fabric",
       getThresholdTokens: (key) => key === "anthropic/sonnet" ? 150_000 : undefined,
       // A configured token threshold takes precedence: this ratio is ignored.
       getThresholdContextRatio: () => 0.25,
@@ -100,14 +101,15 @@ describe("model-linked compaction thresholds", () => {
     const event = {
       reason: "threshold",
       preparation: { tokensBefore: 120_000 },
-      branchEntries: [],
+      branchEntries: [{ type: "message", id: "user", parentId: null, timestamp: "2026-11-21T00:00:00Z",
+        message: { role: "user", content: "Continue the task", timestamp: 1 } }],
     } as unknown as SessionBeforeCompactEvent;
 
     expect(handler?.(event, context)).toEqual({ cancel: true });
     expect(handler?.({ ...event, preparation: { tokensBefore: 150_000 } } as SessionBeforeCompactEvent, context))
-      .toBeUndefined();
+      .toHaveProperty("compaction");
     expect(handler?.({ ...event, reason: "overflow" } as SessionBeforeCompactEvent, context))
-      .toBeUndefined();
+      .toHaveProperty("compaction");
   });
 
   it("does not compact below threshold or for an unconfigured model", async () => {

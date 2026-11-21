@@ -60,28 +60,58 @@ describe("Fabric-hosted compaction recovery", () => {
   });
 
   // smarty-dev#17478/#9271: alarm publication is not a retry completion or an idle edge.
-  it("deduplicates concurrent failures before publication finishes without signaling recovery", async () => {
+  it("allows concurrent publications, then deduplicates only after success without signaling recovery", async () => {
     const h = harness(false);
     let finish!: () => void;
     h.alarm.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
     const pending = h.failure();
     await h.failure({ errorMessage: "another failure" });
-    expect(h.alarm).toHaveBeenCalledOnce();
+    expect(h.alarm).toHaveBeenCalledTimes(2);
     expect(h.retryEnded).not.toHaveBeenCalled();
     finish(); await pending; await h.failure();
     await vi.runOnlyPendingTimersAsync();
-    expect(h.alarm).toHaveBeenCalledOnce(); expect(h.retryEnded).not.toHaveBeenCalled();
+    expect(h.alarm).toHaveBeenCalledTimes(2); expect(h.retryEnded).not.toHaveBeenCalled();
     expect(h.compact).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each([{ aborted: true }, { errorMessage: "Compaction failed: Already compacted" },
-    { errorMessage: "Nothing to compact (session too small)" }, { errorMessage: "Compaction cancelled" },
-    { errorMessage: "Auto-compaction failed: Compaction cancelled" },
-    { errorMessage: "Context overflow recovery failed: Already compacted" }])("ignores owner cancellation, extension veto or benign no-op: %j", async extra => {
+  it.each([{ errorMessage: "Compaction failed: Already compacted" },
+    { errorMessage: "Nothing to compact (session too small)" },
+    { errorMessage: "Context overflow recovery failed: Already compacted" }])("ignores benign no-ops: %j", async extra => {
     const h = harness(); await h.failure(extra); await vi.runOnlyPendingTimersAsync();
     expect(h.compact).not.toHaveBeenCalled(); expect(h.alarm).not.toHaveBeenCalled();
     expect(h.retryEnded).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
     await h.failure(); expect(h.alarm).toHaveBeenCalledOnce();
+  });
+
+  // smarty-dev#21393 (c): Pi's veto and owner-cancel events are indistinguishable.
+  it.each([
+    { aborted: true, errorMessage: undefined, fromExtension: false },
+    { errorMessage: "Compaction cancelled" },
+    { errorMessage: "Auto-compaction failed: Compaction cancelled" },
+  ])("alarms on a possible veto without inventing its cause: %j", async extra => {
+    const h = harness(); await h.failure(extra);
+    expect(h.alarm).toHaveBeenCalledWith(expect.objectContaining({
+      error: "Compaction cancelled: owner cancellation or extension veto (Pi does not expose the cause)",
+    }), h.context);
+    expect(h.compact).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("deduplicates each session/reason pair, not just the latest reason", async () => {
+    const h = harness();
+    for (const reason of ["threshold", "overflow", "threshold", "manual", "overflow", "manual"]) {
+      await h.failure({ reason });
+    }
+    expect(h.alarm.mock.calls.map(([data]) => data.reason)).toEqual(["threshold", "overflow", "manual"]);
+  });
+
+  it("does not latch a publication for a session that changed while awaiting it", async () => {
+    const h = harness();
+    let finish!: () => void;
+    h.alarm.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    const pending = h.failure(); h.session("Main-B");
+    finish(); await pending;
+    h.session("Main-A"); await h.failure();
+    expect(h.alarm).toHaveBeenCalledTimes(2);
   });
 
   it("does nothing while disabled, then reports a fresh enabled failure", async () => {
@@ -125,10 +155,11 @@ describe("Fabric-hosted compaction recovery", () => {
       return Promise.reject(new Error("mesh unavailable"));
     });
     await expect(h.failure()).resolves.toBeUndefined();
-    await h.failure(); await h.emit("agent_settled"); await vi.runOnlyPendingTimersAsync();
+    await h.emit("agent_settled"); await vi.runOnlyPendingTimersAsync();
     expect(h.alarm).toHaveBeenCalledOnce(); expect(h.compact).not.toHaveBeenCalled();
     expect(h.retryEnded).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
-    await h.emit("session_compact"); await h.failure();
+    await h.failure(); // A genuine later event can publish: rejection did not latch.
+    await h.failure();
     expect(h.alarm).toHaveBeenCalledTimes(2);
   });
 });

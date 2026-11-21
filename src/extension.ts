@@ -1492,7 +1492,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
 
   // Deterministic, LLM-free compaction is registered unconditionally and is
   // active by default. The documented "pi" escape hatch returns early so
-  // pi-core's own summarization proceeds normally.
+  // existing provider hooks (including better-compaction) and Pi's default can proceed.
   registerLazyCompactionHook(pi, {
     getEngine: () =>
       state.cwd

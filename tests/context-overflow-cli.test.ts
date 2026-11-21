@@ -13,10 +13,9 @@ import {
 
 // smarty-dev#19998 FixB: trust-boundary/data-safety proof through real native CLI + built Fabric.
 // Expected skip: ordinary SDK runs use npm Pi 1.1, which predates native repair-only continuation.
-// The parent MUST run both explicit repair modes against frozen built artifacts:
-// - summary-cut: UNPATCHED installed 741 CLI + built Fabric (2,700,000 bytes, 3 MiB, small-only).
-// - context-edit: compiled native candidate + built Fabric (3 MiB, small-only).
-// FABRIC_OVERFLOW_REAL_CLI=1 FABRIC_OVERFLOW_REPAIR_MODE=summary-cut|context-edit \
+// The parent must run native context-edit repair against frozen built artifacts.
+// Fabric no longer supplies an oversized-kept-tail summary/cut fallback.
+// FABRIC_OVERFLOW_REAL_CLI=1 \
 //   FABRIC_OVERFLOW_PI_CLI=<installed-or-candidate>/dist/cli.js FABRIC_OVERFLOW_EVIDENCE_DIR=<private-dir> \
 //   bunx vitest run tests/context-overflow-cli.test.ts
 // Optional FABRIC_OVERFLOW_FABRIC_ENTRY=<pristine-clone>/dist/index.js selects an immutable RED baseline.
@@ -27,9 +26,9 @@ const fabricEntry = path.resolve(process.env.FABRIC_OVERFLOW_FABRIC_ENTRY ?? pat
 const fixture = path.join(repo, "tests/fixtures/overflow-giant-reply.ts");
 const cli = process.env.FABRIC_OVERFLOW_PI_CLI;
 const evidenceDir = process.env.FABRIC_OVERFLOW_EVIDENCE_DIR;
-const repairMode = process.env.FABRIC_OVERFLOW_REPAIR_MODE ?? "context-edit";
+const repairMode = "context-edit";
 const scenarios = [
-  ...(repairMode === "summary-cut" ? [{ name: "2.7 MB org-sized reply", bytes: 2_700_000 }] : []),
+  { name: "2.7 MB org-sized reply", bytes: 2_700_000 },
   { name: "exact 3 MiB reply", bytes: OVERFLOW_GIANT_BYTES },
   { name: "small-only counterexample", bytes: 0 },
 ];
@@ -77,7 +76,6 @@ const assertStub = (text: string, sourceId: string, bytes: number): void => {
 // Import the candidate's own public RPC client, never this repo's protocol-incompatible npm client.
 describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_CLI === "1")("real CLI context-overflow recovery", () => {
   it.each(scenarios)("$name: SAME-prompt recovery, append-only raw history and durable reopened projection", async ({ bytes: giantBytes }) => {
-    expect(["context-edit", "summary-cut"], "select one explicit repair contract, never silently accept either").toContain(repairMode);
     if (!cli) throw new Error("FABRIC_OVERFLOW_PI_CLI must name the compiled native candidate cli.js");
     for (const artifact of [cli, fabricEntry, fixture]) expect(fs.existsSync(artifact), `missing built proof input: ${artifact}`).toBe(true);
     const candidateIndex = path.join(path.dirname(cli), "index.js");
@@ -113,8 +111,7 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
     let manualPromptsBeforeReopen = 0;
     let stub = "";
     let repairEntry: RawEntry | undefined;
-    // Both repair contracts count UTF-8 JSON-serialized MODEL-FACING CONTENT, not
-    // whole-message JSON or plain text. The 50 KiB guard threshold is 51,200 such bytes.
+    // Native repair counts UTF-8 JSON-serialized model-facing content, not whole-message JSON or plain text.
     // Record all three measures so the original 2.7 MB text payload remains unambiguous.
     const serializedToolBytes = () => Buffer.byteLength(JSON.stringify(originalGiant!.message), "utf8");
     const serializedContentBytes = () => Buffer.byteLength(JSON.stringify(originalGiant!.message!.content), "utf8");
@@ -233,7 +230,7 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
               event("content_block_stop", { index });
             }
           } else {
-            // Never manufacture the byte/source omission stub here: the real guard must add it.
+            // Never manufacture the byte/source omission stub here: native repair must add it.
             const reply = summary ? `## Goal\n${PROMPT}\n## Progress\nThe tools completed. Raw results are retained in the session file.\n## Next Steps\nAnswer the original user without asking for another prompt.`
               : phase === "reopen" ? REOPEN_ANSWER : ANSWER;
             event("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
@@ -293,7 +290,7 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
       // provider with full tool text, not win by proactive compaction before the injected 400.
       fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: true } }));
       // Use Pi's native kept-tail selector, not Fabric's existing cut planner: the latter can drop the giant
-      // before retry and hide the retained-oversize RED this fixture is meant to exercise in both modes.
+      // before retry and hide the retained-oversize RED this fixture is meant to exercise.
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ fullCodeMode: false, autoReload: false,
         compaction: { engine: "pi" }, mesh: { enabled: false }, mcp: { enabled: false }, jev: { enabled: false }, memory: { enabled: false }, records: { enabled: false },
         prewalk: { enabled: false, alwaysRearm: false }, entropy: { compile: false }, speculation: { enabled: false } }));
@@ -331,7 +328,7 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
       assertPrefix(afterRecovery);
       const raw = parseEntries(afterRecovery);
       expect(raw.filter(entry => entry.type === "message" && entry.message?.role === "user")).toHaveLength(1);
-      if (repairMode === "context-edit") {
+      {
         const edits = raw.filter(entry => entry.type === "context_edit" && entry.targetId === originalGiant!.id);
         expect(edits.length, "append-only giant result replacement").toBeGreaterThan(0);
         repairEntry = edits.at(-1)!;
@@ -343,21 +340,6 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
           "same correlated tool result with the exact durable replacement content").toBe(stub);
         expect(recovered[0]!.toolUses).toContain(GIANT_CALL);
         expect(recovered[0]!.toolResults.find(tool => tool.id === SMALL_CALL)?.text).toBe(OVERFLOW_SMALL_TEXT);
-      } else {
-        // On the UNPATCHED installed runtime, Fabric advances the cut past the entire
-        // assistant call/results group and appends the source/byte stub to native compact()'s summary.
-        expect(raw.some(entry => entry.type === "context_edit" && entry.targetId === originalGiant!.id),
-          "summary-cut mode must not pass by accidentally testing native context-edit repair").toBe(false);
-        repairEntry = raw.filter(entry => entry.type === "compaction").at(-1);
-        expect(repairEntry, "a genuine durable compaction, not merely a transient context hook").toBeDefined();
-        stub = summaryStub();
-        expect(repairEntry!.summary).toContain(stub);
-        const cut = raw.findIndex(entry => entry.id === repairEntry!.firstKeptEntryId);
-        expect(cut, "cut follows the giant result and every sibling result of its assistant call").toBeGreaterThan(
-          Math.max(raw.findIndex(entry => entry.id === originalGiant!.id), raw.findIndex(entry => entry.id === originalSmall!.id)));
-        expect(recovered[0]!.hasSourceStub).toBe(true);
-        expect(recovered[0]!.toolUses).not.toContain(GIANT_CALL);
-        expect(recovered[0]!.toolResults.some(tool => tool.id === GIANT_CALL)).toBe(false);
       }
       expect(raw.findIndex(entry => entry.id === repairEntry!.id)).toBeGreaterThan(parseEntries(prefix!).length - 1);
       checks.appendOnlyRepair = true;
@@ -377,15 +359,8 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
       expect(reopenedEntries.find(entry => entry.id === repairEntry!.id)).toEqual(repairEntry);
       const projected = await reopened.getMessages();
       const projectedGiant = projected.find(message => message.role === "toolResult" && message.toolCallId === GIANT_CALL);
-      if (repairMode === "context-edit") {
-        expect(projectedGiant?.role).toBe("toolResult");
-        expect(textOf(projectedGiant && "content" in projectedGiant ? projectedGiant.content : undefined)).toBe(stub);
-      } else {
-        expect(projectedGiant).toBeUndefined();
-        // getMessages exposes the pre-conversion AgentMessage; compaction summaries store text in `summary`.
-        expect(projected.some(message => message.role === "compactionSummary" && message.summary.includes(stub))).toBe(true);
-        expect(projected.some(message => message.role === "assistant" && message.content.some(part => part.type === "toolCall" && part.id === GIANT_CALL))).toBe(false);
-      }
+      expect(projectedGiant?.role).toBe("toolResult");
+      expect(textOf(projectedGiant && "content" in projectedGiant ? projectedGiant.content : undefined)).toBe(stub);
       expect(JSON.stringify(projected)).not.toContain("G".repeat(4096));
       const beforeReopenPrompt = fs.readFileSync(sessionFile);
       expect(beforeReopenPrompt.subarray(0, afterRecovery.length).equals(afterRecovery), "reopen does not rewrite prior history").toBe(true);
@@ -398,14 +373,8 @@ describe.runIf(process.platform === "linux" && process.env.FABRIC_OVERFLOW_REAL_
       const replay = requests.filter(row => row.kind === "reopened");
       expect(replay).toHaveLength(1);
       expect(replay[0]!.hasReopenPrompt).toBe(true);
-      if (repairMode === "context-edit") {
-        expect(replay[0]!.toolResults.find(tool => tool.id === GIANT_CALL)?.text).toBe(stub);
-        expect(replay[0]!.toolResults.find(tool => tool.id === SMALL_CALL)?.text).toBe(OVERFLOW_SMALL_TEXT);
-      } else {
-        expect(replay[0]!.hasSourceStub).toBe(true);
-        expect(replay[0]!.toolUses).not.toContain(GIANT_CALL);
-        expect(replay[0]!.toolResults.some(tool => tool.id === GIANT_CALL)).toBe(false);
-      }
+      expect(replay[0]!.toolResults.find(tool => tool.id === GIANT_CALL)?.text).toBe(stub);
+      expect(replay[0]!.toolResults.find(tool => tool.id === SMALL_CALL)?.text).toBe(OVERFLOW_SMALL_TEXT);
       const afterReopen = fs.readFileSync(sessionFile);
       assertPrefix(afterReopen);
       expect(afterReopen.subarray(0, afterRecovery.length).equals(afterRecovery)).toBe(true);

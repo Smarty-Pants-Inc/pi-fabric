@@ -30,11 +30,17 @@ jobs:
       - name: CI affected set (#2017 vs 0596428c) + agents-provider in one vitest run
         shell: bash
         run: |
-          set -u
+          set +e
           files=$(for f in $(cat .github/fifo-probe-files.txt) tests/agents-provider.test.ts; do [ -f "$f" ] && echo "$f"; done)
           echo "files: $(echo "$files" | wc -l)"
-          bunx vitest run $files > "$RUNNER_TEMP/set.log" 2>&1; rc=$?
+          bunx vitest run $files > "$RUNNER_TEMP/set.log" 2>&1 && rc=0 || rc=$?
           grep -E "FAIL .*agents-provider|admits queued workers in FIFO" "$RUNNER_TEMP/set.log" | head -5
           grep -E "^ *(Test Files|Tests) " "$RUNNER_TEMP/set.log" | tail -2
           grep -E " FAIL " "$RUNNER_TEMP/set.log" | sort -u | head -20
           echo "RESULT tree=$(git rev-parse HEAD) rep=${{ matrix.rep }} rc=$rc fifo_fail=$(grep -c 'FAIL .*FIFO order' "$RUNNER_TEMP/set.log")"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: set-log-${{ matrix.rep }}
+          path: ${{ runner.temp }}/set.log
+          retention-days: 3

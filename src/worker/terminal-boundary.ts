@@ -6,7 +6,7 @@ import { REPLY_TOOL_NAME } from "../core/reply-tool-identity.js";
 import { followUpFile, followUpState } from "../agents/follow-up-delivery.js";
 import { queuedTerminalControls, settleTerminalControl, terminalControlInputId } from "./terminal-controls.js";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { finalAssistantText, readFinalAnswerReceipt, saveFinalAnswerReceipt, type FinalAnswerReceipt } from "./terminal-answer.js";
+import { assistantAnswerEvidence, finalAssistantText, readFinalAnswerReceipt, saveFinalAnswerReceipt, type FinalAnswerReceipt } from "./terminal-answer.js";
 
 /** Task-only ingress fence, installed before native RPC attaches its JSONL reader.
  * Session wrappers alone cannot fence compact/queue-mode/UI RPC handlers. Filter
@@ -64,6 +64,8 @@ export const installTerminalAnswerBoundary = (session: AgentSession, runDirector
   // native attempt establishes recovery. Inherited parent transcript errors do
   // not authorize continuation of an ordinary task after its final answer.
   let recovering = resuming;
+  let latestAssistant: unknown;
+  const unresolvedToolCalls = new Set<string>();
   const hasPendingFollowUpAdmission = (): boolean => queuedTerminalControls(runDirectory).some(control => {
     if (control.delivery !== "followUp") return false;
     const file = followUpFile(runDirectory, control.id);
@@ -125,8 +127,11 @@ export const installTerminalAnswerBoundary = (session: AgentSession, runDirector
   const queueFollowUp = agent.followUp.bind(agent);
   agent.followUp = (...args) => { if (receipt) { discard(args[0]); session.clearQueue(); return; } rememberQueued(args[0]); queueFollowUp(...args); };
   const finishTurn = agent.finishTurn;
-  const record = (text: string): void => {
-    receipt = saveFinalAnswerReceipt(runDirectory, runId, text);
+  const record = (text: string, structuredReply = false): void => {
+    receipt = saveFinalAnswerReceipt(runDirectory, runId, text, {
+      assistant: assistantAnswerEvidence(latestAssistant, unresolvedToolCalls.size),
+      ...(structuredReply ? { structuredReply: true as const } : {}),
+    });
     session.clearQueue();
     // Synchronous child-local notification discards extension-held inputs before
     // IPC/EOF can start teardown. It is not a transport ACK or a registry sweep.
@@ -138,11 +143,13 @@ export const installTerminalAnswerBoundary = (session: AgentSession, runDirector
     // though its assistant message contains a tool call. Core's terminate:true
     // skips tool continuation but does NOT skip queue draining. Seal the reply
     // file first, then apply the same task-only native fence before that drain.
-    if (!receipt && replyFile && args[0].toolResults.some(result => result.toolName === REPLY_TOOL_NAME && !result.isError)) {
+    for (const result of args[0].toolResults) unresolvedToolCalls.delete(result.toolCallId);
+    if (!receipt && replyFile && unresolvedToolCalls.size === 0 &&
+        args[0].toolResults.some(result => result.toolName === REPLY_TOOL_NAME && !result.isError)) {
       const reply = fs.readFileSync(replyFile, "utf8");
       JSON.parse(reply); // Never seal a partial/malformed tool artifact.
       writeFileAtomic(replyFile, reply, { durable: true });
-      record("");
+      record("", true);
     }
     const decision = await finishTurn?.(...args);
     if (receipt) { session.clearQueue(); return { action: "end" }; }
@@ -150,11 +157,19 @@ export const installTerminalAnswerBoundary = (session: AgentSession, runDirector
   };
   agent.subscribe(event => {
     if (receipt) { session.clearQueue(); return; }
+    if (event.type === "message_start" && event.message.role === "assistant") latestAssistant = undefined;
+    if (event.type === "tool_execution_start") unresolvedToolCalls.add(event.toolCallId);
+    if (event.type === "tool_execution_end") unresolvedToolCalls.delete(event.toolCallId);
     if (event.type !== "message_end") return;
-    if (event.message.role === "assistant" &&
-        (event.message.stopReason === "error" || event.message.stopReason === "aborted")) recovering = true;
+    if (event.message.role === "toolResult") unresolvedToolCalls.delete(event.message.toolCallId);
+    if (event.message.role !== "assistant") return;
+    latestAssistant = event.message;
+    if (event.message.stopReason === "error" || event.message.stopReason === "aborted") recovering = true;
+    // Core returns before tool execution on error/aborted assistants. Do not
+    // retain their partial calls, or erase obligations from earlier real starts.
+    else for (const block of event.message.content) if (block.type === "toolCall") unresolvedToolCalls.add(block.id);
     const text = finalAssistantText(event.message);
-    if (text === undefined) return;
+    if (text === undefined || unresolvedToolCalls.size > 0) return;
     const nativeQueued = agent.hasQueuedMessages();
     // A held tracked input has not reached native admission yet. With no native
     // queue owning it, let turn_end/before_settle finish that admission; the

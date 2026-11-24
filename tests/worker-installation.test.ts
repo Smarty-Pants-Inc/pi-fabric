@@ -29,7 +29,7 @@ const installation = (text = "hi") => {
   const piBinary = path.join(root, "offline-pi.mjs");
   fs.writeFileSync(piBinary, [
     'process.stdin.resume();',
-    `process.stdout.write(${JSON.stringify(JSON.stringify({ type: "message_end", message: { role: "assistant", content: text } }) + "\n" + JSON.stringify({ type: "agent_settled" }) + "\n")});`,
+    `process.stdout.write(${JSON.stringify(JSON.stringify({ type: "message_end", message: { role: "assistant", content: text, stopReason: "stop" } }) + "\n" + JSON.stringify({ type: "agent_settled" }) + "\n")});`,
     'process.exit(0);',
   ].join("\n"));
   const worker = path.join(root, "dist/worker.js");

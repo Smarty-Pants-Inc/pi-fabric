@@ -1,6 +1,6 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
-// Local mirror of the context-projection helpers in pi 1.1.0
+// Local mirror of the context-projection helpers in pi 1.2.0
 // core/session-manager.js and core/messages.js. Kept identical so Fabric's
 // compaction projections match the host's without importing the host package
 // during extension load.

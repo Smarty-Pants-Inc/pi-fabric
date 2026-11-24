@@ -1054,6 +1054,8 @@ export class ActorManager {
   /** Residents publish both scopes through their one registry-fenced host heartbeat. */
   readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
   readonly #presenceRevisions = new Map<string, object>();
+  /** Only foreground recovery waits for proof of its own actor put in a committed batch. */
+  readonly #requiredPresenceCommits = new Map<string, { revision: object; committed: boolean }>();
   /** Serialized presence this instance committed through the host heartbeat. A new
    * instance (restart) starts empty, so its first full heartbeat republishes all once. */
   readonly #publishedPresence = new Map<string, string>();
@@ -2497,6 +2499,8 @@ export class ActorManager {
         for (const [id, revision] of pending) {
           // A mutation while the shared write waited belongs to the next refresh.
           if (this.#presenceRevisions.get(id) !== revision) continue;
+          const required = this.#requiredPresenceCommits.get(id);
+          if (required && required.revision === revision && written.get(id) !== undefined) required.committed = true;
           this.#pendingPresence.delete(id);
           this.#presenceRevisions.delete(id);
           this.#orphanPresence.delete(id);
@@ -3157,7 +3161,8 @@ export class ActorManager {
 
   /** smarty-dev#9890: an explicit reset is the documented repair for a hard block (auth, config,
    * unknown): it ends the block and its failure streak, so routing presence reads idle again. A
-   * transient block keeps its own expiry. Context rotation also ends a typed overflow block after
+   * transient block keeps its own expiry. Instruction re-apply uses the same rollback only for
+   * failing-preparation; it never clears other hard blocks. Context rotation also ends a typed overflow block after
    * that activation settled; it never clears auth/config/security failures. Returns an undo for a
    * reset whose commit failed; it reports whether it restored the exact prior hard block and streak
    * (never over a newer failure recorded meanwhile). */
@@ -3165,11 +3170,16 @@ export class ActorManager {
     const blocked = actor.activationBlocked;
     if (!blocked || activationBlockClass(blocked.code) !== "hard") return () => false;
     const streak = actor.failureStreak;
+    const lineage = this.#lineage(actor);
     delete actor.activationBlocked;
     delete actor.failureStreak;
     this.#armActivationBlockExpiry(actor);
     return () => {
-      if (actor.activationBlocked || actor.failureStreak) return false;
+      // Publication can reload the registry and replace the object we cleared.
+      // Restore the live generation, never a successor's custody or a newer failure.
+      const live = this.#actors.get(actor.id);
+      if (!live || this.#lineage(live) !== lineage || live.activationBlocked || live.failureStreak) return false;
+      actor = live;
       actor.activationBlocked = blocked;
       if (streak) actor.failureStreak = streak;
       this.#armActivationBlockExpiry(actor);
@@ -3406,8 +3416,27 @@ export class ActorManager {
     beforeCommit?.(actor.id);
     actor.instructions = instructions;
     actor.updatedAt = Date.now();
-    await this.#publishPresence(actor, true);
-    return this.#publicInfo(actor);
+    // smarty-dev#6829: factory re-apply refreshes instructions in place. Only a
+    // preparation block authorizes a fresh preparation attempt; never infer this
+    // from reason text or clear safety/custody/worker failures on a config write.
+    const preparationBlock = actor.activationBlocked?.code === "failing-preparation" ? actor.activationBlocked : undefined;
+    const restore = preparationBlock ? this.#clearHardBlockForReset(actor) : undefined;
+    try {
+      await this.#publishPresence(actor, true, undefined, preparationBlock !== undefined);
+    } catch (error) {
+      restore?.();
+      if (preparationBlock) {
+        logDiagnostic("src/actors/manager.ts", `[pi-fabric] actor ${actor.id} re-apply publication refused`);
+      }
+      throw error;
+    }
+    const live = this.#liveActor(actor);
+    if (preparationBlock) {
+      logDiagnostic("src/actors/manager.ts", `[pi-fabric] actor ${actor.id} re-apply cleared activation block: code=${preparationBlock.code}; reason=${preparationBlock.reason}`);
+      this.#forgetRealarm(live);
+      if (live.queue.length > 0) this.#requestDrain(live);
+    }
+    return this.#publicInfo(live);
   }
 
   tell(
@@ -9673,7 +9702,7 @@ export class ActorManager {
     }
   }
 
-  async #publishPresence(actor: ManagedActor, requireCommit = false, filterUpdate?: ActorFilterUpdate): Promise<void> {
+  async #publishPresence(actor: ManagedActor, requireCommit = false, filterUpdate?: ActorFilterUpdate, requirePresenceCommit = false): Promise<void> {
     if (!this.#canManage(actor.id) || !this.#slotCurrent(actor) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
       if (requireCommit) throw new ActorRegistryOwnershipError();
       return;
@@ -9686,7 +9715,7 @@ export class ActorManager {
     // prove its selected object/generation survived inside the commit fence.
     await this.#saveActors(new Set(), requireCommit ? { requiredActor: actor, ...(filterUpdate ? { filterUpdate } : {}) } : undefined);
     if (filterUpdate) this.#emitChange(); // the staged value is live only after the registry accepts it
-    await this.#writePresence(actor.id);
+    await this.#writePresence(actor.id, requirePresenceCommit);
   }
 
   async #publishBindingView(actor: ManagedActor): Promise<void> {
@@ -9717,17 +9746,21 @@ export class ActorManager {
   // so the mesh never keeps a stale entry or misses a new actor (smarty-dev#448).
   // Writes are serialized per id, and each reads the state only when it runs, so a write that
   // waited on the lock can never land after a newer one (a removed actor put back).
-  #writePresence(id: string): Promise<void> {
-    if (this.#presenceQueued.has(id)) return this.#presenceChains.get(id)!;
+  #writePresence(id: string, requireCommit = false): Promise<void> {
+    // A recovery acknowledgement needs its own attempt, never a coalesced best-effort write.
+    if (!requireCommit && this.#presenceQueued.has(id)) return this.#presenceChains.get(id)!;
     this.#presenceQueued.add(id);
     const previous = this.#presenceChains.get(id) ?? Promise.resolve();
     const next = previous.then(() => {
       this.#presenceQueued.delete(id);
-      return this.#writePresenceNow(id);
+      return this.#writePresenceNow(id, requireCommit);
     });
-    this.#presenceChains.set(id, next);
-    void next.finally(() => {
-      if (this.#presenceChains.get(id) === next) this.#presenceChains.delete(id);
+    // Report a refused foreground attempt to its caller without poisoning the serialized
+    // background/rollback writes behind it. #writePresenceNow already retained the retry.
+    const tracked = requireCommit ? next.catch(() => undefined) : next;
+    this.#presenceChains.set(id, tracked);
+    void tracked.finally(() => {
+      if (this.#presenceChains.get(id) === tracked) this.#presenceChains.delete(id);
     }).catch(error => this.#presenceRetries.get(id)?.failure(error));
     return next;
   }
@@ -9798,12 +9831,18 @@ export class ActorManager {
     return value;
   }
 
-  async #writePresenceNow(id: string): Promise<void> {
+  async #writePresenceNow(id: string, requireCommit = false): Promise<void> {
     if (this.#presencePublisher) {
       this.#pendingPresence.add(id);
-      this.#presenceRevisions.set(id, {});
-      try { await this.#presencePublisher.refresh(); }
-      catch (error) {
+      const revision = {};
+      this.#presenceRevisions.set(id, revision);
+      const required = requireCommit ? { revision, committed: false } : undefined;
+      if (required) this.#requiredPresenceCommits.set(id, required);
+      try {
+        await this.#presencePublisher.refresh();
+        // Clearing pending ids is not proof: ownership selection can omit this actor.
+        if (required && (!required.committed || this.#pendingPresence.has(id))) throw new Error("Actor presence publication deferred");
+      } catch (error) {
         // The failed acquisition wrote nothing. The host's next heartbeat carries
         // every pending id, with no per-actor timer, extra retry, or warning storm.
         // The class or code only: a mesh error's message can carry WAL reader diagnostics (pi-fabric#893 round 4).
@@ -9811,6 +9850,9 @@ export class ActorManager {
           const code = (error as { code?: unknown } | null)?.code;
           diagnostics.warn("src/actors/manager.ts", `[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
         }
+        if (requireCommit) throw error;
+      } finally {
+        if (required) this.#requiredPresenceCommits.delete(id);
       }
       return;
     }
@@ -9827,7 +9869,8 @@ export class ActorManager {
         .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })), this.#meshOutageAlarmMs);
       this.#presenceRetries.set(id, retry);
     }
-    if (retry.waitMs > 0) {
+    // An explicit recovery must observe a write, not acknowledge a deferred retry.
+    if (retry.waitMs > 0 && !requireCommit) {
       this.#pendingPresence.add(id);
       this.#schedulePresenceRetry();
       return;
@@ -9837,16 +9880,20 @@ export class ActorManager {
       // Retain this publication obligation; explicit recovery re-arms the existing
       // retry queue. Never advertise a row just because actors.json still has it.
       this.#pendingPresence.add(id);
+      if (requireCommit) throw new ActorRegistryOwnershipError();
       return;
     }
     if (actor && !this.#ownershipDecision(id)) {
       this.#pendingPresence.delete(id);                        // another host owns its presence
+      if (requireCommit) throw new ActorRegistryOwnershipError();
       return;
     }
+    if (!actor && requireCommit) throw new ActorRegistryOwnershipError();
     const fence = actor ? undefined : this.#orphanPresence.get(id);
     try {
       if (actor) {
         const value = this.#presenceValue(actor);
+        if (!value && requireCommit) throw new Error("Actor presence publication refused");
         if (value) {
           const publish = async () => {
             this.#assertSlotCurrent(actor);
@@ -9877,6 +9924,7 @@ export class ActorManager {
       retry.failure(error);
       this.#pendingPresence.add(id);
       this.#schedulePresenceRetry();
+      if (requireCommit) throw error;
     }
   }
 

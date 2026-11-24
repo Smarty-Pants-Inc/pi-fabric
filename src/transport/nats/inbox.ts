@@ -303,12 +303,12 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
   }
 };
 
-const authorizationFailure = (error: unknown): boolean => {
+const permanentAuthorizationFailure = (error: unknown): boolean => {
   let cause: unknown = error;
   for (let depth = 0; cause && depth < 6; depth += 1) {
     if (typeof cause === "object" && cause !== null) {
-      const candidate = cause as { readonly name?: unknown; readonly code?: unknown; readonly cause?: unknown };
-      if (candidate.name === "NatsAuthorizationError" || candidate.code === "FABRIC_NATS_AUTHORIZATION") return true;
+      const candidate = cause as { readonly name?: unknown; readonly code?: unknown; readonly retryable?: unknown; readonly cause?: unknown };
+      if (candidate.name === "NatsAuthorizationError" || candidate.code === "FABRIC_NATS_AUTHORIZATION") return candidate.retryable !== true;
       cause = candidate.cause;
     } else break;
   }
@@ -647,7 +647,7 @@ class NatsTransportImpl implements FabricTransport {
         return;
       } catch (error) {
         if (this.#closed || this.#closeController.signal.aborted) return;
-        if (authorizationFailure(error)) {
+        if (permanentAuthorizationFailure(error)) {
           this.#terminalError = error instanceof Error ? error : new Error("NATS authorization failed");
           this.#activeInbox?.controller.abort();
           this.#rejectWaiters(this.#terminalError);

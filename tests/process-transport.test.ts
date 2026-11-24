@@ -17,10 +17,12 @@ const nativeReadFileSync = fs.readFileSync;
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
+const originalArgv = [...process.argv];
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  process.argv.splice(0, process.argv.length, ...originalArgv);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -42,6 +44,8 @@ const fixture = (fullCodeMode = true) => {
   const profile = path.join(root, "profile");
   fs.mkdirSync(profile);
   vi.stubEnv("PI_CODING_AGENT_DIR", profile);
+  vi.stubEnv("SMARTY_FABRIC_PIN", undefined);
+  process.argv.splice(0, process.argv.length, process.execPath, "pi");
   const release = (name: string, version: number | undefined = WORKER_PROTOCOL_VERSION) => {
     const directory = path.join(root, name);
     fs.mkdirSync(path.join(directory, "dist"), { recursive: true });
@@ -61,6 +65,8 @@ const fixture = (fullCodeMode = true) => {
   managers.push(manager);
   return { root, cwd, profile, parent, manager, release, select };
 };
+
+const setMainArgv = (args: string[]) => process.argv.splice(0, process.argv.length, process.execPath, "pi", ...args);
 
 const probe = async (f: ReturnType<typeof fixture>, expected: string) => {
   let launched: AgentHandleInfo | undefined;
@@ -91,6 +97,46 @@ describe("process transport spawn-time Fabric release selection", () => {
     f.select(f.parent);
     await probe(f, f.parent);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { form: "-e", args: (extension: string) => ["-e", extension] },
+    { form: "--extension", args: (extension: string) => ["--extension", extension] },
+    { form: "--extension=", args: (extension: string) => [`--extension=${extension}`] },
+  ])("keeps the explicit Main Fabric release for $form", async ({ args }) => {
+    const f = fixture();
+    const current = f.release("profile-selected-with-main-pin");
+    f.select(current);
+    setMainArgv(args(path.join(f.parent, "dist/index.js")));
+    await probe(f, f.parent);
+  });
+
+  it("keeps the explicit Main Fabric release when SMARTY_FABRIC_PIN is set", async () => {
+    const f = fixture();
+    const current = f.release("profile-selected-with-env-pin");
+    f.select(current);
+    vi.stubEnv("SMARTY_FABRIC_PIN", f.parent);
+    await probe(f, f.parent);
+  });
+
+  it("recognizes a symlinked explicit Main Fabric extension", async () => {
+    const f = fixture();
+    const current = f.release("profile-selected-with-symlinked-main-pin");
+    f.select(current);
+    const alias = path.join(f.root, "parent-main-alias");
+    fs.symlinkSync(f.parent, alias, "junction");
+    setMainArgv(["--extension", path.join(alias, "dist/index.js")]);
+    await probe(f, f.parent);
+  });
+
+  it("does not pin an unrelated Main hook inside a Fabric checkout", async () => {
+    const f = fixture();
+    const current = f.release("profile-selected-with-custom-main-hook");
+    f.select(current);
+    const hook = path.join(f.parent, "custom-main-hook.mjs");
+    fs.writeFileSync(hook, "export default function () {}\n");
+    setMainArgv(["-e", hook]);
+    await probe(f, current);
   });
 
   it("selects release metadata at native launch, not when returning a queued receipt", async () => {

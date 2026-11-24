@@ -2595,6 +2595,8 @@ export class StoreBridgeSide implements BridgeSide {
       }
       if (page.length < this.store.maxReadEvents) return { ids, through: page.at(-1)?.sequence ?? cursor, done: true };
       cursor = page.at(-1)!.sequence;
+      // A legacy mark can span the whole log. Let peer replies run between bounded pages.
+      await new Promise<void>(resolve => setImmediate(resolve));
       if (ids.length >= BRIDGED_IDS_PAGE) return { ids, through: cursor, done: false };
     }
   }
@@ -3222,7 +3224,7 @@ interface DirectionCursor {
   after: number;
   /** Source byte offset, tagged with the live-log generation; old cursor files omit it. */
   offset?: number;
-  /** The destination sequence of the last event bridged in (restart dedupe starts after it). */
+  /** Destination recovery floor, saved atomically with the consumed source prefix. */
   mark: number;
   /** Optional v1 cursor extension: one retained relay boundary's local grace start. */
   relayGrace?: RelayGraceCursor;
@@ -3618,6 +3620,7 @@ export class MeshBridge {
   #factoryLoggedAt = Number.NEGATIVE_INFINITY;
   #lastCursorAfter: Partial<Record<Direction, number>> = {};
   #directionHeads: Partial<Record<Direction, number>> = {};
+  #quiescent = new Set<Direction>();
   #directionPendingSince: Partial<Record<Direction, number>> = {};
   #lastOkToRemote: number | undefined;
   #lastOkToLocal: number | undefined;
@@ -3865,6 +3868,7 @@ export class MeshBridge {
   async start(): Promise<void> {
     if (this.#stopped) throw relayUnavailable();
     this.#ready = false;
+    this.#quiescent.clear();
     this.#unaddressedRefreshMs = parseBridgeUnaddressedRefreshMs(process.env.FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS);
     if (this.#unaddressedRefreshMs !== UNADDRESSED_REFRESH_MS) {
       this.#log(`bridge: unaddressed membership refresh ${this.#unaddressedRefreshMs} ms`);
@@ -4003,6 +4007,12 @@ export class MeshBridge {
   }
 
   #save(): void {
+    // Only a drained direction can exclude destination events from restart dedupe. Reuse the
+    // opposite drain/watchdog's observed head; never add head RPCs to an otherwise idle bridge.
+    if (this.#cursor) for (const direction of this.#quiescent) {
+      const head = this.#directionHeads[direction === "toRemote" ? "toLocal" : "toRemote"];
+      if (head !== undefined) this.#cursor[direction].mark = Math.max(this.#cursor[direction].mark, head);
+    }
     fs.mkdirSync(path.dirname(this.options.cursorPath), { recursive: true, mode: 0o700 });
     writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600, durable: true });
     if (!this.#cursor) return;
@@ -4642,6 +4652,7 @@ export class MeshBridge {
     };
     const cursor = this.#cursor![direction];
     const seen = this.#seen[direction];
+    this.#quiescent.delete(direction); // Before any await: another direction's save cannot cover an in-flight receipt.
     let forwarded = 0;
     let dropped = 0;
     const retainedBoundary = this.#membershipSequence[direction];
@@ -5048,6 +5059,11 @@ export class MeshBridge {
       if (moved) checkpoint();
       if (!moved) break;
     }
+    // Every delivery/relay receipt is settled and after covers its source. Later appends remain
+    // unread; they cannot have a destination commit from this drain until it leaves quiescence.
+    this.#quiescent.add(direction);
+    const head = this.#directionHeads[direction === "toRemote" ? "toLocal" : "toRemote"];
+    if (!this.#stopped && head !== undefined && head > cursor.mark) checkpoint();
     return { forwarded, dropped };
   }
 

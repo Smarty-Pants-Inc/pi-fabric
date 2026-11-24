@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import { Worker } from "node:worker_threads";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { buildSync } from "esbuild";
-import { BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, DEFAULT_CALL_TIMEOUT_MS, MeshBridge, RemoteBridgeSide,
+import { BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeDispatchDeferredError, DEFAULT_CALL_TIMEOUT_MS, MeshBridge, RemoteBridgeSide,
   serveBridgeAgent, StoreBridgeSide, type BridgePresence, type BridgeRead } from "../src/mesh/bridge.js";
 import { serveBridgeAgentWorker } from "../src/mesh/bridge-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -338,7 +338,21 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
       const heldPresence = observe(remote.presence());
       await withTimeout(entered.promise, 2_000, "held topology service");
       const receivedAt = wall;
-      const queuedMirror = observe(remote.mirror(mirrorSample(receivedAt, bootAt)));
+      await expect(remote.mirror(mirrorSample(receivedAt, bootAt))).rejects.toMatchObject({ sent: false, reason: "traffic-in-flight" });
+      // The hub now refuses this queueing. Inject the raw RECEIVER test frame deliberately:
+      // receipt-clock conservation must still hold for old hubs and direct wire senders.
+      const queuedMirror = observe(new Promise<void>((resolve, reject) => {
+        const onReply = (chunk: unknown): void => {
+          for (const line of String(chunk).trim().split("\n")) {
+            const reply = JSON.parse(line) as { id?: number; ok?: boolean; error?: string };
+            if (reply.id !== 100_000) continue;
+            output.off("data", onReply);
+            if (reply.ok) resolve(); else reject(new Error(reply.error));
+          }
+        };
+        output.on("data", onReply);
+        input.write(`${JSON.stringify({ id: 100_000, op: "mirror", args: mirrorSample(receivedAt, bootAt) })}\n`);
+      }));
       wall += BRIDGE_LEASE_MS + 1;
       release.resolve(undefined);
       valueOf(await heldPresence);
@@ -529,16 +543,14 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     expect(DEFAULT_CALL_TIMEOUT_MS).toBe(30_000);
     const agent = await startAgent({ mode: "commit", delayMs: 35_000 });
     fs.writeFileSync(agent.armPath, "armed\n");
-    // A valid mirror mutation enters the fixture's JS Atomics.wait before its SQLite
-    // COMMIT. Its timeout is nonfatal; the following publication queues behind the worker
-    // and owns the fatal default 30 s deadline measured below.
-    const blockingMirror = observe(agent.remote.mirror(mirrorSample(Date.now())));
-    const commitEntry = await waitForJsonFile<{ threadId: number; writeChanges: number }>(agent.enteredPath, 5_000,
-      "JS Atomics.wait entry before queuing the publication");
-    expect(commitEntry.threadId).toBeGreaterThan(0);
-    expect(commitEntry.writeChanges).toBeGreaterThan(0);
+    // An independently SENT publication (no mirror) owns the unchanged fatal deadline.
+    // The JS Atomics fixture is not proof of a native COMMIT stall.
     const startedAt = performance.now();
     const pendingPublish = observe(agent.remote.publish(publish("deadline-residual")));
+    const commitEntry = await waitForJsonFile<{ threadId: number; writeChanges: number }>(agent.enteredPath, 5_000,
+      "JS Atomics.wait entry for independently sent publication");
+    expect(commitEntry.threadId).toBeGreaterThan(0);
+    expect(commitEntry.writeChanges).toBeGreaterThan(0);
 
     const closed = await withTimeout(agent.remote.closed, 34_000, "fatal default publication deadline");
     const elapsedMs = performance.now() - startedAt;
@@ -550,8 +562,7 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     expect(elapsedMs).toBeGreaterThanOrEqual(29_000);
     expect(elapsedMs).toBeLessThan(34_000);
     expect(agent.wire.countRequests("publish")).toBe(1); // fatal close; no automatic replay
-    expect(agent.wire.countRequests("mirror")).toBe(1);
-    expect((await blockingMirror).ok).toBe(false);
+    expect(agent.wire.countRequests("mirror")).toBe(0);
     expect(agent.nativeStore.read().filter(event => event.text === "deadline-residual")).toEqual([]);
     // These assertions exercise shutdown with the fixture stalled in JS Atomics.wait;
     // they do not establish a hard termination bound for a native SQLite call.
@@ -562,6 +573,28 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     console.info(`[bridge-worker-default-deadline] close=${elapsedMs.toFixed(0)}ms ` +
       `publishRequests=${agent.wire.countRequests("publish")} jsWaitCompletionMarkerAbsent=true replayed=false`);
   }, 42_000);
+
+  it("refuses publication during a worker mirror, keeps busy/ping responsive, then delivers exactly once", async () => {
+    const agent = await startAgent({ mode: "commit", delayMs: 1_500 });
+    fs.writeFileSync(agent.armPath, "armed\n");
+    const mirror = observe(agent.remote.mirror(mirrorSample(Date.now())));
+    await waitForJsonFile(agent.enteredPath, 5_000, "worker mirror JS wait entry");
+    const started = performance.now();
+    const refused = await agent.remote.publish(publish("mirror-retained")).catch(error => error);
+    expect(refused).toBeInstanceOf(BridgeDispatchDeferredError);
+    expect(refused).toMatchObject({ sent: false, reason: "mirror-pending" });
+    expect(agent.wire.countRequests("publish")).toBe(0);
+    await expect(agent.remote.watchdogPing!(1_000)).resolves.toEqual({ busy: true });
+    const busy = await agent.remote.tail(0);
+    expect(busy).toMatchObject({ events: [], through: 0, busy: true });
+    valueOf(await mirror);
+    expect(performance.now() - started).toBeGreaterThan(1_000); // real policy cost, NOT instantaneous delivery
+    await agent.remote.mirror(mirrorSample(Date.now())); // current source observation, never late-ACK renewal
+    const receipt = await agent.remote.publish(publish("mirror-retained"));
+    expect(receipt.sequence).toBeGreaterThan(0);
+    expect(agent.wire.countRequests("publish")).toBe(1);
+    expect(agent.nativeStore.read().filter(event => event.text === "mirror-retained")).toHaveLength(1);
+  }, 15_000);
 
   it("invalidates a completed empty page on a real append and preserves a cached nonempty prefix", async () => {
     const emptyAgent = await startAgent({ mode: "scan", delayMs: 1_500, maxReadEvents: 1 });

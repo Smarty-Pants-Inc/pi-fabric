@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BridgeMirrorDeferredError, RemoteBridgeSide } from "../src/mesh/bridge.js";
+import { BridgeDispatchDeferredError, BridgeMirrorDeferredError, RemoteBridgeSide } from "../src/mesh/bridge.js";
 
 // KEEP: a real RPC channel must retain one late-reply slot, then release a silent
 // transport to the existing reconnect owner; virtual time reaches the safety bound.
@@ -36,7 +36,10 @@ describe("bounded timed-out mirror gate", () => {
     const f = await fixture();
     let closed: Error | undefined;
     void f.remote.closed.then(error => { closed = error; });
-    await expect(f.remote.presence()).rejects.toBe(f.failure);
+    const deferred = await f.remote.presence().catch(error => error);
+    expect(deferred).toBeInstanceOf(BridgeDispatchDeferredError);
+    expect(deferred).toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false, reason: "mirror-pending" });
+    expect(deferred).not.toBe(f.failure); // The timed-out MIRROR and UNSENT protected call are distinct.
     await vi.advanceTimersByTimeAsync(149_999);
     expect(closed).toBeUndefined();
     expect(f.requests.filter(request => request.op === "mirror")).toHaveLength(1);

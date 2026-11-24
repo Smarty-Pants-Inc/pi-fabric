@@ -18,6 +18,13 @@ export class BridgeRelayUnavailableError extends Error {
   }
 }
 
+/** Internal callback guard only; never serialized or supplied by a relay event. */
+export interface BridgeRelayDispatchBudget {
+  readonly signal: AbortSignal;
+  /** Rechecks the ORIGINAL connection deadline/cancellation and authenticated source binding. */
+  remaining: () => number;
+}
+
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$/;
 const DEADLINE_MS = 4_000;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
@@ -371,20 +378,22 @@ const readFrame = (socket: net.Socket, maximum: number, requireEof: boolean): Pr
   });
 
 /** One absolute deadline covers connect, BOTH authentications, handshake, body, callback and receipt. */
-const deadline = (socket: net.Socket): { wait: <T>(work: Promise<T>) => Promise<T>; remaining: () => number; finish: () => void } => {
+const deadline = (socket: net.Socket): BridgeRelayDispatchBudget & { wait: <T>(work: Promise<T>) => Promise<T>; finish: () => void } => {
   const now = (): number => Number(process.hrtime.bigint() / 1_000_000n);
   const expires = now() + DEADLINE_MS;
   let rejectFailure!: (error: BridgeRelayUnavailableError) => void;
   const failure = new Promise<never>((_, reject) => { rejectFailure = reject; });
   // A close between two waits must not make an unobserved rejection.
   void failure.catch(() => undefined);
-  const fail = (): void => { rejectFailure(unavailable()); socket.destroy(); };
+  const controller = new AbortController();
+  const fail = (): void => { controller.abort(); rejectFailure(unavailable()); socket.destroy(); };
   const timer = setTimeout(fail, DEADLINE_MS);
   socket.once("error", fail); socket.once("close", fail);
   return {
+    signal: controller.signal,
     wait: work => Promise.race([failure, work]),
-    remaining: () => { const left = expires - now(); if (left <= 0 || socket.destroyed) throw unavailable(); return left; },
-    finish: () => { clearTimeout(timer); socket.off("error", fail); socket.off("close", fail); },
+    remaining: () => { const left = expires - now(); if (left <= 0 || socket.destroyed || controller.signal.aborted) throw unavailable(); return left; },
+    finish: () => { controller.abort(); clearTimeout(timer); socket.off("error", fail); socket.off("close", fail); },
   };
 };
 const writeFrame = (socket: net.Socket, frame: Buffer, end: boolean): Promise<void> => new Promise((resolve, reject) => {
@@ -397,7 +406,8 @@ export async function startBridgeRelay(options: {
   remoteName: string;
   meshRoot: string;
   bridgeScriptPath: string;
-  deliver: (sourceRemote: string, event: BridgePublish) => Promise<void>;
+  deliver: (sourceRemote: string, event: BridgePublish, budget: BridgeRelayDispatchBudget) => Promise<void>;
+  log?: (line: string) => void;
 }): Promise<{ send: (destinationRemote: string, event: BridgePublish) => Promise<void>; close: () => Promise<void> }> {
   let directory: Directory | undefined;
   let bindFd: number | undefined;
@@ -445,8 +455,8 @@ export async function startBridgeRelay(options: {
     if (ownedSocket) closeFd(ownedSocket.fd);
     directory?.close();
     if (failed) throw unavailable();
-    // deliver() has no cancellation argument. Admitted work may complete after receipt loss;
-    // its slot remains occupied until settlement, and bridge teardown owns the underlying transport.
+    // Cancellation fences only NEW dispatch. Already sent work may complete after receipt
+    // loss; its slot remains occupied until settlement and bridge teardown owns the transport.
   })().catch(() => { throw unavailable(); });
   try {
     if (process.platform !== "linux" || typeof process.getuid !== "function" || process.release.name !== "node" ||
@@ -490,8 +500,15 @@ export async function startBridgeRelay(options: {
             deliveries.size >= MAX_DELIVERIES) throw unavailable();
           const fresh = validatePeer(peer.credentials, expected, pinned, uid, currentBoot, peer.identity.remoteName);
           if (fresh.startTicks !== peer.identity.startTicks) throw unavailable();
-          limit.remaining();
-          const delivery = Promise.resolve(options.deliver(fresh.remoteName, value.event));
+          const budget: BridgeRelayDispatchBudget = { signal: limit.signal, remaining: () => {
+            limit.remaining();
+            if (closed || !ready) throw unavailable();
+            const current = validatePeer(peer.credentials, expected, pinned, uid, currentBoot, peer.identity.remoteName);
+            if (current.startTicks !== peer.identity.startTicks) throw unavailable();
+            return limit.remaining();
+          } };
+          budget.remaining();
+          const delivery = Promise.resolve(options.deliver(fresh.remoteName, value.event, budget));
           deliveries.add(delivery);
           void delivery.then(() => deliveries.delete(delivery), () => deliveries.delete(delivery));
           await limit.wait(delivery);
@@ -501,6 +518,9 @@ export async function startBridgeRelay(options: {
         } catch (error) {
           if (!socket.destroyed && !socket.writableEnded) {
             const refusal = object(error) && error.code === FABRIC_IDEMPOTENCY_KEY_REUSED ? IDEMPOTENCY_REFUSED : REFUSED;
+            // Fixed metadata only. Log every attempted negative frame, including an
+            // ambiguous write, without trusting payload-bearing callback/system errors.
+            try { options.log?.(`relay NAK stage=ipc reason=${refusal === IDEMPOTENCY_REFUSED ? "idempotency-conflict" : "destination-unavailable"}`); } catch { /* diagnostic only */ }
             try { await limit.wait(writeFrame(socket, refusal, true)); } catch { /* fixed refusal or connection loss only */ }
           }
         } finally { limit.finish(); socket.destroy(); incoming.delete(socket); }

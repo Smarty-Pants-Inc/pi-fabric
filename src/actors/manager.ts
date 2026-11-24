@@ -7011,13 +7011,9 @@ export class ActorManager {
             actor.status = "stopped";
             actor.stopReason = "directive";
             actor.stoppedAt ??= Date.now();
-            this.#takeQueued(actor).forEach((queued) =>
-              queued.reject?.(
-                new Error(
-                  `Fabric actor ${actor.name} (${actor.id}) stopped itself with a stop directive while messages were queued`,
-                ),
-              ),
-            );
+            // smarty-dev#19907: only an ask has a reject; a queued event without a caller is recorded as dropped.
+            this.#drop(actor, this.#takeQueued(actor),
+              `Fabric actor ${actor.name} (${actor.id}) stopped itself with a stop directive while messages were queued`);
           }
         } catch (error) {
           if (this.#closeCompleted) continue;

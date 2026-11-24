@@ -209,6 +209,38 @@ describe("agents.stop with queued work (smarty-dev#16416)", () => {
   }, 30_000);
 });
 
+// smarty-dev#19907: the actor's own stop directive is a stop path too. It rejected the queued asks and let
+// every queued event without a caller vanish; each one must leave a drop record, as on the other stop paths.
+describe("a self-issued stop directive with queued work (smarty-dev#19907)", () => {
+  it("records each queued event without a caller as dropped, and rejects the queued ask as before", async () => {
+    const { root, mesh, actors } = setup();
+    const actor = await actors.create({ name: "self-stopper", instructions: "Stop when your role is complete.",
+      responseMode: "directive", topics: [TOPIC], coalesce: false });
+    // Hold the activation that answers with the stop directive, so the rest is certainly queued behind it.
+    const release = path.join(root, "stop-directive-release");
+    closers.unshift(async () => { fs.writeFileSync(release, "release"); });
+    actors.tell(actor.id, "STOP_DIRECTIVE", { fakeWorkerFinishGate: release });
+    await waitFor(() => fs.existsSync(`${release}.entered`));
+    const told = actors.tell(actor.id, "a queued tell").messageId;
+    await publish(mesh, 0);
+    const asked = actors.ask(actor.id, "a queued ask").then(() => "answered", (error: Error) => error.message);
+    await waitFor(() => actors.status(actor.id).queued === 3 && meshRecords(root, actor.id).length === 1);
+    const [event] = meshRecords(root, actor.id);
+    fs.writeFileSync(release, "release");
+    await waitFor(() => actors.status(actor.id).status === "stopped" && actors.inFlightCount() === 0);
+
+    const reason = `Fabric actor self-stopper (${actor.id}) stopped itself with a stop directive while messages were queued`;
+    expect(await asked).toBe(reason);
+    expect(actors.status(actor.id)).toMatchObject({ status: "stopped", stopReason: "directive", queued: 0 });
+    const dropped = actors.messages(actor.id).filter(message => message.error?.startsWith("Dropped a queued event"));
+    expect(dropped.map(({ source, error, data }) => ({ source, error, data }))).toEqual([
+      { source: "direct", error: `Dropped a queued event: ${reason}`, data: { droppedItemId: told } },
+      { source: `mesh:${TOPIC}`, error: `Dropped a queued event: ${reason}`, data: { droppedItemId: event!.id } },
+    ]);
+    expect(meshRecords(root, actor.id)).toEqual([]);
+  }, 30_000);
+});
+
 describe("setActivationFilter over queued work (smarty-dev#16416)", () => {
   const MATCHES = new Set([0, 2, 3, 5, 7, 9]);
   const queuedTen = async (limit: number) => {

@@ -1500,7 +1500,10 @@ describe("Main non-owner automatic decline and compaction recovery in a real Pi 
             });
             // Register the actual Fabric veto BEFORE Main's handler. Pi short-circuits
             // cancel dispatch, so the drain cannot rely on seeing session_before_compact.
-            (lazy ? registerLazyCompactionHook : registerCompactionHook)(pi, { getEngine: () => "pi", getThresholdTokens: () => outcome === "automatic-decline" ? 100_000 : undefined });
+            (lazy ? registerLazyCompactionHook : registerCompactionHook)(pi, {
+              getEngine: () => outcome === "automatic-decline" ? "fabric" : "pi",
+              getThresholdTokens: () => outcome === "automatic-decline" ? 100_000 : undefined,
+            });
             pi.on("session_start", (_event, ctx) => {
               const main = new MainAgentController(pi, "session:root", true, root, "root");
               main.attachFollowUpDrain(ctx, flushMs, journal);

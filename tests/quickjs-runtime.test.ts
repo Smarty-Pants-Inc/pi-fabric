@@ -263,6 +263,58 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
       code: "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", retryable: true, keys: ["code", "message", "name", "retryable"] });
   });
 
+  it("carries only the bridge-stale project agent contract through public guest lookups", async () => {
+    const error = Object.assign(new Error("Refresh bridge presence and retry this lookup"), {
+      name: "FabricProjectAgentBridgeStaleError", code: "FABRIC_PROJECT_AGENT_BRIDGE_STALE", retryable: true,
+      targetId: "session:11111111-1111-4111-8111-111111111111", remoteHost: "forge",
+      secret: "host-only", cause: { secret: "nested-host-only" }, idempotencyKey: "unrelated",
+    });
+    const hostCall = vi.fn(async () => { throw error; });
+    const result = await new QuickJsRuntime().execute(
+      `const failures = [];
+       for (const lookup of [agents.projectAgent, () => tools.call({ ref: "agents.projectAgent" })]) {
+         try { await lookup(); }
+         catch (error) { failures.push({ name: error.name, code: error.code, retryable: error.retryable,
+           targetId: error.targetId, remoteHost: error.remoteHost, isError: error instanceof Error,
+           secret: typeof error.secret, cause: typeof error.cause, idempotencyKey: typeof error.idempotencyKey,
+           keys: Object.keys(error).sort() }); }
+       } return failures;`, hostCall, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual(Array(2).fill({ name: "FabricProjectAgentBridgeStaleError",
+      code: "FABRIC_PROJECT_AGENT_BRIDGE_STALE", retryable: true,
+      targetId: "session:11111111-1111-4111-8111-111111111111", remoteHost: "forge", isError: true,
+      secret: "undefined", cause: "undefined", idempotencyKey: "undefined",
+      keys: ["code", "message", "name", "remoteHost", "retryable", "targetId"] }));
+    expect(hostCall).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["targetId", "remoteHost"])("bridges only bounded own data %s for the exact bridge-stale classification", async (field) => {
+    const getter = vi.fn(() => { throw new Error("must not invoke a getter"); });
+    const make = (value: unknown) => Object.assign(new Error("bridge-stale lookup"), {
+      name: "FabricProjectAgentBridgeStaleError", code: "FABRIC_PROJECT_AGENT_BRIDGE_STALE", retryable: true,
+      [field]: value,
+    });
+    const errors = [make(""), make("x".repeat(201)), make(7), make(null), make("x".repeat(200)),
+      make("getter"), make("inherited"), make("unrelated"), make("mismatched"), make("unknown")];
+    Object.defineProperty(errors[5], field, { get: getter });
+    Reflect.deleteProperty(errors[6]!, field);
+    Object.setPrototypeOf(errors[6], Object.assign(Object.create(Error.prototype), { [field]: "inherited" }));
+    Object.assign(errors[7]!, { name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE" });
+    Object.assign(errors[8]!, { name: "RangeError" });
+    Object.assign(errors[9]!, { code: "HOST_SECRET" });
+    let index = 0;
+    const result = await new QuickJsRuntime().execute(
+      `const failures = []; for (let i = 0; i < 10; i++) {
+        try { await agents.projectAgent(); }
+        catch (error) { failures.push(error[${JSON.stringify(field)}] ?? null); }
+      } return failures;`, async () => { throw errors[index++]; }, options,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual([null, null, null, null, "x".repeat(200), null, null, null, null, null]);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
   it("carries bounded STALE metadata and the original key through a public same-key guest retry", async () => {
     const calls: unknown[] = [];
     const result = await new QuickJsRuntime().execute(
@@ -398,6 +450,7 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
     ["FABRIC_TASK_ESCALATION_TARGET_DENIED", "TaskEscalationTargetError"],
     ["FABRIC_PROJECT_AGENT_UNRESOLVED", "FabricProjectAgentUnresolvedError"],
     ["FABRIC_PROJECT_AGENT_AMBIGUOUS", "FabricProjectAgentAmbiguousError"],
+    ["FABRIC_PROJECT_AGENT_BRIDGE_STALE", "FabricProjectAgentBridgeStaleError"],
     ["FABRIC_PROJECT_LEAD_INVALID", "FabricProjectLeadInvalidError"],
   ])("preserves vetted %s metadata alongside ordinary host names across repeated calls", async (code, name) => {
     let call = 0;

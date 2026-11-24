@@ -1467,6 +1467,17 @@ export class FabricControlPlane {
       }
     }
     void this.#publishCancellation(commandId, timedOut);
+    if (timedOut.commandPublished && timedOut.mirroredOwner) {
+      try {
+        const current = this.#readPendingMirroredOwner(timedOut);
+        if (current && mirroredOwnerRoutingStatus(current, (this.options.now ?? Date.now)()) === "bridge-stale") {
+          const error = new FabricBridgeStaleError(timedOut.mirroredOwner.remoteHost, timedOut.targetId);
+          Object.assign(error, { idempotencyKey: timedOut.idempotencyKey });
+          timedOut.reject(error);
+          return;
+        }
+      } catch { /* Missing/unreadable authority is not a fresh stale-bridge diagnosis. */ }
+    }
     // Neither a live lease nor a missing ACK proves the handler did not run. Never replay.
     const unknown = (): void => {
       const error = new Error(
@@ -1552,6 +1563,18 @@ export class FabricControlPlane {
     return pending;
   }
 
+  /** Refresh evidence only for the captured link/activation, never adopt a successor. */
+  #readPendingMirroredOwner(pending: PendingControlRequest): MirroredControlOwner | undefined {
+    const captured = pending.mirroredOwner;
+    if (!captured) return undefined;
+    const current = this.options.readMirroredOwner?.(pending.ownerHostId, pending.ownerIdentityId,
+      pending.routingTargetId ?? pending.targetId);
+    if (current?.remoteHost !== captured.remoteHost || current.ownerIncarnation !== captured.ownerIncarnation ||
+        pending.ownerIncarnation !== undefined && current.ownerIncarnation !== undefined &&
+          current.ownerIncarnation !== pending.ownerIncarnation) return undefined;
+    return current;
+  }
+
   #startLeaseWatchdog(): void {
     if (this.#leaseWatchdog) return;
     // Independent of the async mesh drain: a locked write must not hide a lease lapse.
@@ -1570,15 +1593,19 @@ export class FabricControlPlane {
         }
         let current: PendingControlRequest["mirroredOwner"];
         try {
-          current = this.options.readMirroredOwner?.(pending.ownerHostId, pending.ownerIdentityId, pending.routingTargetId ?? pending.targetId);
+          current = this.#readPendingMirroredOwner(pending);
         } catch {
           // A failed read is not evidence of a lapse. The independent request timer stays armed.
           continue;
         }
-        // Never adopt a different link's label. Missing ownership cannot renew this lease.
-        if (current?.remoteHost === captured.remoteHost) Object.assign(captured, { ...current, mirror: current.mirror, bridgeStale: current.bridgeStale });
+        // Missing or replacement ownership cannot renew the captured lease.
+        if (current) Object.assign(captured, { ...current, mirror: current.mirror, bridgeStale: current.bridgeStale });
         const status = mirroredOwnerRoutingStatus(captured, (this.options.now ?? Date.now)());
         if (status === "live") continue;
+        // After publication, an unconfirmed projection alone says nothing about delivery.
+        // Keep the ORIGINAL ACK timer and pinned receipt authority; never renew or resend.
+        // Admission-pending work still fails here and must pass its strict commit checks.
+        if (status === "bridge-stale" && pending.commandPublished) continue;
         const lapsed = this.#clearPending(commandId);
         if (!lapsed) continue;
         void this.#publishCancellation(commandId, lapsed);

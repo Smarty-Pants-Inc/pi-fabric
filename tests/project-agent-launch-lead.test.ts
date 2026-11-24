@@ -36,7 +36,9 @@ describe("#16723 projectAgent launch binding", () => {
   const repository = "code.example/team/lane";
   const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
   const fixture = async (binding: "marker" | "env" | "none" = "marker", remote = false) => {
-    vi.stubEnv("SMARTY_LEAD_SESSION", binding === "env" ? leadId : "");
+    vi.stubEnv("SMARTY_LEAD_SESSION", "");
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", binding === "env" ? leadId : undefined);
+    vi.stubEnv("PI_FABRIC_SPAWNER_KIND", binding === "env" ? "main" : undefined);
     vi.stubEnv("PI_FABRIC_PROJECT", "");
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launch-lead-"));
     roots.push(lane);
@@ -54,7 +56,8 @@ describe("#16723 projectAgent launch binding", () => {
       enabled: true, hostId: identity.id, rootId: identity.id, identity, reapDeadHosts: false,
     });
     directories.push(directory);
-    const agents = new AgentManager(cwd, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(lane, "runs") });
+    // Runtime cwd is bound to the actual lane; the invocation may start in its subdirectory.
+    const agents = new AgentManager(lane, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(lane, "runs") });
     // This test only discovers roots; delivery is deliberately not implemented.
     const mainAgent: FabricMainAgentTarget = {
       id: identity.id, local: true, matches: id => id === identity.id,
@@ -103,7 +106,7 @@ describe("#16723 projectAgent launch binding", () => {
     code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("is absent or stale"),
   };
 
-  it.each(["marker", "env"] as const)("resolves the exact same-repo then cross-repo recorded lead via %s", async binding => {
+  it.each(["marker", "env"] as const)("resolves the exact same-repo then cross-repo lead via lane marker or incoming Main binding (%s)", async binding => {
     const f = await fixture(binding);
     await f.publish(leadId);
     await expect(f.call()).resolves.toMatchObject({ id: leadId });
@@ -130,16 +133,16 @@ describe("#16723 projectAgent launch binding", () => {
     });
   });
 
-  it("diagnoses repository mismatch only for unbound native election", async () => {
+  it("never elects an unbound native root or fresh mirror, regardless of repository identity", async () => {
     const f = await fixture("none", true);
     await f.publish(otherId, { repository: "code.example/team/other" });
     await f.publish(leadId); // A fresh same-repository mirror still cannot be elected without a binding.
     expect(f.directory.sessions().find(root => root.id === leadId)).toMatchObject({ remoteHost: "remote" });
     await expect(f.call()).rejects.toMatchObject({
-      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("No recorded launch lead; live native roots belong to another repository"),
+      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("no actual Main spawner or lane launch lead binding"),
     });
     await f.publish(otherId);
-    await expect(f.call()).resolves.toMatchObject({ id: otherId });
+    await expect(f.call()).rejects.toMatchObject({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" });
   });
 
   it.each(["bridge", "source-lease"] as const)("accepts a cross-repo recorded mirror only while its %s is fresh", async kind => {

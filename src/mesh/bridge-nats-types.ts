@@ -610,6 +610,12 @@ export type BridgeNatsClaimAction =
   | { readonly action: "refuse"; readonly record: BridgeNatsCommandRecord;
     readonly refuse: typeof BRIDGE_NATS_REFUSAL.idConflict | typeof BRIDGE_NATS_REFUSAL.claimMismatch };
 
+export interface BridgeNatsEventRefusal {
+  readonly kind: "refused";
+  readonly reason: string;
+  readonly code?: string;
+}
+
 export interface BridgeNatsSeenRecord {
   readonly v: 1;
   /** Source event/envelope id. */
@@ -618,6 +624,8 @@ export interface BridgeNatsSeenRecord {
   /** The destination's durable id/sequence, when known. */
   readonly destinationId?: string;
   readonly destinationSequence?: number;
+  /** A terminal per-event decision, not an owner outcome or a link failure. */
+  readonly refusal?: BridgeNatsEventRefusal;
   readonly seenAt: number;
   readonly expiresAt: number;
 }
@@ -647,6 +655,6 @@ export interface BridgeNatsLedger {
   /** Event-level dedupe for non-command traffic and inbound deliveries already appended. */
   seen(direction: BridgeNatsDirection, eventId: string): BridgeNatsSeenRecord | undefined;
   markSeen(direction: BridgeNatsDirection, eventId: string,
-    receipt?: { readonly destinationId?: string; readonly destinationSequence?: number }): Promise<BridgeNatsSeenRecord>;
+    receipt?: { readonly destinationId?: string; readonly destinationSequence?: number; readonly refusal?: BridgeNatsEventRefusal }): Promise<BridgeNatsSeenRecord>;
   close(): Promise<void>;
 }

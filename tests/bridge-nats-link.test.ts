@@ -79,21 +79,25 @@ const gatedFixture = async (clock?: () => number) => {
   const allow = parseBridgeNatsAllowSection(ALLOW, { link: LINK, natsMachine: BRIDGE_MACHINE });
   const gate = createBridgeNatsIdentityGate(allow, { pins });
   let remote: NatsCarrierSide | undefined;
-  const { authorize, authorizeTopic } = natsLinkAuthorizers(gate, { file: () => remote!.filePresence.view(), nats: () => port.presenceView() });
+  const { authorize, authorizeTopic } = natsLinkAuthorizers(gate, { file: () => remote!.filePresence.view(), nats: () => remote!.port.presenceView() });
   const logs: string[] = [];
   const ledger = await ledgerIn(root);
-  const link = createNatsFileLink({ store, localName: "ryzen1", link: LINK, cursorPath: path.join(root, "cursor.json"), port,
-    ledger: natsCarrierLedger(ledger, LINK), authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow),
-    waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
-    log: line => logs.push(line), resendDelayMs: 0, bridge: { presenceMs: 60_000,
-      ...(clock ? { clock } : {}),
-      diagnosticTargetAdmitted: (id, direction) => allow.entries.some(entry =>
-        entry.side === (direction === "toRemote" ? "nats" : "file") && entry.id === id) } });
-  remote = link.remote;
+  const make = (port: FakePort, ledger: FileBridgeNatsLedger) => {
+    const link = createNatsFileLink({ store, localName: "ryzen1", link: LINK, cursorPath: path.join(root, "cursor.json"), port,
+      ledger: natsCarrierLedger(ledger, LINK), authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow),
+      waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
+      log: line => logs.push(line), resendDelayMs: 0, bridge: { presenceMs: 60_000,
+        ...(clock ? { clock } : {}),
+        diagnosticTargetAdmitted: (id, direction) => allow.entries.some(entry =>
+          entry.side === (direction === "toRemote" ? "nats" : "file") && entry.id === id) } });
+    remote = link.remote;
+    return link;
+  };
+  const link = make(port, ledger);
   closers.push(() => link.bridge.stop());
   await link.bridge.start();
   const events = (topic: string): MeshEvent[] => store.read({ after: 0, limit: store.maxReadEvents }).filter(event => event.topic === topic);
-  return { root, store, port, link, logs, ledger, events };
+  return { root, store, port, link, logs, ledger, events, make };
 };
 
 const fileCommand = (store: MeshStore, operation: string, commandId: string, extra: Record<string, unknown> = {}) => store.publish({
@@ -118,6 +122,97 @@ const onPlatform = async <T>(platform: NodeJS.Platform, work: () => Promise<T>):
 const WINDOWS = process.platform === "win32";
 
 describe("startNatsLink composition with L3's allow gate", () => {
+  // Keep: the live A' crash-loop (2026-10-28): one non-owner ACK must not stop either direction.
+  it("durably refuses one outbound ACK, keeps running, forwards the next event and does not replay after restart", async () => {
+    const { root, store, port, link, logs, ledger, make } = await gatedFixture();
+    let ended = false;
+    const running = link.bridge.run().finally(() => { ended = true; });
+    void running.catch(() => undefined);
+    closers.push(async () => { await link.bridge.stop(); await running; });
+    const bad = await store.publish({ topic: "fabric.control.ack", kind: "ack", from: fileLead, to: natsLead.id,
+      data: { version: 1, commandId: "not-an-owner-answer", targetId: fileLead.id } });
+    const good = await fileCommand(store, "followUp", "after-refusal");
+    await vi.waitFor(() => {
+      expect(ledger.seen("toNats", bad.id)).toMatchObject({ refusal: { kind: "refused", reason: "ack carries no owner outcome" } });
+      expect(port.sent.some(event => event.body.commandId === bridgeNatsMappedCommandId(LINK, "toNats", fileLead.id, "after-refusal"))).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(root, "cursor.json"), "utf8")).toRemote.after).toBeGreaterThanOrEqual(good.sequence);
+    }, { timeout: 10_000 });
+    expect(ended).toBe(false);
+    expect(port.closed).toBe(false);
+    expect(port.sent).toHaveLength(1);
+    const refusalLog = `toNats: refused fabric.control.ack ${bad.id}: ack carries no owner outcome`;
+    expect(logs.filter(line => line.includes(bad.id))).toEqual([refusalLog]);
+    await link.bridge.stop();
+    await running;
+    await ledger.close();
+    const reopened = await ledgerIn(root);
+    const nextPort = fakePort();
+    const next = make(nextPort, reopened);
+    closers.push(() => next.bridge.stop());
+    await next.bridge.start();
+    // Even a replay from before the cursor checkpoint must honor the first durable refusal,
+    // without consulting a changed gate/producer or logging/refusing the same event twice.
+    const translate = vi.spyOn(next.remote.carrier, "outbound");
+    await expect(next.remote.publish({ topic: bad.topic, kind: bad.kind, from: bad.from, to: bad.to!,
+      data: { ...(bad.data as Record<string, unknown>), bridge: { from: "ryzen1", id: bad.id } } }))
+      .resolves.toMatchObject({ kind: "refused", sequence: 0 });
+    expect(translate).not.toHaveBeenCalled();
+    await next.bridge.step();
+    expect(nextPort.sent).toEqual([]);
+    await fileCommand(store, "followUp", "after-restart");
+    expect((await next.bridge.step()).toRemote).toBe(1);
+    expect(nextPort.sent).toHaveLength(1);
+    expect(reopened.seen("toNats", bad.id)?.refusal).toEqual({ kind: "refused", reason: "ack carries no owner outcome" });
+    expect(logs.filter(line => line.includes(bad.id))).toEqual([refusalLog]);
+  });
+
+  it("consumes a bridge-generated relay refusal ACK at the outbound boundary, rather than rejecting its caller", async () => {
+    const { port, link, ledger, logs } = await gatedFixture();
+    // bridge.ts #relayCommand writes this from inside its failure path, outside the ordinary
+    // single-event publish catch. It is intentionally a hop refusal, NOT an owner's outcome.
+    await expect(link.remote.publish({ topic: "fabric.control.ack", kind: "ack", from: linkIdentity, to: natsLead.id,
+      data: { version: 1, commandId: "relay-command", targetId: fileLead.id, accepted: false,
+        error: "Relay destination unavailable", errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true,
+        bridge: { from: "ryzen1", id: "relay-source-event" } } }))
+      .resolves.toMatchObject({ kind: "refused", sequence: 0 });
+    expect(ledger.seen("toNats", "relay-source-event")?.refusal).toEqual({ kind: "refused", reason: "ack carries no owner outcome" });
+    expect(port.sent).toEqual([]);
+    expect(logs.filter(line => line.includes("relay-source-event"))).toEqual([
+      "toNats: refused fabric.control.ack relay-source-event: ack carries no owner outcome",
+    ]);
+  });
+
+  it("retains the source cursor when a refusal cannot be recorded durably", async () => {
+    const { root, store, link, ledger, port } = await gatedFixture();
+    const before = fs.readFileSync(path.join(root, "cursor.json"), "utf8");
+    const write = vi.spyOn(ledger, "markSeen").mockRejectedValueOnce(new Error("refusal receipt disk failure"));
+    const bad = await store.publish({ topic: "fabric.control.ack", kind: "ack", from: fileLead, to: natsLead.id,
+      data: { version: 1, commandId: "bad", targetId: fileLead.id } });
+    await expect(link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(fs.readFileSync(path.join(root, "cursor.json"), "utf8")).toBe(before);
+    expect(port.sent).toEqual([]);
+    write.mockRestore();
+    const result = await link.bridge.step();
+    expect(result.toRemote).toBe(0);
+    expect(ledger.seen("toNats", bad.id)?.refusal?.kind).toBe("refused");
+  });
+
+  it.each(["FABRIC_BRIDGE_NATS_FENCED", "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_DENIED"])(
+    "stops the running link for a port safety failure: %s (even a 'not allowed' message)", async code => {
+      const { root, store, port, link, ledger } = await gatedFixture();
+      const failure = Object.assign(new Error("port identity/credential not allowed"), { code });
+      vi.spyOn(port, "send").mockRejectedValue(failure);
+      const running = link.bridge.run();
+      const failed = expect(running).rejects.toMatchObject({ cause: failure });
+      void running.catch(() => undefined);
+      closers.push(async () => { await link.bridge.stop(); await running.catch(() => undefined); });
+      const event = await fileCommand(store, "followUp", `unsafe-${code}`);
+      await failed;
+      expect(ledger.seen("toNats", event.id)).toBeUndefined();
+      expect(JSON.parse(fs.readFileSync(path.join(root, "cursor.json"), "utf8")).toRemote.after).toBeLessThan(event.sequence);
+      expect(port.sent).toEqual([]);
+    });
+
   it("mirrors only allow-listed file identities into KV", async () => {
     const { port } = await gatedFixture();
     const ids = port.mirrors.at(-1)!.participants.map(entry => entry.id);

@@ -233,6 +233,20 @@ describe("states", () => {
 });
 
 describe("crash durability", () => {
+  it("keeps the first event refusal through compaction and reopen without settling any owner outcome", async () => {
+    let ledger = await ledgerAt(dir(), 1);
+    for (let index = 0; index < 5; index++) await ledger.markSeen("toFile", `expired-${index}`);
+    clock.now += BRIDGE_NATS_HORIZON_MS + 1;
+    const refusal = { kind: "refused" as const, reason: "ack carries no owner outcome", code: "TEST_REFUSAL" };
+    const first = await ledger.markSeen("toNats", "bad-ack", { refusal });
+    expect(await ledger.markSeen("toNats", "bad-ack", { refusal: { kind: "refused", reason: "changed" } })).toEqual(first);
+    expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE), "utf8").trim().split("\n")).toHaveLength(1);
+    await ledger.close();
+    ledger = await ledgerAt(dir(), 1);
+    expect(ledger.seen("toNats", "bad-ack")?.refusal).toEqual(refusal);
+    expect(ledger.pendingAcks()).toEqual([]);
+    expect(ledger.pendingResends()).toEqual([]);
+  });
   it("reopens with every resolved mutation: claims, uncertain bytes, ACKs, the mapping and seen events", async () => {
     let ledger = await ledgerAt();
     const sent = (await ledger.claim(toNats("a"))).record.commandId;

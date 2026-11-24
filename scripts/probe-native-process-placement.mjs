@@ -12,9 +12,10 @@ import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { assertMainProofCaller, assertWorkHostRoutes, linkProofModels } from "./lib/native-placement-proof.mjs";
 
-const [piPackageInput, outputInput, launcherInput, host, mapInput, mode] = process.argv.slice(2);
-assert(piPackageInput && outputInput && launcherInput && host && mapInput && ["local", "ssh"].includes(mode),
-  "usage: probe-native-process-placement.mjs PI_PACKAGE OUTPUT_DIR REAL_LAUNCHER HOST WORK_HOSTS_JSON local|ssh");
+const [piPackageInput, outputInput, launcherInput, host, mapInput, mode, nativeTaskRoot] = process.argv.slice(2);
+assert(piPackageInput && outputInput && launcherInput && host && mapInput && ["local", "ssh"].includes(mode)
+  && typeof nativeTaskRoot === "string" && nativeTaskRoot.trim().length > 0 && path.isAbsolute(nativeTaskRoot),
+  "usage: probe-native-process-placement.mjs PI_PACKAGE OUTPUT_DIR REAL_LAUNCHER HOST WORK_HOSTS_JSON local|ssh NATIVE_TASK_ROOT (absolute path required)");
 for (const input of [piPackageInput, launcherInput, mapInput]) {
   assert(path.isAbsolute(input) && fs.existsSync(input), `BLOCKED: missing absolute local input ${input}`);
 }
@@ -41,12 +42,12 @@ execFileSync("git", ["-C", cwd, "add", "proof.txt"]);
 const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const dirty = execFileSync("git", ["diff", "HEAD", "--", "src", "scripts", "docs", "tests"], { encoding: "utf8" }).length > 0;
 const task = "Run hostname in the foreground using your bash tool, then reply with only the exact hostname. Do not spawn agents, use SSH, edit files, access credentials, or leave any work running.";
-const nativeRoot = "/srv/scratch/paul/tasks/direct";
-const reader = "python3 -c 'import json,pathlib,sys; p=pathlib.Path(\"/srv/scratch/paul/tasks/direct\")/sys.argv[1]; rc=p/\"rc\"; print(json.dumps({\"rc\":rc.read_text().strip(),\"text\":(p/\"result.md\").read_text(),\"stderr\":(p/\"stderr.log\").read_text() if (p/\"stderr.log\").exists() else \"\"} if rc.exists() else {\"rc\":None}))' {id}";
+const shellQuote = value => "'" + value.replace(/'/g, "'\\''") + "'";
+const reader = "python3 -c 'import json,pathlib,sys; p=pathlib.Path(sys.argv[1])/sys.argv[2]; rc=p/\"rc\"; print(json.dumps({\"rc\":rc.read_text().strip(),\"text\":(p/\"result.md\").read_text(),\"stderr\":(p/\"stderr.log\").read_text() if (p/\"stderr.log\").exists() else \"\"} if rc.exists() else {\"rc\":None}))' " + shellQuote(nativeTaskRoot) + " {id}";
 const placement = {
   default: "remote", capabilities: [], sshAliases: aliases,
   command: [launcher, "{id}", "--host", host, "--minutes", "{minutes}", "--src", "{cwd}", "--model", "{model}", "--thinking", "{thinking}", "--", "{task}"],
-  ...(mode === "local" ? { resultDirectory: nativeRoot + "/{id}" } : { resultCommand: ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "{sshAlias}", reader] }),
+  ...(mode === "local" ? { resultDirectory: path.join(nativeTaskRoot, "{id}") } : { resultCommand: ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "{sshAlias}", reader] }),
   cancelCommand: [launcher, "--host", "{host}", "--cancel", "{id}"], pollIntervalMs: 1000, commandTimeoutMs: 30000,
 };
 // Keep HOME unchanged: the real launcher resolves its factory installation
@@ -109,7 +110,7 @@ try {
   const acceptanceFile = files.find(file => path.basename(file) === "placement.json" && JSON.parse(fs.readFileSync(file, "utf8")).id === value.handle.id);
   if (acceptanceFile) evidence.acceptance = JSON.parse(fs.readFileSync(acceptanceFile, "utf8"));
   if (mode === "local") {
-    const native = path.join(nativeRoot, value.handle.id);
+    const native = path.join(nativeTaskRoot, value.handle.id);
     for (const name of ["rc", "pi-rc", "result.md", "stderr.log", "completion.json"]) if (fs.existsSync(path.join(native, name))) fs.copyFileSync(path.join(native, name), path.join(output, "native-" + name));
   }
   assert.equal(value.result.status, "completed", "BLOCKED: real launcher did not return a completed task; inspect fabric-exec-result and native logs");

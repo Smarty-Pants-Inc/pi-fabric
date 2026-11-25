@@ -895,12 +895,18 @@ const laneUnresolvedDenial = (error: unknown): boolean => {
   return false;
 };
 
-/** Only known preparation deadlines/deferred mesh writes, registry-phase vetoes and an unresolved
- * root lane may expire. A typed veto from binding or another phase is not registry retry authority. */
+/** A typed registry veto committed nothing, regardless of its preparation phase or wrapper.
+ * All drain/diagnostic failure paths share this extraction before reducing errors to text.
+ * Scan the whole chain first so an outer timeout cannot hide a veto; cycles must terminate.
+ * Other preparation kinds retain their existing bounded lookup and retry policy. */
 const preparationFailureKind = (error: unknown): true | "timeout" | "lane-unresolved" | ActorRegistryUpdateVetoedError => {
+  const seen = new Set<Error>();
+  for (let cause: unknown = error; cause instanceof Error && !seen.has(cause); cause = cause.cause) {
+    seen.add(cause);
+    if (cause instanceof ActorRegistryUpdateVetoedError) return cause;
+  }
   if (laneUnresolvedDenial(error)) return "lane-unresolved";
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
-    if (cause instanceof ActorRegistryUpdateVetoedError && error instanceof ActorPreparationError && error.phase === "registry") return cause;
     if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
   }
   return true;

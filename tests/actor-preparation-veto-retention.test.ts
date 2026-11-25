@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager, ActorPreparationError } from "../src/actors/manager.js";
+import { ActorManager, ActorPreparationError, ActorPreparationTimeoutError } from "../src/actors/manager.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -153,6 +153,29 @@ describe("real registry preparation and callerless subscription retention", () =
     });
   });
 
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+  it("REGRESSION: an unwrapped registry veto during drain cleanup is transient", async () => {
+    const { actors, agents, mesh } = setup();
+    const actor = await create(actors);
+    const run = vi.spyOn(agents, "run");
+    // This cleanup checkpoint calls #saveActors directly, outside #prepare(registry).
+    const veto = registryVeto(rows => rows.some(row => row.id === actor.id && row.lastCleanedRunWorker));
+    const done = settled(actors, actor.id, () => veto.errors.length > 0);
+    await publish(mesh);
+    await done;
+    expect(veto.errors.some(error => error instanceof ActorRegistryUpdateVetoedError)).toBe(true);
+    const diagnostic = actors.messages(actor.id).find(message => message.source === "preparation" &&
+      (message.data as { errorType?: string })?.errorType === "ActorRegistryUpdateVetoedError");
+    expect(diagnostic?.data).toMatchObject({ errorType: "ActorRegistryUpdateVetoedError" });
+    expect(diagnostic!.data).not.toHaveProperty("phase");
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(queue(actor.sessionFile!)).toEqual([]); // completed work must not replay
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({
+      code: "registry-update-vetoed", class: "transient", reason: "actor registry validation veto (generation)",
+      retryAt: expect.any(Number),
+    });
+  });
+
   it.each(["text", "directive"] as const)("REGRESSION: permanent pre-launch binding failure retains accepted %s event without worker execution", async responseMode => {
     let unavailable = false;
     let sessionFile: string | undefined;
@@ -284,10 +307,21 @@ describe("real registry preparation and callerless subscription retention", () =
     expect(queue(actor.sessionFile!)).toEqual([]);
   });
 
-  it("does not trust veto-shaped binding text or automatically retry its hard preparation", async () => {
+  it.each(["plain text", "retryable lookalike", "cycle without veto", "typed veto with auth contradiction"] as const)(
+    "keeps %s binding failure hard without automatic retry", async variant => {
     let unavailable = false;
     const { actors, agents, mesh } = setup({ preparationRetryMs: 5, resolvePiModel: async model => {
-      if (unavailable) throw new Error("Actor registry update was vetoed by its validation and not committed; retry");
+      if (unavailable) {
+        const error = new Error(new ActorRegistryUpdateVetoedError().message);
+        if (variant === "retryable lookalike") Object.assign(error, {
+          name: "ActorRegistryUpdateVetoedError", code: "FABRIC_ACTOR_REGISTRY_UPDATE_VETOED", retryable: true,
+        });
+        if (variant === "cycle without veto") error.cause = error;
+        if (variant === "typed veto with auth contradiction") {
+          throw new Error(`401 Unauthorized: ${error.message}`, { cause: new ActorRegistryUpdateVetoedError("generation") });
+        }
+        throw error;
+      }
       return model;
     } });
     const actor = await create(actors);
@@ -296,18 +330,36 @@ describe("real registry preparation and callerless subscription retention", () =
     const done = settled(actors, actor.id, () => queue(actor.sessionFile!)[0]?.preparationAttempts === 1);
     await publish(mesh);
     await done;
-    expect(actors.status(actor.id).activationBlocked).toMatchObject({ class: "hard", code: "failing-preparation" });
+    expect(actors.status(actor.id).activationBlocked).toMatchObject({ class: "hard" });
+    expect(actors.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
     await pause(100);
     expect(queue(actor.sessionFile!)[0]?.preparationAttempts).toBe(1);
     expect(run).not.toHaveBeenCalled();
   });
 
-  it.each(["direct typed", "false-registry wrapped typed"] as const)("P1: a %s veto thrown by binding stays hard until explicit reset", async variant => {
+  // catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+  it.each(["direct typed", "false-registry wrapped typed", "deeply wrapped typed", "timeout wrapped typed", "cyclic typed"] as const)("REGRESSION: a %s veto thrown by binding is transient and recovers after owner recreation", async variant => {
     let unavailable = false;
-    const { actors, agents, mesh, root } = setup({ preparationRetryMs: 5, resolvePiModel: async model => {
+    const { actors, agents, mesh, root } = setup({ resolvePiModel: async model => {
       if (unavailable) {
         const veto = new ActorRegistryUpdateVetoedError("generation");
-        throw variant === "direct typed" ? veto : new ActorPreparationError("session:veto-retention", "registry", veto);
+        if (variant === "direct typed") throw veto;
+        if (variant === "deeply wrapped typed") {
+          let wrapped: Error = veto;
+          for (let depth = 0; depth < 8; depth++) wrapped = new Error(wrapped.message, { cause: wrapped });
+          throw wrapped;
+        }
+        if (variant === "timeout wrapped typed") {
+          const timeout = new ActorPreparationTimeoutError("session:veto-retention", "capabilities", 10_000);
+          timeout.cause = veto;
+          throw timeout;
+        }
+        if (variant === "cyclic typed") {
+          const wrapped = new Error(veto.message, { cause: veto });
+          veto.cause = wrapped;
+          throw wrapped;
+        }
+        throw new ActorPreparationError("session:veto-retention", "registry", veto);
       }
       return model;
     } });
@@ -317,7 +369,7 @@ describe("real registry preparation and callerless subscription retention", () =
     const done = settled(actors, actor.id, () => queue(actor.sessionFile!)[0]?.preparationAttempts === 1);
     const event = await publish(mesh, { finding: "P1" });
     await done;
-    expect(actors.messages(actor.id).find(message => message.error?.includes("Actor registry update was vetoed"))?.data)
+    expect(actors.messages(actor.id).find(message => (message.data as { phase?: string })?.phase === "binding")?.data)
       .toMatchObject({ errorType: "ActorPreparationError", phase: "binding", attempts: 1 });
     const retained = queue(actor.sessionFile!);
     const block = actors.status(actor.id).activationBlocked;
@@ -326,16 +378,16 @@ describe("real registry preparation and callerless subscription retention", () =
     expect(JSON.parse(fs.readFileSync(path.join(root, "cursor.json"), "utf8")).last.sequence)
       .toBeGreaterThanOrEqual(event.sequence);
     expect(run).not.toHaveBeenCalled();
-    // Neither a repaired resolver nor a newer callerless observation grants recovery.
+    // Keep the existing preparation retry pending; newer input remains durable too.
     unavailable = false;
     const newer = await publish(mesh, { finding: "P1", later: true });
     await pause(150);
     expect(run).not.toHaveBeenCalled();
-    expect(block).toMatchObject({ class: "hard", code: "failing-preparation" });
+    expect(block).toMatchObject({ class: "transient", code: "registry-update-vetoed",
+      reason: "actor registry validation veto (generation)", retryAt: expect.any(Number) });
     expect(actors.status(actor.id).activationBlocked).toEqual(block);
     expect(queue(actor.sessionFile!).map(item => item.payload.id)).toEqual([event.id, newer.id]);
-    // A restart must not promote the persisted binding wrapper's veto-shaped text
-    // into legacy registry evidence and undo the phase-aware hard classification.
+    // The typed classification is persisted canonically, not inferred from binding text.
     await actors.close();
     await agents.close();
     const nextAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -348,12 +400,10 @@ describe("real registry preparation and callerless subscription retention", () =
         meshRetentionSweepPath: false, preparationRetryMs: 5, resolvePiModel: async model => model,
       });
     cleanups.push(async () => { await next.close(); await nextAgents.close(); });
-    await pause(150);
-    expect(nextRun).not.toHaveBeenCalled();
-    expect(next.status(actor.id).activationBlocked).toMatchObject({ class: "hard", code: "failing-preparation" });
+    expect(next.status(actor.id).activationBlocked).toMatchObject({ class: "transient", code: "registry-update-vetoed" });
     expect(queue(actor.sessionFile!).map(item => item.payload.id)).toEqual([event.id, newer.id]);
     const recovered = settled(next, actor.id, () => outputs(next, actor.id).length === 2);
-    await next.resetSession(actor.id);
+    // A recreated owner resumes retained preparation using the existing retry policy, no reset.
     await recovered;
     await pause(50);
     expect(nextRun).toHaveBeenCalledTimes(2);
